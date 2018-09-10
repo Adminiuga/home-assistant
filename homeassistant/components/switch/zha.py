@@ -35,8 +35,8 @@ async def make_sensor(discovery_info):
         in_clusters = discovery_info['in_clusters']
         cluster = in_clusters[OnOff.cluster_id]
         await zha.configure_reporting(
-            sensor.entity_id, cluster, sensor.value_attribute, min_report=0, max_report=600,
-            reportable_change=1
+            sensor.entity_id, cluster, sensor.value_attribute,
+            min_report=0, max_report=600, reportable_change=1
         )
 
     return sensor
