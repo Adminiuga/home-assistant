@@ -39,9 +39,6 @@ async def make_sensor(discovery_info):
             reportable_change=1
         )
 
-#        await cluster.bind()
-#        await cluster.configure_reporting(sensor.value_attribute, 0, 600, 1)
-
     return sensor
 
 
