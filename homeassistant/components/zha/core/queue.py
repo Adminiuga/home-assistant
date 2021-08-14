@@ -40,6 +40,7 @@ class RetryableQueue:
     def __init__(self) -> None:
         """Initialize instance."""
         self._queue: dict[str, DeferredCommand] = {}
+        self._deplete_task: asyncio.Task | None = None
 
     def __len__(self) -> int:
         """Return queue length."""
@@ -108,3 +109,22 @@ class RetryableQueue:
                 "Success running %s(%s, %s) -> %s", cmd.tag, cmd.args, cmd.kwargs, res
             )
             cmd.future.set_result(res)
+
+    def deplete_queue(self) -> None:
+        """Schedule queue depletion."""
+
+        if self._deplete_task and not self._deplete_task.done():
+            self._deplete_task.cancel()
+
+        self._deplete_task = asyncio.create_task(self._deplete_queue())
+
+    async def _deplete_queue(self) -> None:
+        """Deplete queue as long as task are successful."""
+
+        for cmd in self._queue.values():
+            try:
+                await self._run(cmd)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # pylint: disable=broad-except
+                break
