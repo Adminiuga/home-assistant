@@ -75,8 +75,17 @@ class RetryableQueue:
             await self._run(cmd)
         except asyncio.CancelledError:
             raise
-        except Exception:  # pylint: disable=broad-except
+        except (asyncio.TimeoutError, zigpy.exceptions.DeliveryError):
+            # these are allowed to fail
             pass
+        except Exception as exc:  # pylint: disable=broad-except
+            _LOGGER.warning(
+                "Unexpected failure executing %s(%s, %s)",
+                cmd.tag,
+                cmd.args,
+                cmd.kwargs,
+                exc_info=exc,
+            )
 
     async def _run(self, cmd: DeferredCommand) -> None:
         """Run the deferred command."""
