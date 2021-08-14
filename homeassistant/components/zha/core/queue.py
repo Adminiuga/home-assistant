@@ -67,7 +67,12 @@ class RetryableQueue:
             existing_cmd.future.cancel()
 
         asyncio.create_task(self.catching_run(cmd))
-        return cmd.future
+        return asyncio.create_task(self._unwrap(cmd.future))
+
+    async def _unwrap(self, future) -> Any:
+        """Unwrap future result."""
+        await future
+        return future.result()
 
     async def catching_run(self, cmd: DeferredCommand) -> None:
         """Run cmd but catch any exceptions."""
@@ -123,14 +128,14 @@ class RetryableQueue:
         """Schedule queue depletion."""
 
         if self._deplete_task and not self._deplete_task.done():
-            self._deplete_task.cancel()
+            return
 
         self._deplete_task = asyncio.create_task(self._deplete_queue())
 
     async def _deplete_queue(self) -> None:
         """Deplete queue as long as task are successful."""
 
-        for cmd in self._queue.values():
+        for cmd in [*self._queue.values()]:
             try:
                 await self._run(cmd)
             except asyncio.CancelledError:
