@@ -182,3 +182,77 @@ async def test_queue_enqueue_cancelled(cmd_queue):
     assert res.done() is True
     with pytest.raises(asyncio.CancelledError):
         res.result()
+
+
+async def test_queue_enqueue_deplete(cmd_queue):
+    """Test queue depltion."""
+
+    success = False
+
+    async def _coro():
+        if not success:
+            raise asyncio.TimeoutError
+        return sentinel.value_3
+
+    coro1 = AsyncMock(wraps=_coro)
+    coro2 = AsyncMock(wraps=_coro)
+    tag = "command_tag_{}"
+
+    assert len(cmd_queue) == 0
+    res1 = cmd_queue.enqueue(
+        tag.format(1),
+        coro1,
+    )
+    res2 = cmd_queue.enqueue(
+        tag.format(2),
+        coro2,
+    )
+
+    # yield loop
+    for i in range(0, 5):
+        await asyncio.sleep(0)
+
+    assert coro1.await_count == 1
+    assert coro2.await_count == 1
+    assert len(cmd_queue) == 2
+    assert res1.done() is False
+    assert res2.done() is False
+
+    coro1.reset_mock()
+    coro2.reset_mock()
+    cmd_queue.deplete_queue()
+    for i in range(0, 5):
+        await asyncio.sleep(0)
+
+    assert coro1.await_count == 1
+    assert coro2.await_count == 0
+    assert len(cmd_queue) == 2
+    assert res1.done() is False
+    assert res2.done() is False
+
+    coro1.reset_mock()
+    coro2.reset_mock()
+    cmd_queue.deplete_queue()
+    for i in range(0, 5):
+        await asyncio.sleep(0)
+
+    assert coro1.await_count == 0
+    assert coro2.await_count == 1
+    assert len(cmd_queue) == 2
+    assert res1.done() is False
+    assert res2.done() is False
+
+    coro1.reset_mock()
+    coro2.reset_mock()
+    success = True
+    cmd_queue.deplete_queue()
+    for i in range(0, 15):
+        await asyncio.sleep(0)
+
+    assert coro1.await_count == 1
+    assert coro2.await_count == 1
+    assert len(cmd_queue) == 0
+    assert res1.done() is True
+    assert res2.done() is True
+    assert res1.result() is sentinel.value_3
+    assert res2.result() is sentinel.value_3
