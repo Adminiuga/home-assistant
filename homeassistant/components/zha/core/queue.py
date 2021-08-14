@@ -86,18 +86,20 @@ class RetryableQueue:
         except (asyncio.TimeoutError, zigpy.exceptions.DeliveryError) as exc:
             # well, maybe better luck next time, unless ttl expired
             if cmd.expired:
-                _LOGGER.debug("Command %s has expired, not retrying: %s", cmd.tag, exc)
+                _LOGGER.debug(
+                    "Command '%s' has expired, not retrying", cmd.tag, exc_info=exc
+                )
                 cmd.future.set_exception(exc)
             else:
                 self._queue[cmd.tag] = cmd
             raise
         except (Exception, asyncio.CancelledError) as exc:
             _LOGGER.debug(
-                "Fatal exception running %s(%s, %s): %s",
+                "Fatal exception running %s(%s, %s)",
                 cmd.tag,
                 cmd.args,
                 cmd.kwargs,
-                exc,
+                exc_info=exc,
             )
             cmd.future.set_exception(exc)
             raise
