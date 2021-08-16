@@ -133,6 +133,7 @@ class ZHADevice(LogMixin):
         self.status = DeviceStatus.CREATED
         self._channels = channels.Channels(self)
         self.command_queue: queue.RetryableQueue = queue.RetryableQueue()
+        self.options: dict[str, bool | float | int | str] = {}
 
     @property
     def device_id(self):

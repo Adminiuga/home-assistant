@@ -507,6 +507,7 @@ class ZHAGateway:
             )
             zha_device.set_device_id(device_registry_device.id)
         entry = self.zha_storage.async_get_or_create_device(zha_device)
+        zha_device.options = entry.options
         zha_device.async_update_last_seen(entry.last_seen)
         return zha_device
 

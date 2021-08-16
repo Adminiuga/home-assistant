@@ -20,6 +20,7 @@ STORAGE_KEY = "zha.storage"
 STORAGE_VERSION = 1
 SAVE_DELAY = 10
 TOMBSTONE_LIFETIME = datetime.timedelta(days=60).total_seconds()
+DEVICE_ATTR_OPTIONS = "options"
 
 
 @attr.s(slots=True, frozen=True)
@@ -29,6 +30,7 @@ class ZhaDeviceEntry:
     name: str | None = attr.ib(default=None)
     ieee: str | None = attr.ib(default=None)
     last_seen: float | None = attr.ib(default=None)
+    options: dict[str, bool | float | int | str] = attr.ib(factory=dict)
 
 
 class ZhaStorage:
@@ -44,7 +46,10 @@ class ZhaStorage:
     def async_create_device(self, device: ZhaDeviceType) -> ZhaDeviceEntry:
         """Create a new ZhaDeviceEntry."""
         device_entry: ZhaDeviceEntry = ZhaDeviceEntry(
-            name=device.name, ieee=str(device.ieee), last_seen=device.last_seen
+            name=device.name,
+            ieee=str(device.ieee),
+            last_seen=device.last_seen,
+            options=device.options,
         )
         self.devices[device_entry.ieee] = device_entry
         self.async_schedule_save()
@@ -84,6 +89,8 @@ class ZhaStorage:
 
         changes = {}
         changes["last_seen"] = device.last_seen
+        changes["name"] = device.name
+        changes[DEVICE_ATTR_OPTIONS] = device.options
 
         new = self.devices[ieee_str] = attr.evolve(old, **changes)
         self.async_schedule_save()
@@ -101,6 +108,7 @@ class ZhaStorage:
                     name=device["name"],
                     ieee=device["ieee"],
                     last_seen=device.get("last_seen"),
+                    options=device.get(DEVICE_ATTR_OPTIONS, {}),
                 )
 
         self.devices = devices
@@ -120,7 +128,12 @@ class ZhaStorage:
         data = {}
 
         data["devices"] = [
-            {"name": entry.name, "ieee": entry.ieee, "last_seen": entry.last_seen}
+            {
+                "name": entry.name,
+                "ieee": entry.ieee,
+                "last_seen": entry.last_seen,
+                DEVICE_ATTR_OPTIONS: entry.options,
+            }
             for entry in self.devices.values()
             if entry.last_seen and (time.time() - entry.last_seen) < TOMBSTONE_LIFETIME
         ]
