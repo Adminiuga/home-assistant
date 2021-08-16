@@ -24,7 +24,7 @@ from homeassistant.helpers.dispatcher import (
 )
 from homeassistant.helpers.event import async_track_time_interval
 
-from . import channels, typing as zha_typing
+from . import channels, queue, typing as zha_typing
 from .const import (
     ATTR_ARGS,
     ATTR_ATTRIBUTE,
@@ -132,6 +132,7 @@ class ZHADevice(LogMixin):
         self._ha_device_id = None
         self.status = DeviceStatus.CREATED
         self._channels = channels.Channels(self)
+        self.command_queue: queue.RetryableQueue = queue.RetryableQueue()
 
     @property
     def device_id(self):
