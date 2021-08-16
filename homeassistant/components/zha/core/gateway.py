@@ -55,6 +55,7 @@ from .const import (
     DEBUG_LEVELS,
     DEBUG_RELAY_LOGGERS,
     DEFAULT_DATABASE_NAME,
+    DEVICE_OPT_CONFIGURED_BY,
     DEVICE_PAIRING_STATUS,
     DOMAIN,
     SIGNAL_ADD_ENTITIES,
@@ -685,6 +686,26 @@ class ZHAGateway:
             zha_device.command_queue.deplete_queue()
             if not zha_device.available:
                 self.async_update_device(sender, available=True)
+
+    async def check_configured_by(self) -> None:
+        """Reconfigure devices if required for any devices we have."""
+        devices_to_reconfigure = [
+            device
+            for device in self.devices.values()
+            if device.is_mains_powered
+            and device.options.get(DEVICE_OPT_CONFIGURED_BY)
+            == str(self.application_controller.ieee)
+        ]
+        # check battery powered devices last
+        devices_to_reconfigure.extend(
+            [
+                device
+                for device in self.devices.values()
+                if device.options.get(DEVICE_OPT_CONFIGURED_BY)
+                == str(self.application_controller.ieee)
+                and not device.is_mains_powered
+            ]
+        )
 
 
 @callback
