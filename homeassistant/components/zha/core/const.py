@@ -196,6 +196,7 @@ DEFAULT_RADIO_TYPE = "ezsp"
 DEFAULT_BAUDRATE = 57600
 DEFAULT_DATABASE_NAME = "zigbee.db"
 
+DEVICE_OPT_MIGRATED_FROM = "migrated_from"
 DEVICE_PAIRING_STATUS = "pairing_status"
 
 DISCOVERY_KEY = "zha_discovery_info"

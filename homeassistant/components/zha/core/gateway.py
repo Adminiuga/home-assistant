@@ -14,6 +14,7 @@ import traceback
 from serial import SerialException
 from zigpy.config import CONF_DEVICE
 import zigpy.device as zigpy_dev
+import zigpy.types
 
 from homeassistant.components.system_log import LogEntry, _figure_out_source
 from homeassistant.core import callback
@@ -55,7 +56,7 @@ from .const import (
     DEBUG_LEVELS,
     DEBUG_RELAY_LOGGERS,
     DEFAULT_DATABASE_NAME,
-    DEVICE_OPT_CONFIGURED_BY,
+    DEVICE_OPT_MIGRATED_FROM,
     DEVICE_PAIRING_STATUS,
     DOMAIN,
     SIGNAL_ADD_ENTITIES,
@@ -85,6 +86,8 @@ from .store import async_get_registry
 from .typing import ZhaGroupType, ZigpyEndpointType, ZigpyGroupType
 
 _LOGGER = logging.getLogger(__name__)
+_DEVCE_MIGRATION_MAINS_S = 30
+_DEVICE_MIGRATION_BATTERY_S = _DEVCE_MIGRATION_MAINS_S * 6
 
 EntityReference = collections.namedtuple(
     "EntityReference",
@@ -687,25 +690,50 @@ class ZHAGateway:
             if not zha_device.available:
                 self.async_update_device(sender, available=True)
 
-    async def check_configured_by(self) -> None:
-        """Reconfigure devices if required for any devices we have."""
+    async def migrate_from_other_coord(self, old_ieee: zigpy.types.EUI64) -> None:
+        """Reconfigure devices for current if required for any devices we have.
+
+        Crawl through all devices and remove any bindings containing old ieee address
+        and then reconfigure again.
+        """
         devices_to_reconfigure = [
             device
             for device in self.devices.values()
             if device.is_mains_powered
-            and device.options.get(DEVICE_OPT_CONFIGURED_BY)
+            and device.options.get(DEVICE_OPT_MIGRATED_FROM)
             == str(self.application_controller.ieee)
+            and not device.skip_configuration
         ]
-        # check battery powered devices last
+        # migrate battery powered devices last
         devices_to_reconfigure.extend(
             [
                 device
                 for device in self.devices.values()
-                if device.options.get(DEVICE_OPT_CONFIGURED_BY)
+                if device.options.get(DEVICE_OPT_MIGRATED_FROM)
                 == str(self.application_controller.ieee)
                 and not device.is_mains_powered
+                and not device.skip_configuration
             ]
         )
+
+        pending_reconfigurations = []
+        for device in devices_to_reconfigure:
+            """Give each device a few moments to reconfigure, then carry on."""
+            task = asyncio.create_task(device.helpers.migrate_device(old_ieee))
+            if device.is_mains_powered:
+                timeout = _DEVCE_MIGRATION_MAINS_S
+            else:
+                timeout = _DEVICE_MIGRATION_BATTERY_S
+            done, pending = await asyncio.wait(
+                (task,), timeout=timeout, return_when=asyncio.FIRST_EXCEPTION
+            )
+            if task in done:
+                device.debug("Finished migration from %s", old_ieee)
+            else:
+                pending_reconfigurations.append(task)
+
+        # if device hasn't finished reconfiguration in allotted time, continue running in background
+        await asyncio.gather(*pending_reconfigurations, return_exceptions=True)
 
 
 @callback
