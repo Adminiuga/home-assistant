@@ -787,3 +787,24 @@ class ZHADeviceHelpers:
 
     async def migrate_device(self, old_ieee: zigpy.types.EUI64) -> None:
         """Migrate a device from old coordinator ieee."""
+        for channel_pool in self._zha_device.channels.pools:
+            for channel in (*channel_pool.all_channels, *channel_pool.client_channels):
+                bindings = await self.get_channel_bindings(channel)
+                await self.remove_binding_for_ieee(channel, bindings, old_ieee)
+        await self._zha_device.async_configure()
+
+    async def get_channel_bindings(self, channel: zha_typing.ChannelType) -> list:
+        """Return a list of all bindings."""
+
+        channel.debug("Getting current bindings")
+        return []
+
+    async def remove_binding_for_ieee(
+        self,
+        channel: zha_typing.ChannelType,
+        bindings: list,
+        old_ieee: zigpy.types.EUI64,
+    ) -> None:
+        """Remove any binding with specific ieee."""
+
+        channel.debug("Removing bindings referencing '%s' IEEE", old_ieee)
