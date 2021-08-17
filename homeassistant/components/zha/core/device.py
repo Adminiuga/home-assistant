@@ -134,6 +134,7 @@ class ZHADevice(LogMixin):
         self._channels = channels.Channels(self)
         self.command_queue: queue.RetryableQueue = queue.RetryableQueue()
         self.options: dict[str, bool | float | int | str] = {}
+        self.helpers = ZHADeviceHelpers(self)
 
     @property
     def device_id(self):
@@ -775,3 +776,14 @@ class ZHADevice(LogMixin):
         msg = f"[%s](%s): {msg}"
         args = (self.nwk, self.model) + args
         _LOGGER.log(level, msg, *args)
+
+
+class ZHADeviceHelpers:
+    """A collection of helpers for ZHA devices."""
+
+    def __init__(self, zha_device: ZHADevice) -> None:
+        """Initialize Instance."""
+        self._zha_device: ZHADevice = zha_device
+
+    async def migrate_device(self, old_ieee: zigpy.types.EUI64) -> None:
+        """Migrate a device from old coordinator ieee."""
