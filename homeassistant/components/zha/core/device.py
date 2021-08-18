@@ -788,7 +788,10 @@ class ZHADeviceHelpers:
     async def migrate_device(self, old_ieee: zigpy.types.EUI64) -> None:
         """Migrate a device from old coordinator ieee."""
         for channel_pool in self._zha_device.channels.pools:
-            for channel in (*channel_pool.all_channels, *channel_pool.client_channels):
+            for channel in (
+                *channel_pool.all_channels.values(),
+                *channel_pool.client_channels.values(),
+            ):
                 bindings = await self.get_channel_bindings(channel)
                 await self.remove_binding_for_ieee(channel, bindings, old_ieee)
         await self._zha_device.async_configure()

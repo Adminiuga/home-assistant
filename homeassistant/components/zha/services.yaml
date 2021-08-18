@@ -430,3 +430,15 @@ set_lock_user_code:
       example: 1234
       selector:
         text:
+
+migrate_from_old_ieee:
+  name: Migrate from old IEEE
+  description: Remove binding to old IEEE from all devices
+  fields:
+    ieee:
+      name: IEEE
+      description: IEEE address of the binding to remove
+      required: true
+      example: "00:0d:6f:00:05:7d:2d:34"
+      selector:
+        text:

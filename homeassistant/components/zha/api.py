@@ -87,6 +87,7 @@ ATTR_QR_CODE = "qr_code"
 
 SERVICE_PERMIT = "permit"
 SERVICE_REMOVE = "remove"
+SERVICE_MIGRATE_FROM_IEEE = "migrate_from_old_ieee"
 SERVICE_SET_ZIGBEE_CLUSTER_ATTRIBUTE = "set_zigbee_cluster_attribute"
 SERVICE_ISSUE_ZIGBEE_CLUSTER_COMMAND = "issue_zigbee_cluster_command"
 SERVICE_ISSUE_ZIGBEE_GROUP_COMMAND = "issue_zigbee_group_command"
@@ -1219,6 +1220,22 @@ def async_load_api(hass):
         SERVICE_WARNING_DEVICE_WARN,
         warning_device_warn,
         schema=SERVICE_SCHEMAS[SERVICE_WARNING_DEVICE_WARN],
+    )
+
+    async def migrate_from_old_ieee(service):
+        """Migrate from the old coordinator IEEE.
+
+        Crawl through all devices and replace any bindings referencing
+        old coordinator IEEE
+        """
+        old_ieee = service.data[ATTR_IEEE]
+        hass.async_create_task(zha_gateway.migrate_from_other_coord(old_ieee))
+
+    hass.helpers.service.async_register_admin_service(
+        DOMAIN,
+        SERVICE_MIGRATE_FROM_IEEE,
+        migrate_from_old_ieee,
+        schema=SERVICE_SCHEMAS[IEEE_SERVICE],
     )
 
     websocket_api.async_register_command(hass, websocket_permit_devices)

@@ -700,8 +700,7 @@ class ZHAGateway:
             device
             for device in self.devices.values()
             if device.is_mains_powered
-            and device.options.get(DEVICE_OPT_MIGRATED_FROM)
-            == str(self.application_controller.ieee)
+            and device.options.get(DEVICE_OPT_MIGRATED_FROM) != str(old_ieee)
             and not device.skip_configuration
         ]
         # migrate battery powered devices last
@@ -709,13 +708,15 @@ class ZHAGateway:
             [
                 device
                 for device in self.devices.values()
-                if device.options.get(DEVICE_OPT_MIGRATED_FROM)
-                == str(self.application_controller.ieee)
+                if device.options.get(DEVICE_OPT_MIGRATED_FROM) != str(old_ieee)
                 and not device.is_mains_powered
                 and not device.skip_configuration
             ]
         )
 
+        _LOGGER.debug(
+            "Starting migration for: %s", [d.nwk for d in devices_to_reconfigure]
+        )
         pending_reconfigurations = []
         for device in devices_to_reconfigure:
             """Give each device a few moments to reconfigure, then carry on."""
