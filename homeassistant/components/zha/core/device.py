@@ -62,6 +62,7 @@ from .const import (
     CONF_DEFAULT_CONSIDER_UNAVAILABLE_BATTERY,
     CONF_DEFAULT_CONSIDER_UNAVAILABLE_MAINS,
     CONF_ENABLE_IDENTIFY_ON_JOIN,
+    DEVICE_OPT_MIGRATED_FROM,
     EFFECT_DEFAULT_VARIANT,
     EFFECT_OKAY,
     POWER_BATTERY_OR_UNKNOWN,
@@ -793,6 +794,7 @@ class ZHADeviceHelpers:
         if bindings:
             await self.remove_binding_for_ieee(bindings, old_ieee)
             # await self._zha_device.async_configure()
+        self._zha_device.options[DEVICE_OPT_MIGRATED_FROM] = str(old_ieee)
 
     async def get_device_bindings(self) -> list:
         """Return a list of all bindings."""
