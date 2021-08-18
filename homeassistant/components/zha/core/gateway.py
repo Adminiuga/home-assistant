@@ -676,8 +676,14 @@ class ZHAGateway:
         message: bytes,
     ) -> None:
         """Handle message from a device Event handler."""
-        if sender.ieee in self.devices and not self.devices[sender.ieee].available:
-            self.async_update_device(sender, available=True)
+        try:
+            zha_device = self.devices[sender.ieee]
+        except KeyError:
+            pass
+        else:
+            zha_device.command_queue.deplete_queue()
+            if not zha_device.available:
+                self.async_update_device(sender, available=True)
 
 
 @callback
