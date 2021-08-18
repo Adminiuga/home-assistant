@@ -792,7 +792,7 @@ class ZHADeviceHelpers:
         bindings = await self.get_device_bindings()
         if bindings:
             await self.remove_binding_for_ieee(bindings, old_ieee)
-            await self._zha_device.async_configure()
+            # await self._zha_device.async_configure()
 
     async def get_device_bindings(self) -> list:
         """Return a list of all bindings."""
@@ -823,8 +823,12 @@ class ZHADeviceHelpers:
             zha_device.debug("binding: %s", binding)
         zha_device.debug("total %s bindings", total)
 
-        json = {"ieee": zha_device.ieee, "name": zha_device.name, "bindings": bindings}
-        suffix = f"_{str(zha_device.ieee).replace(':', '')}.txt"
+        json = {
+            "ieee": str(zha_device.ieee),
+            "name": zha_device.name,
+            **{f"binding_{i}": str(b) for i, b in enumerate(bindings)},
+        }
+        suffix = f"{str(zha_device.ieee).replace(':', '')}_{zha_device.name.replace(' ', '_')}.txt"
         file_name = os.path.join("zigpy_bindings", suffix)
         await zha_device.hass.async_add_executor_job(save_json, file_name, json)
         return bindings
