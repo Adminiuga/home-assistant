@@ -720,6 +720,8 @@ class ZHAGateway:
         pending_reconfigurations = []
         for device in devices_to_reconfigure:
             """Give each device a few moments to reconfigure, then carry on."""
+            if device.ieee == self.application_controller.ieee:
+                continue
             task = asyncio.create_task(device.helpers.migrate_device(old_ieee))
             if device.is_mains_powered:
                 timeout = _DEVCE_MIGRATION_MAINS_S
