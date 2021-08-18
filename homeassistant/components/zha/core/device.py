@@ -5,6 +5,7 @@ import asyncio
 from datetime import timedelta
 from enum import Enum
 import logging
+import os
 import random
 import time
 from typing import Any
@@ -23,6 +24,7 @@ from homeassistant.helpers.dispatcher import (
     async_dispatcher_send,
 )
 from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.util.json import save_json
 
 from . import channels, queue, typing as zha_typing
 from .const import (
@@ -795,8 +797,37 @@ class ZHADeviceHelpers:
     async def get_device_bindings(self) -> list:
         """Return a list of all bindings."""
 
-        self._zha_device.debug("Getting current bindings")
-        return []
+        zha_device = self._zha_device
+        zha_device.debug("Getting current bindings")
+
+        tag = "mig-dev-get-binding"
+        idx = 0
+        bindings = []
+
+        while True:
+            status, total, new_idx, rsp = await zha_device.command_queue.enqueue(
+                tag, zha_device.device.zdo.Mgmt_Bind_req, idx
+            )
+            if status != zdo_types.Status.SUCCESS:
+                zha_device.debug("does not support Mgmt_bind_req")
+                return
+
+            for binding in rsp:
+                idx += 1
+                bindings.append(binding)
+
+            if idx >= total or not rsp:
+                break
+
+        for binding in bindings:
+            zha_device.debug("binding: %s", binding)
+        zha_device.debug("total %s bindings", total)
+
+        json = {"ieee": zha_device.ieee, "name": zha_device.name, "bindings": bindings}
+        suffix = f"_{str(zha_device.ieee).replace(':', '')}.txt"
+        file_name = os.path.join("zigpy_bindings", suffix)
+        await zha_device.hass.async_add_executor_job(save_json, file_name, json)
+        return bindings
 
     async def remove_binding_for_ieee(
         self,

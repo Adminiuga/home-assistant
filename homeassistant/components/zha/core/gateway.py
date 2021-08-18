@@ -696,6 +696,21 @@ class ZHAGateway:
         Crawl through all devices and remove any bindings containing old ieee address
         and then reconfigure again.
         """
+
+        def mkdir(dir):
+            try:
+                os.mkdir(dir)
+                return True
+            except OSError as exc:
+                _LOGGER.error("Couldn't create '%s' dir: %s", dir, exc)
+                return False
+
+        output_dir = "zigpy_bindings"
+        if not os.path.isdir(
+            output_dir
+        ) and not await self._hass.async_add_executor_job(mkdir, output_dir):
+            return
+
         devices_to_reconfigure = [
             device
             for device in self.devices.values()
