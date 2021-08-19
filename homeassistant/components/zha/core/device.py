@@ -832,9 +832,9 @@ class ZHADeviceHelpers:
             **{f"binding_{i}": str(b) for i, b in enumerate(bindings)},
         }
         suffix = f"{str(zha_device.ieee).replace(':', '')}_{zha_device.name.replace(' ', '_')}.txt"
-        file_name = os.path.join("zigpy_bindings", suffix)
         for replace in (":", "/", "\\"):
-            file_name = file_name.replace(replace, "_")
+            suffix = suffix.replace(replace, "_")
+        file_name = os.path.join("zigpy_bindings", suffix)
         await zha_device.hass.async_add_executor_job(save_json, file_name, json)
         return bindings
 
