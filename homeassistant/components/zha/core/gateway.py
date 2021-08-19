@@ -88,6 +88,8 @@ from .typing import ZhaGroupType, ZigpyEndpointType, ZigpyGroupType
 _LOGGER = logging.getLogger(__name__)
 _DEVCE_MIGRATION_MAINS_S = 30
 _DEVICE_MIGRATION_BATTERY_S = _DEVCE_MIGRATION_MAINS_S * 6
+_DEVICE_MIGRATION_IGNORE_OFFLINE_S = 60 * 60 * 24 * 5
+_DEVICE_MIGRATION_TIMEOUT_S = 60 * 60 * 12
 
 EntityReference = collections.namedtuple(
     "EntityReference",
@@ -717,6 +719,7 @@ class ZHAGateway:
             if device.is_mains_powered
             and device.options.get(DEVICE_OPT_MIGRATED_FROM) != str(old_ieee)
             and not device.skip_configuration
+            and device.available
         ]
         # migrate battery powered devices last
         devices_to_reconfigure.extend(
@@ -726,6 +729,20 @@ class ZHAGateway:
                 if device.options.get(DEVICE_OPT_MIGRATED_FROM) != str(old_ieee)
                 and not device.is_mains_powered
                 and not device.skip_configuration
+                and device.available
+            ]
+        )
+        # try migrating unavailable devices last
+        devices_to_reconfigure.extend(
+            [
+                device
+                for device in self.devices.values()
+                if device.options.get(DEVICE_OPT_MIGRATED_FROM) != str(old_ieee)
+                and not device.available
+                and device.device.last_seen
+                and device.device.last_seen
+                and time.time() - device.device.last_seen
+                < _DEVICE_MIGRATION_IGNORE_OFFLINE_S
             ]
         )
 
@@ -737,7 +754,12 @@ class ZHAGateway:
             """Give each device a few moments to reconfigure, then carry on."""
             if device.ieee == self.application_controller.ieee:
                 continue
-            task = asyncio.create_task(device.helpers.migrate_device(old_ieee))
+            task = asyncio.create_task(
+                asyncio.wait_for(
+                    device.helpers.migrate_device(old_ieee),
+                    timeout=_DEVICE_MIGRATION_TIMEOUT_S,
+                )
+            )
             if device.is_mains_powered:
                 timeout = _DEVCE_MIGRATION_MAINS_S
             else:
@@ -746,12 +768,25 @@ class ZHAGateway:
                 (task,), timeout=timeout, return_when=asyncio.FIRST_EXCEPTION
             )
             if task in done:
-                device.debug("Finished migration from %s", old_ieee)
+                if task.exception():
+                    device.warning(
+                        "Failed migration from %s", old_ieee, exc_info=task.exception()
+                    )
+                else:
+                    device.debug("Finished migration from %s", old_ieee)
             else:
                 pending_reconfigurations.append(task)
 
         # if device hasn't finished reconfiguration in allotted time, continue running in background
-        await asyncio.gather(*pending_reconfigurations, return_exceptions=True)
+        while pending_reconfigurations:
+            done, pending_reconfigurations = await asyncio.wait(
+                pending_reconfigurations, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in done:
+                if task.exception():
+                    _LOGGER.warning(
+                        "Error running device migration", exc_info=task.exception()
+                    )
 
 
 @callback
