@@ -62,6 +62,7 @@ from .const import (
     CONF_DEFAULT_CONSIDER_UNAVAILABLE_BATTERY,
     CONF_DEFAULT_CONSIDER_UNAVAILABLE_MAINS,
     CONF_ENABLE_IDENTIFY_ON_JOIN,
+    DEVICE_MIGRATION_TIMEOUT_S,
     DEVICE_OPT_MIGRATED_FROM,
     EFFECT_DEFAULT_VARIANT,
     EFFECT_OKAY,
@@ -795,8 +796,7 @@ class ZHADeviceHelpers:
         """Migrate a device from old coordinator ieee."""
         bindings = await self.get_device_bindings()
         if bindings:
-            await self.remove_binding_for_ieee(bindings, old_ieee)
-            # await self._zha_device.async_configure()
+            await self.remove_binding_for_ieee_and_rebind(bindings, old_ieee)
         self._zha_device.options[DEVICE_OPT_MIGRATED_FROM] = str(old_ieee)
 
     async def get_device_bindings(self) -> list:
@@ -811,7 +811,10 @@ class ZHADeviceHelpers:
 
         while True:
             status, total, new_idx, rsp = await zha_device.command_queue.enqueue(
-                tag, zha_device.device.zdo.Mgmt_Bind_req, idx
+                tag,
+                zha_device.device.zdo.Mgmt_Bind_req,
+                idx,
+                ttl=DEVICE_MIGRATION_TIMEOUT_S,
             )
             if status != zdo_types.Status.SUCCESS:
                 zha_device.debug("does not support Mgmt_bind_req")
@@ -841,11 +844,52 @@ class ZHADeviceHelpers:
         await zha_device.hass.async_add_executor_job(save_json, file_name, json)
         return bindings
 
-    async def remove_binding_for_ieee(
+    async def remove_binding_for_ieee_and_rebind(
         self,
         bindings: list,
         old_ieee: zigpy.types.EUI64,
     ) -> None:
-        """Remove any binding with specific ieee."""
+        """Remove any binding with specific IEEE and rebind to coordinator IEEE."""
 
-        self._zha_device.debug("Removing bindings referencing '%s' IEEE", old_ieee)
+        zha_device: zha_typing.ZhaDeviceType = self._zha_device
+        zha_device.debug("Removing bindings referencing '%s' IEEE", old_ieee)
+        tag = "mig-dev-rebind"
+        to_rebind = [
+            bind
+            for bind in bindings
+            if bind.DstAddress.addrmode == 3 and bind.DstAddress.ieee == old_ieee
+        ]
+        for binding in to_rebind:
+            (status,) = await zha_device.command_queue.enqueue(
+                tag,
+                zha_device.device.zdo.Mgmt_Unbind_req,
+                binding.SrcAddress,
+                binding.SrcEndpoint,
+                binding.ClusterId,
+                binding.DstAddress,
+                ttl=DEVICE_MIGRATION_TIMEOUT_S,
+            )
+            zha_device.debug(
+                "Cluster: %s, Dst: %s Unbind response status: %s",
+                binding.ClusterId,
+                binding.DstAddr,
+                status,
+            )
+
+            # Rebind to current coordinator IEEE
+            binding.DstAddr.ieee = self._zha_gateway.application_controller.ieee
+            (status,) = await zha_device.command_queue.enqueue(
+                tag,
+                zha_device.device.zdo.Mgmt_Bind_req,
+                binding.SrcAddress,
+                binding.SrcEndpoint,
+                binding.ClusterId,
+                binding.DstAddress,
+                ttl=DEVICE_MIGRATION_TIMEOUT_S,
+            )
+            zha_device.debug(
+                "Cluster: %s, Dst: %s Bind response status: %s",
+                binding.ClusterId,
+                binding.DstAddr,
+                status,
+            )
