@@ -750,6 +750,7 @@ class ZHAGateway:
             "Starting migration for: %s", [d.nwk for d in devices_to_reconfigure]
         )
         pending_reconfigurations = []
+        total = len(pending_reconfigurations)
         for device in devices_to_reconfigure:
             """Give each device a few moments to reconfigure, then carry on."""
             if device.ieee == self.application_controller.ieee:
@@ -758,7 +759,8 @@ class ZHAGateway:
                 asyncio.wait_for(
                     device.helpers.migrate_device(old_ieee),
                     timeout=_DEVICE_MIGRATION_TIMEOUT_S,
-                )
+                ),
+                name=str(device.ieee),
             )
             if device.is_mains_powered:
                 timeout = _DEVCE_MIGRATION_MAINS_S
@@ -778,6 +780,7 @@ class ZHAGateway:
                 pending_reconfigurations.append(task)
 
         # if device hasn't finished reconfiguration in allotted time, continue running in background
+        completed = 0
         while pending_reconfigurations:
             done, pending_reconfigurations = await asyncio.wait(
                 pending_reconfigurations, return_when=asyncio.FIRST_COMPLETED
@@ -785,8 +788,30 @@ class ZHAGateway:
             for task in done:
                 if task.exception():
                     _LOGGER.warning(
-                        "Error running device migration", exc_info=task.exception()
+                        """Error running '%s' device migration. """
+                        """Completed: %s, pending: %s, failed: %s""",
+                        task.get_name(),
+                        completed,
+                        len(pending_reconfigurations),
+                        total - completed - len(pending_reconfigurations),
+                        exc_info=task.exception(),
                     )
+                else:
+                    completed += 1
+                    _LOGGER.debug(
+                        """Finished '%s' device migration. """
+                        """Completed: %s, pending: %s, failed: %s""",
+                        task.get_name(),
+                        completed,
+                        len(pending_reconfigurations),
+                        total - completed - len(pending_reconfigurations),
+                    )
+        _LOGGER.debug(
+            "Finished migration from '%s'. Migrated: %s, Failed: %s",
+            old_ieee,
+            completed,
+            total - completed,
+        )
 
 
 @callback
