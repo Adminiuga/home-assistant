@@ -56,6 +56,7 @@ from .const import (
     DEBUG_LEVELS,
     DEBUG_RELAY_LOGGERS,
     DEFAULT_DATABASE_NAME,
+    DEVICE_MIGRATION_TIMEOUT_S,
     DEVICE_OPT_MIGRATED_FROM,
     DEVICE_PAIRING_STATUS,
     DOMAIN,
@@ -89,7 +90,6 @@ _LOGGER = logging.getLogger(__name__)
 _DEVCE_MIGRATION_MAINS_S = 30
 _DEVICE_MIGRATION_BATTERY_S = _DEVCE_MIGRATION_MAINS_S * 6
 _DEVICE_MIGRATION_IGNORE_OFFLINE_S = 60 * 60 * 24 * 5
-_DEVICE_MIGRATION_TIMEOUT_S = 60 * 60 * 12
 
 EntityReference = collections.namedtuple(
     "EntityReference",
@@ -758,7 +758,7 @@ class ZHAGateway:
             task = asyncio.create_task(
                 asyncio.wait_for(
                     device.helpers.migrate_device(old_ieee),
-                    timeout=_DEVICE_MIGRATION_TIMEOUT_S,
+                    timeout=DEVICE_MIGRATION_TIMEOUT_S,
                 ),
                 name=str(device.ieee),
             )

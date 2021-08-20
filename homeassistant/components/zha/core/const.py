@@ -398,3 +398,6 @@ class Strobe(t.enum8):
 
     No_Strobe = 0x00
     Strobe = 0x01
+
+
+DEVICE_MIGRATION_TIMEOUT_S = 60 * 60 * 12
