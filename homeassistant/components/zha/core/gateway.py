@@ -772,7 +772,7 @@ class ZHAGateway:
             if task in done:
                 if task.exception():
                     device.warning(
-                        "Failed migration from %s", old_ieee, exc_info=task.exception()
+                        "Failed migration from %s: %s", old_ieee, task.exception()
                     )
                 else:
                     device.debug("Finished migration from %s", old_ieee)
@@ -788,13 +788,13 @@ class ZHAGateway:
             for task in done:
                 if task.exception():
                     _LOGGER.warning(
-                        """Error running '%s' device migration. """
+                        """'%s' error running '%s' device migration. """
                         """Completed: %s, pending: %s, failed: %s""",
+                        task.exception(),
                         task.get_name(),
                         completed,
                         len(pending_reconfigurations),
                         total - completed - len(pending_reconfigurations),
-                        exc_info=task.exception(),
                     )
                 else:
                     completed += 1
