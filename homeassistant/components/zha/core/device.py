@@ -15,6 +15,7 @@ import zigpy.exceptions
 from zigpy.profiles import PROFILES
 import zigpy.quirks
 from zigpy.zcl.clusters.general import Groups
+from zigpy.zcl.clusters.security import IasZone
 import zigpy.zdo.types as zdo_types
 
 from homeassistant.const import ATTR_COMMAND, ATTR_NAME
@@ -797,6 +798,7 @@ class ZHADeviceHelpers:
         bindings = await self.get_device_bindings()
         if bindings:
             await self.remove_binding_for_ieee_and_rebind(bindings, old_ieee)
+        await self.rewrite_ias_ieee()
         self._zha_device.options[DEVICE_OPT_MIGRATED_FROM] = str(old_ieee)
 
     async def get_device_bindings(self) -> list:
@@ -861,8 +863,8 @@ class ZHADeviceHelpers:
         ]
         for binding in to_rebind:
             (status,) = await zha_device.command_queue.enqueue(
-                tag,
-                zha_device.device.zdo.Mgmt_Unbind_req,
+                f"{tag}-unbind",
+                zha_device.device.zdo.Unbind_req,
                 binding.SrcAddress,
                 binding.SrcEndpoint,
                 binding.ClusterId,
@@ -872,15 +874,15 @@ class ZHADeviceHelpers:
             zha_device.debug(
                 "Cluster: %s, Dst: %s Unbind response status: %s",
                 binding.ClusterId,
-                binding.DstAddr,
+                binding.DstAddress,
                 status,
             )
 
             # Rebind to current coordinator IEEE
-            binding.DstAddr.ieee = self._zha_gateway.application_controller.ieee
+            binding.DstAddress.ieee = self._zha_gateway.application_controller.ieee
             (status,) = await zha_device.command_queue.enqueue(
-                tag,
-                zha_device.device.zdo.Mgmt_Bind_req,
+                f"{tag}-bind",
+                zha_device.device.zdo.Bind_req,
                 binding.SrcAddress,
                 binding.SrcEndpoint,
                 binding.ClusterId,
@@ -890,6 +892,23 @@ class ZHADeviceHelpers:
             zha_device.debug(
                 "Cluster: %s, Dst: %s Bind response status: %s",
                 binding.ClusterId,
-                binding.DstAddr,
+                binding.DstAddress,
                 status,
             )
+
+    async def rewrite_ias_ieee(self) -> None:
+        """If any IAS Server cluster found, then rewrite CIE Addr unconditionally."""
+
+        zha_device: zha_typing.ZhaDeviceType = self._zha_device
+        tag = "mig-dev-ias-ieee"
+
+        for ep in (ep for ep_id, ep in zha_device.device.endpoints.items() if ep_id):
+            if IasZone.cluster_id in ep.in_clusters:
+                cluster = ep.in_clusters[IasZone.cluster_id]
+                (res,) = await zha_device.command_queue.enqueue(
+                    tag,
+                    cluster.write_attributes,
+                    {"cie_addr": self._zha_gateway.application_controller.ieee},
+                    ttl=DEVICE_MIGRATION_TIMEOUT_S,
+                )
+                zha_device.debug("Writine cie_addr result: %s", res)
