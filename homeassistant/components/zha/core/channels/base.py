@@ -14,7 +14,7 @@ from homeassistant.const import ATTR_COMMAND
 from homeassistant.core import callback
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 
-from .. import typing as zha_typing
+from .. import queue as zha_queue, typing as zha_typing
 from ..const import (
     ATTR_ARGS,
     ATTR_ATTRIBUTE_ID,
@@ -129,6 +129,11 @@ class ZigbeeChannel(LogMixin):
         return self._generic_id
 
     @property
+    def queue(self) -> zha_queue.RetryableQueue:
+        """Return ZHA device's command queue."""
+        return self._ch_pool.queue
+
+    @property
     def unique_id(self):
         """Return the unique id for this channel."""
         return self._unique_id
@@ -164,7 +169,7 @@ class ZigbeeChannel(LogMixin):
         devices are unreachable.
         """
         try:
-            res = await self.cluster.bind()
+            res = await self.queue.enqueue(f"bind-{self.id}", self.cluster.bind)
             self.debug("bound '%s' cluster: %s", self.cluster.ep_attribute, res[0])
             async_dispatcher_send(
                 self._ch_pool.hass,
@@ -206,6 +211,7 @@ class ZigbeeChannel(LogMixin):
         if self.cluster.cluster_id >= 0xFC00 and self._ch_pool.manufacturer_code:
             kwargs["manufacturer"] = self._ch_pool.manufacturer_code
 
+        tag = f"cfg-rpt-{self.id}"
         for attr_report in self.REPORT_CONFIG:
             attr, config = attr_report["attr"], attr_report["config"]
             attr_name = self.cluster.attributes.get(attr, [attr])[0]
@@ -226,7 +232,12 @@ class ZigbeeChannel(LogMixin):
         while chunk:
             reports = {rec["attr"]: rec["config"] for rec in chunk}
             try:
-                res = await self.cluster.configure_reporting_multiple(reports, **kwargs)
+                res = await self.queue.enqueue(
+                    tag,
+                    self.cluster.configure_reporting_multiple,
+                    reports,
+                    **kwargs,
+                )
                 self._configure_reporting_status(reports, res[0])
                 # if we get a response, then it's a success
                 for attr_stat in event_data.values():
@@ -399,7 +410,9 @@ class ZigbeeChannel(LogMixin):
         result = {}
         while chunk:
             try:
-                read, _ = await self.cluster.read_attributes(
+                read, _ = await self.queue.enqueue(
+                    f"get-attr-{self.id}-{attributes.keys()}",
+                    self.cluster.read_attributes,
                     attributes,
                     allow_cache=from_cache,
                     only_cache=from_cache and not self._ch_pool.is_mains_powered,

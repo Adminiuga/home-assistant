@@ -28,6 +28,7 @@ from .. import (
     const,
     device as zha_core_device,
     discovery as zha_disc,
+    queue as zha_queue,
     registries as zha_regs,
     typing as zha_typing,
 )
@@ -204,6 +205,11 @@ class ChannelPool:
     def endpoint(self) -> zha_typing.ZigpyEndpointType:
         """Return endpoint of zigpy device."""
         return self._channels.zha_device.device.endpoints[self.id]
+
+    @property
+    def queue(self) -> zha_queue.RetryableQueue:
+        """Return ZHA device's command queue."""
+        return self._channels.zha_device.command_queue
 
     @property
     def id(self) -> int:
