@@ -67,12 +67,17 @@ class RetryableQueue:
             existing_cmd.future.cancel()
 
         asyncio.create_task(self.catching_run(cmd))
-        return asyncio.create_task(self._unwrap(cmd.future))
+        return asyncio.create_task(self._unwrap(cmd, ttl))
 
-    async def _unwrap(self, future) -> Any:
-        """Unwrap future result."""
-        await future
-        return future.result()
+    async def _unwrap(self, cmd: DeferredCommand, ttl: int) -> Any:
+        """Unwrap future result or raise TimeoutError if exceed TTL."""
+        try:
+            await asyncio.wait_for(cmd.future, timeout=ttl + 1)
+        except asyncio.TimeoutError:
+            self._queue.pop(cmd.tag, None)
+            raise
+
+        return cmd.future.result()
 
     async def catching_run(self, cmd: DeferredCommand) -> None:
         """Run cmd but catch any exceptions."""
