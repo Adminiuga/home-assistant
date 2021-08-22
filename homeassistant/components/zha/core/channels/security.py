@@ -370,7 +370,11 @@ class IASZoneChannel(ZigbeeChannel):
         ieee = self.cluster.endpoint.device.application.ieee
 
         try:
-            res = await self._cluster.write_attributes({"cie_addr": ieee})
+            res = await self.queue.enqueue(
+                "ias-write-cie",
+                self._cluster.write_attributes,
+                {"cie_addr": ieee},
+            )
             self.debug(
                 "wrote cie_addr: %s to '%s' cluster: %s",
                 str(ieee),

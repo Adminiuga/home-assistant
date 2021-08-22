@@ -385,7 +385,9 @@ class ZigbeeChannel(LogMixin):
         manufacturer_code = self._ch_pool.manufacturer_code
         if self.cluster.cluster_id >= 0xFC00 and manufacturer_code:
             manufacturer = manufacturer_code
-        result = await safe_read(
+        result = await self.queue.enqueue(
+            f"get-attr-val-{attribute}",
+            safe_read,
             self._cluster,
             [attribute],
             allow_cache=from_cache,
