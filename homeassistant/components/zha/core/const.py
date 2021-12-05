@@ -100,6 +100,7 @@ CLUSTER_TYPE_IN = "in"
 CLUSTER_TYPE_OUT = "out"
 
 PLATFORMS = (
+<<<<<<< HEAD
     Platform.ALARM_CONTROL_PANEL,
     Platform.BINARY_SENSOR,
     Platform.CLIMATE,
@@ -112,6 +113,21 @@ PLATFORMS = (
     Platform.SENSOR,
     Platform.SIREN,
     Platform.SWITCH,
+=======
+    ALARM,
+    BINARY_SENSOR,
+    BUTTON,
+    CLIMATE,
+    COVER,
+    DEVICE_TRACKER,
+    FAN,
+    LIGHT,
+    LOCK,
+    NUMBER,
+    SENSOR,
+    SIREN,
+    SWITCH,
+>>>>>>> 5bd9399bae (Identify buttons)
 )
 
 CONF_ALARM_MASTER_CODE = "alarm_master_code"
