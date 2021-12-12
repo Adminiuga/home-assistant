@@ -448,3 +448,132 @@ async def test_group_probe_cleanup_called(
     await config_entry.async_unload(hass_disable_services)
     await hass_disable_services.async_block_till_done()
     disc.GROUP_PROBE.cleanup.assert_called()
+
+
+@pytest.fixture(scope="session")
+def file_output(tmpdir):
+    """Save output of device corrections."""
+    fh = open("/tmp/zha_device_list-updates.txt", "w")  # nosec
+    yield fh
+    fh.close()
+
+
+@patch(
+    "zigpy.zcl.clusters.general.Identify.request",
+    new=AsyncMock(return_value=[mock.sentinel.data, zcl_f.Status.SUCCESS]),
+)
+@pytest.mark.parametrize("device", DEVICES)
+async def test_dump_device_entities(
+    device,
+    hass,
+    hass_disable_services,
+    zigpy_device_mock,
+    zha_device_joined_restored,
+    file_output,
+):
+    """Test device discovery."""
+    entity_registry = homeassistant.helpers.entity_registry.async_get(
+        hass_disable_services
+    )
+
+    zigpy_device = zigpy_device_mock(
+        device[SIG_ENDPOINTS],
+        "00:11:22:33:44:55:66:77",
+        device[SIG_MANUFACTURER],
+        device[SIG_MODEL],
+        node_descriptor=device[SIG_NODE_DESC],
+        patch_cluster=False,
+    )
+
+    cluster_identify = _get_first_identify_cluster(zigpy_device)
+    if cluster_identify:
+        cluster_identify.request.reset_mock()
+
+    orig_new_entity = zha_channels.ChannelPool.async_new_entity
+    _dispatch = mock.MagicMock(wraps=orig_new_entity)
+    try:
+        zha_channels.ChannelPool.async_new_entity = lambda *a, **kw: _dispatch(*a, **kw)
+        zha_dev = await zha_device_joined_restored(zigpy_device)
+        await hass_disable_services.async_block_till_done()
+    finally:
+        zha_channels.ChannelPool.async_new_entity = orig_new_entity
+
+    event_channels = {
+        ch.id for pool in zha_dev.channels.pools for ch in pool.client_channels.values()
+    }
+    try:
+        assert event_channels == set(device[DEV_SIG_EVT_CHANNELS])
+    except AssertionError:
+        _print_dev_evt_channels(file_output, event_channels)
+
+    # build a dict of entity_class -> (component, unique_id, channels) tuple
+    ha_ent_info = {}
+    for call in _dispatch.call_args_list:
+        _, component, entity_cls, unique_id, channels = call[0]
+        unique_id_head = UNIQUE_ID_HD.match(unique_id).group(0)  # ieee + endpoint_id
+        ha_ent_info[(unique_id_head, entity_cls.__name__)] = (
+            component,
+            unique_id,
+            channels,
+        )
+
+    try:
+        for comp_id, ent_info in device[DEV_SIG_ENT_MAP].items():
+            component, unique_id = comp_id
+            no_tail_id = NO_TAIL_ID.sub("", ent_info[DEV_SIG_ENT_MAP_ID])
+            ha_entity_id = entity_registry.async_get_entity_id(
+                component, "zha", unique_id
+            )
+            assert ha_entity_id is not None
+            assert ha_entity_id.startswith(no_tail_id)
+
+            test_ent_class = ent_info[DEV_SIG_ENT_MAP_CLASS]
+            test_unique_id_head = UNIQUE_ID_HD.match(unique_id).group(0)
+            assert (test_unique_id_head, test_ent_class) in ha_ent_info
+
+            ha_comp, ha_unique_id, ha_channels = ha_ent_info[
+                (test_unique_id_head, test_ent_class)
+            ]
+            assert component is ha_comp
+            # unique_id used for discover is the same for "multi entities"
+            assert unique_id.startswith(ha_unique_id)
+            assert {ch.name for ch in ha_channels} == set(ent_info[DEV_SIG_CHANNELS])
+
+        assert _dispatch.call_count == len(device[DEV_SIG_ENT_MAP])
+    except AssertionError:
+        await _print_dev_ent(file_output, hass, device, ha_ent_info, entity_registry)
+
+    if device.get("header_printed"):
+        file_output.write("},\r\n")
+
+
+def _print_dev_header(fh, device: dict):
+    """Print device header."""
+    if device.get("header_printed"):
+        return
+
+    device["header_printed"] = True
+    fh.write("{\r\n")
+    fh.write("    DEV_SIG_DEV_NO: {},\r\n".format(device["device_no"]))
+
+
+def _print_dev_evt_channels(fh, device: dict, evt_channels: dict):
+    """Print device event channels."""
+    _print_dev_header(fh, device)
+    fh.write(f"    DEV_SIG_EVT_CHANNELS: {list(evt_channels)},\r\n")
+
+
+async def _print_dev_ent(fh, hass, device, ha_ent_info, entity_registry):
+    """Print device entities."""
+    _print_dev_header(fh, device)
+
+    fh.write("    DEV_SIG_ENTITIES: [\r\n")
+    entity_ids = hass.states.async_entity_ids()
+    await hass.async_block_till_done()
+    zha_entities = [
+        ent for ent in entity_ids if ent.split(".")[0] in zha_const.PLATFORMS
+    ]
+    for entity_id in zha_entities:
+        fh.write(f"        {entity_id},\r\n")
+
+    fh.write("    ],\r\n")
