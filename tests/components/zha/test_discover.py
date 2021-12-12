@@ -451,10 +451,38 @@ async def test_group_probe_cleanup_called(
 
 
 @pytest.fixture(scope="session")
-def file_output(tmpdir):
+def file_output():
     """Save output of device corrections."""
     fh = open("/tmp/zha_device_list-updates.txt", "w")  # nosec
+    fh.write(
+        '''"""Example Zigbee Devices."""
+
+from zigpy.const import (
+    SIG_ENDPOINTS,
+    SIG_EP_INPUT,
+    SIG_EP_OUTPUT,
+    SIG_EP_PROFILE,
+    SIG_EP_TYPE,
+    SIG_MANUFACTURER,
+    SIG_MODEL,
+    SIG_NODE_DESC,
+)
+
+DEV_SIG_CHANNELS = "channels"
+DEV_SIG_DEV_NO = "device_no"
+DEV_SIG_ENTITIES = "entities"
+DEV_SIG_ENT_MAP = "entity_map"
+DEV_SIG_ENT_MAP_CLASS = "entity_class"
+DEV_SIG_ENT_MAP_ID = "entity_id"
+DEV_SIG_EP_ID = "endpoint_id"
+DEV_SIG_EVT_CHANNELS = "event_channels"
+DEV_SIG_ZHA_QUIRK = "zha_quirk"
+
+DEVICES = [
+    '''
+    )
     yield fh
+    fh.write("]\r\n")
     fh.close()
 
 
@@ -511,7 +539,7 @@ async def test_dump_device_entities(
     for call in _dispatch.call_args_list:
         _, component, entity_cls, unique_id, channels = call[0]
         unique_id_head = UNIQUE_ID_HD.match(unique_id).group(0)  # ieee + endpoint_id
-        ha_ent_info[(unique_id_head, entity_cls.__name__)] = (
+        ha_ent_info[(unique_id_head, entity_cls)] = (
             component,
             unique_id,
             channels,
@@ -532,7 +560,7 @@ async def test_dump_device_entities(
             assert (test_unique_id_head, test_ent_class) in ha_ent_info
 
             ha_comp, ha_unique_id, ha_channels = ha_ent_info[
-                (test_unique_id_head, test_ent_class)
+                (test_unique_id_head, test_ent_class.__name__)
             ]
             assert component is ha_comp
             # unique_id used for discover is the same for "multi entities"
@@ -574,6 +602,19 @@ async def _print_dev_ent(fh, hass, device, ha_ent_info, entity_registry):
         ent for ent in entity_ids if ent.split(".")[0] in zha_const.PLATFORMS
     ]
     for entity_id in zha_entities:
-        fh.write(f"        {entity_id},\r\n")
+        fh.write(f'        "{entity_id}",\r\n')
 
     fh.write("    ],\r\n")
+
+    # print entity map
+    fh.write("    DEV_SIG_ENT_MAP: {\r\n")
+    for key, val in ha_ent_info.items():
+        unique_id_head, entity_cls = key
+        component, unique_id, channels = val
+        fh.write(f'        ("{component}", "{unique_id}"):')
+        ch_names = [f'"{ch.name}"' for ch in channels]
+        fh.write(" {\r\n")
+        fh.write(f"            DEV_SIG_CHANNELS: [{','.join(ch_names)}],\r\n")
+        fh.write(f'            DEV_SIG_ENT_MAP_CLASS: "{entity_cls.__name__}",\r\n')
+        fh.write("        },\r\n")
+    fh.write("    },\r\n")
