@@ -1,5 +1,6 @@
 """Elmax sensor platform."""
-from __future__ import annotations
+
+from typing import override
 
 from elmax_api.model.panel import PanelStatus
 
@@ -7,27 +8,26 @@ from homeassistant.components.binary_sensor import (
     BinarySensorDeviceClass,
     BinarySensorEntity,
 )
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from . import ElmaxCoordinator
-from .common import ElmaxEntity
-from .const import DOMAIN
+from .coordinator import ElmaxConfigEntry
+from .entity import ElmaxEntity
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    config_entry: ElmaxConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up the Elmax sensor platform."""
-    coordinator: ElmaxCoordinator = hass.data[DOMAIN][config_entry.entry_id]
+    coordinator = config_entry.runtime_data
     known_devices = set()
 
     def _discover_new_devices():
         panel_status: PanelStatus = coordinator.data
-        # In case the panel is offline, its status will be None. In that case, simply do nothing
+        # In case the panel is offline, its status will be
+        # None. In that case, simply do nothing
         if panel_status is None:
             return
 
@@ -38,17 +38,19 @@ async def async_setup_entry(
             if zone.endpoint_id in known_devices:
                 continue
             entity = ElmaxSensor(
-                panel=coordinator.panel_entry,
                 elmax_device=zone,
                 panel_version=panel_status.release,
                 coordinator=coordinator,
             )
             entities.append(entity)
-        async_add_entities(entities, True)
-        known_devices.update([e.unique_id for e in entities])
+
+        if entities:
+            async_add_entities(entities)
+            known_devices.update([e.unique_id for e in entities])
 
     # Register a listener for the discovery of new devices
-    coordinator.async_add_listener(_discover_new_devices)
+    remove_handle = coordinator.async_add_listener(_discover_new_devices)
+    config_entry.async_on_unload(remove_handle)
 
     # Immediately run a discovery, so we don't need to wait for the next update
     _discover_new_devices()
@@ -57,12 +59,10 @@ async def async_setup_entry(
 class ElmaxSensor(ElmaxEntity, BinarySensorEntity):
     """Elmax Sensor entity implementation."""
 
+    _attr_device_class = BinarySensorDeviceClass.DOOR
+
     @property
+    @override
     def is_on(self) -> bool:
         """Return true if the binary sensor is on."""
         return self.coordinator.get_zone_state(self._device.endpoint_id).opened
-
-    @property
-    def device_class(self) -> BinarySensorDeviceClass:
-        """Return the class of this device, from component DEVICE_CLASSES."""
-        return BinarySensorDeviceClass.DOOR

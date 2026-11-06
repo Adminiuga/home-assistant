@@ -1,15 +1,18 @@
 """Test the Anthem A/V Receivers config flow."""
-from typing import Callable
+
+from collections.abc import Callable
 from unittest.mock import ANY, AsyncMock, patch
 
 from anthemav.device_error import DeviceError
 import pytest
+from pytest_homeassistant.common import MockConfigEntry
+from syrupy.assertion import SnapshotAssertion
 
-from homeassistant import config_entries
+from homeassistant.components.anthemav.const import DOMAIN
+from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import STATE_OFF, STATE_ON
 from homeassistant.core import HomeAssistant
-
-from tests.common import MockConfigEntry
+from homeassistant.helpers import device_registry as dr
 
 
 async def test_load_unload_config_entry(
@@ -23,14 +26,34 @@ async def test_load_unload_config_entry(
     mock_connection_create.assert_called_with(
         host="1.1.1.1", port=14999, update_callback=ANY
     )
-    assert init_integration.state == config_entries.ConfigEntryState.LOADED
+    assert init_integration.state is ConfigEntryState.LOADED
 
     # unload
     await hass.config_entries.async_unload(init_integration.entry_id)
     await hass.async_block_till_done()
     # assert unload and avr is closed
-    assert init_integration.state == config_entries.ConfigEntryState.NOT_LOADED
+    assert init_integration.state is ConfigEntryState.NOT_LOADED
     mock_anthemav.close.assert_called_once()
+
+
+async def test_device_registry(
+    hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
+    init_integration: MockConfigEntry,
+    snapshot: SnapshotAssertion,
+) -> None:
+    """Test the device registry entry, including the network MAC connection."""
+    device_entry = device_registry.async_get_device_by_identifier(
+        (DOMAIN, "00:00:00:00:00:01"), init_integration.entry_id
+    )
+    assert device_entry
+    assert device_entry == snapshot
+
+    zone_2_device_entry = device_registry.async_get_device_by_identifier(
+        (DOMAIN, "00:00:00:00:00:01_2"), init_integration.entry_id
+    )
+    assert zone_2_device_entry
+    assert zone_2_device_entry.via_device_id == device_entry.id
 
 
 @pytest.mark.parametrize("error", [OSError, DeviceError])
@@ -45,7 +68,7 @@ async def test_config_entry_not_ready_when_oserror(
         mock_config_entry.add_to_hass(hass)
         await hass.config_entries.async_setup(mock_config_entry.entry_id)
         await hass.async_block_till_done()
-        assert mock_config_entry.state is config_entries.ConfigEntryState.SETUP_RETRY
+        assert mock_config_entry.state is ConfigEntryState.SETUP_RETRY
 
 
 async def test_anthemav_dispatcher_signal(

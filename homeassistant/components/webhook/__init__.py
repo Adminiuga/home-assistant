@@ -1,63 +1,114 @@
 """Webhooks for Home Assistant."""
-from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
+from dataclasses import dataclass
 from http import HTTPStatus
 from ipaddress import ip_address
 import logging
 import secrets
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from aiohttp import StreamReader
+from aiohttp.hdrs import METH_GET, METH_HEAD, METH_POST, METH_PUT
 from aiohttp.web import Request, Response
-import voluptuous as vol
+import probatio
 
 from homeassistant.components import websocket_api
-from homeassistant.components.http.view import HomeAssistantView
+from homeassistant.components.http import KEY_HASS, HomeAssistantView
+from homeassistant.components.http.const import is_supervisor_unix_socket_request
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.network import get_url
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.network import get_url, is_cloud_connection
 from homeassistant.helpers.typing import ConfigType
-from homeassistant.loader import bind_hass
-from homeassistant.util import network
+from homeassistant.util import network as network_util
 from homeassistant.util.aiohttp import MockRequest, MockStreamReader, serialize_response
+from homeassistant.util.hass_dict import HassKey
 
 _LOGGER = logging.getLogger(__name__)
 
 DOMAIN = "webhook"
 
+DEFAULT_METHODS = (METH_POST, METH_PUT)
+SUPPORTED_METHODS = (METH_GET, METH_HEAD, METH_POST, METH_PUT)
 URL_WEBHOOK_PATH = "/api/webhook/{webhook_id}"
+
+CONFIG_SCHEMA = cv.empty_config_schema(DOMAIN)
+
+type HandlerType = Callable[[HomeAssistant, str, Request], Awaitable[Response | None]]
+
+__all__ = [
+    "DOMAIN",
+    "SUPPORTED_METHODS",
+    "async_generate_id",
+    "async_generate_path",
+    "async_generate_url",
+    "async_handle_webhook",
+    "async_register",
+    "async_unregister",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class WebhookData:
+    """Data for a registered webhook."""
+
+    domain: str
+    name: str
+    handler: HandlerType
+    local_only: bool
+    allowed_methods: frozenset[str]
+
+
+_HANDLERS: HassKey[dict[str, WebhookData]] = HassKey(DOMAIN)
 
 
 @callback
-@bind_hass
 def async_register(
     hass: HomeAssistant,
     domain: str,
     name: str,
     webhook_id: str,
-    handler: Callable[[HomeAssistant, str, Request], Awaitable[Response | None]],
+    handler: HandlerType,
     *,
-    local_only=False,
+    local_only: bool = False,
+    allowed_methods: Iterable[str] | None = None,
 ) -> None:
     """Register a webhook."""
-    handlers = hass.data.setdefault(DOMAIN, {})
+    handlers = hass.data.setdefault(_HANDLERS, {})
 
     if webhook_id in handlers:
         raise ValueError("Handler is already defined!")
 
-    handlers[webhook_id] = {
-        "domain": domain,
-        "name": name,
-        "handler": handler,
-        "local_only": local_only,
-    }
+    if allowed_methods is None:
+        allowed_methods = DEFAULT_METHODS
+    allowed_methods = frozenset(allowed_methods)
+
+    if not allowed_methods.issubset(SUPPORTED_METHODS):
+        raise ValueError(
+            f"Unexpected method: {allowed_methods.difference(SUPPORTED_METHODS)}"
+        )
+
+    if not isinstance(local_only, bool):
+        # Previously it was valid to pass None for
+        # local_only and it was treated as False
+        # with a deprecation warning. In case a custom component is still passing None,
+        # we want to raise an error instead of silently treating it as False as the
+        # deprecation period has ended and the message was removed.
+        raise TypeError("local_only must be a boolean")
+
+    handlers[webhook_id] = WebhookData(
+        domain=domain,
+        name=name,
+        handler=handler,
+        local_only=local_only,
+        allowed_methods=allowed_methods,
+    )
 
 
 @callback
-@bind_hass
 def async_unregister(hass: HomeAssistant, webhook_id: str) -> None:
     """Remove a webhook."""
-    handlers = hass.data.setdefault(DOMAIN, {})
+    handlers = hass.data.setdefault(_HANDLERS, {})
     handlers.pop(webhook_id, None)
 
 
@@ -68,12 +119,27 @@ def async_generate_id() -> str:
 
 
 @callback
-@bind_hass
-def async_generate_url(hass: HomeAssistant, webhook_id: str) -> str:
+def async_generate_url(
+    hass: HomeAssistant,
+    webhook_id: str,
+    allow_internal: bool = True,
+    allow_external: bool = True,
+    allow_ip: bool | None = None,
+    prefer_external: bool | None = True,
+) -> str:
     """Generate the full URL for a webhook_id."""
-    return "{}{}".format(
-        get_url(hass, prefer_external=True, allow_cloud=False),
-        async_generate_path(webhook_id),
+    return (
+        f"{
+            get_url(
+                hass,
+                allow_internal=allow_internal,
+                allow_external=allow_external,
+                allow_cloud=False,
+                allow_ip=allow_ip,
+                prefer_external=prefer_external,
+            )
+        }"
+        f"{async_generate_path(webhook_id)}"
     )
 
 
@@ -83,23 +149,33 @@ def async_generate_path(webhook_id: str) -> str:
     return URL_WEBHOOK_PATH.format(webhook_id=webhook_id)
 
 
-@bind_hass
 async def async_handle_webhook(
     hass: HomeAssistant, webhook_id: str, request: Request | MockRequest
 ) -> Response:
     """Handle a webhook."""
-    handlers: dict[str, dict[str, Any]] = hass.data.setdefault(DOMAIN, {})
+    handlers = hass.data.setdefault(_HANDLERS, {})
+
+    content_stream: StreamReader | MockStreamReader
+    received_from: str | None
+    if isinstance(request, MockRequest):
+        received_from = request.mock_source
+        if request.remote is not None:
+            received_from += f" ({request.remote})"
+        content_stream = request.content
+        method_name = request.method
+        is_supervisor_request = False
+        if TYPE_CHECKING:
+            # MockRequest mimics the aiohttp Request interface and is used for
+            # cloudhooks and webhooks triggered via the WebSocket API.
+            request = cast(Request, request)
+    else:
+        received_from = request.remote
+        content_stream = request.content
+        method_name = request.method
+        is_supervisor_request = is_supervisor_unix_socket_request(request)
 
     # Always respond successfully to not give away if a hook exists or not.
     if (webhook := handlers.get(webhook_id)) is None:
-        content_stream: StreamReader | MockStreamReader
-        if isinstance(request, MockRequest):
-            received_from = request.mock_source
-            content_stream = request.content
-        else:
-            received_from = request.remote
-            content_stream = request.content
-
         _LOGGER.info(
             "Received message for unregistered webhook %s from %s",
             webhook_id,
@@ -111,28 +187,48 @@ async def async_handle_webhook(
         _LOGGER.debug("%s", content)
         return Response(status=HTTPStatus.OK)
 
-    if webhook["local_only"]:
-        if TYPE_CHECKING:
-            assert isinstance(request, Request)
-            assert request.remote is not None
-        try:
-            remote = ip_address(request.remote)
-        except ValueError:
-            _LOGGER.debug("Unable to parse remote ip %s", request.remote)
+    if method_name not in webhook.allowed_methods:
+        if method_name == METH_HEAD:
+            # Allow websites to verify that the URL exists.
             return Response(status=HTTPStatus.OK)
 
-        if not network.is_local(remote):
+        _LOGGER.warning(
+            "Webhook %s only supports %s methods but %s was received from %s",
+            webhook_id,
+            ",".join(webhook.allowed_methods),
+            method_name,
+            received_from,
+        )
+        return Response(status=HTTPStatus.METHOD_NOT_ALLOWED)
+
+    # Requests over the Supervisor Unix socket are always local
+    if webhook.local_only and not is_supervisor_request:
+        is_local = not (is_cloud_connection(hass) or request.remote is None)
+
+        if is_local:
+            if TYPE_CHECKING:
+                assert request.remote is not None
+
+            try:
+                request_remote = ip_address(request.remote)
+            except ValueError:
+                _LOGGER.debug("Unable to parse remote ip %s", request.remote)
+                return Response(status=HTTPStatus.OK)
+
+            is_local = network_util.is_local(request_remote)
+
+        if not is_local:
             _LOGGER.warning("Received remote request for local webhook %s", webhook_id)
             return Response(status=HTTPStatus.OK)
 
     try:
-        response = await webhook["handler"](hass, webhook_id, request)
+        response = await webhook.handler(hass, webhook_id, request)
         if response is None:
             response = Response(status=HTTPStatus.OK)
-        return response
-    except Exception:  # pylint: disable=broad-except
+    except Exception:
         _LOGGER.exception("Error processing webhook %s", webhook_id)
         return Response(status=HTTPStatus.OK)
+    return response
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
@@ -154,9 +250,10 @@ class WebhookView(HomeAssistantView):
     async def _handle(self, request: Request, webhook_id: str) -> Response:
         """Handle webhook call."""
         _LOGGER.debug("Handling webhook %s payload for %s", request.method, webhook_id)
-        hass = request.app["hass"]
+        hass = request.app[KEY_HASS]
         return await async_handle_webhook(hass, webhook_id, request)
 
+    get = _handle
     head = _handle
     post = _handle
     put = _handle
@@ -167,6 +264,7 @@ class WebhookView(HomeAssistantView):
         "type": "webhook/list",
     }
 )
+@websocket_api.require_admin
 @callback
 def websocket_list(
     hass: HomeAssistant,
@@ -174,13 +272,14 @@ def websocket_list(
     msg: dict[str, Any],
 ) -> None:
     """Return a list of webhooks."""
-    handlers = hass.data.setdefault(DOMAIN, {})
+    handlers = hass.data.setdefault(_HANDLERS, {})
     result = [
         {
             "webhook_id": webhook_id,
-            "domain": info["domain"],
-            "name": info["name"],
-            "local_only": info["local_only"],
+            "domain": info.domain,
+            "name": info.name,
+            "local_only": info.local_only,
+            "allowed_methods": sorted(info.allowed_methods),
         }
         for webhook_id, info in handlers.items()
     ]
@@ -190,12 +289,12 @@ def websocket_list(
 
 @websocket_api.websocket_command(
     {
-        vol.Required("type"): "webhook/handle",
-        vol.Required("webhook_id"): str,
-        vol.Required("method"): vol.In(["GET", "POST", "PUT"]),
-        vol.Optional("body", default=""): str,
-        vol.Optional("headers", default={}): {str: str},
-        vol.Optional("query", default=""): str,
+        probatio.Required("type"): "webhook/handle",
+        probatio.Required("webhook_id"): str,
+        probatio.Required("method"): probatio.In(SUPPORTED_METHODS),
+        probatio.Optional("body", default=""): str,
+        probatio.Optional("headers", default={}): {str: str},
+        probatio.Optional("query", default=""): str,
     }
 )
 @websocket_api.async_response
@@ -211,6 +310,7 @@ async def websocket_handle(
         method=msg["method"],
         query_string=msg["query"],
         mock_source=f"{DOMAIN}/ws",
+        remote=connection.remote,
     )
 
     response = await async_handle_webhook(hass, msg["webhook_id"], request)

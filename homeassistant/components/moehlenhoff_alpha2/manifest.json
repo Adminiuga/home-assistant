@@ -1,9 +1,12 @@
 {
   "domain": "moehlenhoff_alpha2",
-  "name": "Möhlenhoff Alpha 2",
+  "name": "M\u00f6hlenhoff Alpha 2",
+  "categories": ["climate.thermostats_heating"],
+  "codeowners": ["@j-a-n"],
   "config_flow": true,
+  "connectivity": ["network"],
   "documentation": "https://www.home-assistant.io/integrations/moehlenhoff_alpha2",
-  "requirements": ["moehlenhoff-alpha2==1.2.1"],
+  "integration_type": "hub",
   "iot_class": "local_push",
-  "codeowners": ["@j-a-n"]
+  "requirements": ["moehlenhoff-alpha2==1.4.0"]
 }

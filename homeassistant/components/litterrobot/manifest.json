@@ -1,12 +1,22 @@
 {
   "domain": "litterrobot",
-  "name": "Litter-Robot",
-  "config_flow": true,
-  "documentation": "https://www.home-assistant.io/integrations/litterrobot",
-  "requirements": ["pylitterbot==2022.11.0"],
+  "name": "Whisker",
+  "categories": ["pets"],
   "codeowners": ["@natekspencer", "@tkdrob"],
-  "dhcp": [{ "hostname": "litter-robot4" }],
+  "config_flow": true,
+  "connectivity": ["cloud"],
+  "dhcp": [
+    {
+      "hostname": "litter-robot4"
+    },
+    {
+      "hostname": "whiskerrobots"
+    }
+  ],
+  "documentation": "https://www.home-assistant.io/integrations/litterrobot",
+  "integration_type": "hub",
   "iot_class": "cloud_push",
   "loggers": ["pylitterbot"],
-  "integration_type": "hub"
+  "quality_scale": "platinum",
+  "requirements": ["pylitterbot==2025.7.0"]
 }

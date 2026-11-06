@@ -1,10 +1,14 @@
 {
   "domain": "senz",
   "name": "nVent RAYCHEM SENZ",
-  "config_flow": true,
-  "documentation": "https://www.home-assistant.io/integrations/senz",
-  "requirements": ["aiosenz==1.0.0"],
-  "dependencies": ["application_credentials"],
+  "categories": ["climate.thermostats_heating"],
   "codeowners": ["@milanmeu"],
-  "iot_class": "cloud_polling"
+  "config_flow": true,
+  "connectivity": ["cloud"],
+  "dependencies": ["application_credentials"],
+  "documentation": "https://www.home-assistant.io/integrations/senz",
+  "integration_type": "hub",
+  "iot_class": "cloud_polling",
+  "loggers": ["pysenz"],
+  "requirements": ["pysenz==1.1.2"]
 }

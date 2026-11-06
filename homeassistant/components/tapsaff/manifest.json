@@ -1,9 +1,12 @@
 {
   "domain": "tapsaff",
   "name": "Taps Aff",
-  "documentation": "https://www.home-assistant.io/integrations/tapsaff",
-  "requirements": ["tapsaff==0.2.1"],
+  "categories": ["weather_alerts.forecasts"],
   "codeowners": ["@bazwilliams"],
-  "iot_class": "local_polling",
-  "loggers": ["tapsaff"]
+  "connectivity": ["cloud"],
+  "documentation": "https://www.home-assistant.io/integrations/tapsaff",
+  "iot_class": "cloud_polling",
+  "loggers": ["tapsaff"],
+  "quality_scale": "legacy",
+  "requirements": ["tapsaff==0.2.1"]
 }

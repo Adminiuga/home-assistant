@@ -1,9 +1,9 @@
 """Support for Tailscale sensors."""
-from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
+from typing import override
 
 from tailscale import Device as TailscaleDevice
 
@@ -12,47 +12,40 @@ from homeassistant.components.sensor import (
     SensorEntity,
     SensorEntityDescription,
 )
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity import EntityCategory
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from . import TailscaleEntity
-from .const import DOMAIN
+from .coordinator import TailscaleConfigEntry
+from .entity import TailscaleEntity
+
+PARALLEL_UPDATES = 0
 
 
-@dataclass
-class TailscaleSensorEntityDescriptionMixin:
-    """Mixin for required keys."""
+@dataclass(frozen=True, kw_only=True)
+class TailscaleSensorEntityDescription(SensorEntityDescription):
+    """Describes a Tailscale sensor entity."""
 
     value_fn: Callable[[TailscaleDevice], datetime | str | None]
-
-
-@dataclass
-class TailscaleSensorEntityDescription(
-    SensorEntityDescription, TailscaleSensorEntityDescriptionMixin
-):
-    """Describes a Tailscale sensor entity."""
 
 
 SENSORS: tuple[TailscaleSensorEntityDescription, ...] = (
     TailscaleSensorEntityDescription(
         key="expires",
-        name="Expires",
+        translation_key="expires",
         device_class=SensorDeviceClass.TIMESTAMP,
         entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda device: device.expires,
     ),
     TailscaleSensorEntityDescription(
         key="ip",
-        name="IP address",
-        icon="mdi:ip-network",
+        translation_key="ip",
         entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda device: device.addresses[0] if device.addresses else None,
     ),
     TailscaleSensorEntityDescription(
         key="last_seen",
-        name="Last seen",
+        translation_key="last_seen",
         device_class=SensorDeviceClass.TIMESTAMP,
         value_fn=lambda device: device.last_seen,
     ),
@@ -61,11 +54,11 @@ SENSORS: tuple[TailscaleSensorEntityDescription, ...] = (
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    entry: TailscaleConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up a Tailscale sensors based on a config entry."""
-    coordinator = hass.data[DOMAIN][entry.entry_id]
+    coordinator = entry.runtime_data
     async_add_entities(
         TailscaleSensorEntity(
             coordinator=coordinator,
@@ -83,6 +76,7 @@ class TailscaleSensorEntity(TailscaleEntity, SensorEntity):
     entity_description: TailscaleSensorEntityDescription
 
     @property
+    @override
     def native_value(self) -> datetime | str | None:
         """Return the state of the sensor."""
         return self.entity_description.value_fn(self.coordinator.data[self.device_id])

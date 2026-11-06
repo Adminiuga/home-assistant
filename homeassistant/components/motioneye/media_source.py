@@ -1,26 +1,33 @@
 """motionEye Media Source Implementation."""
-from __future__ import annotations
 
+from base64 import b64decode, urlsafe_b64encode
+from binascii import Error
+from datetime import timedelta
 import logging
 from pathlib import PurePath
-from typing import Optional, cast
+from typing import Any, cast, override
 
+from aiohttp import web
+from motioneye_client.client import MotionEyeClientError
 from motioneye_client.const import KEY_MEDIA_LIST, KEY_MIME_TYPE, KEY_PATH
 
+from homeassistant.components.http import HomeAssistantView
+from homeassistant.components.http.auth import async_sign_path
 from homeassistant.components.media_player import MediaClass, MediaType
-from homeassistant.components.media_source.error import MediaSourceError, Unresolvable
-from homeassistant.components.media_source.models import (
+from homeassistant.components.media_source import (
     BrowseMediaSource,
     MediaSource,
+    MediaSourceError,
     MediaSourceItem,
     PlayMedia,
+    Unresolvable,
 )
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import device_registry as dr
 
-from . import get_media_url, split_motioneye_device_identifier
-from .const import CONF_CLIENT, DOMAIN
+from .const import DOMAIN
+from .coordinator import MotionEyeConfigEntry
 
 MIME_TYPE_MAP = {
     "movies": "video/mp4",
@@ -33,6 +40,133 @@ MEDIA_CLASS_MAP = {
 }
 
 _LOGGER = logging.getLogger(__name__)
+
+MEDIA_PROXY_URL = "/api/motioneye/media/{config_id}/{camera_id}/{kind}/{preview}/{path}"
+
+
+def split_motioneye_device_identifier(
+    identifier: tuple[str, str],
+) -> tuple[str, str, int] | None:
+    """Get the identifiers for a motionEye device."""
+    if len(identifier) != 2 or identifier[0] != DOMAIN or "_" not in identifier[1]:
+        return None
+    config_id, camera_id_str = identifier[1].split("_", 1)
+    try:
+        camera_id = int(camera_id_str)
+    except ValueError:
+        return None
+    return (DOMAIN, config_id, camera_id)
+
+
+def _encode_media_path(path: str) -> str:
+    """Encode a motionEye media path for use in a Home Assistant proxy URL."""
+    return urlsafe_b64encode(path.encode("utf-8")).decode("ascii")
+
+
+def _build_media_proxy_path(
+    config_id: str,
+    camera_id: int,
+    kind: str,
+    path: str,
+    *,
+    preview: bool,
+) -> str:
+    """Build an authenticated Home Assistant proxy path for motionEye media."""
+    return MEDIA_PROXY_URL.format(
+        config_id=config_id,
+        camera_id=camera_id,
+        kind=kind,
+        preview="1" if preview else "0",
+        path=_encode_media_path(path),
+    )
+
+
+class MotionEyeMediaProxyView(HomeAssistantView):
+    """Proxy saved motionEye media through Home Assistant."""
+
+    requires_auth = True
+    url = MEDIA_PROXY_URL
+    name = "api:motioneye_media"
+
+    def __init__(self, hass: HomeAssistant) -> None:
+        """Initialize the proxy."""
+        self.hass = hass
+
+    async def get(
+        self,
+        request: web.Request,
+        config_id: str,
+        camera_id: str,
+        kind: str,
+        preview: str,
+        path: str,
+    ) -> web.StreamResponse:
+        """Stream saved media fetched with the authenticated motionEye session."""
+        entry = self.hass.config_entries.async_get_entry(config_id)
+        if (
+            not entry
+            or entry.domain != DOMAIN
+            or entry.state is not ConfigEntryState.LOADED
+        ):
+            return web.Response(status=404)
+
+        if kind not in MIME_TYPE_MAP:
+            return web.Response(status=400)
+
+        try:
+            media_path = b64decode(
+                path.encode("ascii"), altchars=b"-_", validate=True
+            ).decode("utf-8")
+            camera = int(camera_id)
+        except Error, UnicodeDecodeError, UnicodeEncodeError, ValueError:
+            return web.Response(status=400)
+
+        media_path_obj = PurePath(media_path)
+        if media_path_obj.root != "/" or ".." in media_path_obj.parts:
+            return web.Response(status=400)
+
+        range_header = request.headers.get("Range")
+        response: web.StreamResponse | None = None
+
+        try:
+            async with cast(Any, entry.runtime_data.client).async_get_media_stream(
+                camera,
+                media_path,
+                image=kind == "images",
+                preview=preview == "1",
+                range_header=range_header,
+            ) as upstream:
+                headers = {}
+                for header in (
+                    "Accept-Ranges",
+                    "Content-Length",
+                    "Content-Range",
+                    "Content-Type",
+                ):
+                    if value := upstream.headers.get(header):
+                        headers[header] = value
+
+                response = web.StreamResponse(
+                    status=upstream.status,
+                    headers=headers,
+                )
+
+                if "Content-Type" not in headers:
+                    response.content_type = (
+                        "image/jpeg" if preview == "1" else MIME_TYPE_MAP[kind]
+                    )
+
+                await response.prepare(request)
+
+                async for chunk in upstream.content.iter_chunked(64 * 1024):
+                    await response.write(chunk)
+
+                await response.write_eof()
+                return response
+        except MotionEyeClientError:
+            if response is not None and response.prepared:
+                raise
+            return web.Response(status=502)
 
 
 # Hierarchy:
@@ -58,6 +192,7 @@ class MotionEyeMediaSource(MediaSource):
         super().__init__(DOMAIN)
         self.hass = hass
 
+    @override
     async def async_resolve_media(self, item: MediaSourceItem) -> PlayMedia:
         """Resolve media to a url."""
         config_id, device_id, kind, path = self._parse_identifier(item.identifier)
@@ -71,16 +206,16 @@ class MotionEyeMediaSource(MediaSource):
         device = self._get_device_or_raise(device_id)
         self._verify_kind_or_raise(kind)
 
-        url = get_media_url(
-            self.hass.data[DOMAIN][config.entry_id][CONF_CLIENT],
-            self._get_camera_id_or_raise(config, device),
-            self._get_path_or_raise(path),
-            kind == "images",
+        camera_id = self._get_camera_id_or_raise(config, device)
+        media_path = self._get_path_or_raise(path)
+        proxy_path = _build_media_proxy_path(
+            config.entry_id,
+            camera_id,
+            kind,
+            media_path,
+            preview=False,
         )
-        if not url:
-            raise Unresolvable(f"Could not resolve media item: {item.identifier}")
-
-        return PlayMedia(url, MIME_TYPE_MAP[kind])
+        return PlayMedia(proxy_path, MIME_TYPE_MAP[kind])
 
     @callback
     @classmethod
@@ -90,10 +225,11 @@ class MotionEyeMediaSource(MediaSource):
         base = [None] * 4
         data = identifier.split("#", 3)
         return cast(
-            tuple[Optional[str], Optional[str], Optional[str], Optional[str]],
+            tuple[str | None, str | None, str | None, str | None],
             tuple(data + base)[:4],  # type: ignore[operator]
         )
 
+    @override
     async def async_browse_media(
         self,
         item: MediaSourceItem,
@@ -118,17 +254,19 @@ class MotionEyeMediaSource(MediaSource):
                 return self._build_media_devices(config)
         return self._build_media_configs()
 
-    def _get_config_or_raise(self, config_id: str) -> ConfigEntry:
+    def _get_config_or_raise(self, config_id: str) -> MotionEyeConfigEntry:
         """Get a config entry from a URL."""
         entry = self.hass.config_entries.async_get_entry(config_id)
-        if not entry:
+        if not entry or entry.state is not ConfigEntryState.LOADED:
             raise MediaSourceError(f"Unable to find config entry with id: {config_id}")
         return entry
 
     def _get_device_or_raise(self, device_id: str) -> dr.DeviceEntry:
         """Get a config entry from a URL."""
         device_registry = dr.async_get(self.hass)
-        if not (device := device_registry.async_get(device_id)):
+        if not (
+            device := device_registry.async_get(device_id, include_child_devices=False)
+        ):
             raise MediaSourceError(f"Unable to find device with id: {device_id}")
         return device
 
@@ -152,7 +290,7 @@ class MotionEyeMediaSource(MediaSource):
 
     @classmethod
     def _get_camera_id_or_raise(
-        cls, config: ConfigEntry, device: dr.DeviceEntry
+        cls, config: MotionEyeConfigEntry, device: dr.DeviceEntry
     ) -> int:
         """Get a config entry from a URL."""
         for identifier in device.identifiers:
@@ -162,7 +300,7 @@ class MotionEyeMediaSource(MediaSource):
         raise MediaSourceError(f"Could not find camera id for device id: {device.id}")
 
     @classmethod
-    def _build_media_config(cls, config: ConfigEntry) -> BrowseMediaSource:
+    def _build_media_config(cls, config: MotionEyeConfigEntry) -> BrowseMediaSource:
         return BrowseMediaSource(
             domain=DOMAIN,
             identifier=config.entry_id,
@@ -194,7 +332,7 @@ class MotionEyeMediaSource(MediaSource):
     @classmethod
     def _build_media_device(
         cls,
-        config: ConfigEntry,
+        config: MotionEyeConfigEntry,
         device: dr.DeviceEntry,
         full_title: bool = True,
     ) -> BrowseMediaSource:
@@ -209,7 +347,7 @@ class MotionEyeMediaSource(MediaSource):
             children_media_class=MediaClass.DIRECTORY,
         )
 
-    def _build_media_devices(self, config: ConfigEntry) -> BrowseMediaSource:
+    def _build_media_devices(self, config: MotionEyeConfigEntry) -> BrowseMediaSource:
         """Build the media sources for device entries."""
         device_registry = dr.async_get(self.hass)
         devices = dr.async_entries_for_config_entry(device_registry, config.entry_id)
@@ -224,7 +362,7 @@ class MotionEyeMediaSource(MediaSource):
     @classmethod
     def _build_media_kind(
         cls,
-        config: ConfigEntry,
+        config: MotionEyeConfigEntry,
         device: dr.DeviceEntry,
         kind: str,
         full_title: bool = True,
@@ -249,7 +387,7 @@ class MotionEyeMediaSource(MediaSource):
         )
 
     def _build_media_kinds(
-        self, config: ConfigEntry, device: dr.DeviceEntry
+        self, config: MotionEyeConfigEntry, device: dr.DeviceEntry
     ) -> BrowseMediaSource:
         base = self._build_media_device(config, device)
         base.children = [
@@ -260,7 +398,7 @@ class MotionEyeMediaSource(MediaSource):
 
     async def _build_media_path(
         self,
-        config: ConfigEntry,
+        config: MotionEyeConfigEntry,
         device: dr.DeviceEntry,
         kind: str,
         path: str,
@@ -274,7 +412,7 @@ class MotionEyeMediaSource(MediaSource):
 
         base.children = []
 
-        client = self.hass.data[DOMAIN][config.entry_id][CONF_CLIENT]
+        client = config.runtime_data.client
         camera_id = self._get_camera_id_or_raise(config, device)
 
         if kind == "movies":
@@ -284,7 +422,7 @@ class MotionEyeMediaSource(MediaSource):
 
         sub_dirs: set[str] = set()
         parts = parsed_path.parts
-        media_list = resp.get(KEY_MEDIA_LIST, [])
+        media_list = resp.get(KEY_MEDIA_LIST, []) if resp else []
 
         def get_media_sort_key(media: dict) -> str:
             """Get media sort key."""
@@ -307,14 +445,19 @@ class MotionEyeMediaSource(MediaSource):
 
                 # Child is a media file.
                 if len(parts) + 1 == len(parts_media):
-                    if kind == "movies":
-                        thumbnail_url = client.get_movie_url(
-                            camera_id, full_child_path, preview=True
-                        )
-                    else:
-                        thumbnail_url = client.get_image_url(
-                            camera_id, full_child_path, preview=True
-                        )
+                    thumbnail_path = _build_media_proxy_path(
+                        config.entry_id,
+                        camera_id,
+                        kind,
+                        full_child_path,
+                        preview=True,
+                    )
+                    thumbnail_url = async_sign_path(
+                        self.hass,
+                        thumbnail_path,
+                        timedelta(minutes=5),
+                        use_content_user=True,
+                    )
 
                     base.children.append(
                         BrowseMediaSource(

@@ -1,280 +1,184 @@
 """The xbox integration."""
-from __future__ import annotations
 
-from contextlib import suppress
-from dataclasses import dataclass
-from datetime import timedelta
+import asyncio
 import logging
 
-import voluptuous as vol
-from xbox.webapi.api.client import XboxLiveClient
-from xbox.webapi.api.provider.catalog.const import SYSTEM_PFN_ID_MAP
-from xbox.webapi.api.provider.catalog.models import AlternateIdType, Product
-from xbox.webapi.api.provider.people.models import (
-    PeopleResponse,
-    Person,
-    PresenceDetail,
-)
-from xbox.webapi.api.provider.smartglass.models import (
-    SmartglassConsoleList,
-    SmartglassConsoleStatus,
-)
+from httpx2 import HTTPStatusError, RequestError, TimeoutException
+from pythonxbox.api.client import XboxLiveClient
 
-from homeassistant.components import application_credentials
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_CLIENT_ID, CONF_CLIENT_SECRET, Platform
+from homeassistant.config_entries import ConfigSubentry
+from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers import (
-    aiohttp_client,
-    config_entry_oauth2_flow,
-    config_validation as cv,
+from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.helpers import config_validation as cv, device_registry as dr
+from homeassistant.helpers.config_entry_oauth2_flow import (
+    OAuth2Session,
+    async_get_config_entry_implementation,
 )
-from homeassistant.helpers.issue_registry import IssueSeverity, async_create_issue
-from homeassistant.helpers.typing import ConfigType
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+from homeassistant.helpers.httpx_client import get_async_client
 
 from . import api
+from .api import AsyncConfigEntryAuth
 from .const import DOMAIN
+from .coordinator import (
+    XboxConfigEntry,
+    XboxConsolesCoordinator,
+    XboxConsoleStatusCoordinator,
+    XboxCoordinators,
+    XboxPresenceCoordinator,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
-CONFIG_SCHEMA = vol.Schema(
-    vol.All(
-        cv.deprecated(DOMAIN),
-        {
-            DOMAIN: vol.Schema(
-                {
-                    vol.Required(CONF_CLIENT_ID): cv.string,
-                    vol.Required(CONF_CLIENT_SECRET): cv.string,
-                }
-            )
-        },
-    ),
-    extra=vol.ALLOW_EXTRA,
-)
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 PLATFORMS = [
     Platform.BINARY_SENSOR,
+    Platform.IMAGE,
     Platform.MEDIA_PLAYER,
     Platform.REMOTE,
     Platform.SENSOR,
 ]
 
 
-async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    """Set up the xbox component."""
-    hass.data[DOMAIN] = {}
-
-    if DOMAIN not in config:
-        return True
-
-    await application_credentials.async_import_client_credential(
-        hass,
-        DOMAIN,
-        application_credentials.ClientCredential(
-            config[DOMAIN][CONF_CLIENT_ID], config[DOMAIN][CONF_CLIENT_SECRET]
-        ),
-    )
-    async_create_issue(
-        hass,
-        DOMAIN,
-        "deprecated_yaml",
-        breaks_in_ha_version="2022.9.0",
-        is_fixable=False,
-        severity=IssueSeverity.WARNING,
-        translation_key="deprecated_yaml",
-    )
-    _LOGGER.warning(
-        "Configuration of Xbox integration in YAML is deprecated and "
-        "will be removed in Home Assistant 2022.9.; Your existing configuration "
-        "(including OAuth Application Credentials) has been imported into "
-        "the UI automatically and can be safely removed from your "
-        "configuration.yaml file"
-    )
-
-    return True
-
-
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_setup_entry(hass: HomeAssistant, entry: XboxConfigEntry) -> None:
     """Set up xbox from a config entry."""
-    implementation = (
-        await config_entry_oauth2_flow.async_get_config_entry_implementation(
-            hass, entry
-        )
-    )
-    session = config_entry_oauth2_flow.OAuth2Session(hass, entry, implementation)
-    auth = api.AsyncConfigEntryAuth(
-        aiohttp_client.async_get_clientsession(hass), session
-    )
 
+    implementation = await async_get_config_entry_implementation(hass, entry)
+
+    session = OAuth2Session(hass, entry, implementation)
+    async_session = get_async_client(hass)
+    auth = api.AsyncConfigEntryAuth(async_session, session)
     client = XboxLiveClient(auth)
-    consoles: SmartglassConsoleList = await client.smartglass.get_console_list()
-    _LOGGER.debug(
-        "Found %d consoles: %s",
-        len(consoles.result),
-        consoles.dict(),
+
+    consoles = XboxConsolesCoordinator(hass, entry, client)
+    await consoles.async_config_entry_first_refresh()
+
+    status = XboxConsoleStatusCoordinator(hass, entry, client, consoles.data)
+    presence = XboxPresenceCoordinator(hass, entry, client)
+    await asyncio.gather(
+        status.async_config_entry_first_refresh(),
+        presence.async_config_entry_first_refresh(),
     )
 
-    coordinator = XboxUpdateCoordinator(hass, client, consoles)
-    await coordinator.async_config_entry_first_refresh()
-
-    hass.data[DOMAIN][entry.entry_id] = {
-        "client": XboxLiveClient(auth),
-        "consoles": consoles,
-        "coordinator": coordinator,
-    }
+    entry.runtime_data = XboxCoordinators(consoles, status, presence)
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    return True
+    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def _async_update_listener(hass: HomeAssistant, entry: XboxConfigEntry) -> None:
+    """Handle update."""
+    await hass.config_entries.async_reload(entry.entry_id)
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: XboxConfigEntry) -> None:
     """Unload a config entry."""
-    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-    if unload_ok:
-        # Unsub from coordinator updates
-        hass.data[DOMAIN][entry.entry_id]["sensor_unsub"]()
-        hass.data[DOMAIN][entry.entry_id]["binary_sensor_unsub"]()
-        hass.data[DOMAIN].pop(entry.entry_id)
 
-    return unload_ok
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)
 
 
-@dataclass
-class ConsoleData:
-    """Xbox console status data."""
+async def async_remove_config_entry_device(
+    hass: HomeAssistant,
+    config_entry: XboxConfigEntry,
+    device_entry: dr.AnyDeviceEntry,
+) -> bool:
+    """Remove a stale device from a config entry."""
 
-    status: SmartglassConsoleStatus
-    app_details: Product | None
-
-
-@dataclass
-class PresenceData:
-    """Xbox user presence data."""
-
-    xuid: str
-    gamertag: str
-    display_pic: str
-    online: bool
-    status: str
-    in_party: bool
-    in_game: bool
-    in_multiplayer: bool
-    gamer_score: str
-    gold_tenure: str | None
-    account_tier: str
-
-
-@dataclass
-class XboxData:
-    """Xbox dataclass for update coordinator."""
-
-    consoles: dict[str, ConsoleData]
-    presence: dict[str, PresenceData]
-
-
-class XboxUpdateCoordinator(DataUpdateCoordinator):
-    """Store Xbox Console Status."""
-
-    def __init__(
-        self,
-        hass: HomeAssistant,
-        client: XboxLiveClient,
-        consoles: SmartglassConsoleList,
-    ) -> None:
-        """Initialize."""
-        super().__init__(
-            hass,
-            _LOGGER,
-            name=DOMAIN,
-            update_interval=timedelta(seconds=10),
-        )
-        self.data: XboxData = XboxData({}, {})
-        self.client: XboxLiveClient = client
-        self.consoles: SmartglassConsoleList = consoles
-
-    async def _async_update_data(self) -> XboxData:
-        """Fetch the latest console status."""
-        # Update Console Status
-        new_console_data: dict[str, ConsoleData] = {}
-        for console in self.consoles.result:
-            current_state: ConsoleData | None = self.data.consoles.get(console.id)
-            status: SmartglassConsoleStatus = (
-                await self.client.smartglass.get_console_status(console.id)
+    return not any(
+        identifier
+        for identifier in device_entry.identifiers
+        if identifier[0] == DOMAIN
+        and (
+            (
+                isinstance(device_entry, dr.DeviceEntry)
+                and device_entry.entry_type == dr.DeviceEntryType.SERVICE
             )
-
-            _LOGGER.debug(
-                "%s status: %s",
-                console.name,
-                status.dict(),
-            )
-
-            # Setup focus app
-            app_details: Product | None = None
-            if current_state is not None:
-                app_details = current_state.app_details
-
-            if status.focus_app_aumid:
-                if (
-                    not current_state
-                    or status.focus_app_aumid != current_state.status.focus_app_aumid
-                ):
-                    app_id = status.focus_app_aumid.split("!")[0]
-                    id_type = AlternateIdType.PACKAGE_FAMILY_NAME
-                    if app_id in SYSTEM_PFN_ID_MAP:
-                        id_type = AlternateIdType.LEGACY_XBOX_PRODUCT_ID
-                        app_id = SYSTEM_PFN_ID_MAP[app_id][id_type]
-                    catalog_result = (
-                        await self.client.catalog.get_product_from_alternate_id(
-                            app_id, id_type
-                        )
-                    )
-                    if catalog_result and catalog_result.products:
-                        app_details = catalog_result.products[0]
-            else:
-                app_details = None
-
-            new_console_data[console.id] = ConsoleData(
-                status=status, app_details=app_details
-            )
-
-        # Update user presence
-        presence_data: dict[str, PresenceData] = {}
-        batch: PeopleResponse = await self.client.people.get_friends_own_batch(
-            [self.client.xuid]
+            or identifier[1] in config_entry.runtime_data.consoles.data
         )
-        own_presence: Person = batch.people[0]
-        presence_data[own_presence.xuid] = _build_presence_data(own_presence)
-
-        friends: PeopleResponse = await self.client.people.get_friends_own()
-        for friend in friends.people:
-            if not friend.is_favorite:
-                continue
-
-            presence_data[friend.xuid] = _build_presence_data(friend)
-
-        return XboxData(new_console_data, presence_data)
-
-
-def _build_presence_data(person: Person) -> PresenceData:
-    """Build presence data from a person."""
-    active_app: PresenceDetail | None = None
-    with suppress(StopIteration):
-        active_app = next(
-            presence for presence in person.presence_details if presence.is_primary
-        )
-
-    return PresenceData(
-        xuid=person.xuid,
-        gamertag=person.gamertag,
-        display_pic=person.display_pic_raw,
-        online=person.presence_state == "Online",
-        status=person.presence_text,
-        in_party=person.multiplayer_summary.in_party > 0,
-        in_game=active_app is not None and active_app.is_game,
-        in_multiplayer=person.multiplayer_summary.in_multiplayer_session,
-        gamer_score=person.gamer_score,
-        gold_tenure=person.detail.tenure,
-        account_tier=person.detail.account_tier,
     )
+
+
+async def async_migrate_entry(hass: HomeAssistant, entry: XboxConfigEntry) -> None:
+    """Migrate config entry."""
+
+    if entry.version == 1 and entry.minor_version < 3:
+        implementation = await async_get_config_entry_implementation(hass, entry)
+        session = OAuth2Session(hass, entry, implementation)
+        async_session = get_async_client(hass)
+        auth = AsyncConfigEntryAuth(async_session, session)
+        await auth.refresh_tokens()
+        client = XboxLiveClient(auth)
+
+        if entry.minor_version < 2:
+            # Migrate unique_id from `xbox` to account xuid and
+            # change generic entry name to user's gamertag
+            try:
+                own = await client.people.get_friend_by_xuid(client.xuid)
+            except TimeoutException as e:
+                raise ConfigEntryNotReady(
+                    translation_domain=DOMAIN,
+                    translation_key="timeout_exception",
+                ) from e
+            except (RequestError, HTTPStatusError) as e:
+                _LOGGER.debug("Xbox exception:", exc_info=True)
+                raise ConfigEntryNotReady(
+                    translation_domain=DOMAIN,
+                    translation_key="request_exception",
+                ) from e
+
+            hass.config_entries.async_update_entry(
+                entry,
+                unique_id=client.xuid,
+                title=(
+                    own.people[0].gamertag
+                    if entry.title == "Home Assistant Cloud"
+                    else entry.title
+                ),
+                minor_version=2,
+            )
+        if entry.minor_version < 3:
+            # Migrate favorite friends to friend subentries
+            try:
+                friends = await client.people.get_friends_own()
+            except TimeoutException as e:
+                raise ConfigEntryNotReady(
+                    translation_domain=DOMAIN,
+                    translation_key="timeout_exception",
+                ) from e
+            except (RequestError, HTTPStatusError) as e:
+                _LOGGER.debug("Xbox exception:", exc_info=True)
+                raise ConfigEntryNotReady(
+                    translation_domain=DOMAIN,
+                    translation_key="request_exception",
+                ) from e
+
+            dev_reg = dr.async_get(hass)
+            for friend in friends.people:
+                if not friend.is_favorite:
+                    continue
+                subentry = ConfigSubentry(
+                    subentry_type="friend",
+                    title=friend.gamertag,
+                    unique_id=friend.xuid,
+                    data={},  # type: ignore[arg-type]
+                )
+                hass.config_entries.async_add_subentry(entry, subentry)
+
+                if device := dev_reg.async_get_device_by_identifier(
+                    (DOMAIN, friend.xuid), entry.entry_id
+                ):
+                    dev_reg.async_update_device(
+                        device.id,
+                        new_config_entry_id=entry.entry_id,
+                        new_config_subentry_id=subentry.subentry_id,
+                    )
+            if device := dev_reg.async_get_device_by_identifier(
+                (DOMAIN, "xbox_live"), entry.entry_id
+            ):
+                dev_reg.async_update_device(
+                    device.id, new_identifiers={(DOMAIN, client.xuid)}
+                )
+            hass.config_entries.async_update_entry(entry, minor_version=3)
+            hass.config_entries.async_schedule_reload(entry.entry_id)

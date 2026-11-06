@@ -1,9 +1,12 @@
 {
   "domain": "sony_projector",
   "name": "Sony Projector",
-  "documentation": "https://www.home-assistant.io/integrations/sony_projector",
-  "requirements": ["pysdcp==1"],
+  "categories": ["media_entertainment.tv_streaming"],
   "codeowners": [],
+  "connectivity": ["network"],
+  "documentation": "https://www.home-assistant.io/integrations/sony_projector",
   "iot_class": "local_polling",
-  "loggers": ["pysdcp"]
+  "loggers": ["pysdcp"],
+  "quality_scale": "legacy",
+  "requirements": ["pySDCP==1"]
 }

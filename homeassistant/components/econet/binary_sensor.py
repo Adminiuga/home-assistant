@@ -1,49 +1,51 @@
 """Support for Rheem EcoNet water heaters."""
-from __future__ import annotations
 
-from pyeconet.equipment import EquipmentType
+from typing import override
+
+from pyeconet.equipment import Equipment, EquipmentType
 
 from homeassistant.components.binary_sensor import (
     BinarySensorDeviceClass,
     BinarySensorEntity,
     BinarySensorEntityDescription,
 )
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from . import EcoNetEntity
-from .const import DOMAIN, EQUIPMENT
+from . import EconetConfigEntry
+from .entity import EcoNetEntity
 
 BINARY_SENSOR_TYPES: tuple[BinarySensorEntityDescription, ...] = (
     BinarySensorEntityDescription(
         key="shutoff_valve_open",
-        name="shutoff_valve",
+        translation_key="shutoff_valve",
         device_class=BinarySensorDeviceClass.OPENING,
     ),
     BinarySensorEntityDescription(
         key="running",
-        name="running",
+        translation_key="running",
         device_class=BinarySensorDeviceClass.POWER,
     ),
     BinarySensorEntityDescription(
         key="screen_locked",
-        name="screen_locked",
+        translation_key="screen_locked",
         device_class=BinarySensorDeviceClass.LOCK,
     ),
     BinarySensorEntityDescription(
         key="beep_enabled",
-        name="beep_enabled",
+        translation_key="beep_enabled",
         device_class=BinarySensorDeviceClass.SOUND,
     ),
 )
 
 
 async def async_setup_entry(
-    hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
+    hass: HomeAssistant,
+    entry: EconetConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up EcoNet binary sensor based on a config entry."""
-    equipment = hass.data[DOMAIN][EQUIPMENT][entry.entry_id]
+    equipment = entry.runtime_data
     all_equipment = equipment[EquipmentType.WATER_HEATER].copy()
     all_equipment.extend(equipment[EquipmentType.THERMOSTAT].copy())
 
@@ -60,23 +62,19 @@ async def async_setup_entry(
 class EcoNetBinarySensor(EcoNetEntity, BinarySensorEntity):
     """Define a Econet binary sensor."""
 
-    def __init__(self, econet_device, description: BinarySensorEntityDescription):
+    _attr_has_entity_name = True
+
+    def __init__(
+        self, econet_device: Equipment, description: BinarySensorEntityDescription
+    ) -> None:
         """Initialize."""
         super().__init__(econet_device)
         self.entity_description = description
-        self._econet = econet_device
+        # Translation keys are also legacy unique-ID suffixes and must stay stable.
+        self._attr_unique_id = f"{econet_device.device_id}_{econet_device.device_name}_{description.translation_key}"
 
     @property
-    def is_on(self):
+    @override
+    def is_on(self) -> bool:
         """Return true if the binary sensor is on."""
         return getattr(self._econet, self.entity_description.key)
-
-    @property
-    def name(self):
-        """Return the name of the entity."""
-        return f"{self._econet.device_name}_{self.entity_description.name}"
-
-    @property
-    def unique_id(self):
-        """Return the unique ID of the entity."""
-        return f"{self._econet.device_id}_{self._econet.device_name}_{self.entity_description.name}"

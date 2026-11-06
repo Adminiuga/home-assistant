@@ -1,31 +1,34 @@
 """Support for interfacing with WS66i 6 zone home audio controller."""
+
+from typing import override
+
 from pyws66i import WS66i, ZoneStatus
 
 from homeassistant.components.media_player import (
+    MediaPlayerDeviceClass,
     MediaPlayerEntity,
     MediaPlayerEntityFeature,
     MediaPlayerState,
 )
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.entity import DeviceInfo
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN, MAX_VOL
 from .coordinator import Ws66iDataUpdateCoordinator
-from .models import Ws66iData
+from .models import Ws66iConfigEntry, Ws66iData
 
 PARALLEL_UPDATES = 1
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    config_entry: Ws66iConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up the WS66i 6-zone amplifier platform from a config entry."""
-    ws66i_data: Ws66iData = hass.data[DOMAIN][config_entry.entry_id]
+    ws66i_data = config_entry.runtime_data
 
     # Build and add the entities from the data class
     async_add_entities(
@@ -44,6 +47,19 @@ async def async_setup_entry(
 class Ws66iZone(CoordinatorEntity[Ws66iDataUpdateCoordinator], MediaPlayerEntity):
     """Representation of a WS66i amplifier zone."""
 
+    _attr_has_entity_name = True
+    _attr_name = None
+    _attr_device_class = MediaPlayerDeviceClass.RECEIVER
+    _attr_supported_features = (
+        MediaPlayerEntityFeature.VOLUME_MUTE
+        | MediaPlayerEntityFeature.VOLUME_SET
+        | MediaPlayerEntityFeature.VOLUME_STEP
+        | MediaPlayerEntityFeature.TURN_ON
+        | MediaPlayerEntityFeature.TURN_OFF
+        | MediaPlayerEntityFeature.SELECT_SOURCE
+    )
+    _attr_volume_step = 1 / MAX_VOL
+
     def __init__(
         self,
         device: WS66i,
@@ -61,25 +77,17 @@ class Ws66iZone(CoordinatorEntity[Ws66iDataUpdateCoordinator], MediaPlayerEntity
         self._zone_id_idx: int = data_idx
         self._status: ZoneStatus = coordinator.data[data_idx]
         self._attr_source_list = ws66i_data.sources.name_list
-        self._attr_unique_id = f"{entry_id}_{self._zone_id}"
-        self._attr_name = f"Zone {self._zone_id}"
-        self._attr_supported_features = (
-            MediaPlayerEntityFeature.VOLUME_MUTE
-            | MediaPlayerEntityFeature.VOLUME_SET
-            | MediaPlayerEntityFeature.VOLUME_STEP
-            | MediaPlayerEntityFeature.TURN_ON
-            | MediaPlayerEntityFeature.TURN_OFF
-            | MediaPlayerEntityFeature.SELECT_SOURCE
-        )
+        self._attr_unique_id = f"{entry_id}_{zone_id}"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, str(self.unique_id))},
-            name=self.name,
+            name=f"Zone {zone_id}",
             manufacturer="Soundavo",
             model="WS66i 6-Zone Amplifier",
         )
         self._set_attrs_from_status()
 
     @callback
+    @override
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""
         # This will be called for each of the entities after the coordinator
@@ -106,6 +114,7 @@ class Ws66iZone(CoordinatorEntity[Ws66iDataUpdateCoordinator], MediaPlayerEntity
         self._set_attrs_from_status()
         self.async_write_ha_state()
 
+    @override
     async def async_select_source(self, source: str) -> None:
         """Set input source."""
         idx = self._ws66i_data.sources.name_id[source]
@@ -115,6 +124,7 @@ class Ws66iZone(CoordinatorEntity[Ws66iDataUpdateCoordinator], MediaPlayerEntity
         self._status.source = idx
         self._async_update_attrs_write_ha_state()
 
+    @override
     async def async_turn_on(self) -> None:
         """Turn the media player on."""
         await self.hass.async_add_executor_job(
@@ -123,6 +133,7 @@ class Ws66iZone(CoordinatorEntity[Ws66iDataUpdateCoordinator], MediaPlayerEntity
         self._status.power = True
         self._async_update_attrs_write_ha_state()
 
+    @override
     async def async_turn_off(self) -> None:
         """Turn the media player off."""
         await self.hass.async_add_executor_job(
@@ -131,6 +142,7 @@ class Ws66iZone(CoordinatorEntity[Ws66iDataUpdateCoordinator], MediaPlayerEntity
         self._status.power = False
         self._async_update_attrs_write_ha_state()
 
+    @override
     async def async_mute_volume(self, mute: bool) -> None:
         """Mute (true) or unmute (false) media player."""
         await self.hass.async_add_executor_job(
@@ -139,23 +151,10 @@ class Ws66iZone(CoordinatorEntity[Ws66iDataUpdateCoordinator], MediaPlayerEntity
         self._status.mute = bool(mute)
         self._async_update_attrs_write_ha_state()
 
+    @override
     async def async_set_volume_level(self, volume: float) -> None:
         """Set volume level, range 0..1."""
         await self.hass.async_add_executor_job(self._set_volume, int(volume * MAX_VOL))
-        self._async_update_attrs_write_ha_state()
-
-    async def async_volume_up(self) -> None:
-        """Volume up the media player."""
-        await self.hass.async_add_executor_job(
-            self._set_volume, min(self._status.volume + 1, MAX_VOL)
-        )
-        self._async_update_attrs_write_ha_state()
-
-    async def async_volume_down(self) -> None:
-        """Volume down media player."""
-        await self.hass.async_add_executor_job(
-            self._set_volume, max(self._status.volume - 1, 0)
-        )
         self._async_update_attrs_write_ha_state()
 
     def _set_volume(self, volume: int) -> None:

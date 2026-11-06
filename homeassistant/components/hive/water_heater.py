@@ -1,27 +1,19 @@
 """Support for hive water heaters."""
-from datetime import timedelta
 
-import voluptuous as vol
+from datetime import timedelta
+from typing import Any, override
 
 from homeassistant.components.water_heater import (
     STATE_ECO,
     WaterHeaterEntity,
     WaterHeaterEntityFeature,
 )
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import STATE_OFF, STATE_ON, TEMP_CELSIUS
+from homeassistant.const import STATE_OFF, STATE_ON, UnitOfTemperature
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers import config_validation as cv, entity_platform
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from . import HiveEntity, refresh_system
-from .const import (
-    ATTR_ONOFF,
-    ATTR_TIME_PERIOD,
-    DOMAIN,
-    SERVICE_BOOST_HOT_WATER,
-    WATER_HEATER_MODES,
-)
+from . import HiveConfigEntry, refresh_system
+from .entity import HiveEntity
 
 HOTWATER_NAME = "Hot Water"
 PARALLEL_UPDATES = 0
@@ -42,59 +34,50 @@ SUPPORT_WATER_HEATER = [STATE_ECO, STATE_ON, STATE_OFF]
 
 
 async def async_setup_entry(
-    hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
+    hass: HomeAssistant,
+    entry: HiveConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up Hive thermostat based on a config entry."""
 
-    hive = hass.data[DOMAIN][entry.entry_id]
+    hive = entry.runtime_data
     devices = hive.session.deviceList.get("water_heater")
-    entities = []
     if devices:
-        for dev in devices:
-            entities.append(HiveWaterHeater(hive, dev))
-    async_add_entities(entities, True)
-
-    platform = entity_platform.async_get_current_platform()
-
-    platform.async_register_entity_service(
-        SERVICE_BOOST_HOT_WATER,
-        {
-            vol.Optional(ATTR_TIME_PERIOD, default="00:30:00"): vol.All(
-                cv.time_period,
-                cv.positive_timedelta,
-                lambda td: td.total_seconds() // 60,
-            ),
-            vol.Required(ATTR_ONOFF): vol.In(WATER_HEATER_MODES),
-        },
-        "async_hot_water_boost",
-    )
+        async_add_entities(
+            (HiveWaterHeater(hass, entry, hive, dev) for dev in devices), True
+        )
 
 
 class HiveWaterHeater(HiveEntity, WaterHeaterEntity):
     """Hive Water Heater Device."""
 
-    _attr_supported_features = WaterHeaterEntityFeature.OPERATION_MODE
-    _attr_temperature_unit = TEMP_CELSIUS
+    _attr_supported_features = (
+        WaterHeaterEntityFeature.ON_OFF | WaterHeaterEntityFeature.OPERATION_MODE
+    )
+    _attr_native_temperature_unit = UnitOfTemperature.CELSIUS
     _attr_operation_list = SUPPORT_WATER_HEATER
 
     @refresh_system
-    async def async_turn_on(self, **kwargs):
+    @override
+    async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn on hotwater."""
         await self.hive.hotwater.setMode(self.device, "MANUAL")
 
     @refresh_system
-    async def async_turn_off(self, **kwargs):
+    @override
+    async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn on hotwater."""
         await self.hive.hotwater.setMode(self.device, "OFF")
 
     @refresh_system
+    @override
     async def async_set_operation_mode(self, operation_mode: str) -> None:
         """Set operation mode."""
         new_mode = HASS_TO_HIVE_STATE[operation_mode]
         await self.hive.hotwater.setMode(self.device, new_mode)
 
     @refresh_system
-    async def async_hot_water_boost(self, time_period, on_off):
+    async def async_hot_water_boost(self, time_period: int, on_off: str) -> None:
         """Handle the service call."""
         if on_off == "on":
             await self.hive.hotwater.setBoostOn(self.device, time_period)

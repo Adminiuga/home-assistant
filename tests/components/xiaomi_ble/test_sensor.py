@@ -1,17 +1,41 @@
-"""Test the Xiaomi config flow."""
+"""Test Xiaomi BLE sensors."""
 
+from datetime import timedelta
+import time
 
+from pytest_homeassistant.common import MockConfigEntry, async_fire_time_changed
+from pytest_homeassistant.components.bluetooth import (
+    inject_bluetooth_service_info_bleak,
+    patch_all_discovered_devices,
+    patch_bluetooth_time,
+)
+
+from homeassistant.components.bluetooth import (
+    FALLBACK_MAXIMUM_STALE_ADVERTISEMENT_SECONDS,
+)
 from homeassistant.components.sensor import ATTR_STATE_CLASS
-from homeassistant.components.xiaomi_ble.const import DOMAIN
-from homeassistant.const import ATTR_FRIENDLY_NAME, ATTR_UNIT_OF_MEASUREMENT
+from homeassistant.components.xiaomi_ble.const import CONF_SLEEPY_DEVICE, DOMAIN
+from homeassistant.const import (
+    ATTR_FRIENDLY_NAME,
+    ATTR_UNIT_OF_MEASUREMENT,
+    STATE_ON,
+    STATE_UNAVAILABLE,
+)
+from homeassistant.core import HomeAssistant
+from homeassistant.util import dt as dt_util
 
-from . import MMC_T201_1_SERVICE_INFO, make_advertisement
+from . import (
+    HHCCJCY10_SERVICE_INFO,
+    MISCALE_S400_PACKET2_SERVICE_INFO,
+    MISCALE_S400_SERVICE_INFO,
+    MISCALE_V1_SERVICE_INFO,
+    MISCALE_V2_SERVICE_INFO,
+    MMC_T201_1_SERVICE_INFO,
+    make_advertisement,
+)
 
-from tests.common import MockConfigEntry
-from tests.components.bluetooth import inject_bluetooth_service_info_bleak
 
-
-async def test_sensors(hass):
+async def test_sensors(hass: HomeAssistant) -> None:
     """Test setting up creates the sensors."""
     entry = MockConfigEntry(
         domain=DOMAIN,
@@ -40,7 +64,7 @@ async def test_sensors(hass):
     await hass.async_block_till_done()
 
 
-async def test_xiaomi_formaldeyhde(hass):
+async def test_xiaomi_formaldeyhde(hass: HomeAssistant) -> None:
     """Make sure that formldehyde sensors are correctly mapped."""
     entry = MockConfigEntry(
         domain=DOMAIN,
@@ -76,7 +100,7 @@ async def test_xiaomi_formaldeyhde(hass):
     await hass.async_block_till_done()
 
 
-async def test_xiaomi_consumable(hass):
+async def test_xiaomi_consumable(hass: HomeAssistant) -> None:
     """Make sure that consumable sensors are correctly mapped."""
     entry = MockConfigEntry(
         domain=DOMAIN,
@@ -112,7 +136,41 @@ async def test_xiaomi_consumable(hass):
     await hass.async_block_till_done()
 
 
-async def test_xiaomi_battery_voltage(hass):
+async def test_xiaomi_score(hass: HomeAssistant) -> None:
+    """Make sure that score sensors are correctly mapped."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="ED:DE:34:3F:48:0C",
+        data={"bindkey": "1330b99cded13258acc391627e9771f7"},
+    )
+    entry.add_to_hass(hass)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert len(hass.states.async_all()) == 0
+    inject_bluetooth_service_info_bleak(
+        hass,
+        make_advertisement(
+            "ED:DE:34:3F:48:0C",
+            b"\x48\x58\x06\x08\xc9H\x0e\xf1\x12\x81\x07\x973\xfc\x14\x00\x00VD\xdbA",
+        ),
+    )
+    await hass.async_block_till_done()
+    assert len(hass.states.async_all()) == 2
+
+    sensor = hass.states.get("sensor.smart_toothbrush_480c_score")
+
+    sensor_attr = sensor.attributes
+    assert sensor.state == "83"
+    assert sensor_attr[ATTR_FRIENDLY_NAME] == "Smart Toothbrush 480C Score"
+    assert sensor_attr[ATTR_STATE_CLASS] == "measurement"
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+async def test_xiaomi_battery_voltage(hass: HomeAssistant) -> None:
     """Make sure that battery voltage sensors are correctly mapped."""
     entry = MockConfigEntry(
         domain=DOMAIN,
@@ -153,8 +211,11 @@ async def test_xiaomi_battery_voltage(hass):
     await hass.async_block_till_done()
 
 
-async def test_xiaomi_HHCCJCY01(hass):
-    """This device has multiple advertisements before all sensors are visible. Test that this works."""
+async def test_xiaomi_hhccjcy01(hass: HomeAssistant) -> None:
+    """Test HHCCJCY01 multiple advertisements.
+
+    This device has multiple advertisements before all sensors are visible.
+    """
     entry = MockConfigEntry(
         domain=DOMAIN,
         unique_id="C4:7C:8D:6A:3E:7A",
@@ -203,7 +264,7 @@ async def test_xiaomi_HHCCJCY01(hass):
     cond_sensor_attribtes = cond_sensor.attributes
     assert cond_sensor.state == "599"
     assert cond_sensor_attribtes[ATTR_FRIENDLY_NAME] == "Plant Sensor 3E7A Conductivity"
-    assert cond_sensor_attribtes[ATTR_UNIT_OF_MEASUREMENT] == "µS/cm"
+    assert cond_sensor_attribtes[ATTR_UNIT_OF_MEASUREMENT] == "μS/cm"
     assert cond_sensor_attribtes[ATTR_STATE_CLASS] == "measurement"
 
     moist_sensor = hass.states.get("sensor.plant_sensor_3e7a_moisture")
@@ -231,8 +292,12 @@ async def test_xiaomi_HHCCJCY01(hass):
     await hass.async_block_till_done()
 
 
-async def test_xiaomi_HHCCJCY01_not_connectable(hass):
-    """This device has multiple advertisements before all sensors are visible but not connectable."""
+async def test_xiaomi_hhccjcy01_not_connectable(hass: HomeAssistant) -> None:
+    """Test HHCCJCY01 when sensors are not connectable.
+
+    This device has multiple advertisements before all sensors are
+    visible but not connectable.
+    """
     entry = MockConfigEntry(
         domain=DOMAIN,
         unique_id="C4:7C:8D:6A:3E:7A",
@@ -289,7 +354,7 @@ async def test_xiaomi_HHCCJCY01_not_connectable(hass):
     cond_sensor_attribtes = cond_sensor.attributes
     assert cond_sensor.state == "599"
     assert cond_sensor_attribtes[ATTR_FRIENDLY_NAME] == "Plant Sensor 3E7A Conductivity"
-    assert cond_sensor_attribtes[ATTR_UNIT_OF_MEASUREMENT] == "µS/cm"
+    assert cond_sensor_attribtes[ATTR_UNIT_OF_MEASUREMENT] == "μS/cm"
     assert cond_sensor_attribtes[ATTR_STATE_CLASS] == "measurement"
 
     moist_sensor = hass.states.get("sensor.plant_sensor_3e7a_moisture")
@@ -312,8 +377,14 @@ async def test_xiaomi_HHCCJCY01_not_connectable(hass):
     await hass.async_block_till_done()
 
 
-async def test_xiaomi_HHCCJCY01_only_some_sources_connectable(hass):
-    """This device has multiple advertisements before all sensors are visible and some sources are connectable."""
+async def test_xiaomi_hhccjcy01_only_some_sources_connectable(
+    hass: HomeAssistant,
+) -> None:
+    """Test HHCCJCY01 partial sources.
+
+    This device has multiple advertisements before all sensors are visible
+    and some sources are connectable.
+    """
     entry = MockConfigEntry(
         domain=DOMAIN,
         unique_id="C4:7C:8D:6A:3E:7A",
@@ -370,7 +441,7 @@ async def test_xiaomi_HHCCJCY01_only_some_sources_connectable(hass):
     cond_sensor_attribtes = cond_sensor.attributes
     assert cond_sensor.state == "599"
     assert cond_sensor_attribtes[ATTR_FRIENDLY_NAME] == "Plant Sensor 3E7A Conductivity"
-    assert cond_sensor_attribtes[ATTR_UNIT_OF_MEASUREMENT] == "µS/cm"
+    assert cond_sensor_attribtes[ATTR_UNIT_OF_MEASUREMENT] == "μS/cm"
     assert cond_sensor_attribtes[ATTR_STATE_CLASS] == "measurement"
 
     moist_sensor = hass.states.get("sensor.plant_sensor_3e7a_moisture")
@@ -398,8 +469,121 @@ async def test_xiaomi_HHCCJCY01_only_some_sources_connectable(hass):
     await hass.async_block_till_done()
 
 
-async def test_xiaomi_CGDK2(hass):
-    """This device has encrypion so we need to retrieve its bindkey from the configentry."""
+async def test_xiaomi_xmosb01xs(hass: HomeAssistant) -> None:
+    """Test XMOSB01XS multiple advertisements.
+
+    This device has multiple advertisements before all sensors are visible.
+    """
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="DC:8E:95:23:07:B7",
+        data={"bindkey": "272b1c920ef435417c49228b8ab9a563"},
+    )
+    entry.add_to_hass(hass)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert len(hass.states.async_all()) == 0
+    inject_bluetooth_service_info_bleak(
+        hass,
+        make_advertisement(
+            "DC:8E:95:23:07:B7",
+            (
+                b"\x58\x59\x83\x46\x91\xb7\x07\x23\x95\x8e\xdc\xc7\x17\x61\xc1"
+                b"\x24\x03\x00\x25\x44\xb0\x65"
+            ),
+            connectable=False,
+        ),
+    )
+    inject_bluetooth_service_info_bleak(
+        hass,
+        make_advertisement(
+            "DC:8E:95:23:07:B7",
+            b"\x10\x59\x83\x46\x90\xb7\x07\x23\x95\x8e\xdc",
+            connectable=False,
+        ),
+    )
+    inject_bluetooth_service_info_bleak(
+        hass,
+        make_advertisement(
+            "DC:8E:95:23:07:B7",
+            b"\x48\x59\x83\x46\x9d\x34\x45\xec\xab\xda\x93\xf9\x24\x03\x00\x9e\x01\x6d\x3d",
+            connectable=False,
+        ),
+    )
+    inject_bluetooth_service_info_bleak(
+        hass,
+        make_advertisement(
+            "DC:8E:95:23:07:B7",
+            (
+                b"\x58\x59\x83\x46\xa9\xb7\x07\x23\x95\x8e\xdc\xc6\x59\xa2\xdc\xc5"
+                b"\x24\x03\x00\xa0\x4d\x0d\x45"
+            ),
+            connectable=False,
+        ),
+    )
+    inject_bluetooth_service_info_bleak(
+        hass,
+        make_advertisement(
+            "DC:8E:95:23:07:B7",
+            (
+                b"\x58\x59\x83\x46\xa4\xb7\x07\x23\x95\x8e\xdc\x77\x2a\xe2\x5c\x11"
+                b"\x24\x03\x00\xab\x87\x7b\xd7"
+            ),
+            connectable=False,
+        ),
+    )
+    await hass.async_block_till_done()
+    assert len(hass.states.async_all()) == 4
+
+    occupancy_sensor = hass.states.get("binary_sensor.occupancy_sensor_07b7_occupancy")
+    occupancy_sensor_attribtes = occupancy_sensor.attributes
+    assert occupancy_sensor.state == STATE_ON
+    assert (
+        occupancy_sensor_attribtes[ATTR_FRIENDLY_NAME]
+        == "Occupancy Sensor 07B7 Occupancy"
+    )
+
+    illum_sensor = hass.states.get("sensor.occupancy_sensor_07b7_illuminance")
+    illum_sensor_attr = illum_sensor.attributes
+    assert illum_sensor.state == "111.0"
+    assert illum_sensor_attr[ATTR_FRIENDLY_NAME] == "Occupancy Sensor 07B7 Illuminance"
+    assert illum_sensor_attr[ATTR_UNIT_OF_MEASUREMENT] == "lx"
+    assert illum_sensor_attr[ATTR_STATE_CLASS] == "measurement"
+
+    illum_sensor = hass.states.get("sensor.occupancy_sensor_07b7_duration_detected")
+    illum_sensor_attr = illum_sensor.attributes
+    assert illum_sensor.state == "2"
+    assert (
+        illum_sensor_attr[ATTR_FRIENDLY_NAME]
+        == "Occupancy Sensor 07B7 Duration detected"
+    )
+    assert illum_sensor_attr[ATTR_UNIT_OF_MEASUREMENT] == "min"
+    assert illum_sensor_attr[ATTR_STATE_CLASS] == "measurement"
+
+    illum_sensor = hass.states.get("sensor.occupancy_sensor_07b7_duration_cleared")
+    illum_sensor_attr = illum_sensor.attributes
+    assert illum_sensor.state == "2"
+    assert (
+        illum_sensor_attr[ATTR_FRIENDLY_NAME]
+        == "Occupancy Sensor 07B7 Duration cleared"
+    )
+    assert illum_sensor_attr[ATTR_UNIT_OF_MEASUREMENT] == "min"
+    assert illum_sensor_attr[ATTR_STATE_CLASS] == "measurement"
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert entry.data[CONF_SLEEPY_DEVICE] is True
+
+
+async def test_xiaomi_cgdk2_bind_key(hass: HomeAssistant) -> None:
+    """Test CGDK2 bind key.
+
+    This device has encryption so we need to retrieve its bind key
+    from the config entry.
+    """
     entry = MockConfigEntry(
         domain=DOMAIN,
         unique_id="58:2D:34:12:20:89",
@@ -433,3 +617,427 @@ async def test_xiaomi_CGDK2(hass):
 
     assert await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()
+
+
+async def test_hhccjcy10_uuid(hass: HomeAssistant) -> None:
+    """Test HHCCJCY10 UUID.
+
+    This device uses a different UUID compared to the other Xiaomi sensors.
+    """
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="DC:23:4D:E5:5B:FC",
+    )
+    entry.add_to_hass(hass)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    inject_bluetooth_service_info_bleak(hass, HHCCJCY10_SERVICE_INFO)
+
+    await hass.async_block_till_done()
+    assert len(hass.states.async_all()) == 5
+
+    temp_sensor = hass.states.get("sensor.plant_sensor_5bfc_temperature")
+    temp_sensor_attr = temp_sensor.attributes
+    assert temp_sensor.state == "11.0"
+    assert temp_sensor_attr[ATTR_FRIENDLY_NAME] == "Plant Sensor 5BFC Temperature"
+    assert temp_sensor_attr[ATTR_UNIT_OF_MEASUREMENT] == "°C"
+    assert temp_sensor_attr[ATTR_STATE_CLASS] == "measurement"
+
+    illu_sensor = hass.states.get("sensor.plant_sensor_5bfc_illuminance")
+    illu_sensor_attr = illu_sensor.attributes
+    assert illu_sensor.state == "79012"
+    assert illu_sensor_attr[ATTR_FRIENDLY_NAME] == "Plant Sensor 5BFC Illuminance"
+    assert illu_sensor_attr[ATTR_UNIT_OF_MEASUREMENT] == "lx"
+    assert illu_sensor_attr[ATTR_STATE_CLASS] == "measurement"
+
+    cond_sensor = hass.states.get("sensor.plant_sensor_5bfc_conductivity")
+    cond_sensor_attr = cond_sensor.attributes
+    assert cond_sensor.state == "91"
+    assert cond_sensor_attr[ATTR_FRIENDLY_NAME] == "Plant Sensor 5BFC Conductivity"
+    assert cond_sensor_attr[ATTR_UNIT_OF_MEASUREMENT] == "μS/cm"
+    assert cond_sensor_attr[ATTR_STATE_CLASS] == "measurement"
+
+    moist_sensor = hass.states.get("sensor.plant_sensor_5bfc_moisture")
+    moist_sensor_attr = moist_sensor.attributes
+    assert moist_sensor.state == "14"
+    assert moist_sensor_attr[ATTR_FRIENDLY_NAME] == "Plant Sensor 5BFC Moisture"
+    assert moist_sensor_attr[ATTR_UNIT_OF_MEASUREMENT] == "%"
+    assert moist_sensor_attr[ATTR_STATE_CLASS] == "measurement"
+
+    bat_sensor = hass.states.get("sensor.plant_sensor_5bfc_battery")
+    bat_sensor_attr = bat_sensor.attributes
+    assert bat_sensor.state == "40"
+    assert bat_sensor_attr[ATTR_FRIENDLY_NAME] == "Plant Sensor 5BFC Battery"
+    assert bat_sensor_attr[ATTR_UNIT_OF_MEASUREMENT] == "%"
+    assert bat_sensor_attr[ATTR_STATE_CLASS] == "measurement"
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+async def test_miscale_v1_uuid(hass: HomeAssistant) -> None:
+    """Test MiScale V1 UUID.
+
+    This device uses a different UUID compared to the other Xiaomi sensors.
+    """
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="50:FB:19:1B:B5:DC",
+    )
+    entry.add_to_hass(hass)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    inject_bluetooth_service_info_bleak(hass, MISCALE_V1_SERVICE_INFO)
+
+    await hass.async_block_till_done()
+    assert len(hass.states.async_all()) == 3
+
+    mass_non_stabilized_sensor = hass.states.get(
+        "sensor.mi_smart_scale_b5dc_weight_non_stabilized"
+    )
+    mass_non_stabilized_sensor_attr = mass_non_stabilized_sensor.attributes
+    assert mass_non_stabilized_sensor.state == "86.55"
+    assert (
+        mass_non_stabilized_sensor_attr[ATTR_FRIENDLY_NAME]
+        == "Mi Smart Scale (B5DC) Weight non-stabilized"
+    )
+    assert mass_non_stabilized_sensor_attr[ATTR_UNIT_OF_MEASUREMENT] == "kg"
+    assert mass_non_stabilized_sensor_attr[ATTR_STATE_CLASS] == "measurement"
+
+    mass_sensor = hass.states.get("sensor.mi_smart_scale_b5dc_weight")
+    mass_sensor_attr = mass_sensor.attributes
+    assert mass_sensor.state == "86.55"
+    assert mass_sensor_attr[ATTR_FRIENDLY_NAME] == "Mi Smart Scale (B5DC) Weight"
+    assert mass_sensor_attr[ATTR_UNIT_OF_MEASUREMENT] == "kg"
+    assert mass_sensor_attr[ATTR_STATE_CLASS] == "measurement"
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+async def test_miscale_v2_uuid(hass: HomeAssistant) -> None:
+    """Test MiScale V2 UUID.
+
+    This device uses a different UUID compared to the other Xiaomi sensors.
+    """
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="50:FB:19:1B:B5:DC",
+    )
+    entry.add_to_hass(hass)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    inject_bluetooth_service_info_bleak(hass, MISCALE_V2_SERVICE_INFO)
+
+    await hass.async_block_till_done()
+    assert len(hass.states.async_all()) == 4
+
+    mass_non_stabilized_sensor = hass.states.get(
+        "sensor.mi_body_composition_scale_b5dc_weight_non_stabilized"
+    )
+    mass_non_stabilized_sensor_attr = mass_non_stabilized_sensor.attributes
+    assert mass_non_stabilized_sensor.state == "85.15"
+    assert (
+        mass_non_stabilized_sensor_attr[ATTR_FRIENDLY_NAME]
+        == "Mi Body Composition Scale (B5DC) Weight non-stabilized"
+    )
+    assert mass_non_stabilized_sensor_attr[ATTR_UNIT_OF_MEASUREMENT] == "kg"
+    assert mass_non_stabilized_sensor_attr[ATTR_STATE_CLASS] == "measurement"
+
+    mass_sensor = hass.states.get("sensor.mi_body_composition_scale_b5dc_weight")
+    mass_sensor_attr = mass_sensor.attributes
+    assert mass_sensor.state == "85.15"
+    assert (
+        mass_sensor_attr[ATTR_FRIENDLY_NAME]
+        == "Mi Body Composition Scale (B5DC) Weight"
+    )
+    assert mass_sensor_attr[ATTR_UNIT_OF_MEASUREMENT] == "kg"
+    assert mass_sensor_attr[ATTR_STATE_CLASS] == "measurement"
+
+    impedance_sensor = hass.states.get(
+        "sensor.mi_body_composition_scale_b5dc_impedance"
+    )
+    impedance_sensor_attr = impedance_sensor.attributes
+    assert impedance_sensor.state == "428"
+    assert (
+        impedance_sensor_attr[ATTR_FRIENDLY_NAME]
+        == "Mi Body Composition Scale (B5DC) Impedance"
+    )
+    assert impedance_sensor_attr[ATTR_UNIT_OF_MEASUREMENT] == "ohm"
+    assert impedance_sensor_attr[ATTR_STATE_CLASS] == "measurement"
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+async def test_miscale_s400_packet1(hass: HomeAssistant) -> None:
+    """Test MiScale S400 first packet: mass + impedance_low + heart_rate + profile_id + stabilized."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="8C:D0:B2:F6:BE:EF",
+        data={"bindkey": "0728974d657a4b60964c1b1677f35f7c"},
+    )
+    entry.add_to_hass(hass)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert len(hass.states.async_all()) == 0
+    inject_bluetooth_service_info_bleak(hass, MISCALE_S400_SERVICE_INFO)
+    await hass.async_block_till_done()
+
+    assert len(hass.states.async_all()) == 5
+
+    impedance_low_sensor = hass.states.get(
+        "sensor.body_composition_scale_beef_impedance_low"
+    )
+    impedance_low_sensor_attr = impedance_low_sensor.attributes
+    assert impedance_low_sensor.state == "543.2"
+    assert (
+        impedance_low_sensor_attr[ATTR_FRIENDLY_NAME]
+        == "Body Composition Scale BEEF Impedance Low"
+    )
+    assert impedance_low_sensor_attr[ATTR_UNIT_OF_MEASUREMENT] == "ohm"
+    assert impedance_low_sensor_attr[ATTR_STATE_CLASS] == "measurement"
+
+    mass_sensor = hass.states.get("sensor.body_composition_scale_beef_weight")
+    mass_sensor_attr = mass_sensor.attributes
+    assert mass_sensor.state == "69.9"
+    assert mass_sensor_attr[ATTR_FRIENDLY_NAME] == "Body Composition Scale BEEF Weight"
+    assert mass_sensor_attr[ATTR_UNIT_OF_MEASUREMENT] == "kg"
+    assert mass_sensor_attr[ATTR_STATE_CLASS] == "measurement"
+
+    heart_rate_sensor = hass.states.get("sensor.body_composition_scale_beef_heart_rate")
+    heart_rate_sensor_attr = heart_rate_sensor.attributes
+    assert heart_rate_sensor.state == "92"
+    assert (
+        heart_rate_sensor_attr[ATTR_FRIENDLY_NAME]
+        == "Body Composition Scale BEEF Heart Rate"
+    )
+    assert heart_rate_sensor_attr[ATTR_UNIT_OF_MEASUREMENT] == "bpm"
+
+    profile_id_sensor = hass.states.get("sensor.body_composition_scale_beef_profile_id")
+    profile_id_sensor_attr = profile_id_sensor.attributes
+    assert profile_id_sensor.state == "1"
+    assert (
+        profile_id_sensor_attr[ATTR_FRIENDLY_NAME]
+        == "Body Composition Scale BEEF Profile ID"
+    )
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+async def test_miscale_s400_packet2(hass: HomeAssistant) -> None:
+    """Test MiScale S400 second packet: impedance_high + profile_id + stabilized."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="8C:D0:B2:F6:BE:EF",
+        data={"bindkey": "0728974d657a4b60964c1b1677f35f7c"},
+    )
+    entry.add_to_hass(hass)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert len(hass.states.async_all()) == 0
+    inject_bluetooth_service_info_bleak(hass, MISCALE_S400_PACKET2_SERVICE_INFO)
+    await hass.async_block_till_done()
+
+    assert len(hass.states.async_all()) == 3
+
+    impedance_high_sensor = hass.states.get(
+        "sensor.body_composition_scale_beef_impedance_high"
+    )
+    impedance_high_sensor_attr = impedance_high_sensor.attributes
+    assert impedance_high_sensor.state == "497.6"
+    assert (
+        impedance_high_sensor_attr[ATTR_FRIENDLY_NAME]
+        == "Body Composition Scale BEEF Impedance High"
+    )
+    assert impedance_high_sensor_attr[ATTR_UNIT_OF_MEASUREMENT] == "ohm"
+    assert impedance_high_sensor_attr[ATTR_STATE_CLASS] == "measurement"
+
+    profile_id_sensor = hass.states.get("sensor.body_composition_scale_beef_profile_id")
+    profile_id_sensor_attr = profile_id_sensor.attributes
+    assert profile_id_sensor.state == "1"
+    assert (
+        profile_id_sensor_attr[ATTR_FRIENDLY_NAME]
+        == "Body Composition Scale BEEF Profile ID"
+    )
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+async def test_unavailable(hass: HomeAssistant) -> None:
+    """Test normal device goes to unavailable after 60 minutes."""
+    start_monotonic = time.monotonic()
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="58:2D:34:12:20:89",
+        data={"bindkey": "a3bfe9853dd85a620debe3620caaa351"},
+    )
+    entry.add_to_hass(hass)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert len(hass.states.async_all()) == 0
+    inject_bluetooth_service_info_bleak(
+        hass,
+        make_advertisement(
+            "58:2D:34:12:20:89",
+            b"XXo\x06\x07\x89 \x124-X_\x17m\xd5O\x02\x00\x00/\xa4S\xfa",
+        ),
+    )
+    await hass.async_block_till_done()
+    assert len(hass.states.async_all()) == 1
+
+    temp_sensor = hass.states.get("sensor.temperature_humidity_sensor_2089_temperature")
+    assert temp_sensor.state == "22.6"
+
+    # Fastforward time without BLE advertisements
+    monotonic_now = start_monotonic + FALLBACK_MAXIMUM_STALE_ADVERTISEMENT_SECONDS + 1
+
+    with (
+        patch_bluetooth_time(
+            monotonic_now,
+        ),
+        patch_all_discovered_devices([]),
+    ):
+        async_fire_time_changed(
+            hass,
+            dt_util.utcnow()
+            + timedelta(seconds=FALLBACK_MAXIMUM_STALE_ADVERTISEMENT_SECONDS + 1),
+        )
+        await hass.async_block_till_done()
+
+    temp_sensor = hass.states.get("sensor.temperature_humidity_sensor_2089_temperature")
+
+    # Sleepy devices should keep their state over time
+    assert temp_sensor.state == STATE_UNAVAILABLE
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+async def test_sleepy_device(hass: HomeAssistant) -> None:
+    """Test sleepy devices stay available."""
+    start_monotonic = time.monotonic()
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="50:FB:19:1B:B5:DC",
+    )
+    entry.add_to_hass(hass)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert len(hass.states.async_all()) == 0
+    inject_bluetooth_service_info_bleak(hass, MISCALE_V1_SERVICE_INFO)
+
+    await hass.async_block_till_done()
+    assert len(hass.states.async_all()) == 3
+
+    mass_non_stabilized_sensor = hass.states.get(
+        "sensor.mi_smart_scale_b5dc_weight_non_stabilized"
+    )
+    assert mass_non_stabilized_sensor.state == "86.55"
+
+    # Fastforward time without BLE advertisements
+    monotonic_now = start_monotonic + FALLBACK_MAXIMUM_STALE_ADVERTISEMENT_SECONDS + 1
+
+    with (
+        patch_bluetooth_time(
+            monotonic_now,
+        ),
+        patch_all_discovered_devices([]),
+    ):
+        async_fire_time_changed(
+            hass,
+            dt_util.utcnow()
+            + timedelta(seconds=FALLBACK_MAXIMUM_STALE_ADVERTISEMENT_SECONDS + 1),
+        )
+        await hass.async_block_till_done()
+
+    mass_non_stabilized_sensor = hass.states.get(
+        "sensor.mi_smart_scale_b5dc_weight_non_stabilized"
+    )
+
+    # Sleepy devices should keep their state over time
+    assert mass_non_stabilized_sensor.state == "86.55"
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+async def test_sleepy_device_restore_state(hass: HomeAssistant) -> None:
+    """Test sleepy devices stay available."""
+    start_monotonic = time.monotonic()
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="50:FB:19:1B:B5:DC",
+    )
+    entry.add_to_hass(hass)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert len(hass.states.async_all()) == 0
+    inject_bluetooth_service_info_bleak(hass, MISCALE_V1_SERVICE_INFO)
+
+    await hass.async_block_till_done()
+    assert len(hass.states.async_all()) == 3
+
+    mass_non_stabilized_sensor = hass.states.get(
+        "sensor.mi_smart_scale_b5dc_weight_non_stabilized"
+    )
+    assert mass_non_stabilized_sensor.state == "86.55"
+
+    # Fastforward time without BLE advertisements
+    monotonic_now = start_monotonic + FALLBACK_MAXIMUM_STALE_ADVERTISEMENT_SECONDS + 1
+
+    with (
+        patch_bluetooth_time(
+            monotonic_now,
+        ),
+        patch_all_discovered_devices([]),
+    ):
+        async_fire_time_changed(
+            hass,
+            dt_util.utcnow()
+            + timedelta(seconds=FALLBACK_MAXIMUM_STALE_ADVERTISEMENT_SECONDS + 1),
+        )
+        await hass.async_block_till_done()
+
+    mass_non_stabilized_sensor = hass.states.get(
+        "sensor.mi_smart_scale_b5dc_weight_non_stabilized"
+    )
+
+    # Sleepy devices should keep their state over time
+    assert mass_non_stabilized_sensor.state == "86.55"
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    mass_non_stabilized_sensor = hass.states.get(
+        "sensor.mi_smart_scale_b5dc_weight_non_stabilized"
+    )
+
+    # Sleepy devices should keep their state over time and restore it
+    assert mass_non_stabilized_sensor.state == "86.55"
+
+    assert entry.data[CONF_SLEEPY_DEVICE] is True

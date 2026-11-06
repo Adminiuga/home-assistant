@@ -1,0 +1,424 @@
+"""Tesla Fleet Data Coordinator."""
+
+from datetime import timedelta
+from random import randint
+from time import time
+from typing import TYPE_CHECKING, Any, override
+
+from tesla_fleet_api.const import TeslaEnergyPeriod, VehicleDataEndpoint
+from tesla_fleet_api.exceptions import (
+    InternalServerError,
+    InvalidToken,
+    LoginRequired,
+    NotFound,
+    OAuthExpired,
+    RateLimited,
+    TeslaFleetError,
+    VehicleOffline,
+)
+from tesla_fleet_api.tesla import EnergySite, VehicleFleet
+
+from homeassistant.const import CONF_TOKEN
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+
+if TYPE_CHECKING:
+    from . import TeslaFleetConfigEntry
+
+from homeassistant.util import dt as dt_util
+
+from .const import DOMAIN, ENERGY_HISTORY_FIELDS, LOGGER, TeslaFleetState
+
+VEHICLE_INTERVAL_SECONDS = 600
+VEHICLE_INTERVAL = timedelta(seconds=VEHICLE_INTERVAL_SECONDS)
+VEHICLE_WAIT_SECONDS = 900
+VEHICLE_WAIT = timedelta(seconds=VEHICLE_WAIT_SECONDS)
+VEHICLE_STUCK_SECONDS = 1200
+
+# Kept well under Home Assistant's stage-2 setup budget (SLOW_SETUP_MAX_WAIT, 300s)
+# so a sleeping vehicle raises ConfigEntryNotReady and the entry retries instead of
+# being cancelled into a non-retried setup error.
+VEHICLE_FIRST_REFRESH_TIMEOUT = 60
+
+ENERGY_INTERVAL_SECONDS = 60
+ENERGY_INTERVAL = timedelta(seconds=ENERGY_INTERVAL_SECONDS)
+ENERGY_HISTORY_INTERVAL = timedelta(minutes=5)
+
+
+def _stale_site_info_error(err: BaseException | None) -> TeslaFleetError | None:
+    """Return the stale site_info error from an exception cause chain."""
+    while err is not None:
+        if isinstance(err, TeslaFleetError) and _is_stale_site_info_error(err):
+            return err
+        err = err.__cause__
+    return None
+
+
+def _is_stale_site_info_error(err: TeslaFleetError) -> bool:
+    """Return whether a Tesla API site_info error indicates a stale energy site."""
+    if isinstance(err, NotFound):
+        return True
+    if not isinstance(err, InternalServerError) or not isinstance(err.data, dict):
+        return False
+    return (
+        "response" in err.data
+        and err.data["response"] is None
+        and err.data.get("error") == "upstream internal error"
+    )
+
+
+ENDPOINTS = [
+    VehicleDataEndpoint.CHARGE_STATE,
+    VehicleDataEndpoint.CLIMATE_STATE,
+    VehicleDataEndpoint.DRIVE_STATE,
+    VehicleDataEndpoint.VEHICLE_STATE,
+    VehicleDataEndpoint.VEHICLE_CONFIG,
+    VehicleDataEndpoint.LOCATION_DATA,
+]
+
+
+def _invalidate_access_token(
+    hass: HomeAssistant, config_entry: TeslaFleetConfigEntry
+) -> None:
+    """Invalidate the cached access token to force a refresh."""
+    if (
+        not (token_data := config_entry.data.get(CONF_TOKEN))
+        or token_data.get("expires_at") == 0
+    ):
+        return
+
+    hass.config_entries.async_update_entry(
+        config_entry,
+        data={
+            **config_entry.data,
+            CONF_TOKEN: {
+                **token_data,
+                "expires_at": 0,
+            },
+        },
+    )
+
+
+def flatten(data: dict[str, Any], parent: str | None = None) -> dict[str, Any]:
+    """Flatten the data structure."""
+    result = {}
+    for key, value in data.items():
+        if parent:
+            key = f"{parent}_{key}"
+        if isinstance(value, dict):
+            result.update(flatten(value, key))
+        else:
+            result[key] = value
+    return result
+
+
+class TeslaFleetCoordinator(DataUpdateCoordinator[dict[str, Any]]):
+    """Base coordinator that logs a rate limit once until it clears."""
+
+    _rate_limit_logged = False
+
+    def _handle_rate_limited(self, err: RateLimited) -> dict[str, Any]:
+        """Back off after a 429 and keep the last data."""
+        log = LOGGER.debug if self._rate_limit_logged else LOGGER.warning
+        self._rate_limit_logged = True
+        if isinstance(err.data, dict) and (after := err.data.get("after")):
+            log("%s rate limited, will retry in %s seconds", self.name, after)
+            self.update_interval = timedelta(seconds=int(after))
+        else:
+            log("%s rate limited, will skip refresh", self.name)
+        return self.data
+
+    def _rate_limit_cleared(self) -> None:
+        """Log once when a refresh succeeds after a rate limit."""
+        if self._rate_limit_logged:
+            LOGGER.info("%s is no longer rate limited", self.name)
+            self._rate_limit_logged = False
+
+
+class TeslaFleetVehicleDataCoordinator(TeslaFleetCoordinator):
+    """Class to manage fetching data from the TeslaFleet API."""
+
+    config_entry: TeslaFleetConfigEntry
+    updated_once: bool
+    pre2021: bool
+    last_active: float
+    endpoints: list[VehicleDataEndpoint]
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        config_entry: TeslaFleetConfigEntry,
+        api: VehicleFleet,
+        product: dict,
+        location: bool,
+    ) -> None:
+        """Initialize TeslaFleet Vehicle Update Coordinator."""
+        super().__init__(
+            hass,
+            LOGGER,
+            config_entry=config_entry,
+            name="Tesla Fleet Vehicle",
+            update_interval=VEHICLE_INTERVAL,
+        )
+        self.api = api
+        self.data = flatten(product)
+        self.updated_once = False
+        self.last_active = time()
+        self.endpoints = (
+            ENDPOINTS
+            if location
+            else [ep for ep in ENDPOINTS if ep != VehicleDataEndpoint.LOCATION_DATA]
+        )
+
+    @override
+    async def _async_update_data(self) -> dict[str, Any]:
+        """Update vehicle data using TeslaFleet API."""
+
+        self.update_interval = VEHICLE_INTERVAL
+
+        try:
+            # Check if the vehicle is awake using a free API call
+            response = await self.api.vehicle()
+            self.data["state"] = response["response"]["state"]
+
+            if self.data["state"] != TeslaFleetState.ONLINE:
+                self._rate_limit_cleared()
+                return self.data
+
+            response = await self.api.vehicle_data(endpoints=self.endpoints)
+            data = response["response"]
+
+        except VehicleOffline:
+            self.data["state"] = TeslaFleetState.ASLEEP
+            self._rate_limit_cleared()
+            return self.data
+        except RateLimited as e:
+            return self._handle_rate_limited(e)
+        except (InvalidToken, OAuthExpired) as e:
+            _invalidate_access_token(self.hass, self.config_entry)
+            raise UpdateFailed(e.message) from e
+        except LoginRequired as e:
+            raise ConfigEntryAuthFailed from e
+        except TeslaFleetError as e:
+            raise UpdateFailed(e.message) from e
+
+        self._rate_limit_cleared()
+        self.updated_once = True
+
+        if self.api.pre2021 and data["state"] == TeslaFleetState.ONLINE:
+            # Handle pre-2021 vehicles which cannot sleep by themselves
+            if (
+                data["charge_state"].get("charging_state") == "Charging"
+                or data["vehicle_state"].get("is_user_present")
+                or data["vehicle_state"].get("sentry_mode")
+            ):
+                # Vehicle is active, reset timer
+                self.last_active = time()
+            else:
+                elapsed = time() - self.last_active
+                if elapsed > VEHICLE_STUCK_SECONDS:
+                    # Vehicle didn't sleep, try again in 15 minutes
+                    self.last_active = time()
+                elif elapsed > VEHICLE_WAIT_SECONDS:
+                    # Let vehicle go to sleep now
+                    self.update_interval = VEHICLE_WAIT
+
+        return flatten(data)
+
+
+class TeslaFleetEnergySiteLiveCoordinator(TeslaFleetCoordinator):
+    """Class to manage fetching energy site live status from the TeslaFleet API."""
+
+    config_entry: TeslaFleetConfigEntry
+    updated_once: bool
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        config_entry: TeslaFleetConfigEntry,
+        api: EnergySite,
+    ) -> None:
+        """Initialize TeslaFleet Energy Site Live coordinator."""
+        super().__init__(
+            hass,
+            LOGGER,
+            config_entry=config_entry,
+            name="Tesla Fleet Energy Site Live",
+            update_interval=timedelta(seconds=10),
+        )
+        self.api = api
+        self.data = {}
+        self.updated_once = False
+
+    @override
+    async def _async_update_data(self) -> dict[str, Any]:
+        """Update energy site data using TeslaFleet API."""
+
+        self.update_interval = ENERGY_INTERVAL
+
+        try:
+            data = (await self.api.live_status())["response"]
+        except RateLimited as e:
+            return self._handle_rate_limited(e)
+        except (InvalidToken, OAuthExpired) as e:
+            _invalidate_access_token(self.hass, self.config_entry)
+            raise UpdateFailed(e.message) from e
+        except LoginRequired as e:
+            raise ConfigEntryAuthFailed from e
+        except TeslaFleetError as e:
+            raise UpdateFailed(e.message) from e
+
+        if not isinstance(data, dict):
+            LOGGER.debug(
+                "%s got unexpected live status response type: %s",
+                self.name,
+                type(data).__name__,
+            )
+            return self.data
+
+        self._rate_limit_cleared()
+
+        # Convert Wall Connectors from array to dict
+        wall_connectors = data.get("wall_connectors")
+        if not isinstance(wall_connectors, list):
+            wall_connectors = []
+        data["wall_connectors"] = {
+            wc["din"]: wc
+            for wc in wall_connectors
+            if isinstance(wc, dict) and "din" in wc
+        }
+
+        self.updated_once = True
+        return data
+
+
+class TeslaFleetEnergySiteHistoryCoordinator(TeslaFleetCoordinator):
+    """Manage fetching energy site history from the Tesla Fleet API."""
+
+    config_entry: TeslaFleetConfigEntry
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        config_entry: TeslaFleetConfigEntry,
+        api: EnergySite,
+    ) -> None:
+        """Initialize Tesla Fleet Energy Site History coordinator."""
+        super().__init__(
+            hass,
+            LOGGER,
+            config_entry=config_entry,
+            name=f"Tesla Fleet Energy History {api.energy_site_id}",
+            update_interval=timedelta(seconds=300),
+        )
+        self.api = api
+        self.data = {}
+        self.updated_once = False
+
+    @override
+    async def async_config_entry_first_refresh(self) -> None:
+        """Set up the data coordinator."""
+        await super().async_config_entry_first_refresh()
+
+        # Calculate seconds until next 5 minute period plus a random delay
+        delta = randint(310, 330) - (int(time()) % 300)
+        self.logger.debug("Scheduling next %s refresh in %s seconds", self.name, delta)
+        self.update_interval = timedelta(seconds=delta)
+        self._schedule_refresh()
+        self.update_interval = ENERGY_HISTORY_INTERVAL
+
+    @override
+    async def _async_update_data(self) -> dict[str, Any]:
+        """Update energy site history data using Tesla Fleet API."""
+
+        self.update_interval = ENERGY_HISTORY_INTERVAL
+
+        try:
+            data = (await self.api.energy_history(TeslaEnergyPeriod.DAY))["response"]
+        except RateLimited as e:
+            return self._handle_rate_limited(e)
+        except (InvalidToken, OAuthExpired) as e:
+            _invalidate_access_token(self.hass, self.config_entry)
+            raise UpdateFailed(e.message) from e
+        except LoginRequired as e:
+            raise ConfigEntryAuthFailed from e
+        except TeslaFleetError as e:
+            raise UpdateFailed(e.message) from e
+        self.updated_once = True
+
+        if (
+            not data
+            or not isinstance((time_series := data.get("time_series")), list)
+            or not time_series
+            or not isinstance((first_period := time_series[0]), dict)
+            or not isinstance((timestamp := first_period.get("timestamp")), str)
+            or (period_start := dt_util.parse_datetime(timestamp)) is None
+        ):
+            raise UpdateFailed(
+                translation_domain=DOMAIN,
+                translation_key="invalid_data",
+            )
+
+        self._rate_limit_cleared()
+
+        # Tesla omits a field instead of sending zero, so an omitted field is zero
+        # only when the response has a reading; without one it stays unknown
+        output: dict[str, Any] = dict.fromkeys(ENERGY_HISTORY_FIELDS)
+        if any(
+            key in period for period in time_series for key in ENERGY_HISTORY_FIELDS
+        ):
+            for key in ENERGY_HISTORY_FIELDS:
+                output[key] = sum(period.get(key, 0) for period in time_series)
+
+        output["_period_start"] = period_start
+
+        return output
+
+
+class TeslaFleetEnergySiteInfoCoordinator(TeslaFleetCoordinator):
+    """Class to manage fetching energy site info from the TeslaFleet API."""
+
+    config_entry: TeslaFleetConfigEntry
+    updated_once: bool
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        config_entry: TeslaFleetConfigEntry,
+        api: EnergySite,
+        product: dict,
+    ) -> None:
+        """Initialize TeslaFleet Energy Info coordinator."""
+        super().__init__(
+            hass,
+            LOGGER,
+            config_entry=config_entry,
+            name="Tesla Fleet Energy Site Info",
+            update_interval=timedelta(seconds=15),
+        )
+        self.api = api
+        self.data = flatten(product)
+        self.updated_once = False
+
+    @override
+    async def _async_update_data(self) -> dict[str, Any]:
+        """Update energy site data using TeslaFleet API."""
+
+        self.update_interval = ENERGY_INTERVAL
+
+        try:
+            data = (await self.api.site_info())["response"]
+        except RateLimited as e:
+            return self._handle_rate_limited(e)
+        except (InvalidToken, OAuthExpired) as e:
+            _invalidate_access_token(self.hass, self.config_entry)
+            raise UpdateFailed(e.message) from e
+        except LoginRequired as e:
+            raise ConfigEntryAuthFailed from e
+        except TeslaFleetError as e:
+            raise UpdateFailed(e.message) from e
+
+        self._rate_limit_cleared()
+        self.updated_once = True
+        return flatten(data)

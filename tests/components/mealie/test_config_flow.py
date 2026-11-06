@@ -1,0 +1,566 @@
+"""Tests for the Mealie config flow."""
+
+from unittest.mock import AsyncMock, patch
+
+from aiomealie import About, MealieAuthenticationError, MealieConnectionError
+import pytest
+from pytest_homeassistant.common import MockConfigEntry
+
+from homeassistant.components.mealie.const import CONF_PARSER, DOMAIN
+from homeassistant.config_entries import (
+    SOURCE_HASSIO,
+    SOURCE_IGNORE,
+    SOURCE_USER,
+    ConfigEntryState,
+)
+from homeassistant.const import CONF_API_TOKEN, CONF_HOST, CONF_VERIFY_SSL
+from homeassistant.core import HomeAssistant
+from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.helpers.service_info.hassio import HassioServiceInfo
+
+from . import setup_integration
+
+
+@pytest.mark.usefixtures("mock_setup_entry")
+async def test_full_flow(hass: HomeAssistant, mock_mealie_client: AsyncMock) -> None:
+    """Test full flow."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": SOURCE_USER},
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "user"
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_HOST: "demo.mealie.io", CONF_API_TOKEN: "token"},
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["title"] == "Mealie"
+    assert result["data"] == {
+        CONF_HOST: "demo.mealie.io",
+        CONF_API_TOKEN: "token",
+        CONF_VERIFY_SSL: True,
+    }
+    assert result["result"].unique_id == "bf1c62fe-4941-4332-9886-e54e88dbdba0"
+
+
+@pytest.mark.parametrize(
+    ("exception", "error"),
+    [
+        (MealieConnectionError, "cannot_connect"),
+        (MealieAuthenticationError, "invalid_auth"),
+        (Exception, "unknown"),
+    ],
+)
+@pytest.mark.usefixtures("mock_setup_entry")
+async def test_flow_errors(
+    hass: HomeAssistant, mock_mealie_client: AsyncMock, exception: Exception, error: str
+) -> None:
+    """Test flow errors."""
+    mock_mealie_client.get_user_info.side_effect = exception
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": SOURCE_USER},
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "user"
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_HOST: "demo.mealie.io", CONF_API_TOKEN: "token"},
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": error}
+
+    mock_mealie_client.get_user_info.side_effect = None
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_HOST: "demo.mealie.io", CONF_API_TOKEN: "token"},
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+
+
+@pytest.mark.usefixtures("mock_setup_entry")
+async def test_ingress_host(hass: HomeAssistant, mock_mealie_client: AsyncMock) -> None:
+    """Test disallow ingress host."""
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": SOURCE_USER},
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "user"
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {
+            CONF_HOST: "http://homeassistant/app/db21ed7f_mealie",
+            CONF_API_TOKEN: "token",
+        },
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": "ingress_url"}
+
+    mock_mealie_client.get_user_info.side_effect = None
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_HOST: "http://homeassistant:9001", CONF_API_TOKEN: "token"},
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+
+
+@pytest.mark.parametrize(
+    ("version"),
+    [
+        ("v1.0.0beta-5"),
+        ("v1.0.0-RC2"),
+        ("v0.1.0"),
+        ("v1.9.0"),
+        ("v2.0.0beta-2"),
+    ],
+)
+@pytest.mark.usefixtures("mock_setup_entry")
+async def test_flow_version_error(
+    hass: HomeAssistant, mock_mealie_client: AsyncMock, version: str
+) -> None:
+    """Test flow version error."""
+    mock_mealie_client.get_about.return_value = About(version=version)
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": SOURCE_USER},
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "user"
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_HOST: "demo.mealie.io", CONF_API_TOKEN: "token"},
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": "mealie_version"}
+
+    mock_mealie_client.get_about.return_value = About(version="v3.7.0")
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_HOST: "demo.mealie.io", CONF_API_TOKEN: "token"},
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+
+
+@pytest.mark.usefixtures("mock_setup_entry")
+async def test_duplicate(
+    hass: HomeAssistant,
+    mock_mealie_client: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test duplicate flow."""
+    mock_config_entry.add_to_hass(hass)
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": SOURCE_USER},
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "user"
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_HOST: "demo.mealie.io", CONF_API_TOKEN: "token"},
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "already_configured"
+
+
+@pytest.mark.usefixtures("mock_setup_entry")
+async def test_reauth_flow(
+    hass: HomeAssistant,
+    mock_mealie_client: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test reauth flow."""
+    await setup_integration(hass, mock_config_entry)
+
+    result = await mock_config_entry.start_reauth_flow(hass)
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "reauth_confirm"
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_API_TOKEN: "token2"},
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reauth_successful"
+    assert mock_config_entry.data[CONF_API_TOKEN] == "token2"
+
+
+async def test_reauth_flow_after_setup_error(
+    hass: HomeAssistant,
+    mock_mealie_client: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test reauth retries an entry that failed during setup."""
+    mock_config_entry.add_to_hass(hass)
+    mock_mealie_client.get_about.side_effect = MealieAuthenticationError()
+
+    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    assert mock_config_entry.state is ConfigEntryState.SETUP_ERROR
+
+    mock_mealie_client.get_about.side_effect = None
+    result = await mock_config_entry.start_reauth_flow(hass)
+
+    with patch.object(hass.config_entries, "async_schedule_reload") as mock_reload:
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {CONF_API_TOKEN: "token2"}
+        )
+
+    mock_reload.assert_called_once_with(mock_config_entry.entry_id)
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reauth_successful"
+
+
+async def test_reauth_flow_unchanged_token(
+    hass: HomeAssistant,
+    mock_mealie_client: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test reauth reloads when the token is unchanged."""
+    await setup_integration(hass, mock_config_entry)
+    result = await mock_config_entry.start_reauth_flow(hass)
+
+    with patch.object(hass.config_entries, "async_schedule_reload") as mock_reload:
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {CONF_API_TOKEN: "token"}
+        )
+
+    mock_reload.assert_called_once_with(mock_config_entry.entry_id)
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reauth_successful"
+
+
+@pytest.mark.usefixtures("mock_setup_entry")
+async def test_reauth_flow_wrong_account(
+    hass: HomeAssistant,
+    mock_mealie_client: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test reauth flow with wrong account."""
+    await setup_integration(hass, mock_config_entry)
+
+    result = await mock_config_entry.start_reauth_flow(hass)
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "reauth_confirm"
+
+    mock_mealie_client.get_user_info.return_value.user_id = "wrong_user_id"
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_API_TOKEN: "token2"},
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "wrong_account"
+
+
+@pytest.mark.parametrize(
+    ("exception", "error"),
+    [
+        (MealieConnectionError, "cannot_connect"),
+        (MealieAuthenticationError, "invalid_auth"),
+        (Exception, "unknown"),
+    ],
+)
+@pytest.mark.usefixtures("mock_setup_entry")
+async def test_reauth_flow_exceptions(
+    hass: HomeAssistant,
+    mock_mealie_client: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+    exception: Exception,
+    error: str,
+) -> None:
+    """Test reauth flow errors."""
+    await setup_integration(hass, mock_config_entry)
+    mock_mealie_client.get_user_info.side_effect = exception
+
+    result = await mock_config_entry.start_reauth_flow(hass)
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "reauth_confirm"
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_API_TOKEN: "token"},
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "reauth_confirm"
+    assert result["errors"] == {"base": error}
+
+    mock_mealie_client.get_user_info.side_effect = None
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_API_TOKEN: "token"},
+    )
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reauth_successful"
+
+
+@pytest.mark.usefixtures("mock_setup_entry")
+async def test_reconfigure_flow(
+    hass: HomeAssistant,
+    mock_mealie_client: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test reconfigure flow."""
+    await setup_integration(hass, mock_config_entry)
+
+    result = await mock_config_entry.start_reconfigure_flow(hass)
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "reconfigure"
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {
+            CONF_HOST: "http://test:9090",
+            CONF_API_TOKEN: "token2",
+            CONF_VERIFY_SSL: False,
+        },
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    assert mock_config_entry.data[CONF_API_TOKEN] == "token2"
+    assert mock_config_entry.data[CONF_HOST] == "http://test:9090"
+    assert mock_config_entry.data[CONF_VERIFY_SSL] is False
+
+
+@pytest.mark.usefixtures("mock_setup_entry")
+async def test_reconfigure_flow_wrong_account(
+    hass: HomeAssistant,
+    mock_mealie_client: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test reconfigure flow with wrong account."""
+    await setup_integration(hass, mock_config_entry)
+
+    result = await mock_config_entry.start_reconfigure_flow(hass)
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "reconfigure"
+
+    mock_mealie_client.get_user_info.return_value.user_id = "wrong_user_id"
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_HOST: "http://test:9090", CONF_API_TOKEN: "token2"},
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "wrong_account"
+
+
+@pytest.mark.parametrize(
+    ("exception", "error"),
+    [
+        (MealieConnectionError, "cannot_connect"),
+        (MealieAuthenticationError, "invalid_auth"),
+        (Exception, "unknown"),
+    ],
+)
+@pytest.mark.usefixtures("mock_setup_entry")
+async def test_reconfigure_flow_exceptions(
+    hass: HomeAssistant,
+    mock_mealie_client: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+    exception: Exception,
+    error: str,
+) -> None:
+    """Test reconfigure flow errors."""
+    await setup_integration(hass, mock_config_entry)
+    mock_mealie_client.get_user_info.side_effect = exception
+
+    result = await mock_config_entry.start_reconfigure_flow(hass)
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "reconfigure"
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_HOST: "http://test:9090", CONF_API_TOKEN: "token"},
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "reconfigure"
+    assert result["errors"] == {"base": error}
+
+    mock_mealie_client.get_user_info.side_effect = None
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_HOST: "http://test:9090", CONF_API_TOKEN: "token"},
+    )
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+
+
+@pytest.mark.usefixtures("mock_setup_entry")
+async def test_hassio_success(
+    hass: HomeAssistant,
+    mock_mealie_client: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test successful Supervisor flow."""
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        data=HassioServiceInfo(
+            config={"addon": "Mealie", "host": "http://test", "port": 9090},
+            name="mealie",
+            slug="mealie",
+            uuid="1234",
+        ),
+        context={"source": SOURCE_HASSIO},
+    )
+
+    assert result.get("type") is FlowResultType.FORM
+    assert result.get("step_id") == "hassio_confirm"
+    assert result.get("description_placeholders") == {"addon": "Mealie"}
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {CONF_API_TOKEN: "token"}
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["title"] == "Mealie"
+    assert result["data"] == {
+        CONF_HOST: "http://test:9090",
+        CONF_API_TOKEN: "token",
+        CONF_VERIFY_SSL: True,
+    }
+    assert result["result"].unique_id == "bf1c62fe-4941-4332-9886-e54e88dbdba0"
+
+
+async def test_hassio_already_configured(
+    hass: HomeAssistant, mock_config_entry: MockConfigEntry
+) -> None:
+    """Test we only allow a single config flow."""
+    mock_config_entry.add_to_hass(hass)
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        data=HassioServiceInfo(
+            config={
+                "addon": "Mealie",
+                "host": "mock-mealie",
+                "port": "9090",
+            },
+            name="Mealie",
+            slug="mealie",
+            uuid="1234",
+        ),
+        context={"source": SOURCE_HASSIO},
+    )
+    assert result
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "already_configured"
+
+
+async def test_hassio_ignored(hass: HomeAssistant) -> None:
+    """Test the supervisor discovered instance can be ignored."""
+    MockConfigEntry(domain=DOMAIN, source=SOURCE_IGNORE).add_to_hass(hass)
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        data=HassioServiceInfo(
+            config={
+                "addon": "Mealie",
+                "host": "mock-mealie",
+                "port": "9090",
+            },
+            name="Mealie",
+            slug="mealie",
+            uuid="1234",
+        ),
+        context={"source": SOURCE_HASSIO},
+    )
+    assert result
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "already_configured"
+
+
+@pytest.mark.parametrize(
+    ("exception", "error"),
+    [
+        (MealieConnectionError, "cannot_connect"),
+        (MealieAuthenticationError, "invalid_auth"),
+        (Exception, "unknown"),
+    ],
+)
+@pytest.mark.usefixtures("mock_setup_entry")
+async def test_hassio_connection_error(
+    hass: HomeAssistant, mock_mealie_client: AsyncMock, exception: Exception, error: str
+) -> None:
+    """Test flow errors."""
+    mock_mealie_client.get_user_info.side_effect = exception
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        data=HassioServiceInfo(
+            config={"addon": "Mealie", "host": "http://test", "port": 9090},
+            name="mealie",
+            slug="mealie",
+            uuid="1234",
+        ),
+        context={"source": SOURCE_HASSIO},
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "hassio_confirm"
+    assert result["description_placeholders"] == {"addon": "Mealie"}
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {CONF_API_TOKEN: "token"}
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": error}
+
+    mock_mealie_client.get_user_info.side_effect = None
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {CONF_API_TOKEN: "token"}
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+
+
+async def test_options(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test updating options."""
+    await setup_integration(hass, mock_config_entry)
+
+    result = await hass.config_entries.options.async_init(mock_config_entry.entry_id)
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "init"
+    parser_selector = result["data_schema"].schema[CONF_PARSER]
+    assert parser_selector.config["translation_key"] == CONF_PARSER
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], user_input={"parse_todo_new": False, CONF_PARSER: "brute"}
+    )
+
+    assert not result["data"]["parse_todo_new"]
+    assert result["data"]["parse_todo_edit"]
+    assert result["data"][CONF_PARSER] == "brute"
+    assert result["type"] is FlowResultType.CREATE_ENTRY

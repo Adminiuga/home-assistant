@@ -1,5 +1,9 @@
 """Models to represent various Plex objects used in the integration."""
+
 import logging
+from typing import override
+
+import plexapi.playqueue
 
 from homeassistant.components.media_player import MediaType
 from homeassistant.helpers.template import result_as_boolean
@@ -57,6 +61,7 @@ class PlexSession:
 
         self.update_media(session)
 
+    @override
     def __repr__(self):
         """Return representation of the session."""
         return f"<{self.session_key}:{self.sensor_title}>"
@@ -77,7 +82,10 @@ class PlexSession:
         elif media.librarySectionID and media.librarySectionID < 1:
             self.media_library_title = UNKNOWN_SECTION
             _LOGGER.warning(
-                "Unknown library section ID (%s) for title '%s', please create an issue",
+                (
+                    "Unknown library section ID (%s) for title '%s',"
+                    " please create an issue"
+                ),
                 media.librarySectionID,
                 media.title,
             )
@@ -92,7 +100,11 @@ class PlexSession:
             self.media_series_title = media.grandparentTitle
             if media.index is not None:
                 self.media_episode = media.index
-            self.sensor_title = f"{self.media_series_title} - {media.seasonEpisode} - {self.media_title}"
+            self.sensor_title = (
+                f"{self.media_series_title} -"
+                f" {media.seasonEpisode} -"
+                f" {self.media_title}"
+            )
         elif media.type == "movie":
             self.media_content_type = MediaType.MOVIE
             if media.year is not None and media.title is not None:
@@ -159,7 +171,10 @@ class PlexMediaSearchResult:
         if isinstance(resume, str):
             resume = result_as_boolean(resume)
         if resume:
-            return self.media.viewOffset
+            media = self.media
+            if isinstance(media, plexapi.playqueue.PlayQueue) and len(media.items) > 0:
+                media = media.items[0]
+            return media.viewOffset
         return 0
 
     @property
@@ -169,3 +184,11 @@ class PlexMediaSearchResult:
         if isinstance(shuffle, str):
             shuffle = result_as_boolean(shuffle)
         return shuffle
+
+    @property
+    def continuous(self) -> bool:
+        """Return value of continuous parameter."""
+        continuous = self._params.get("continuous", False)
+        if isinstance(continuous, str):
+            continuous = result_as_boolean(continuous)
+        return continuous

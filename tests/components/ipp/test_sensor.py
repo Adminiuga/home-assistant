@@ -1,111 +1,168 @@
 """Tests for the IPP sensor platform."""
-from datetime import datetime
-from unittest.mock import patch
 
-from homeassistant.components.ipp.const import DOMAIN
-from homeassistant.components.sensor import DOMAIN as SENSOR_DOMAIN
-from homeassistant.const import ATTR_ICON, ATTR_UNIT_OF_MEASUREMENT, PERCENTAGE
+from unittest.mock import AsyncMock, MagicMock
+
+from freezegun.api import FrozenDateTimeFactory
+from pyipp import Counters, Printer
+import pytest
+from pytest_homeassistant.common import (
+    MockConfigEntry,
+    async_fire_time_changed,
+    snapshot_platform,
+)
+from syrupy.assertion import SnapshotAssertion
+
+from homeassistant.components.ipp.coordinator import SCAN_INTERVAL
+from homeassistant.config_entries import ConfigEntryState
+from homeassistant.const import STATE_UNKNOWN
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
-from homeassistant.util import dt as dt_util
-
-from . import init_integration, mock_connection
-
-from tests.test_util.aiohttp import AiohttpClientMocker
 
 
+@pytest.mark.freeze_time("2019-11-11 09:10:32+00:00")
+@pytest.mark.usefixtures("entity_registry_enabled_by_default")
 async def test_sensors(
-    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    snapshot: SnapshotAssertion,
+    init_integration: MockConfigEntry,
 ) -> None:
     """Test the creation and values of the IPP sensors."""
-    mock_connection(aioclient_mock)
-
-    entry = await init_integration(hass, aioclient_mock, skip_setup=True)
-    registry = er.async_get(hass)
-
-    # Pre-create registry entries for disabled by default sensors
-    registry.async_get_or_create(
-        SENSOR_DOMAIN,
-        DOMAIN,
-        "cfe92100-67c4-11d4-a45f-f8d027761251_uptime",
-        suggested_object_id="epson_xp_6000_series_uptime",
-        disabled_by=None,
-    )
-
-    test_time = datetime(2019, 11, 11, 9, 10, 32, tzinfo=dt_util.UTC)
-    with patch("homeassistant.components.ipp.sensor.utcnow", return_value=test_time):
-        await hass.config_entries.async_setup(entry.entry_id)
-        await hass.async_block_till_done()
-
-    state = hass.states.get("sensor.epson_xp_6000_series")
-    assert state
-    assert state.attributes.get(ATTR_ICON) == "mdi:printer"
-    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) is None
-
-    state = hass.states.get("sensor.epson_xp_6000_series_black_ink")
-    assert state
-    assert state.attributes.get(ATTR_ICON) == "mdi:water"
-    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) is PERCENTAGE
-    assert state.state == "58"
-
-    state = hass.states.get("sensor.epson_xp_6000_series_photo_black_ink")
-    assert state
-    assert state.attributes.get(ATTR_ICON) == "mdi:water"
-    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) is PERCENTAGE
-    assert state.state == "98"
-
-    state = hass.states.get("sensor.epson_xp_6000_series_cyan_ink")
-    assert state
-    assert state.attributes.get(ATTR_ICON) == "mdi:water"
-    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) is PERCENTAGE
-    assert state.state == "91"
-
-    state = hass.states.get("sensor.epson_xp_6000_series_yellow_ink")
-    assert state
-    assert state.attributes.get(ATTR_ICON) == "mdi:water"
-    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) is PERCENTAGE
-    assert state.state == "95"
-
-    state = hass.states.get("sensor.epson_xp_6000_series_magenta_ink")
-    assert state
-    assert state.attributes.get(ATTR_ICON) == "mdi:water"
-    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) is PERCENTAGE
-    assert state.state == "73"
-
-    state = hass.states.get("sensor.epson_xp_6000_series_uptime")
-    assert state
-    assert state.attributes.get(ATTR_ICON) == "mdi:clock-outline"
-    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) is None
-    assert state.state == "2019-10-26T15:37:00+00:00"
-
-    entry = registry.async_get("sensor.epson_xp_6000_series_uptime")
-    assert entry
-    assert entry.unique_id == "cfe92100-67c4-11d4-a45f-f8d027761251_uptime"
+    await snapshot_platform(hass, entity_registry, snapshot, init_integration.entry_id)
 
 
 async def test_disabled_by_default_sensors(
-    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    init_integration: MockConfigEntry,
 ) -> None:
     """Test the disabled by default IPP sensors."""
-    await init_integration(hass, aioclient_mock)
-    registry = er.async_get(hass)
+    entity_id = entity_registry.async_get_entity_id(
+        "sensor", "ipp", f"{init_integration.unique_id}_uptime"
+    )
+    assert entity_id is not None
 
-    state = hass.states.get("sensor.epson_xp_6000_series_uptime")
+    state = hass.states.get(entity_id)
     assert state is None
 
-    entry = registry.async_get("sensor.epson_xp_6000_series_uptime")
-    assert entry
-    assert entry.disabled
-    assert entry.disabled_by is er.RegistryEntryDisabler.INTEGRATION
+    entity_entry = entity_registry.async_get(entity_id)
+    assert entity_entry
+    assert entity_entry.disabled
+    assert entity_entry.disabled_by is er.RegistryEntryDisabler.INTEGRATION
 
 
 async def test_missing_entry_unique_id(
-    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    mock_config_entry: MockConfigEntry,
+    mock_ipp: AsyncMock,
 ) -> None:
     """Test the unique_id of IPP sensor when printer is missing identifiers."""
-    entry = await init_integration(hass, aioclient_mock, uuid=None, unique_id=None)
-    registry = er.async_get(hass)
+    mock_config_entry.add_to_hass(hass)
+    hass.config_entries.async_update_entry(mock_config_entry, unique_id=None)
 
-    entity = registry.async_get("sensor.epson_xp_6000_series")
+    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    entity = entity_registry.async_get("sensor.test_ha_1000_series")
     assert entity
-    assert entity.unique_id == f"{entry.entry_id}_printer"
+    assert entity.unique_id == f"{mock_config_entry.entry_id}_printer"
+
+
+async def test_no_page_count_sensors_when_unsupported(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    mock_config_entry: MockConfigEntry,
+    mock_printer: Printer,
+    mock_ipp: MagicMock,
+) -> None:
+    """Test that page count sensors are not created when printer doesn't support them."""
+    mock_printer.counters = Counters(
+        impressions_completed=None,
+        impressions_completed_col={},
+        pages_completed=None,
+        media_sheets_completed=None,
+        supported=(),
+    )
+    mock_config_entry.add_to_hass(hass)
+
+    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert mock_config_entry.state is ConfigEntryState.LOADED
+
+    unique_id = mock_config_entry.unique_id
+    for key in (
+        "pages_completed",
+        "impressions_completed",
+        "media_sheets_completed",
+        "impressions_completed_monochrome",
+        "impressions_completed_full_color",
+    ):
+        assert not entity_registry.async_get_entity_id(
+            "sensor", "ipp", f"{unique_id}_{key}"
+        )
+
+
+async def test_page_count_sensors_with_partial_counters(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    mock_config_entry: MockConfigEntry,
+    mock_printer: Printer,
+    mock_ipp: MagicMock,
+) -> None:
+    """Test sensors follow which counters the printer supports.
+
+    A supported counter with an unknown value gets a sensor in the unknown
+    state; a counter the printer does not report gets no sensor.
+    """
+    mock_printer.counters = Counters(
+        impressions_completed=None,
+        impressions_completed_col={"monochrome": 1500, "full-color": None},
+        pages_completed=None,
+        media_sheets_completed=None,
+        supported=("impressions_completed", "pages_completed"),
+    )
+    mock_config_entry.add_to_hass(hass)
+
+    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert not entity_registry.async_get_entity_id(
+        "sensor", "ipp", f"{mock_config_entry.unique_id}_media_sheets_completed"
+    )
+
+    state = hass.states.get(
+        "sensor.test_ha_1000_series_monochrome_impressions_completed"
+    )
+    assert state
+    assert state.state == "1500"
+
+    for entity_id in (
+        "sensor.test_ha_1000_series_pages_completed",
+        "sensor.test_ha_1000_series_impressions_completed",
+        "sensor.test_ha_1000_series_color_impressions_completed",
+    ):
+        state = hass.states.get(entity_id)
+        assert state
+        assert state.state == STATE_UNKNOWN
+
+
+async def test_page_count_unknown_when_counter_missing(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    init_integration: MockConfigEntry,
+    mock_printer: Printer,
+) -> None:
+    """Test a page count sensor becomes unknown when the printer stops reporting it."""
+    assert hass.states.get("sensor.test_ha_1000_series_pages_completed").state == "1234"
+
+    mock_printer.counters.pages_completed = None
+    freezer.tick(SCAN_INTERVAL)
+    async_fire_time_changed(hass)
+    await hass.async_block_till_done()
+
+    assert (
+        hass.states.get("sensor.test_ha_1000_series_pages_completed").state
+        == STATE_UNKNOWN
+    )

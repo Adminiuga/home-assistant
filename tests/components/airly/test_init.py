@@ -1,237 +1,287 @@
 """Test init of Airly integration."""
-from unittest.mock import patch
 
+from http import HTTPStatus
+from typing import Any
+from unittest.mock import MagicMock
+
+from airly.exceptions import AirlyError
+from airly.measurements import Measurement
+from freezegun.api import FrozenDateTimeFactory
 import pytest
+from pytest_homeassistant.common import MockConfigEntry, async_fire_time_changed
 
-from homeassistant.components.air_quality import DOMAIN as AIR_QUALITY_PLATFORM
-from homeassistant.components.airly import set_update_interval
-from homeassistant.components.airly.const import DOMAIN
-from homeassistant.config_entries import ConfigEntryState
-from homeassistant.const import STATE_UNAVAILABLE
-from homeassistant.helpers import entity_registry as er
-from homeassistant.util.dt import utcnow
-
-from . import API_POINT_URL, init_integration
-
-from tests.common import (
-    MockConfigEntry,
-    async_fire_time_changed,
-    load_fixture,
-    mock_device_registry,
+from homeassistant.components.air_quality import DOMAIN as AIR_QUALITY_DOMAIN
+from homeassistant.components.airly.const import CONF_USE_NEAREST, DOMAIN
+from homeassistant.components.airly.coordinator import set_update_interval
+from homeassistant.config_entries import SOURCE_REAUTH, ConfigEntryState
+from homeassistant.const import (
+    CONF_API_KEY,
+    CONF_LATITUDE,
+    CONF_LONGITUDE,
+    STATE_UNAVAILABLE,
 )
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr, entity_registry as er
+
+from . import init_integration
 
 
-async def test_async_setup_entry(hass, aioclient_mock):
+@pytest.mark.usefixtures("mock_airly_client")
+async def test_async_setup_entry(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+) -> None:
     """Test a successful setup entry."""
-    await init_integration(hass, aioclient_mock)
+    await init_integration(hass, mock_config_entry)
 
     state = hass.states.get("sensor.home_pm2_5")
     assert state is not None
     assert state.state != STATE_UNAVAILABLE
-    assert state.state == "4"
+    assert state.state == "4.37"
 
 
-async def test_config_not_ready(hass, aioclient_mock):
-    """Test for setup failure if connection to Airly is missing."""
+async def test_async_setup_entry_with_nearest(
+    hass: HomeAssistant,
+    mock_airly_client: MagicMock,
+) -> None:
+    """Test a successful setup entry with nearest station."""
     entry = MockConfigEntry(
         domain=DOMAIN,
         title="Home",
-        unique_id="123-456",
+        unique_id="12.3-45.6",
         data={
-            "api_key": "foo",
-            "latitude": 123,
-            "longitude": 456,
-            "name": "Home",
-            "use_nearest": True,
+            CONF_API_KEY: "foo",
+            CONF_LATITUDE: 12.3,
+            CONF_LONGITUDE: 45.6,
+            CONF_USE_NEAREST: True,
         },
     )
 
-    aioclient_mock.get(API_POINT_URL, exc=ConnectionError())
-    entry.add_to_hass(hass)
-    await hass.config_entries.async_setup(entry.entry_id)
-    assert entry.state is ConfigEntryState.SETUP_RETRY
+    await init_integration(hass, entry)
+
+    assert entry.state is ConfigEntryState.LOADED
+    mock_airly_client.create_measurements_session_nearest.assert_called_once_with(
+        12.3, 45.6, max_distance_km=5
+    )
+    mock_airly_client.create_measurements_session_point.assert_not_called()
+
+    state = hass.states.get("sensor.home_pm2_5")
+    assert state is not None
+    assert state.state == "4.37"
 
 
-async def test_config_without_unique_id(hass, aioclient_mock):
+@pytest.mark.parametrize(
+    "exception",
+    [
+        ConnectionError,
+        AirlyError(HTTPStatus.INTERNAL_SERVER_ERROR, {"message": "Server error"}),
+    ],
+)
+async def test_config_not_ready(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_airly_client: MagicMock,
+    exception: Exception,
+) -> None:
+    """Test for setup failure if connection to Airly is missing."""
+    mock_airly_client.create_measurements_session_point.return_value.update.side_effect = exception
+
+    await init_integration(hass, mock_config_entry)
+    assert mock_config_entry.state is ConfigEntryState.SETUP_RETRY
+
+
+async def test_config_auth_failed(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_airly_client: MagicMock,
+) -> None:
+    """Test that a reauth flow is started when the API key is invalid."""
+    mock_airly_client.create_measurements_session_point.return_value.update.side_effect = AirlyError(
+        HTTPStatus.UNAUTHORIZED, {"message": "Invalid authentication credentials"}
+    )
+
+    await init_integration(hass, mock_config_entry)
+    assert mock_config_entry.state is ConfigEntryState.SETUP_ERROR
+
+    flows = hass.config_entries.flow.async_progress()
+    assert len(flows) == 1
+    assert flows[0]["context"]["source"] == SOURCE_REAUTH
+    assert flows[0]["context"]["entry_id"] == mock_config_entry.entry_id
+    assert flows[0]["step_id"] == "reauth_confirm"
+
+
+@pytest.mark.usefixtures("mock_airly_client")
+async def test_config_without_unique_id(hass: HomeAssistant) -> None:
     """Test for setup entry without unique_id."""
     entry = MockConfigEntry(
         domain=DOMAIN,
         title="Home",
         data={
-            "api_key": "foo",
-            "latitude": 123,
-            "longitude": 456,
-            "name": "Home",
+            CONF_API_KEY: "foo",
+            CONF_LATITUDE: 12.3,
+            CONF_LONGITUDE: 45.6,
         },
     )
 
-    aioclient_mock.get(API_POINT_URL, text=load_fixture("valid_station.json", "airly"))
-    entry.add_to_hass(hass)
-    await hass.config_entries.async_setup(entry.entry_id)
+    await init_integration(hass, entry)
     assert entry.state is ConfigEntryState.LOADED
-    assert entry.unique_id == "123-456"
+    assert entry.unique_id == "12.3-45.6"
 
 
-async def test_config_with_turned_off_station(hass, aioclient_mock):
+async def test_config_with_turned_off_station(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_airly_client: MagicMock,
+    mock_airly_no_station_measurements: Measurement,
+) -> None:
     """Test for setup entry for a turned off measuring station."""
-    entry = MockConfigEntry(
-        domain=DOMAIN,
-        title="Home",
-        unique_id="123-456",
-        data={
-            "api_key": "foo",
-            "latitude": 123,
-            "longitude": 456,
-            "name": "Home",
-        },
+    mock_airly_client.create_measurements_session_point.return_value.current = (
+        mock_airly_no_station_measurements
     )
 
-    aioclient_mock.get(API_POINT_URL, text=load_fixture("no_station.json", "airly"))
-    entry.add_to_hass(hass)
-    await hass.config_entries.async_setup(entry.entry_id)
-    assert entry.state is ConfigEntryState.SETUP_RETRY
+    await init_integration(hass, mock_config_entry)
+    assert mock_config_entry.state is ConfigEntryState.SETUP_RETRY
 
 
-async def test_update_interval(hass, aioclient_mock):
+async def test_update_interval(
+    hass: HomeAssistant,
+    mock_airly_client: MagicMock,
+    freezer: FrozenDateTimeFactory,
+) -> None:
     """Test correct update interval when the number of configured instances changes."""
     REMAINING_REQUESTS = 15
-    HEADERS = {
-        "X-RateLimit-Limit-day": "100",
-        "X-RateLimit-Remaining-day": str(REMAINING_REQUESTS),
-    }
+    mock_airly_client.requests_remaining = REMAINING_REQUESTS
 
     entry = MockConfigEntry(
         domain=DOMAIN,
         title="Home",
-        unique_id="123-456",
+        unique_id="12.3-45.6",
         data={
-            "api_key": "foo",
-            "latitude": 123,
-            "longitude": 456,
-            "name": "Home",
+            CONF_API_KEY: "foo",
+            CONF_LATITUDE: 12.3,
+            CONF_LONGITUDE: 45.6,
         },
     )
 
-    aioclient_mock.get(
-        API_POINT_URL,
-        text=load_fixture("valid_station.json", "airly"),
-        headers=HEADERS,
-    )
-    entry.add_to_hass(hass)
-    await hass.config_entries.async_setup(entry.entry_id)
-    await hass.async_block_till_done()
+    await init_integration(hass, entry)
     instances = 1
 
-    assert aioclient_mock.call_count == 1
+    create_measurements = mock_airly_client.create_measurements_session_point
+    update_measurements = create_measurements.return_value.update
+    assert create_measurements.call_count == 1
+    assert update_measurements.call_count == 1
     assert len(hass.config_entries.async_entries(DOMAIN)) == 1
     assert entry.state is ConfigEntryState.LOADED
 
     update_interval = set_update_interval(instances, REMAINING_REQUESTS)
-    future = utcnow() + update_interval
-    with patch("homeassistant.util.dt.utcnow") as mock_utcnow:
-        mock_utcnow.return_value = future
-        async_fire_time_changed(hass, future)
-        await hass.async_block_till_done()
-
-        # call_count should increase by one because we have one instance configured
-        assert aioclient_mock.call_count == 2
-
-        # Now we add the second Airly instance
-        entry = MockConfigEntry(
-            domain=DOMAIN,
-            title="Work",
-            unique_id="66.66-111.11",
-            data={
-                "api_key": "foo",
-                "latitude": 66.66,
-                "longitude": 111.11,
-                "name": "Work",
-            },
-        )
-
-        aioclient_mock.get(
-            "https://airapi.airly.eu/v2/measurements/point?lat=66.660000&lng=111.110000",
-            text=load_fixture("valid_station.json", "airly"),
-            headers=HEADERS,
-        )
-        entry.add_to_hass(hass)
-        await hass.config_entries.async_setup(entry.entry_id)
-        await hass.async_block_till_done()
-        instances = 2
-
-        assert aioclient_mock.call_count == 3
-        assert len(hass.config_entries.async_entries(DOMAIN)) == 2
-        assert entry.state is ConfigEntryState.LOADED
-
-        update_interval = set_update_interval(instances, REMAINING_REQUESTS)
-        future = utcnow() + update_interval
-        mock_utcnow.return_value = future
-        async_fire_time_changed(hass, future)
-        await hass.async_block_till_done()
-
-        # call_count should increase by two because we have two instances configured
-        assert aioclient_mock.call_count == 5
-
-
-async def test_unload_entry(hass, aioclient_mock):
-    """Test successful unload of entry."""
-    entry = await init_integration(hass, aioclient_mock)
-
-    assert len(hass.config_entries.async_entries(DOMAIN)) == 1
-    assert entry.state is ConfigEntryState.LOADED
-
-    assert await hass.config_entries.async_unload(entry.entry_id)
+    freezer.tick(update_interval)
+    async_fire_time_changed(hass)
     await hass.async_block_till_done()
 
-    assert entry.state is ConfigEntryState.NOT_LOADED
+    # update should be called once more because we have one instance configured.
+    # The measurements session is created once per entry, so create is not
+    # called again on refresh.
+    assert create_measurements.call_count == 1
+    assert update_measurements.call_count == 2
+
+    # Now we add the second Airly instance
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Work",
+        unique_id="66.66-111.11",
+        data={
+            CONF_API_KEY: "foo",
+            CONF_LATITUDE: 66.66,
+            CONF_LONGITUDE: 111.11,
+        },
+    )
+
+    await init_integration(hass, entry)
+    instances = 2
+
+    assert create_measurements.call_count == 2
+    assert update_measurements.call_count == 3
+    assert len(hass.config_entries.async_entries(DOMAIN)) == 2
+    assert entry.state is ConfigEntryState.LOADED
+
+    update_interval = set_update_interval(instances, REMAINING_REQUESTS)
+    freezer.tick(update_interval)
+    async_fire_time_changed(hass)
+    await hass.async_block_till_done()
+
+    # update should be called once more per instance because we have two
+    # instances configured
+    assert create_measurements.call_count == 2
+    assert update_measurements.call_count == 5
+
+
+@pytest.mark.usefixtures("mock_airly_client")
+async def test_unload_entry(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test successful unload of entry."""
+    await init_integration(hass, mock_config_entry)
+
+    assert len(hass.config_entries.async_entries(DOMAIN)) == 1
+    assert mock_config_entry.state is ConfigEntryState.LOADED
+
+    assert await hass.config_entries.async_unload(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert mock_config_entry.state is ConfigEntryState.NOT_LOADED
     assert not hass.data.get(DOMAIN)
 
 
-@pytest.mark.parametrize("old_identifier", ((DOMAIN, 123, 456), (DOMAIN, "123", "456")))
-async def test_migrate_device_entry(hass, aioclient_mock, old_identifier):
+@pytest.mark.parametrize("old_identifier", [(DOMAIN, 123, 456), (DOMAIN, "123", "456")])
+@pytest.mark.usefixtures("mock_airly_client")
+async def test_migrate_device_entry(
+    hass: HomeAssistant,
+    old_identifier: tuple[str, Any, Any],
+    device_registry: dr.DeviceRegistry,
+) -> None:
     """Test device_info identifiers migration."""
     config_entry = MockConfigEntry(
         domain=DOMAIN,
         title="Home",
         unique_id="123-456",
         data={
-            "api_key": "foo",
-            "latitude": 123,
-            "longitude": 456,
-            "name": "Home",
+            CONF_API_KEY: "foo",
+            CONF_LATITUDE: 123,
+            CONF_LONGITUDE: 456,
         },
     )
-
-    aioclient_mock.get(API_POINT_URL, text=load_fixture("valid_station.json", "airly"))
     config_entry.add_to_hass(hass)
 
-    device_reg = mock_device_registry(hass)
-    device_entry = device_reg.async_get_or_create(
+    device_entry = device_registry.async_get_or_create(
         config_entry_id=config_entry.entry_id, identifiers={old_identifier}
     )
 
     await hass.config_entries.async_setup(config_entry.entry_id)
     await hass.async_block_till_done()
 
-    migrated_device_entry = device_reg.async_get_or_create(
+    migrated_device_entry = device_registry.async_get_or_create(
         config_entry_id=config_entry.entry_id, identifiers={(DOMAIN, "123-456")}
     )
     assert device_entry.id == migrated_device_entry.id
 
 
-async def test_remove_air_quality_entities(hass, aioclient_mock):
+async def test_remove_air_quality_entities(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    entity_registry: er.EntityRegistry,
+    mock_airly_client: MagicMock,
+) -> None:
     """Test remove air_quality entities from registry."""
-    registry = er.async_get(hass)
-
-    registry.async_get_or_create(
-        AIR_QUALITY_PLATFORM,
+    entity_registry.async_get_or_create(
+        AIR_QUALITY_DOMAIN,
         DOMAIN,
-        "123-456",
+        "12.3-45.6",
         suggested_object_id="home",
         disabled_by=None,
     )
 
-    await init_integration(hass, aioclient_mock)
+    await init_integration(hass, mock_config_entry)
 
-    entry = registry.async_get("air_quality.home")
+    entry = entity_registry.async_get("air_quality.home")
     assert entry is None

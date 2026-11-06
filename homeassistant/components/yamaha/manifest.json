@@ -1,9 +1,12 @@
 {
   "domain": "yamaha",
   "name": "Yamaha Network Receivers",
-  "documentation": "https://www.home-assistant.io/integrations/yamaha",
-  "requirements": ["rxv==0.7.0"],
+  "categories": ["media_entertainment.speakers_audio"],
   "codeowners": [],
+  "connectivity": ["network"],
+  "documentation": "https://www.home-assistant.io/integrations/yamaha",
   "iot_class": "local_polling",
-  "loggers": ["rxv"]
+  "loggers": ["rxv"],
+  "quality_scale": "legacy",
+  "requirements": ["rxv==0.7.0"]
 }

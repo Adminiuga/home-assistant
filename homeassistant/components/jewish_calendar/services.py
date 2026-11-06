@@ -1,0 +1,104 @@
+"""Services for Jewish Calendar."""
+
+import datetime as dt
+from enum import StrEnum
+import logging
+from typing import get_args
+
+from hdate import HebrewDate
+from hdate.omer import Nusach, Omer
+from hdate.translator import Language, set_language
+import probatio
+
+from homeassistant.const import SUN_EVENT_SUNSET
+from homeassistant.core import (
+    HomeAssistant,
+    ServiceCall,
+    ServiceResponse,
+    SupportsResponse,
+    callback,
+)
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.selector import LanguageSelector, LanguageSelectorConfig
+from homeassistant.helpers.sun import get_astral_event_date
+from homeassistant.util import dt as dt_util
+
+from .const import DOMAIN
+
+
+class JewishCalendarService(StrEnum):
+    """Store keys for Jewish Calendar services."""
+
+    COUNT_OMER = "count_omer"
+
+
+class JewishCalendarServiceArgument(StrEnum):
+    """Store keys for Jewish Calendar service arguments."""
+
+    DATE = "date"
+    AFTER_SUNSET = "after_sunset"
+    NUSACH = "nusach"
+    LANGUAGE = "language"
+
+
+_LOGGER = logging.getLogger(__name__)
+OMER_SCHEMA = probatio.Schema(
+    {
+        probatio.Optional(JewishCalendarServiceArgument.DATE): cv.date,
+        probatio.Optional(
+            JewishCalendarServiceArgument.AFTER_SUNSET, default=True
+        ): cv.boolean,
+        probatio.Required(
+            JewishCalendarServiceArgument.NUSACH, default="sfarad"
+        ): probatio.In([nusach.name.lower() for nusach in Nusach]),
+        probatio.Optional(
+            JewishCalendarServiceArgument.LANGUAGE, default="he"
+        ): LanguageSelector(LanguageSelectorConfig(languages=list(get_args(Language)))),
+    }
+)
+
+
+@callback
+def async_setup_services(hass: HomeAssistant) -> None:
+    """Set up the Jewish Calendar services."""
+
+    def is_after_sunset(hass: HomeAssistant) -> bool:
+        """Determine if the current time is after sunset."""
+        now = dt_util.now()
+        today = now.date()
+        event_date = get_astral_event_date(hass, SUN_EVENT_SUNSET, today)
+        if event_date is None:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN, translation_key="sunset_event"
+            )
+        sunset = dt_util.as_local(event_date)
+        _LOGGER.debug("Now: %s Sunset: %s", now, sunset)
+        return now > sunset
+
+    async def get_omer_count(call: ServiceCall) -> ServiceResponse:
+        """Return the Omer blessing for a given date."""
+        date = call.data.get(JewishCalendarServiceArgument.DATE, dt_util.now().date())
+        after_sunset = (
+            call.data[JewishCalendarServiceArgument.AFTER_SUNSET]
+            if JewishCalendarServiceArgument.DATE in call.data
+            else is_after_sunset(hass)
+        )
+        hebrew_date = HebrewDate.from_gdate(date + dt.timedelta(days=int(after_sunset)))
+        nusach = Nusach[call.data[JewishCalendarServiceArgument.NUSACH].upper()]
+        set_language(call.data[JewishCalendarServiceArgument.LANGUAGE])
+        omer = Omer(date=hebrew_date, nusach=nusach)
+        return {
+            "message": str(omer.count_str()),
+            "weeks": omer.week,
+            "days": omer.day,
+            "total_days": omer.total_days,
+        }
+
+    hass.services.async_register(
+        DOMAIN,
+        JewishCalendarService.COUNT_OMER,
+        get_omer_count,
+        schema=OMER_SCHEMA,
+        supports_response=SupportsResponse.ONLY,
+    )

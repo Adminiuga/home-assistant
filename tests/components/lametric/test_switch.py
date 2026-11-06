@@ -1,8 +1,10 @@
 """Tests for the LaMetric switch platform."""
+
 from unittest.mock import MagicMock
 
 from demetriek import LaMetricConnectionError, LaMetricError
 import pytest
+from pytest_homeassistant.common import async_fire_time_changed
 
 from homeassistant.components.lametric.const import DOMAIN, SCAN_INTERVAL
 from homeassistant.components.switch import (
@@ -14,33 +16,29 @@ from homeassistant.const import (
     ATTR_DEVICE_CLASS,
     ATTR_ENTITY_ID,
     ATTR_FRIENDLY_NAME,
-    ATTR_ICON,
     STATE_OFF,
     STATE_UNAVAILABLE,
+    EntityCategory,
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import device_registry as dr, entity_registry as er
-from homeassistant.helpers.entity import EntityCategory
-import homeassistant.util.dt as dt_util
+from homeassistant.util import dt as dt_util
 
-from tests.common import MockConfigEntry, async_fire_time_changed
+pytestmark = pytest.mark.usefixtures("init_integration")
 
 
 async def test_bluetooth(
     hass: HomeAssistant,
-    init_integration: MockConfigEntry,
     mock_lametric: MagicMock,
+    device_registry: dr.DeviceRegistry,
+    entity_registry: er.EntityRegistry,
 ) -> None:
     """Test the LaMetric Bluetooth control."""
-    device_registry = dr.async_get(hass)
-    entity_registry = er.async_get(hass)
-
     state = hass.states.get("switch.frenck_s_lametric_bluetooth")
     assert state
     assert state.attributes.get(ATTR_DEVICE_CLASS) is None
     assert state.attributes.get(ATTR_FRIENDLY_NAME) == "Frenck's LaMetric Bluetooth"
-    assert state.attributes.get(ATTR_ICON) == "mdi:bluetooth"
     assert state.state == STATE_OFF
 
     entry = entity_registry.async_get(state.entity_id)
@@ -51,13 +49,17 @@ async def test_bluetooth(
 
     device = device_registry.async_get(entry.device_id)
     assert device
-    assert device.configuration_url is None
-    assert device.connections == {(dr.CONNECTION_NETWORK_MAC, "aa:bb:cc:dd:ee:ff")}
+    assert device.configuration_url == "https://127.0.0.1/"
+    assert device.connections == {
+        (dr.CONNECTION_NETWORK_MAC, "aa:bb:cc:dd:ee:ff"),
+        (dr.CONNECTION_BLUETOOTH, "aa:bb:cc:dd:ee:ee"),
+    }
     assert device.entry_type is None
     assert device.hw_version is None
     assert device.identifiers == {(DOMAIN, "SA110405124500W00BS9")}
     assert device.manufacturer == "LaMetric Inc."
     assert device.name == "Frenck's LaMetric"
+    assert device.serial_number == "SA110405124500W00BS9"
     assert device.sw_version == "2.2.2"
 
     await hass.services.async_call(
@@ -95,7 +97,6 @@ async def test_bluetooth(
 
 async def test_switch_error(
     hass: HomeAssistant,
-    init_integration: MockConfigEntry,
     mock_lametric: MagicMock,
 ) -> None:
     """Test error handling of the LaMetric switches."""
@@ -116,7 +117,6 @@ async def test_switch_error(
             },
             blocking=True,
         )
-        await hass.async_block_till_done()
 
     state = hass.states.get("switch.frenck_s_lametric_bluetooth")
     assert state
@@ -125,7 +125,6 @@ async def test_switch_error(
 
 async def test_switch_connection_error(
     hass: HomeAssistant,
-    init_integration: MockConfigEntry,
     mock_lametric: MagicMock,
 ) -> None:
     """Test connection error handling of the LaMetric switches."""
@@ -146,8 +145,54 @@ async def test_switch_connection_error(
             },
             blocking=True,
         )
-        await hass.async_block_till_done()
 
     state = hass.states.get("switch.frenck_s_lametric_bluetooth")
     assert state
     assert state.state == STATE_UNAVAILABLE
+
+
+@pytest.mark.parametrize("device_fixture", ["device_sa5_bluetooth_unavailable"])
+async def test_no_bluetooth_switch_without_bluetooth(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+) -> None:
+    """Test a device without Bluetooth, like a SKY, gets no Bluetooth switch."""
+    entry = hass.config_entries.async_entries(DOMAIN)[0]
+    entities = er.async_entries_for_config_entry(entity_registry, entry.entry_id)
+
+    assert entities
+    assert not any(entity.domain == SWITCH_DOMAIN for entity in entities)
+
+
+async def test_screensaver(
+    hass: HomeAssistant,
+    mock_lametric: MagicMock,
+    entity_registry: er.EntityRegistry,
+) -> None:
+    """Test the LaMetric screensaver control."""
+    state = hass.states.get("switch.frenck_s_lametric_screensaver")
+    assert state
+    assert state.state == STATE_OFF
+
+    entry = entity_registry.async_get(state.entity_id)
+    assert entry
+    assert entry.entity_category is EntityCategory.CONFIG
+    assert entry.unique_id == "SA110405124500W00BS9-screensaver"
+
+    await hass.services.async_call(
+        SWITCH_DOMAIN,
+        SERVICE_TURN_ON,
+        {ATTR_ENTITY_ID: "switch.frenck_s_lametric_screensaver"},
+        blocking=True,
+    )
+
+    mock_lametric.display.assert_called_once_with(screensaver_enabled=True)
+
+    await hass.services.async_call(
+        SWITCH_DOMAIN,
+        SERVICE_TURN_OFF,
+        {ATTR_ENTITY_ID: "switch.frenck_s_lametric_screensaver"},
+        blocking=True,
+    )
+
+    mock_lametric.display.assert_called_with(screensaver_enabled=False)

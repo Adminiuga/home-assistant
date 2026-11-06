@@ -1,12 +1,24 @@
 """The tests for the manual Alarm Control Panel component."""
+
 from datetime import timedelta
 from unittest.mock import MagicMock, patch
 
 from freezegun import freeze_time
 import pytest
+from pytest_homeassistant.common import (
+    async_fire_time_changed,
+    mock_component,
+    mock_restore_cache,
+)
 
+from homeassistant.auth.models import User
 from homeassistant.components import alarm_control_panel
-from homeassistant.components.demo import alarm_control_panel as demo
+from homeassistant.components.alarm_control_panel import (
+    DOMAIN as ALARM_DOMAIN,
+    AlarmControlPanelEntityFeature,
+    AlarmControlPanelState,
+)
+from homeassistant.components.manual.const import ManualEntityStateAttribute
 from homeassistant.const import (
     ATTR_CODE,
     ATTR_ENTITY_ID,
@@ -15,45 +27,31 @@ from homeassistant.const import (
     SERVICE_ALARM_ARM_HOME,
     SERVICE_ALARM_ARM_NIGHT,
     SERVICE_ALARM_ARM_VACATION,
-    STATE_ALARM_ARMED_AWAY,
-    STATE_ALARM_ARMED_CUSTOM_BYPASS,
-    STATE_ALARM_ARMED_HOME,
-    STATE_ALARM_ARMED_NIGHT,
-    STATE_ALARM_ARMED_VACATION,
-    STATE_ALARM_ARMING,
-    STATE_ALARM_DISARMED,
-    STATE_ALARM_PENDING,
-    STATE_ALARM_TRIGGERED,
 )
-from homeassistant.core import CoreState, State
+from homeassistant.core import Context, CoreState, HomeAssistant, State, callback
+from homeassistant.exceptions import ServiceValidationError
 from homeassistant.setup import async_setup_component
-import homeassistant.util.dt as dt_util
+from homeassistant.util import dt as dt_util
 
-from tests.common import async_fire_time_changed, mock_component, mock_restore_cache
 from tests.components.alarm_control_panel import common
 
 CODE = "HELLO_CODE"
 
 
-async def test_setup_demo_platform(hass):
-    """Test setup."""
-    mock = MagicMock()
-    add_entities = mock.MagicMock()
-    await demo.async_setup_platform(hass, {}, add_entities)
-    assert add_entities.call_count == 1
-
-
 @pytest.mark.parametrize(
-    "service,expected_state",
+    ("service", "expected_state"),
     [
-        (SERVICE_ALARM_ARM_AWAY, STATE_ALARM_ARMED_AWAY),
-        (SERVICE_ALARM_ARM_CUSTOM_BYPASS, STATE_ALARM_ARMED_CUSTOM_BYPASS),
-        (SERVICE_ALARM_ARM_HOME, STATE_ALARM_ARMED_HOME),
-        (SERVICE_ALARM_ARM_NIGHT, STATE_ALARM_ARMED_NIGHT),
-        (SERVICE_ALARM_ARM_VACATION, STATE_ALARM_ARMED_VACATION),
+        (SERVICE_ALARM_ARM_AWAY, AlarmControlPanelState.ARMED_AWAY),
+        (
+            SERVICE_ALARM_ARM_CUSTOM_BYPASS,
+            AlarmControlPanelState.ARMED_CUSTOM_BYPASS,
+        ),
+        (SERVICE_ALARM_ARM_HOME, AlarmControlPanelState.ARMED_HOME),
+        (SERVICE_ALARM_ARM_NIGHT, AlarmControlPanelState.ARMED_NIGHT),
+        (SERVICE_ALARM_ARM_VACATION, AlarmControlPanelState.ARMED_VACATION),
     ],
 )
-async def test_no_pending(hass, service, expected_state):
+async def test_no_pending(hass: HomeAssistant, service, expected_state) -> None:
     """Test no pending after arming."""
     assert await async_setup_component(
         hass,
@@ -72,7 +70,7 @@ async def test_no_pending(hass, service, expected_state):
 
     entity_id = "alarm_control_panel.test"
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_DISARMED
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.DISARMED
 
     await hass.services.async_call(
         alarm_control_panel.DOMAIN,
@@ -85,16 +83,21 @@ async def test_no_pending(hass, service, expected_state):
 
 
 @pytest.mark.parametrize(
-    "service,expected_state",
+    ("service", "expected_state"),
     [
-        (SERVICE_ALARM_ARM_AWAY, STATE_ALARM_ARMED_AWAY),
-        (SERVICE_ALARM_ARM_CUSTOM_BYPASS, STATE_ALARM_ARMED_CUSTOM_BYPASS),
-        (SERVICE_ALARM_ARM_HOME, STATE_ALARM_ARMED_HOME),
-        (SERVICE_ALARM_ARM_NIGHT, STATE_ALARM_ARMED_NIGHT),
-        (SERVICE_ALARM_ARM_VACATION, STATE_ALARM_ARMED_VACATION),
+        (SERVICE_ALARM_ARM_AWAY, AlarmControlPanelState.ARMED_AWAY),
+        (
+            SERVICE_ALARM_ARM_CUSTOM_BYPASS,
+            AlarmControlPanelState.ARMED_CUSTOM_BYPASS,
+        ),
+        (SERVICE_ALARM_ARM_HOME, AlarmControlPanelState.ARMED_HOME),
+        (SERVICE_ALARM_ARM_NIGHT, AlarmControlPanelState.ARMED_NIGHT),
+        (SERVICE_ALARM_ARM_VACATION, AlarmControlPanelState.ARMED_VACATION),
     ],
 )
-async def test_no_pending_when_code_not_req(hass, service, expected_state):
+async def test_no_pending_when_code_not_req(
+    hass: HomeAssistant, service, expected_state
+) -> None:
     """Test no pending when code not required."""
     assert await async_setup_component(
         hass,
@@ -114,7 +117,7 @@ async def test_no_pending_when_code_not_req(hass, service, expected_state):
 
     entity_id = "alarm_control_panel.test"
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_DISARMED
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.DISARMED
 
     await hass.services.async_call(
         alarm_control_panel.DOMAIN,
@@ -127,16 +130,19 @@ async def test_no_pending_when_code_not_req(hass, service, expected_state):
 
 
 @pytest.mark.parametrize(
-    "service,expected_state",
+    ("service", "expected_state"),
     [
-        (SERVICE_ALARM_ARM_AWAY, STATE_ALARM_ARMED_AWAY),
-        (SERVICE_ALARM_ARM_CUSTOM_BYPASS, STATE_ALARM_ARMED_CUSTOM_BYPASS),
-        (SERVICE_ALARM_ARM_HOME, STATE_ALARM_ARMED_HOME),
-        (SERVICE_ALARM_ARM_NIGHT, STATE_ALARM_ARMED_NIGHT),
-        (SERVICE_ALARM_ARM_VACATION, STATE_ALARM_ARMED_VACATION),
+        (SERVICE_ALARM_ARM_AWAY, AlarmControlPanelState.ARMED_AWAY),
+        (
+            SERVICE_ALARM_ARM_CUSTOM_BYPASS,
+            AlarmControlPanelState.ARMED_CUSTOM_BYPASS,
+        ),
+        (SERVICE_ALARM_ARM_HOME, AlarmControlPanelState.ARMED_HOME),
+        (SERVICE_ALARM_ARM_NIGHT, AlarmControlPanelState.ARMED_NIGHT),
+        (SERVICE_ALARM_ARM_VACATION, AlarmControlPanelState.ARMED_VACATION),
     ],
 )
-async def test_with_pending(hass, service, expected_state):
+async def test_with_pending(hass: HomeAssistant, service, expected_state) -> None:
     """Test with pending after arming."""
     assert await async_setup_component(
         hass,
@@ -155,7 +161,7 @@ async def test_with_pending(hass, service, expected_state):
 
     entity_id = "alarm_control_panel.test"
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_DISARMED
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.DISARMED
 
     await hass.services.async_call(
         alarm_control_panel.DOMAIN,
@@ -164,14 +170,14 @@ async def test_with_pending(hass, service, expected_state):
         blocking=True,
     )
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_ARMING
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.ARMING
 
     state = hass.states.get(entity_id)
-    assert state.attributes["next_state"] == expected_state
+    assert state.attributes[ManualEntityStateAttribute.NEXT_STATE] == expected_state
 
     future = dt_util.utcnow() + timedelta(seconds=1)
     with patch(
-        ("homeassistant.components.manual.alarm_control_panel.dt_util.utcnow"),
+        "homeassistant.components.manual.alarm_control_panel.dt_util.utcnow",
         return_value=future,
     ):
         async_fire_time_changed(hass, future)
@@ -192,16 +198,19 @@ async def test_with_pending(hass, service, expected_state):
 
 
 @pytest.mark.parametrize(
-    "service,expected_state",
+    ("service", "expected_state"),
     [
-        (SERVICE_ALARM_ARM_AWAY, STATE_ALARM_ARMED_AWAY),
-        (SERVICE_ALARM_ARM_CUSTOM_BYPASS, STATE_ALARM_ARMED_CUSTOM_BYPASS),
-        (SERVICE_ALARM_ARM_HOME, STATE_ALARM_ARMED_HOME),
-        (SERVICE_ALARM_ARM_NIGHT, STATE_ALARM_ARMED_NIGHT),
-        (SERVICE_ALARM_ARM_VACATION, STATE_ALARM_ARMED_VACATION),
+        (SERVICE_ALARM_ARM_AWAY, AlarmControlPanelState.ARMED_AWAY),
+        (
+            SERVICE_ALARM_ARM_CUSTOM_BYPASS,
+            AlarmControlPanelState.ARMED_CUSTOM_BYPASS,
+        ),
+        (SERVICE_ALARM_ARM_HOME, AlarmControlPanelState.ARMED_HOME),
+        (SERVICE_ALARM_ARM_NIGHT, AlarmControlPanelState.ARMED_NIGHT),
+        (SERVICE_ALARM_ARM_VACATION, AlarmControlPanelState.ARMED_VACATION),
     ],
 )
-async def test_with_invalid_code(hass, service, expected_state):
+async def test_with_invalid_code(hass: HomeAssistant, service, expected_state) -> None:
     """Attempt to arm without a valid code."""
     assert await async_setup_component(
         hass,
@@ -220,29 +229,37 @@ async def test_with_invalid_code(hass, service, expected_state):
 
     entity_id = "alarm_control_panel.test"
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_DISARMED
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.DISARMED
 
-    await hass.services.async_call(
-        alarm_control_panel.DOMAIN,
-        service,
-        {ATTR_ENTITY_ID: "alarm_control_panel.test", ATTR_CODE: CODE + "2"},
-        blocking=True,
-    )
+    with pytest.raises(ServiceValidationError) as err:
+        await hass.services.async_call(
+            alarm_control_panel.DOMAIN,
+            service,
+            {
+                ATTR_ENTITY_ID: "alarm_control_panel.test",
+                ATTR_CODE: f"{CODE}2",
+            },
+            blocking=True,
+        )
+    assert err.value.translation_key == "invalid_code"
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_DISARMED
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.DISARMED
 
 
 @pytest.mark.parametrize(
-    "service,expected_state",
+    ("service", "expected_state"),
     [
-        (SERVICE_ALARM_ARM_AWAY, STATE_ALARM_ARMED_AWAY),
-        (SERVICE_ALARM_ARM_CUSTOM_BYPASS, STATE_ALARM_ARMED_CUSTOM_BYPASS),
-        (SERVICE_ALARM_ARM_HOME, STATE_ALARM_ARMED_HOME),
-        (SERVICE_ALARM_ARM_NIGHT, STATE_ALARM_ARMED_NIGHT),
-        (SERVICE_ALARM_ARM_VACATION, STATE_ALARM_ARMED_VACATION),
+        (SERVICE_ALARM_ARM_AWAY, AlarmControlPanelState.ARMED_AWAY),
+        (
+            SERVICE_ALARM_ARM_CUSTOM_BYPASS,
+            AlarmControlPanelState.ARMED_CUSTOM_BYPASS,
+        ),
+        (SERVICE_ALARM_ARM_HOME, AlarmControlPanelState.ARMED_HOME),
+        (SERVICE_ALARM_ARM_NIGHT, AlarmControlPanelState.ARMED_NIGHT),
+        (SERVICE_ALARM_ARM_VACATION, AlarmControlPanelState.ARMED_VACATION),
     ],
 )
-async def test_with_template_code(hass, service, expected_state):
+async def test_with_template_code(hass: HomeAssistant, service, expected_state) -> None:
     """Attempt to arm with a template-based code."""
     assert await async_setup_component(
         hass,
@@ -261,7 +278,7 @@ async def test_with_template_code(hass, service, expected_state):
 
     entity_id = "alarm_control_panel.test"
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_DISARMED
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.DISARMED
 
     await hass.services.async_call(
         alarm_control_panel.DOMAIN,
@@ -275,16 +292,21 @@ async def test_with_template_code(hass, service, expected_state):
 
 
 @pytest.mark.parametrize(
-    "service,expected_state,",
+    ("service", "expected_state"),
     [
-        (SERVICE_ALARM_ARM_AWAY, STATE_ALARM_ARMED_AWAY),
-        (SERVICE_ALARM_ARM_CUSTOM_BYPASS, STATE_ALARM_ARMED_CUSTOM_BYPASS),
-        (SERVICE_ALARM_ARM_HOME, STATE_ALARM_ARMED_HOME),
-        (SERVICE_ALARM_ARM_NIGHT, STATE_ALARM_ARMED_NIGHT),
-        (SERVICE_ALARM_ARM_VACATION, STATE_ALARM_ARMED_VACATION),
+        (SERVICE_ALARM_ARM_AWAY, AlarmControlPanelState.ARMED_AWAY),
+        (
+            SERVICE_ALARM_ARM_CUSTOM_BYPASS,
+            AlarmControlPanelState.ARMED_CUSTOM_BYPASS,
+        ),
+        (SERVICE_ALARM_ARM_HOME, AlarmControlPanelState.ARMED_HOME),
+        (SERVICE_ALARM_ARM_NIGHT, AlarmControlPanelState.ARMED_NIGHT),
+        (SERVICE_ALARM_ARM_VACATION, AlarmControlPanelState.ARMED_VACATION),
     ],
 )
-async def test_with_specific_pending(hass, service, expected_state):
+async def test_with_specific_pending(
+    hass: HomeAssistant, service, expected_state
+) -> None:
     """Test arming with specific pending."""
     assert await async_setup_component(
         hass,
@@ -305,15 +327,15 @@ async def test_with_specific_pending(hass, service, expected_state):
     await hass.services.async_call(
         alarm_control_panel.DOMAIN,
         service,
-        {ATTR_ENTITY_ID: "alarm_control_panel.test"},
+        {ATTR_ENTITY_ID: "alarm_control_panel.test", ATTR_CODE: "1234"},
         blocking=True,
     )
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_ARMING
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.ARMING
 
     future = dt_util.utcnow() + timedelta(seconds=2)
     with patch(
-        ("homeassistant.components.manual.alarm_control_panel.dt_util.utcnow"),
+        "homeassistant.components.manual.alarm_control_panel.dt_util.utcnow",
         return_value=future,
     ):
         async_fire_time_changed(hass, future)
@@ -322,7 +344,7 @@ async def test_with_specific_pending(hass, service, expected_state):
     assert hass.states.get(entity_id).state == expected_state
 
 
-async def test_trigger_no_pending(hass):
+async def test_trigger_no_pending(hass: HomeAssistant) -> None:
     """Test triggering when no pending submitted method."""
     assert await async_setup_component(
         hass,
@@ -340,24 +362,29 @@ async def test_trigger_no_pending(hass):
 
     entity_id = "alarm_control_panel.test"
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_DISARMED
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.DISARMED
 
     await common.async_alarm_trigger(hass, entity_id=entity_id)
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_PENDING
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.PENDING
 
     future = dt_util.utcnow() + timedelta(seconds=60)
     with patch(
-        ("homeassistant.components.manual.alarm_control_panel.dt_util.utcnow"),
+        "homeassistant.components.manual.alarm_control_panel.dt_util.utcnow",
         return_value=future,
     ):
         async_fire_time_changed(hass, future)
         await hass.async_block_till_done()
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_TRIGGERED
+    state = hass.states.get(entity_id)
+    assert (
+        state.attributes[ManualEntityStateAttribute.PREVIOUS_STATE]
+        == AlarmControlPanelState.DISARMED
+    )
+    assert state.state == AlarmControlPanelState.TRIGGERED
 
 
-async def test_trigger_with_delay(hass):
+async def test_trigger_with_delay(hass: HomeAssistant) -> None:
     """Test trigger method and switch from pending to triggered."""
     assert await async_setup_component(
         hass,
@@ -377,31 +404,38 @@ async def test_trigger_with_delay(hass):
 
     entity_id = "alarm_control_panel.test"
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_DISARMED
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.DISARMED
 
     await common.async_alarm_arm_away(hass, CODE)
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_ARMED_AWAY
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.ARMED_AWAY
 
     await common.async_alarm_trigger(hass, entity_id=entity_id)
 
     state = hass.states.get(entity_id)
-    assert state.state == STATE_ALARM_PENDING
-    assert state.attributes["next_state"] == STATE_ALARM_TRIGGERED
+    assert state.state == AlarmControlPanelState.PENDING
+    assert (
+        state.attributes[ManualEntityStateAttribute.NEXT_STATE]
+        == AlarmControlPanelState.TRIGGERED
+    )
 
     future = dt_util.utcnow() + timedelta(seconds=1)
     with patch(
-        ("homeassistant.components.manual.alarm_control_panel.dt_util.utcnow"),
+        "homeassistant.components.manual.alarm_control_panel.dt_util.utcnow",
         return_value=future,
     ):
         async_fire_time_changed(hass, future)
         await hass.async_block_till_done()
 
     state = hass.states.get(entity_id)
-    assert state.state == STATE_ALARM_TRIGGERED
+    assert (
+        state.attributes[ManualEntityStateAttribute.PREVIOUS_STATE]
+        == AlarmControlPanelState.ARMED_AWAY
+    )
+    assert state.state == AlarmControlPanelState.TRIGGERED
 
 
-async def test_trigger_zero_trigger_time(hass):
+async def test_trigger_zero_trigger_time(hass: HomeAssistant) -> None:
     """Test disabled trigger."""
     assert await async_setup_component(
         hass,
@@ -420,14 +454,14 @@ async def test_trigger_zero_trigger_time(hass):
 
     entity_id = "alarm_control_panel.test"
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_DISARMED
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.DISARMED
 
     await common.async_alarm_trigger(hass)
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_DISARMED
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.DISARMED
 
 
-async def test_trigger_zero_trigger_time_with_pending(hass):
+async def test_trigger_zero_trigger_time_with_pending(hass: HomeAssistant) -> None:
     """Test disabled trigger."""
     assert await async_setup_component(
         hass,
@@ -446,14 +480,14 @@ async def test_trigger_zero_trigger_time_with_pending(hass):
 
     entity_id = "alarm_control_panel.test"
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_DISARMED
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.DISARMED
 
     await common.async_alarm_trigger(hass)
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_DISARMED
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.DISARMED
 
 
-async def test_trigger_with_pending(hass):
+async def test_trigger_with_pending(hass: HomeAssistant) -> None:
     """Test arm home method."""
     assert await async_setup_component(
         hass,
@@ -472,39 +506,46 @@ async def test_trigger_with_pending(hass):
 
     entity_id = "alarm_control_panel.test"
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_DISARMED
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.DISARMED
 
     await common.async_alarm_trigger(hass)
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_PENDING
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.PENDING
 
     state = hass.states.get(entity_id)
-    assert state.attributes["next_state"] == STATE_ALARM_TRIGGERED
+    assert (
+        state.attributes[ManualEntityStateAttribute.NEXT_STATE]
+        == AlarmControlPanelState.TRIGGERED
+    )
 
     future = dt_util.utcnow() + timedelta(seconds=2)
     with patch(
-        ("homeassistant.components.manual.alarm_control_panel.dt_util.utcnow"),
+        "homeassistant.components.manual.alarm_control_panel.dt_util.utcnow",
         return_value=future,
     ):
         async_fire_time_changed(hass, future)
         await hass.async_block_till_done()
 
     state = hass.states.get(entity_id)
-    assert state.state == STATE_ALARM_TRIGGERED
+    assert (
+        state.attributes[ManualEntityStateAttribute.PREVIOUS_STATE]
+        == AlarmControlPanelState.DISARMED
+    )
+    assert state.state == AlarmControlPanelState.TRIGGERED
 
     future = dt_util.utcnow() + timedelta(seconds=5)
     with patch(
-        ("homeassistant.components.manual.alarm_control_panel.dt_util.utcnow"),
+        "homeassistant.components.manual.alarm_control_panel.dt_util.utcnow",
         return_value=future,
     ):
         async_fire_time_changed(hass, future)
         await hass.async_block_till_done()
 
     state = hass.states.get(entity_id)
-    assert state.state == STATE_ALARM_DISARMED
+    assert state.state == AlarmControlPanelState.DISARMED
 
 
-async def test_trigger_with_unused_specific_delay(hass):
+async def test_trigger_with_unused_specific_delay(hass: HomeAssistant) -> None:
     """Test trigger method and switch from pending to triggered."""
     assert await async_setup_component(
         hass,
@@ -525,31 +566,38 @@ async def test_trigger_with_unused_specific_delay(hass):
 
     entity_id = "alarm_control_panel.test"
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_DISARMED
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.DISARMED
 
     await common.async_alarm_arm_away(hass, CODE)
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_ARMED_AWAY
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.ARMED_AWAY
 
     await common.async_alarm_trigger(hass, entity_id=entity_id)
 
     state = hass.states.get(entity_id)
-    assert state.state == STATE_ALARM_PENDING
-    assert state.attributes["next_state"] == STATE_ALARM_TRIGGERED
+    assert state.state == AlarmControlPanelState.PENDING
+    assert (
+        state.attributes[ManualEntityStateAttribute.NEXT_STATE]
+        == AlarmControlPanelState.TRIGGERED
+    )
 
     future = dt_util.utcnow() + timedelta(seconds=5)
     with patch(
-        ("homeassistant.components.manual.alarm_control_panel.dt_util.utcnow"),
+        "homeassistant.components.manual.alarm_control_panel.dt_util.utcnow",
         return_value=future,
     ):
         async_fire_time_changed(hass, future)
         await hass.async_block_till_done()
 
     state = hass.states.get(entity_id)
-    assert state.state == STATE_ALARM_TRIGGERED
+    assert (
+        state.attributes[ManualEntityStateAttribute.PREVIOUS_STATE]
+        == AlarmControlPanelState.ARMED_AWAY
+    )
+    assert state.state == AlarmControlPanelState.TRIGGERED
 
 
-async def test_trigger_with_specific_delay(hass):
+async def test_trigger_with_specific_delay(hass: HomeAssistant) -> None:
     """Test trigger method and switch from pending to triggered."""
     assert await async_setup_component(
         hass,
@@ -570,31 +618,38 @@ async def test_trigger_with_specific_delay(hass):
 
     entity_id = "alarm_control_panel.test"
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_DISARMED
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.DISARMED
 
     await common.async_alarm_arm_away(hass, CODE)
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_ARMED_AWAY
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.ARMED_AWAY
 
     await common.async_alarm_trigger(hass, entity_id=entity_id)
 
     state = hass.states.get(entity_id)
-    assert state.state == STATE_ALARM_PENDING
-    assert state.attributes["next_state"] == STATE_ALARM_TRIGGERED
+    assert state.state == AlarmControlPanelState.PENDING
+    assert (
+        state.attributes[ManualEntityStateAttribute.NEXT_STATE]
+        == AlarmControlPanelState.TRIGGERED
+    )
 
     future = dt_util.utcnow() + timedelta(seconds=1)
     with patch(
-        ("homeassistant.components.manual.alarm_control_panel.dt_util.utcnow"),
+        "homeassistant.components.manual.alarm_control_panel.dt_util.utcnow",
         return_value=future,
     ):
         async_fire_time_changed(hass, future)
         await hass.async_block_till_done()
 
     state = hass.states.get(entity_id)
-    assert state.state == STATE_ALARM_TRIGGERED
+    assert (
+        state.attributes[ManualEntityStateAttribute.PREVIOUS_STATE]
+        == AlarmControlPanelState.ARMED_AWAY
+    )
+    assert state.state == AlarmControlPanelState.TRIGGERED
 
 
-async def test_trigger_with_pending_and_delay(hass):
+async def test_trigger_with_pending_and_delay(hass: HomeAssistant) -> None:
     """Test trigger method and switch from pending to triggered."""
     assert await async_setup_component(
         hass,
@@ -614,43 +669,53 @@ async def test_trigger_with_pending_and_delay(hass):
 
     entity_id = "alarm_control_panel.test"
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_DISARMED
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.DISARMED
 
     await common.async_alarm_arm_away(hass, CODE)
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_ARMED_AWAY
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.ARMED_AWAY
 
     await common.async_alarm_trigger(hass, entity_id=entity_id)
 
     state = hass.states.get(entity_id)
-    assert state.state == STATE_ALARM_PENDING
-    assert state.attributes["next_state"] == STATE_ALARM_TRIGGERED
+    assert state.state == AlarmControlPanelState.PENDING
+    assert (
+        state.attributes[ManualEntityStateAttribute.NEXT_STATE]
+        == AlarmControlPanelState.TRIGGERED
+    )
 
     future = dt_util.utcnow() + timedelta(seconds=1)
     with patch(
-        ("homeassistant.components.manual.alarm_control_panel.dt_util.utcnow"),
+        "homeassistant.components.manual.alarm_control_panel.dt_util.utcnow",
         return_value=future,
     ):
         async_fire_time_changed(hass, future)
         await hass.async_block_till_done()
 
     state = hass.states.get(entity_id)
-    assert state.state == STATE_ALARM_PENDING
-    assert state.attributes["next_state"] == STATE_ALARM_TRIGGERED
+    assert state.state == AlarmControlPanelState.PENDING
+    assert (
+        state.attributes[ManualEntityStateAttribute.NEXT_STATE]
+        == AlarmControlPanelState.TRIGGERED
+    )
 
     future += timedelta(seconds=1)
     with patch(
-        ("homeassistant.components.manual.alarm_control_panel.dt_util.utcnow"),
+        "homeassistant.components.manual.alarm_control_panel.dt_util.utcnow",
         return_value=future,
     ):
         async_fire_time_changed(hass, future)
         await hass.async_block_till_done()
 
     state = hass.states.get(entity_id)
-    assert state.state == STATE_ALARM_TRIGGERED
+    assert (
+        state.attributes[ManualEntityStateAttribute.PREVIOUS_STATE]
+        == AlarmControlPanelState.ARMED_AWAY
+    )
+    assert state.state == AlarmControlPanelState.TRIGGERED
 
 
-async def test_trigger_with_pending_and_specific_delay(hass):
+async def test_trigger_with_pending_and_specific_delay(hass: HomeAssistant) -> None:
     """Test trigger method and switch from pending to triggered."""
     assert await async_setup_component(
         hass,
@@ -671,43 +736,53 @@ async def test_trigger_with_pending_and_specific_delay(hass):
 
     entity_id = "alarm_control_panel.test"
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_DISARMED
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.DISARMED
 
     await common.async_alarm_arm_away(hass, CODE)
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_ARMED_AWAY
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.ARMED_AWAY
 
     await common.async_alarm_trigger(hass, entity_id=entity_id)
 
     state = hass.states.get(entity_id)
-    assert state.state == STATE_ALARM_PENDING
-    assert state.attributes["next_state"] == STATE_ALARM_TRIGGERED
+    assert state.state == AlarmControlPanelState.PENDING
+    assert (
+        state.attributes[ManualEntityStateAttribute.NEXT_STATE]
+        == AlarmControlPanelState.TRIGGERED
+    )
 
     future = dt_util.utcnow() + timedelta(seconds=1)
     with patch(
-        ("homeassistant.components.manual.alarm_control_panel.dt_util.utcnow"),
+        "homeassistant.components.manual.alarm_control_panel.dt_util.utcnow",
         return_value=future,
     ):
         async_fire_time_changed(hass, future)
         await hass.async_block_till_done()
 
     state = hass.states.get(entity_id)
-    assert state.state == STATE_ALARM_PENDING
-    assert state.attributes["next_state"] == STATE_ALARM_TRIGGERED
+    assert state.state == AlarmControlPanelState.PENDING
+    assert (
+        state.attributes[ManualEntityStateAttribute.NEXT_STATE]
+        == AlarmControlPanelState.TRIGGERED
+    )
 
     future += timedelta(seconds=1)
     with patch(
-        ("homeassistant.components.manual.alarm_control_panel.dt_util.utcnow"),
+        "homeassistant.components.manual.alarm_control_panel.dt_util.utcnow",
         return_value=future,
     ):
         async_fire_time_changed(hass, future)
         await hass.async_block_till_done()
 
     state = hass.states.get(entity_id)
-    assert state.state == STATE_ALARM_TRIGGERED
+    assert (
+        state.attributes[ManualEntityStateAttribute.PREVIOUS_STATE]
+        == AlarmControlPanelState.ARMED_AWAY
+    )
+    assert state.state == AlarmControlPanelState.TRIGGERED
 
 
-async def test_trigger_with_specific_pending(hass):
+async def test_trigger_with_specific_pending(hass: HomeAssistant) -> None:
     """Test arm home method."""
     assert await async_setup_component(
         hass,
@@ -729,30 +804,35 @@ async def test_trigger_with_specific_pending(hass):
 
     await common.async_alarm_trigger(hass)
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_PENDING
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.PENDING
 
     future = dt_util.utcnow() + timedelta(seconds=2)
     with patch(
-        ("homeassistant.components.manual.alarm_control_panel.dt_util.utcnow"),
+        "homeassistant.components.manual.alarm_control_panel.dt_util.utcnow",
         return_value=future,
     ):
         async_fire_time_changed(hass, future)
         await hass.async_block_till_done()
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_TRIGGERED
+    state = hass.states.get(entity_id)
+    assert (
+        state.attributes[ManualEntityStateAttribute.PREVIOUS_STATE]
+        == AlarmControlPanelState.DISARMED
+    )
+    assert state.state == AlarmControlPanelState.TRIGGERED
 
     future = dt_util.utcnow() + timedelta(seconds=5)
     with patch(
-        ("homeassistant.components.manual.alarm_control_panel.dt_util.utcnow"),
+        "homeassistant.components.manual.alarm_control_panel.dt_util.utcnow",
         return_value=future,
     ):
         async_fire_time_changed(hass, future)
         await hass.async_block_till_done()
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_DISARMED
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.DISARMED
 
 
-async def test_trigger_with_disarm_after_trigger(hass):
+async def test_trigger_with_disarm_after_trigger(hass: HomeAssistant) -> None:
     """Test disarm after trigger."""
     assert await async_setup_component(
         hass,
@@ -771,24 +851,29 @@ async def test_trigger_with_disarm_after_trigger(hass):
 
     entity_id = "alarm_control_panel.test"
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_DISARMED
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.DISARMED
 
     await common.async_alarm_trigger(hass, entity_id=entity_id)
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_TRIGGERED
+    state = hass.states.get(entity_id)
+    assert (
+        state.attributes[ManualEntityStateAttribute.PREVIOUS_STATE]
+        == AlarmControlPanelState.DISARMED
+    )
+    assert state.state == AlarmControlPanelState.TRIGGERED
 
     future = dt_util.utcnow() + timedelta(seconds=5)
     with patch(
-        ("homeassistant.components.manual.alarm_control_panel.dt_util.utcnow"),
+        "homeassistant.components.manual.alarm_control_panel.dt_util.utcnow",
         return_value=future,
     ):
         async_fire_time_changed(hass, future)
         await hass.async_block_till_done()
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_DISARMED
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.DISARMED
 
 
-async def test_trigger_with_zero_specific_trigger_time(hass):
+async def test_trigger_with_zero_specific_trigger_time(hass: HomeAssistant) -> None:
     """Test trigger method."""
     assert await async_setup_component(
         hass,
@@ -808,14 +893,16 @@ async def test_trigger_with_zero_specific_trigger_time(hass):
 
     entity_id = "alarm_control_panel.test"
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_DISARMED
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.DISARMED
 
     await common.async_alarm_trigger(hass, entity_id=entity_id)
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_DISARMED
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.DISARMED
 
 
-async def test_trigger_with_unused_zero_specific_trigger_time(hass):
+async def test_trigger_with_unused_zero_specific_trigger_time(
+    hass: HomeAssistant,
+) -> None:
     """Test disarm after trigger."""
     assert await async_setup_component(
         hass,
@@ -835,24 +922,29 @@ async def test_trigger_with_unused_zero_specific_trigger_time(hass):
 
     entity_id = "alarm_control_panel.test"
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_DISARMED
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.DISARMED
 
     await common.async_alarm_trigger(hass, entity_id=entity_id)
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_TRIGGERED
+    state = hass.states.get(entity_id)
+    assert (
+        state.attributes[ManualEntityStateAttribute.PREVIOUS_STATE]
+        == AlarmControlPanelState.DISARMED
+    )
+    assert state.state == AlarmControlPanelState.TRIGGERED
 
     future = dt_util.utcnow() + timedelta(seconds=5)
     with patch(
-        ("homeassistant.components.manual.alarm_control_panel.dt_util.utcnow"),
+        "homeassistant.components.manual.alarm_control_panel.dt_util.utcnow",
         return_value=future,
     ):
         async_fire_time_changed(hass, future)
         await hass.async_block_till_done()
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_DISARMED
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.DISARMED
 
 
-async def test_trigger_with_specific_trigger_time(hass):
+async def test_trigger_with_specific_trigger_time(hass: HomeAssistant) -> None:
     """Test disarm after trigger."""
     assert await async_setup_component(
         hass,
@@ -871,24 +963,29 @@ async def test_trigger_with_specific_trigger_time(hass):
 
     entity_id = "alarm_control_panel.test"
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_DISARMED
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.DISARMED
 
     await common.async_alarm_trigger(hass, entity_id=entity_id)
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_TRIGGERED
+    state = hass.states.get(entity_id)
+    assert (
+        state.attributes[ManualEntityStateAttribute.PREVIOUS_STATE]
+        == AlarmControlPanelState.DISARMED
+    )
+    assert state.state == AlarmControlPanelState.TRIGGERED
 
     future = dt_util.utcnow() + timedelta(seconds=5)
     with patch(
-        ("homeassistant.components.manual.alarm_control_panel.dt_util.utcnow"),
+        "homeassistant.components.manual.alarm_control_panel.dt_util.utcnow",
         return_value=future,
     ):
         async_fire_time_changed(hass, future)
         await hass.async_block_till_done()
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_DISARMED
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.DISARMED
 
 
-async def test_trigger_with_no_disarm_after_trigger(hass):
+async def test_trigger_with_no_disarm_after_trigger(hass: HomeAssistant) -> None:
     """Test disarm after trigger."""
     assert await async_setup_component(
         hass,
@@ -908,28 +1005,35 @@ async def test_trigger_with_no_disarm_after_trigger(hass):
 
     entity_id = "alarm_control_panel.test"
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_DISARMED
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.DISARMED
 
     await common.async_alarm_arm_away(hass, CODE, entity_id)
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_ARMED_AWAY
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.ARMED_AWAY
 
     await common.async_alarm_trigger(hass, entity_id=entity_id)
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_TRIGGERED
+    state = hass.states.get(entity_id)
+    assert (
+        state.attributes[ManualEntityStateAttribute.PREVIOUS_STATE]
+        == AlarmControlPanelState.ARMED_AWAY
+    )
+    assert state.state == AlarmControlPanelState.TRIGGERED
 
     future = dt_util.utcnow() + timedelta(seconds=5)
     with patch(
-        ("homeassistant.components.manual.alarm_control_panel.dt_util.utcnow"),
+        "homeassistant.components.manual.alarm_control_panel.dt_util.utcnow",
         return_value=future,
     ):
         async_fire_time_changed(hass, future)
         await hass.async_block_till_done()
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_ARMED_AWAY
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.ARMED_AWAY
 
 
-async def test_back_to_back_trigger_with_no_disarm_after_trigger(hass):
+async def test_back_to_back_trigger_with_no_disarm_after_trigger(
+    hass: HomeAssistant,
+) -> None:
     """Test disarm after trigger."""
     assert await async_setup_component(
         hass,
@@ -949,42 +1053,52 @@ async def test_back_to_back_trigger_with_no_disarm_after_trigger(hass):
 
     entity_id = "alarm_control_panel.test"
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_DISARMED
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.DISARMED
 
     await common.async_alarm_arm_away(hass, CODE, entity_id)
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_ARMED_AWAY
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.ARMED_AWAY
 
     await common.async_alarm_trigger(hass, entity_id=entity_id)
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_TRIGGERED
+    state = hass.states.get(entity_id)
+    assert (
+        state.attributes[ManualEntityStateAttribute.PREVIOUS_STATE]
+        == AlarmControlPanelState.ARMED_AWAY
+    )
+    assert state.state == AlarmControlPanelState.TRIGGERED
 
     future = dt_util.utcnow() + timedelta(seconds=5)
     with patch(
-        ("homeassistant.components.manual.alarm_control_panel.dt_util.utcnow"),
+        "homeassistant.components.manual.alarm_control_panel.dt_util.utcnow",
         return_value=future,
     ):
         async_fire_time_changed(hass, future)
         await hass.async_block_till_done()
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_ARMED_AWAY
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.ARMED_AWAY
 
     await common.async_alarm_trigger(hass, entity_id=entity_id)
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_TRIGGERED
+    state = hass.states.get(entity_id)
+    assert (
+        state.attributes[ManualEntityStateAttribute.PREVIOUS_STATE]
+        == AlarmControlPanelState.ARMED_AWAY
+    )
+    assert state.state == AlarmControlPanelState.TRIGGERED
 
     future = dt_util.utcnow() + timedelta(seconds=5)
     with patch(
-        ("homeassistant.components.manual.alarm_control_panel.dt_util.utcnow"),
+        "homeassistant.components.manual.alarm_control_panel.dt_util.utcnow",
         return_value=future,
     ):
         async_fire_time_changed(hass, future)
         await hass.async_block_till_done()
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_ARMED_AWAY
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.ARMED_AWAY
 
 
-async def test_disarm_while_pending_trigger(hass):
+async def test_disarm_while_pending_trigger(hass: HomeAssistant) -> None:
     """Test disarming while pending state."""
     assert await async_setup_component(
         hass,
@@ -1002,28 +1116,28 @@ async def test_disarm_while_pending_trigger(hass):
 
     entity_id = "alarm_control_panel.test"
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_DISARMED
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.DISARMED
 
     await common.async_alarm_trigger(hass)
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_PENDING
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.PENDING
 
     await common.async_alarm_disarm(hass, entity_id=entity_id)
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_DISARMED
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.DISARMED
 
     future = dt_util.utcnow() + timedelta(seconds=5)
     with patch(
-        ("homeassistant.components.manual.alarm_control_panel.dt_util.utcnow"),
+        "homeassistant.components.manual.alarm_control_panel.dt_util.utcnow",
         return_value=future,
     ):
         async_fire_time_changed(hass, future)
         await hass.async_block_till_done()
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_DISARMED
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.DISARMED
 
 
-async def test_disarm_during_trigger_with_invalid_code(hass):
+async def test_disarm_during_trigger_with_invalid_code(hass: HomeAssistant) -> None:
     """Test disarming while code is invalid."""
     assert await async_setup_component(
         hass,
@@ -1033,7 +1147,7 @@ async def test_disarm_during_trigger_with_invalid_code(hass):
                 "platform": "manual",
                 "name": "test",
                 "delay_time": 5,
-                "code": CODE + "2",
+                "code": "12345",
                 "disarm_after_trigger": False,
             }
         },
@@ -1042,28 +1156,113 @@ async def test_disarm_during_trigger_with_invalid_code(hass):
 
     entity_id = "alarm_control_panel.test"
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_DISARMED
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.DISARMED
+    assert (
+        hass.states.get(entity_id).attributes[alarm_control_panel.ATTR_CODE_FORMAT]
+        == alarm_control_panel.CodeFormat.NUMBER
+    )
 
     await common.async_alarm_trigger(hass)
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_PENDING
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.PENDING
 
-    await common.async_alarm_disarm(hass, entity_id=entity_id)
+    with pytest.raises(ServiceValidationError) as err:
+        await common.async_alarm_disarm(hass, entity_id=entity_id)
+    assert err.value.translation_key == "invalid_code"
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_PENDING
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.PENDING
 
     future = dt_util.utcnow() + timedelta(seconds=5)
     with patch(
-        ("homeassistant.components.manual.alarm_control_panel.dt_util.utcnow"),
+        "homeassistant.components.manual.alarm_control_panel.dt_util.utcnow",
         return_value=future,
     ):
         async_fire_time_changed(hass, future)
         await hass.async_block_till_done()
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_TRIGGERED
+    state = hass.states.get(entity_id)
+    assert (
+        state.attributes[ManualEntityStateAttribute.PREVIOUS_STATE]
+        == AlarmControlPanelState.DISARMED
+    )
+    assert state.state == AlarmControlPanelState.TRIGGERED
 
 
-async def test_disarm_with_template_code(hass):
+async def test_bad_code_attempt_event_fired(hass: HomeAssistant) -> None:
+    """Test that manual_alarm_bad_code_attempt event is fired on bad code."""
+
+    entity_id = "alarm_control_panel.test_alarm"
+    config = {
+        ALARM_DOMAIN: {
+            "platform": "manual",
+            "name": "Test Alarm",
+            "code": "1234",
+            "delay_time": 0,
+            "arming_time": 0,
+            "trigger_time": 0,
+        }
+    }
+    assert await async_setup_component(hass, ALARM_DOMAIN, config)
+    await hass.async_block_till_done()
+
+    alarm_entity = hass.states.get(entity_id)
+    assert alarm_entity is not None
+
+    await hass.services.async_call(
+        ALARM_DOMAIN,
+        "alarm_arm_away",
+        {"entity_id": entity_id, "code": "1234"},
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.ARMED_AWAY
+
+    bad_code = "0000"
+
+    mock_user_id = "test_user_id_123"
+    test_context = Context(user_id=mock_user_id)
+
+    events = []
+
+    @callback
+    def event_listener(event):
+        events.append(event.data)
+
+    hass.bus.async_listen("manual_alarm_bad_code_attempt", event_listener)
+
+    await hass.services.async_call(
+        ALARM_DOMAIN,
+        "alarm_disarm",
+        {"entity_id": entity_id, "code": "1234"},
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+
+    assert len(events) == 0
+
+    with patch("homeassistant.auth.AuthManager.async_get_user") as mock_get_user:
+        mock_user = MagicMock(spec=User)
+        mock_user.id = mock_user_id
+        mock_get_user.return_value = mock_user
+
+        with pytest.raises(ServiceValidationError):
+            await hass.services.async_call(
+                ALARM_DOMAIN,
+                "alarm_disarm",
+                {"entity_id": entity_id, "code": bad_code},
+                blocking=True,
+                context=test_context,
+            )
+
+    await hass.async_block_till_done()
+
+    assert len(events) == 1
+    assert events[0].get("entity_id") == entity_id
+    assert events[0].get("target_state") == AlarmControlPanelState.DISARMED
+    assert events[0].get("user_id") == mock_user_id
+
+
+async def test_disarm_with_template_code(hass: HomeAssistant) -> None:
     """Attempt to disarm with a valid or invalid template-based code."""
     assert await async_setup_component(
         hass,
@@ -1082,25 +1281,27 @@ async def test_disarm_with_template_code(hass):
 
     entity_id = "alarm_control_panel.test"
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_DISARMED
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.DISARMED
 
     await common.async_alarm_arm_home(hass, "def")
 
     state = hass.states.get(entity_id)
-    assert state.state == STATE_ALARM_ARMED_HOME
+    assert state.state == AlarmControlPanelState.ARMED_HOME
 
-    await common.async_alarm_disarm(hass, "def")
+    with pytest.raises(ServiceValidationError) as err:
+        await common.async_alarm_disarm(hass, "def")
+    assert err.value.translation_key == "invalid_code"
 
     state = hass.states.get(entity_id)
-    assert state.state == STATE_ALARM_ARMED_HOME
+    assert state.state == AlarmControlPanelState.ARMED_HOME
 
     await common.async_alarm_disarm(hass, "abc")
 
     state = hass.states.get(entity_id)
-    assert state.state == STATE_ALARM_DISARMED
+    assert state.state == AlarmControlPanelState.DISARMED
 
 
-async def test_arm_away_after_disabled_disarmed(hass):
+async def test_arm_away_after_disabled_disarmed(hass: HomeAssistant) -> None:
     """Test pending state with and without zero trigger time."""
     assert await async_setup_component(
         hass,
@@ -1122,21 +1323,33 @@ async def test_arm_away_after_disabled_disarmed(hass):
 
     entity_id = "alarm_control_panel.test"
 
-    assert hass.states.get(entity_id).state == STATE_ALARM_DISARMED
+    assert hass.states.get(entity_id).state == AlarmControlPanelState.DISARMED
 
     await common.async_alarm_arm_away(hass, CODE)
 
     state = hass.states.get(entity_id)
-    assert state.state == STATE_ALARM_ARMING
-    assert state.attributes["previous_state"] == STATE_ALARM_DISARMED
-    assert state.attributes["next_state"] == STATE_ALARM_ARMED_AWAY
+    assert state.state == AlarmControlPanelState.ARMING
+    assert (
+        state.attributes[ManualEntityStateAttribute.PREVIOUS_STATE]
+        == AlarmControlPanelState.DISARMED
+    )
+    assert (
+        state.attributes[ManualEntityStateAttribute.NEXT_STATE]
+        == AlarmControlPanelState.ARMED_AWAY
+    )
 
     await common.async_alarm_trigger(hass, entity_id=entity_id)
 
     state = hass.states.get(entity_id)
-    assert state.state == STATE_ALARM_ARMING
-    assert state.attributes["previous_state"] == STATE_ALARM_DISARMED
-    assert state.attributes["next_state"] == STATE_ALARM_ARMED_AWAY
+    assert state.state == AlarmControlPanelState.ARMING
+    assert (
+        state.attributes[ManualEntityStateAttribute.PREVIOUS_STATE]
+        == AlarmControlPanelState.DISARMED
+    )
+    assert (
+        state.attributes[ManualEntityStateAttribute.NEXT_STATE]
+        == AlarmControlPanelState.ARMED_AWAY
+    )
 
     future = dt_util.utcnow() + timedelta(seconds=1)
     with freeze_time(future):
@@ -1144,14 +1357,20 @@ async def test_arm_away_after_disabled_disarmed(hass):
         await hass.async_block_till_done()
 
         state = hass.states.get(entity_id)
-        assert state.state == STATE_ALARM_ARMED_AWAY
+        assert state.state == AlarmControlPanelState.ARMED_AWAY
 
         await common.async_alarm_trigger(hass, entity_id=entity_id)
 
         state = hass.states.get(entity_id)
-        assert state.state == STATE_ALARM_PENDING
-        assert state.attributes["previous_state"] == STATE_ALARM_ARMED_AWAY
-        assert state.attributes["next_state"] == STATE_ALARM_TRIGGERED
+        assert state.state == AlarmControlPanelState.PENDING
+        assert (
+            state.attributes[ManualEntityStateAttribute.PREVIOUS_STATE]
+            == AlarmControlPanelState.ARMED_AWAY
+        )
+        assert (
+            state.attributes[ManualEntityStateAttribute.NEXT_STATE]
+            == AlarmControlPanelState.TRIGGERED
+        )
 
     future += timedelta(seconds=1)
     with freeze_time(future):
@@ -1159,25 +1378,29 @@ async def test_arm_away_after_disabled_disarmed(hass):
         await hass.async_block_till_done()
 
     state = hass.states.get(entity_id)
-    assert state.state == STATE_ALARM_TRIGGERED
+    assert (
+        state.attributes[ManualEntityStateAttribute.PREVIOUS_STATE]
+        == AlarmControlPanelState.ARMED_AWAY
+    )
+    assert state.state == AlarmControlPanelState.TRIGGERED
 
 
 @pytest.mark.parametrize(
     "expected_state",
     [
-        (STATE_ALARM_ARMED_AWAY),
-        (STATE_ALARM_ARMED_CUSTOM_BYPASS),
-        (STATE_ALARM_ARMED_HOME),
-        (STATE_ALARM_ARMED_NIGHT),
-        (STATE_ALARM_ARMED_VACATION),
-        (STATE_ALARM_DISARMED),
+        (AlarmControlPanelState.ARMED_AWAY),
+        (AlarmControlPanelState.ARMED_CUSTOM_BYPASS),
+        (AlarmControlPanelState.ARMED_HOME),
+        (AlarmControlPanelState.ARMED_NIGHT),
+        (AlarmControlPanelState.ARMED_VACATION),
+        (AlarmControlPanelState.DISARMED),
     ],
 )
-async def test_restore_state(hass, expected_state):
+async def test_restore_state(hass: HomeAssistant, expected_state) -> None:
     """Ensure state is restored on startup."""
     mock_restore_cache(hass, (State("alarm_control_panel.test", expected_state),))
 
-    hass.state = CoreState.starting
+    hass.set_state(CoreState.starting)
     mock_component(hass, "recorder")
 
     assert await async_setup_component(
@@ -1198,3 +1421,337 @@ async def test_restore_state(hass, expected_state):
     state = hass.states.get("alarm_control_panel.test")
     assert state
     assert state.state == expected_state
+
+
+async def test_restore_state_invalid(hass: HomeAssistant) -> None:
+    """Ensure invalid restored state does not crash entity setup."""
+    mock_restore_cache(hass, (State("alarm_control_panel.test", "unknown"),))
+
+    hass.set_state(CoreState.starting)
+    mock_component(hass, "recorder")
+
+    assert await async_setup_component(
+        hass,
+        alarm_control_panel.DOMAIN,
+        {
+            "alarm_control_panel": {
+                "platform": "manual",
+                "name": "test",
+                "arming_time": 0,
+                "trigger_time": 0,
+                "disarm_after_trigger": False,
+            }
+        },
+    )
+    await hass.async_block_till_done()
+
+    state = hass.states.get("alarm_control_panel.test")
+    assert state
+    assert state.state == AlarmControlPanelState.DISARMED
+
+
+@pytest.mark.parametrize(
+    "expected_state",
+    [
+        (AlarmControlPanelState.ARMED_AWAY),
+        (AlarmControlPanelState.ARMED_CUSTOM_BYPASS),
+        (AlarmControlPanelState.ARMED_HOME),
+        (AlarmControlPanelState.ARMED_NIGHT),
+        (AlarmControlPanelState.ARMED_VACATION),
+    ],
+)
+async def test_restore_state_arming(hass: HomeAssistant, expected_state) -> None:
+    """Ensure ARMING state is restored on startup."""
+    time = dt_util.utcnow() - timedelta(seconds=15)
+    entity_id = "alarm_control_panel.test"
+    attributes = {
+        ManualEntityStateAttribute.PREVIOUS_STATE: AlarmControlPanelState.DISARMED,
+        ManualEntityStateAttribute.NEXT_STATE: expected_state,
+    }
+    mock_restore_cache(
+        hass, (State(entity_id, expected_state, attributes, last_updated=time),)
+    )
+
+    hass.set_state(CoreState.starting)
+    mock_component(hass, "recorder")
+
+    assert await async_setup_component(
+        hass,
+        alarm_control_panel.DOMAIN,
+        {
+            "alarm_control_panel": {
+                "platform": "manual",
+                "name": "test",
+                "arming_time": 60,
+                "trigger_time": 0,
+                "disarm_after_trigger": False,
+            }
+        },
+    )
+    await hass.async_block_till_done()
+
+    state = hass.states.get(entity_id)
+    assert state
+    assert (
+        state.attributes[ManualEntityStateAttribute.PREVIOUS_STATE]
+        == AlarmControlPanelState.DISARMED
+    )
+    assert state.attributes[ManualEntityStateAttribute.NEXT_STATE] == expected_state
+    assert state.state == AlarmControlPanelState.ARMING
+
+    future = time + timedelta(seconds=61)
+    with freeze_time(future):
+        async_fire_time_changed(hass, future)
+        await hass.async_block_till_done()
+
+    state = hass.states.get(entity_id)
+    assert state.state == expected_state
+
+
+@pytest.mark.parametrize(
+    "previous_state",
+    [
+        (AlarmControlPanelState.ARMED_AWAY),
+        (AlarmControlPanelState.ARMED_CUSTOM_BYPASS),
+        (AlarmControlPanelState.ARMED_HOME),
+        (AlarmControlPanelState.ARMED_NIGHT),
+        (AlarmControlPanelState.ARMED_VACATION),
+        (AlarmControlPanelState.DISARMED),
+    ],
+)
+async def test_restore_state_pending(hass: HomeAssistant, previous_state) -> None:
+    """Ensure PENDING state is restored on startup."""
+    time = dt_util.utcnow() - timedelta(seconds=15)
+    entity_id = "alarm_control_panel.test"
+    attributes = {
+        ManualEntityStateAttribute.PREVIOUS_STATE: previous_state,
+        ManualEntityStateAttribute.NEXT_STATE: AlarmControlPanelState.TRIGGERED,
+    }
+    mock_restore_cache(
+        hass,
+        (
+            State(
+                entity_id,
+                AlarmControlPanelState.TRIGGERED,
+                attributes,
+                last_updated=time,
+            ),
+        ),
+    )
+
+    hass.set_state(CoreState.starting)
+    mock_component(hass, "recorder")
+
+    assert await async_setup_component(
+        hass,
+        alarm_control_panel.DOMAIN,
+        {
+            "alarm_control_panel": {
+                "platform": "manual",
+                "name": "test",
+                "arming_time": 0,
+                "delay_time": 60,
+                "trigger_time": 60,
+                "disarm_after_trigger": False,
+            }
+        },
+    )
+    await hass.async_block_till_done()
+
+    state = hass.states.get(entity_id)
+    assert state
+    assert state.attributes[ManualEntityStateAttribute.PREVIOUS_STATE] == previous_state
+    assert (
+        state.attributes[ManualEntityStateAttribute.NEXT_STATE]
+        == AlarmControlPanelState.TRIGGERED
+    )
+    assert state.state == AlarmControlPanelState.PENDING
+
+    future = time + timedelta(seconds=61)
+    with freeze_time(future):
+        async_fire_time_changed(hass, future)
+        await hass.async_block_till_done()
+
+    state = hass.states.get(entity_id)
+    assert state.state == AlarmControlPanelState.TRIGGERED
+
+    future = time + timedelta(seconds=121)
+    with freeze_time(future):
+        async_fire_time_changed(hass, future)
+        await hass.async_block_till_done()
+
+    state = hass.states.get(entity_id)
+    assert state.state == previous_state
+
+
+@pytest.mark.parametrize(
+    "previous_state",
+    [
+        (AlarmControlPanelState.ARMED_AWAY),
+        (AlarmControlPanelState.ARMED_CUSTOM_BYPASS),
+        (AlarmControlPanelState.ARMED_HOME),
+        (AlarmControlPanelState.ARMED_NIGHT),
+        (AlarmControlPanelState.ARMED_VACATION),
+        (AlarmControlPanelState.DISARMED),
+    ],
+)
+async def test_restore_state_triggered(hass: HomeAssistant, previous_state) -> None:
+    """Ensure PENDING state is resolved to TRIGGERED on startup."""
+    time = dt_util.utcnow() - timedelta(seconds=75)
+    entity_id = "alarm_control_panel.test"
+    attributes = {
+        ManualEntityStateAttribute.PREVIOUS_STATE: previous_state,
+    }
+    mock_restore_cache(
+        hass,
+        (
+            State(
+                entity_id,
+                AlarmControlPanelState.TRIGGERED,
+                attributes,
+                last_updated=time,
+            ),
+        ),
+    )
+
+    hass.set_state(CoreState.starting)
+    mock_component(hass, "recorder")
+
+    assert await async_setup_component(
+        hass,
+        alarm_control_panel.DOMAIN,
+        {
+            "alarm_control_panel": {
+                "platform": "manual",
+                "name": "test",
+                "arming_time": 0,
+                "delay_time": 60,
+                "trigger_time": 60,
+                "disarm_after_trigger": False,
+            }
+        },
+    )
+    await hass.async_block_till_done()
+
+    state = hass.states.get(entity_id)
+    assert state
+    assert state.attributes[ManualEntityStateAttribute.PREVIOUS_STATE] == previous_state
+    assert state.attributes[ManualEntityStateAttribute.NEXT_STATE] is None
+    assert state.state == AlarmControlPanelState.TRIGGERED
+
+    future = time + timedelta(seconds=121)
+    with freeze_time(future):
+        async_fire_time_changed(hass, future)
+        await hass.async_block_till_done()
+
+    state = hass.states.get(entity_id)
+    assert state.state == previous_state
+
+
+async def test_restore_state_triggered_long_ago(hass: HomeAssistant) -> None:
+    """Ensure TRIGGERED state is resolved on startup."""
+    time = dt_util.utcnow() - timedelta(seconds=125)
+    entity_id = "alarm_control_panel.test"
+    attributes = {
+        ManualEntityStateAttribute.PREVIOUS_STATE: AlarmControlPanelState.ARMED_AWAY,
+    }
+    mock_restore_cache(
+        hass,
+        (
+            State(
+                entity_id,
+                AlarmControlPanelState.TRIGGERED,
+                attributes,
+                last_updated=time,
+            ),
+        ),
+    )
+
+    hass.set_state(CoreState.starting)
+    mock_component(hass, "recorder")
+
+    assert await async_setup_component(
+        hass,
+        alarm_control_panel.DOMAIN,
+        {
+            "alarm_control_panel": {
+                "platform": "manual",
+                "name": "test",
+                "arming_time": 0,
+                "delay_time": 60,
+                "trigger_time": 60,
+                "disarm_after_trigger": True,
+            }
+        },
+    )
+    await hass.async_block_till_done()
+
+    state = hass.states.get(entity_id)
+    assert state.state == AlarmControlPanelState.DISARMED
+
+
+async def test_default_arming_states(hass: HomeAssistant) -> None:
+    """Test default arming_states."""
+    assert await async_setup_component(
+        hass,
+        alarm_control_panel.DOMAIN,
+        {
+            "alarm_control_panel": {
+                "platform": "manual",
+                "name": "test",
+            }
+        },
+    )
+    await hass.async_block_till_done()
+
+    state = hass.states.get("alarm_control_panel.test")
+    assert state.attributes["supported_features"] == (
+        AlarmControlPanelEntityFeature.ARM_HOME
+        | AlarmControlPanelEntityFeature.ARM_AWAY
+        | AlarmControlPanelEntityFeature.ARM_NIGHT
+        | AlarmControlPanelEntityFeature.ARM_VACATION
+        | AlarmControlPanelEntityFeature.TRIGGER
+        | AlarmControlPanelEntityFeature.ARM_CUSTOM_BYPASS
+    )
+
+
+async def test_arming_states(hass: HomeAssistant) -> None:
+    """Test arming_states."""
+    assert await async_setup_component(
+        hass,
+        alarm_control_panel.DOMAIN,
+        {
+            "alarm_control_panel": {
+                "platform": "manual",
+                "name": "test",
+                "arming_states": ["armed_away", "armed_home"],
+            }
+        },
+    )
+    await hass.async_block_till_done()
+
+    state = hass.states.get("alarm_control_panel.test")
+    assert state.attributes["supported_features"] == (
+        AlarmControlPanelEntityFeature.ARM_HOME
+        | AlarmControlPanelEntityFeature.ARM_AWAY
+        | AlarmControlPanelEntityFeature.TRIGGER
+    )
+
+
+async def test_invalid_arming_states(hass: HomeAssistant) -> None:
+    """Test invalid arming_states."""
+    assert await async_setup_component(
+        hass,
+        alarm_control_panel.DOMAIN,
+        {
+            "alarm_control_panel": {
+                "platform": "manual",
+                "name": "test",
+                "arming_states": ["invalid", "armed_home"],
+            }
+        },
+    )
+    await hass.async_block_till_done()
+
+    state = hass.states.get("alarm_control_panel.test")
+    assert state is None

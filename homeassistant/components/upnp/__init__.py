@@ -1,5 +1,4 @@
 """UPnP/IGD integration."""
-from __future__ import annotations
 
 import asyncio
 from datetime import timedelta
@@ -7,13 +6,14 @@ from datetime import timedelta
 from async_upnp_client.exceptions import UpnpConnectionError
 
 from homeassistant.components import ssdp
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
-from homeassistant.helpers import config_validation, device_registry
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers.service_info.ssdp import SsdpServiceInfo
 
 from .const import (
+    CONFIG_ENTRY_FORCE_POLL,
     CONFIG_ENTRY_HOST,
     CONFIG_ENTRY_MAC_ADDRESS,
     CONFIG_ENTRY_ORIGINAL_UDN,
@@ -25,39 +25,35 @@ from .const import (
     IDENTIFIER_SERIAL_NUMBER,
     LOGGER,
 )
-from .coordinator import UpnpDataUpdateCoordinator
-from .device import async_create_device
+from .coordinator import UpnpConfigEntry, UpnpDataUpdateCoordinator
+from .device import async_create_device, get_preferred_location
 
 NOTIFICATION_ID = "upnp_notification"
 NOTIFICATION_TITLE = "UPnP/IGD Setup"
 
 PLATFORMS = [Platform.BINARY_SENSOR, Platform.SENSOR]
 
-CONFIG_SCHEMA = config_validation.removed(DOMAIN, raise_if_present=False)
 
-
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_setup_entry(hass: HomeAssistant, entry: UpnpConfigEntry) -> None:
     """Set up UPnP/IGD device from a config entry."""
     LOGGER.debug("Setting up config entry: %s", entry.entry_id)
 
-    hass.data.setdefault(DOMAIN, {})
-
     udn = entry.data[CONFIG_ENTRY_UDN]
-    st = entry.data[CONFIG_ENTRY_ST]  # pylint: disable=invalid-name
+    st = entry.data[CONFIG_ENTRY_ST]
     usn = f"{udn}::{st}"
 
     # Register device discovered-callback.
     device_discovered_event = asyncio.Event()
-    discovery_info: ssdp.SsdpServiceInfo | None = None
+    discovery_info: SsdpServiceInfo | None = None
 
     async def device_discovered(
-        headers: ssdp.SsdpServiceInfo, change: ssdp.SsdpChange
+        headers: SsdpServiceInfo, change: ssdp.SsdpChange
     ) -> None:
-        if change == ssdp.SsdpChange.BYEBYE:
+        if change is ssdp.SsdpChange.BYEBYE:
             return
 
         nonlocal discovery_info
-        LOGGER.debug("Device discovered: %s, at: %s", usn, headers.ssdp_location)
+        LOGGER.debug("Device discovered: %s, at: %s", usn, headers.ssdp_all_locations)
         discovery_info = headers
         device_discovered_event.set()
 
@@ -70,22 +66,37 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
 
     try:
-        await asyncio.wait_for(device_discovered_event.wait(), timeout=10)
-    except asyncio.TimeoutError as err:
-        raise ConfigEntryNotReady(f"Device not discovered: {usn}") from err
+        async with asyncio.timeout(10):
+            await device_discovered_event.wait()
+    except TimeoutError as err:
+        raise ConfigEntryNotReady(
+            translation_domain=DOMAIN,
+            translation_key="device_not_discovered",
+            translation_placeholders={"usn": usn},
+        ) from err
     finally:
         cancel_discovered_callback()
 
     # Create device.
     assert discovery_info is not None
-    assert discovery_info.ssdp_location is not None
-    location = discovery_info.ssdp_location
+    assert discovery_info.ssdp_udn
+    assert discovery_info.ssdp_all_locations
+    force_poll = entry.options.get(CONFIG_ENTRY_FORCE_POLL, False)
+    location = get_preferred_location(discovery_info.ssdp_all_locations)
     try:
-        device = await async_create_device(hass, location)
+        device = await async_create_device(hass, location, force_poll)
     except UpnpConnectionError as err:
         raise ConfigEntryNotReady(
-            f"Error connecting to device at location: {location}, err: {err}"
+            translation_domain=DOMAIN,
+            translation_key="cannot_connect",
+            translation_placeholders={"location": location},
         ) from err
+
+    # Try to subscribe, if configured.
+    if not force_poll:
+        await device.async_subscribe_services()
+
+    entry.async_on_unload(device.async_stop)
 
     # Track the original UDN such that existing sensors do not change their unique_id.
     if CONFIG_ENTRY_ORIGINAL_UDN not in entry.data:
@@ -110,20 +121,31 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             },
         )
 
-    identifiers = {(DOMAIN, device.usn)}
+    identifiers = [(DOMAIN, device.usn)]
     if device.host:
-        identifiers.add((IDENTIFIER_HOST, device.host))
+        identifiers.append((IDENTIFIER_HOST, device.host))
     if device.serial_number:
-        identifiers.add((IDENTIFIER_SERIAL_NUMBER, device.serial_number))
+        identifiers.append((IDENTIFIER_SERIAL_NUMBER, device.serial_number))
 
-    connections = {(device_registry.CONNECTION_UPNP, device.udn)}
+    connections = [(dr.CONNECTION_UPNP, discovery_info.ssdp_udn)]
+    if discovery_info.ssdp_udn != device.udn:
+        connections.append((dr.CONNECTION_UPNP, device.udn))
     if device_mac_address:
-        connections.add((device_registry.CONNECTION_NETWORK_MAC, device_mac_address))
+        connections.append((dr.CONNECTION_NETWORK_MAC, device_mac_address))
 
-    dev_registry = device_registry.async_get(hass)
-    device_entry = dev_registry.async_get_device(
-        identifiers=identifiers, connections=connections
-    )
+    dev_registry = dr.async_get(hass)
+    device_entry: dr.DeviceEntry | None = None
+    for identifier in identifiers:
+        if device_entry := dev_registry.async_get_device_by_identifier(
+            identifier, entry.entry_id
+        ):
+            break
+    if device_entry is None:
+        for connection in connections:
+            if device_entry := dev_registry.async_get_device_by_connection(
+                connection, entry.entry_id
+            ):
+                break
     if device_entry:
         LOGGER.debug(
             "Found device using connections: %s, device_entry: %s",
@@ -134,8 +156,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # No device found, create new device entry.
         device_entry = dev_registry.async_get_or_create(
             config_entry_id=entry.entry_id,
-            connections=connections,
-            identifiers=identifiers,
+            connections=set(connections),
+            identifiers=set(identifiers),
             name=device.name,
             manufacturer=device.manufacturer,
             model=device.model_name,
@@ -144,16 +166,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "Created device using UDN '%s', device_entry: %s", device.udn, device_entry
         )
     else:
-        # Update identifier.
         device_entry = dev_registry.async_update_device(
             device_entry.id,
-            new_identifiers=identifiers,
+            new_identifiers=set(identifiers),
         )
 
     assert device_entry
     update_interval = timedelta(seconds=DEFAULT_SCAN_INTERVAL)
     coordinator = UpnpDataUpdateCoordinator(
         hass,
+        config_entry=entry,
         device=device,
         device_entry=device_entry,
         update_interval=update_interval,
@@ -163,21 +185,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await coordinator.async_config_entry_first_refresh()
 
     # Save coordinator.
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+    entry.runtime_data = coordinator
 
     # Setup platforms, creating sensors/binary_sensors.
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    return True
 
-
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_unload_entry(hass: HomeAssistant, entry: UpnpConfigEntry) -> None:
     """Unload a UPnP/IGD device from a config entry."""
     LOGGER.debug("Unloading config entry: %s", entry.entry_id)
-
-    # Unload platforms.
-    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-    if unload_ok:
-        del hass.data[DOMAIN][entry.entry_id]
-
-    return unload_ok
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)

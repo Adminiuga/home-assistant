@@ -1,60 +1,92 @@
 """The Jellyfin integration."""
+
 from typing import Any
 
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import CONF_URL
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.helpers import config_validation as cv, device_registry as dr
+from homeassistant.helpers.typing import ConfigType
 
 from .client_wrapper import CannotConnect, InvalidAuth, create_client, validate_input
-from .const import CONF_CLIENT_DEVICE_ID, DOMAIN, LOGGER, PLATFORMS
-from .coordinator import JellyfinDataUpdateCoordinator, SessionsDataUpdateCoordinator
-from .models import JellyfinData
+from .const import CONF_CLIENT_DEVICE_ID, DEFAULT_NAME, DOMAIN, PLATFORMS
+from .coordinator import JellyfinConfigEntry, JellyfinDataUpdateCoordinator
+from .services import async_setup_services
+
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Set up the Jellyfin component."""
+    async_setup_services(hass)
+    return True
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: JellyfinConfigEntry) -> None:
     """Set up Jellyfin from a config entry."""
-    hass.data.setdefault(DOMAIN, {})
-
     if CONF_CLIENT_DEVICE_ID not in entry.data:
         entry_data = entry.data.copy()
         entry_data[CONF_CLIENT_DEVICE_ID] = entry.entry_id
         hass.config_entries.async_update_entry(entry, data=entry_data)
 
-    client = create_client(
-        device_id=entry.data[CONF_CLIENT_DEVICE_ID],
-        device_name=hass.config.location_name,
-    )
+    device_id = entry.data[CONF_CLIENT_DEVICE_ID]
+    device_name = ascii(hass.config.location_name)
+
+    client = create_client(device_id=device_id, device_name=device_name)
 
     try:
         user_id, connect_result = await validate_input(hass, dict(entry.data), client)
     except CannotConnect as ex:
         raise ConfigEntryNotReady("Cannot connect to Jellyfin server") from ex
-    except InvalidAuth:
-        LOGGER.error("Failed to login to Jellyfin server")
-        return False
+    except InvalidAuth as ex:
+        raise ConfigEntryAuthFailed(ex) from ex
 
     server_info: dict[str, Any] = connect_result["Servers"][0]
 
-    coordinators: dict[str, JellyfinDataUpdateCoordinator[Any]] = {
-        "sessions": SessionsDataUpdateCoordinator(hass, client, server_info, user_id),
-    }
-
-    for coordinator in coordinators.values():
-        await coordinator.async_config_entry_first_refresh()
-
-    hass.data[DOMAIN][entry.entry_id] = JellyfinData(
-        client_device_id=entry.data[CONF_CLIENT_DEVICE_ID],
-        jellyfin_client=client,
-        coordinators=coordinators,
+    coordinator = JellyfinDataUpdateCoordinator(
+        hass, entry, client, server_info, user_id
     )
+    await coordinator.async_config_entry_first_refresh()
+
+    device_registry = dr.async_get(hass)
+    device_registry.async_get_or_create(
+        config_entry_id=entry.entry_id,
+        entry_type=dr.DeviceEntryType.SERVICE,
+        identifiers={(DOMAIN, coordinator.server_id)},
+        manufacturer=DEFAULT_NAME,
+        name=coordinator.server_name,
+        sw_version=coordinator.server_version,
+    )
+
+    entry.runtime_data = coordinator
+    entry.async_on_unload(client.stop)
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    return True
+
+async def async_migrate_entry(hass: HomeAssistant, entry: JellyfinConfigEntry) -> None:
+    """Migrate an old config entry."""
+    if entry.version == 1 and entry.minor_version < 2:
+        new_data = {**entry.data, CONF_URL: entry.data[CONF_URL].rstrip("/")}
+        hass.config_entries.async_update_entry(entry, data=new_data, minor_version=2)
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_unload_entry(hass: HomeAssistant, entry: JellyfinConfigEntry) -> None:
     """Unload a config entry."""
-    hass.data[DOMAIN].pop(entry.entry_id)
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)
 
-    return True
+
+async def async_remove_config_entry_device(
+    hass: HomeAssistant,
+    config_entry: JellyfinConfigEntry,
+    device_entry: dr.AnyDeviceEntry,
+) -> bool:
+    """Remove device from a config entry."""
+    coordinator = config_entry.runtime_data
+
+    return not device_entry.identifiers.intersection(
+        (
+            (DOMAIN, coordinator.server_id),
+            *((DOMAIN, device_id) for device_id in coordinator.device_ids),
+        )
+    )

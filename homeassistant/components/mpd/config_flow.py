@@ -1,0 +1,82 @@
+"""Music Player Daemon config flow."""
+
+from asyncio import timeout
+from contextlib import suppress
+from socket import gaierror
+from typing import Any, override
+
+import mpd
+from mpd.asyncio import MPDClient
+import probatio
+
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_PORT
+
+from .const import DOMAIN, LOGGER
+
+SCHEMA = probatio.Schema(
+    {
+        probatio.Required(CONF_HOST): str,
+        probatio.Optional(probatio.Secret(CONF_PASSWORD)): str,
+        probatio.Optional(CONF_PORT, default=6600): int,
+    }
+)
+
+
+class MPDConfigFlow(ConfigFlow, domain=DOMAIN):
+    """Music Player Daemon config flow."""
+
+    @override
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle a flow initiated by the user."""
+        errors = {}
+        if user_input:
+            self._async_abort_entries_match(
+                {CONF_HOST: user_input[CONF_HOST], CONF_PORT: user_input[CONF_PORT]}
+            )
+            client = MPDClient()
+            client.timeout = 30
+            client.idletimeout = 10
+            try:
+                async with timeout(35):
+                    await client.connect(user_input[CONF_HOST], user_input[CONF_PORT])
+                    if CONF_PASSWORD in user_input:
+                        await client.password(user_input[CONF_PASSWORD])
+                    # MPD greets before authenticating, so only a read proves access.
+                    await client.status()
+            except (
+                TimeoutError,
+                gaierror,
+                mpd.ConnectionError,
+                mpd.ProtocolError,
+                OSError,
+            ):
+                errors["base"] = "cannot_connect"
+            except mpd.CommandError as err:
+                if err.errno in (
+                    mpd.FailureResponseCode.PASSWORD,
+                    mpd.FailureResponseCode.PERMISSION,
+                ):
+                    errors["base"] = "invalid_auth"
+                else:
+                    LOGGER.warning("Unexpected MPD error: %s", err)
+                    errors["base"] = "unknown"
+            except Exception:  # noqa: BLE001
+                LOGGER.exception("Unknown exception")
+                errors["base"] = "unknown"
+            else:
+                return self.async_create_entry(
+                    title="Music Player Daemon",
+                    data=user_input,
+                )
+            finally:
+                with suppress(mpd.ConnectionError):
+                    client.disconnect()
+
+        return self.async_show_form(
+            step_id="user",
+            data_schema=SCHEMA,
+            errors=errors,
+        )

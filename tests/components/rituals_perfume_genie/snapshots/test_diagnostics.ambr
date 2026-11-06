@@ -1,0 +1,77 @@
+# serializer version: 1
+# name: test_diagnostics
+  dict({
+    'diffusers': list([
+      dict({
+        'hub': dict({
+          'attributeValues': dict({
+            'fanc': '1',
+            'ledc': '0',
+            'roomc': '3',
+            'roomnamec': 'Genie',
+            'speedc': '2',
+            'squaremeterc': '60',
+          }),
+          'attributes': dict({
+            'ledc': True,
+            'squaremeterc': True,
+          }),
+          'firmwareInfo': dict({
+            'currentFirmware': '4.0',
+            'currentFirmwareId': 127,
+            'newestFirmware': '4.0',
+            'newestFirmwareId': 127,
+          }),
+          'hash': '**REDACTED**',
+          'hublot': '**REDACTED**',
+          'sensors': dict({
+            'battc': True,
+            'fillc': True,
+            'rfidc': True,
+            'versionc': True,
+            'wific': True,
+          }),
+          'status': 1,
+        }),
+        'sensors': dict({
+          'battery': dict({
+            'description': None,
+            'discover_url': None,
+            'icon': 'battery-full.png',
+            'id': 21,
+            'image': None,
+            'raw': None,
+            'scent_found': None,
+            'title': None,
+            'value': None,
+          }),
+          'fill': dict({
+            'description': None,
+            'discover_url': None,
+            'icon': None,
+            'id': None,
+            'image': None,
+            'raw': '1000',
+            'scent_found': None,
+            'title': '90-100%',
+            'value': None,
+          }),
+          'generation': None,
+          'perfume': dict({
+            'description': None,
+            'discover_url': None,
+            'icon': None,
+            'id': None,
+            'image': None,
+            'raw': '048616d0',
+            'scent_found': None,
+            'title': 'Ritual of Sakura',
+            'value': None,
+          }),
+          'version': None,
+          'wifi': None,
+        }),
+      }),
+    ]),
+  })
+# ---

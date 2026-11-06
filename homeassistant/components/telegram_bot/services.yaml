@@ -1,628 +1,768 @@
 # Describes the format for available Telegram bot services
 
 send_message:
-  name: Send message
-  description: Send a notification.
   fields:
+    entity_id:
+      selector:
+        entity:
+          filter:
+            domain: notify
+            integration: telegram_bot
+          multiple: true
+          reorder: true
+    title:
+      example: "Your Garage Door Friend"
+      selector:
+        text:
     message:
-      name: Message
-      description: Message body of the notification.
       required: true
       example: The garage door has been open for 10 minutes.
       selector:
         text:
-    title:
-      name: Title
-      description: Optional title for your notification. Will be composed as '%title\n%message'
-      example: "Your Garage Door Friend"
-      selector:
-        text:
-    target:
-      name: Target
-      description: An array of pre-authorized chat_ids to send the notification to. If not present, first allowed chat_id is the default.
-      example: "[12345, 67890] or 12345"
-      selector:
-        object:
     parse_mode:
-      name: Parse mode
-      description: "Parser for the message text."
       selector:
         select:
           options:
             - "html"
             - "markdown"
-            - "markdown2"
+            - "markdownv2"
+            - "plain_text"
+          translation_key: "parse_mode"
     disable_notification:
-      name: Disable notification
-      description: Sends the message silently. iOS users and Web users will not receive a notification, Android users will receive a notification with no sound.
       selector:
         boolean:
     disable_web_page_preview:
-      name: Disable web page preview
-      description: Disables link previews for links in the message.
       selector:
         boolean:
-    timeout:
-      name: Timeout
-      description: Timeout for send message. Will help with timeout errors (poor internet connection, etc)s
-      selector:
-        number:
-          min: 1
-          max: 3600
-          unit_of_measurement: seconds
-
     keyboard:
-      name: Keyboard
-      description: List of rows of commands, comma-separated, to make a custom keyboard. Empty list clears a previously set keyboard.
       example: '["/command1, /command2", "/command3"]'
       selector:
-        object:
+        text:
+          multiple: true
     inline_keyboard:
-      name: Inline keyboard
-      description: List of rows of commands, comma-separated, to make a custom inline keyboard with buttons with associated callback data.
-      example: '["/button1, /button2", "/button3"] or ["Text button1:/button1, Text button2:/button2", "Text button3:/button3"] or [[["Text button1", "/button1"], ["Text button2", "/button2"]], [["Text button3", "/button3"]]]'
+      example:
+        '["/button1, /button2", "/button3"] or ["Text button1:/button1, Text
+        button2:/button2", "Text button3:/button3"] or [[["Text button1", "/button1"],
+        ["Text button2", "/button2"]], [["Text button3", "/button3"]]]'
       selector:
         object:
     message_tag:
-      name: Message tag
-      description: "Tag for sent message. In telegram_sent event data: {{trigger.event.data.message_tag}}"
       example: "msg_to_edit"
       selector:
         text:
+    reply_to_message_id:
+      selector:
+        number:
+          mode: box
+    message_thread_id:
+      selector:
+        number:
+          mode: box
+    additional_fields:
+      collapsed: true
+      fields:
+        config_entry_id:
+          selector:
+            config_entry:
+              integration: telegram_bot
+        chat_id:
+          example: "[12345, 67890] or 12345"
+          selector:
+            text:
+              multiple: true
+
+send_chat_action:
+  fields:
+    entity_id:
+      selector:
+        entity:
+          filter:
+            domain: notify
+            integration: telegram_bot
+          multiple: true
+          reorder: true
+    chat_action:
+      selector:
+        select:
+          options:
+            - "typing"
+            - "upload_photo"
+            - "record_video"
+            - "upload_video"
+            - "record_voice"
+            - "upload_voice"
+            - "upload_document"
+            - "choose_sticker"
+            - "find_location"
+            - "record_video_note"
+            - "upload_video_note"
+          translation_key: "chat_action"
+    message_thread_id:
+      selector:
+        number:
+          mode: box
+    additional_fields:
+      collapsed: true
+      fields:
+        config_entry_id:
+          selector:
+            config_entry:
+              integration: telegram_bot
+        chat_id:
+          example: "[12345, 67890] or 12345"
+          selector:
+            text:
+              multiple: true
 
 send_photo:
-  name: Send photo
-  description: Send a photo.
   fields:
+    entity_id:
+      selector:
+        entity:
+          filter:
+            domain: notify
+            integration: telegram_bot
+          multiple: true
+          reorder: true
     url:
-      name: URL
-      description: Remote path to an image.
       example: "http://example.org/path/to/the/image.png"
       selector:
         text:
+    url_options:
+      collapsed: true
+      fields:
+        verify_ssl:
+          default: true
+          selector:
+            boolean:
+        authentication:
+          selector:
+            select:
+              options:
+                - "basic"
+                - "digest"
+                - "bearer_token"
+              translation_key: "authentication"
+        username:
+          example: myuser
+          selector:
+            text:
+        password:
+          example: myuser_pwd
+          selector:
+            text:
+              type: password
     file:
-      name: File
-      description: Local path to an image.
       example: "/path/to/the/image.png"
       selector:
         text:
     caption:
-      name: Caption
-      description: The title of the image.
       example: "My image"
       selector:
         text:
-    username:
-      name: Username
-      description: Username for a URL which require HTTP authentication.
-      example: myuser
-      selector:
-        text:
-    password:
-      name: Password
-      description: Password (or bearer token) for a URL which require HTTP authentication.
-      example: myuser_pwd
-      selector:
-        text:
-    authentication:
-      name: Authentication method
-      description: Define which authentication method to use. Set to `digest` to use HTTP digest authentication, or `bearer_token` for OAuth 2.0 bearer token authentication. Defaults to `basic`.
-      default: digest
-      selector:
-        select:
-          options:
-            - "digest"
-            - "bearer_token"
-    target:
-      name: Target
-      description: An array of pre-authorized chat_ids to send the document to. If not present, first allowed chat_id is the default.
-      example: "[12345, 67890] or 12345"
-      selector:
-        object:
     parse_mode:
-      name: Parse mode
-      description: "Parser for the message text."
       selector:
         select:
           options:
             - "html"
             - "markdown"
-            - "markdown2"
+            - "markdownv2"
+            - "plain_text"
+          translation_key: "parse_mode"
     disable_notification:
-      name: Disable notification
-      description: Sends the message silently. iOS users and Web users will not receive a notification, Android users will receive a notification with no sound.
       selector:
         boolean:
-    verify_ssl:
-      name: Verify SSL
-      description: Enable or disable SSL certificate verification. Set to false if you're downloading the file from a URL and you don't want to validate the SSL certificate of the server.
-      selector:
-        boolean:
-    timeout:
-      name: Timeout
-      description: Timeout for send photo. Will help with timeout errors (poor internet connection, etc)
-      selector:
-        number:
-          min: 1
-          max: 3600
-          unit_of_measurement: seconds
     keyboard:
-      name: Keyboard
-      description: List of rows of commands, comma-separated, to make a custom keyboard.
       example: '["/command1, /command2", "/command3"]'
       selector:
-        object:
+        text:
+          multiple: true
     inline_keyboard:
-      name: Inline keyboard
-      description: List of rows of commands, comma-separated, to make a custom inline keyboard with buttons with associated callback data.
-      example: '["/button1, /button2", "/button3"] or [[["Text button1", "/button1"], ["Text button2", "/button2"]], [["Text button3", "/button3"]]]'
+      example:
+        '["/button1, /button2", "/button3"] or [[["Text button1", "/button1"],
+        ["Text button2", "/button2"]], [["Text button3", "/button3"]]]'
       selector:
         object:
     message_tag:
-      name: Message tag
-      description: "Tag for sent message. In telegram_sent event data: {{trigger.event.data.message_tag}}"
       example: "msg_to_edit"
       selector:
         text:
+    reply_to_message_id:
+      selector:
+        number:
+          mode: box
+    message_thread_id:
+      selector:
+        number:
+          mode: box
+    additional_fields:
+      collapsed: true
+      fields:
+        config_entry_id:
+          selector:
+            config_entry:
+              integration: telegram_bot
+        chat_id:
+          example: "[12345, 67890] or 12345"
+          selector:
+            text:
+              multiple: true
+
+send_media_group:
+  fields:
+    entity_id:
+      selector:
+        entity:
+          filter:
+            domain: notify
+            integration: telegram_bot
+          multiple: true
+          reorder: true
+    media:
+      required: true
+      selector:
+        object:
+          multiple: true
+          label_field: url
+          description_field: caption
+          translation_key: "media"
+          fields:
+            media_type:
+              selector:
+                select:
+                  options:
+                    - "audio"
+                    - "document"
+                    - "photo"
+                    - "video"
+                  translation_key: "media_type"
+            caption:
+              selector:
+                text:
+            url:
+              selector:
+                text:
+                  type: url
+            verify_ssl:
+              selector:
+                boolean:
+            authentication:
+              selector:
+                select:
+                  options:
+                    - "basic"
+                    - "digest"
+                    - "bearer_token"
+                  translation_key: "authentication"
+            username:
+              selector:
+                text:
+            password:
+              selector:
+                text:
+                  type: password
+            file:
+              selector:
+                text:
+    parse_mode:
+      selector:
+        select:
+          options:
+            - "html"
+            - "markdown"
+            - "markdownv2"
+            - "plain_text"
+          translation_key: "parse_mode"
+    disable_notification:
+      selector:
+        boolean:
+    protect_content:
+      selector:
+        boolean:
+    reply_to_message_id:
+      selector:
+        number:
+          mode: box
+    message_thread_id:
+      selector:
+        number:
+          mode: box
+    additional_fields:
+      collapsed: true
+      fields:
+        config_entry_id:
+          selector:
+            config_entry:
+              integration: telegram_bot
+        chat_id:
+          example: "[12345, 67890] or 12345"
+          selector:
+            text:
+              multiple: true
 
 send_sticker:
-  name: Send sticker
-  description: Send a sticker.
   fields:
+    entity_id:
+      selector:
+        entity:
+          filter:
+            domain: notify
+            integration: telegram_bot
+          multiple: true
+          reorder: true
     url:
-      name: URL
-      description: Remote path to a static .webp or animated .tgs sticker.
       example: "http://example.org/path/to/the/sticker.webp"
       selector:
         text:
+    url_options:
+      collapsed: true
+      fields:
+        verify_ssl:
+          default: true
+          selector:
+            boolean:
+        authentication:
+          selector:
+            select:
+              options:
+                - "basic"
+                - "digest"
+                - "bearer_token"
+              translation_key: "authentication"
+        username:
+          example: myuser
+          selector:
+            text:
+        password:
+          example: myuser_pwd
+          selector:
+            text:
+              type: password
     file:
-      name: File
-      description: Local path to a static .webp or animated .tgs sticker.
       example: "/path/to/the/sticker.webp"
       selector:
         text:
     sticker_id:
-      name: Sticker ID
-      description: ID of a sticker that exists on telegram servers
       example: CAACAgIAAxkBAAEDDldhZD-hqWclr6krLq-FWSfCrGNmOQAC9gAD9HsZAAFeYY-ltPYnrCEE
       selector:
         text:
-    username:
-      name: Username
-      description: Username for a URL which require HTTP authentication.
-      example: myuser
-      selector:
-        text:
-    password:
-      name: Password
-      description: Password (or bearer token) for a URL which require HTTP authentication.
-      example: myuser_pwd
-      selector:
-        text:
-    authentication:
-      name: Authentication method
-      description: Define which authentication method to use. Set to `digest` to use HTTP digest authentication, or `bearer_token` for OAuth 2.0 bearer token authentication. Defaults to `basic`.
-      default: digest
-      selector:
-        select:
-          options:
-            - "digest"
-            - "bearer_token"
-    target:
-      name: Target
-      description: An array of pre-authorized chat_ids to send the document to. If not present, first allowed chat_id is the default.
-      example: "[12345, 67890] or 12345"
-      selector:
-        object:
     disable_notification:
-      name: Disable notification
-      description: Sends the message silently. iOS users and Web users will not receive a notification, Android users will receive a notification with no sound.
       selector:
         boolean:
-    verify_ssl:
-      name: Verify SSL
-      description: Enable or disable SSL certificate verification. Set to false if you're downloading the file from a URL and you don't want to validate the SSL certificate of the server.
-      selector:
-        boolean:
-    timeout:
-      name: Timeout
-      description: Timeout for send sticker. Will help with timeout errors (poor internet connection, etc)
-      selector:
-        number:
-          min: 1
-          max: 3600
-          unit_of_measurement: seconds
     keyboard:
-      name: Keyboard
-      description: List of rows of commands, comma-separated, to make a custom keyboard.
       example: '["/command1, /command2", "/command3"]'
       selector:
-        object:
+        text:
+          multiple: true
     inline_keyboard:
-      name: Inline keyboard
-      description: List of rows of commands, comma-separated, to make a custom inline keyboard with buttons with associated callback data.
-      example: '["/button1, /button2", "/button3"] or [[["Text button1", "/button1"], ["Text button2", "/button2"]], [["Text button3", "/button3"]]]'
+      example:
+        '["/button1, /button2", "/button3"] or [[["Text button1", "/button1"],
+        ["Text button2", "/button2"]], [["Text button3", "/button3"]]]'
       selector:
         object:
     message_tag:
-      name: Message tag
-      description: "Tag for sent message. In telegram_sent event data: {{trigger.event.data.message_tag}}"
       example: "msg_to_edit"
       selector:
         text:
+    reply_to_message_id:
+      selector:
+        number:
+          mode: box
+    message_thread_id:
+      selector:
+        number:
+          mode: box
+    additional_fields:
+      collapsed: true
+      fields:
+        config_entry_id:
+          selector:
+            config_entry:
+              integration: telegram_bot
+        chat_id:
+          example: "[12345, 67890] or 12345"
+          selector:
+            text:
+              multiple: true
 
 send_animation:
-  name: Send animation
-  description: Send an anmiation.
   fields:
+    entity_id:
+      selector:
+        entity:
+          filter:
+            domain: notify
+            integration: telegram_bot
+          multiple: true
+          reorder: true
     url:
-      name: URL
-      description: Remote path to a GIF or H.264/MPEG-4 AVC video without sound.
       example: "http://example.org/path/to/the/animation.gif"
       selector:
         text:
+    url_options:
+      collapsed: true
+      fields:
+        verify_ssl:
+          default: true
+          selector:
+            boolean:
+        authentication:
+          selector:
+            select:
+              options:
+                - "basic"
+                - "digest"
+                - "bearer_token"
+              translation_key: "authentication"
+        username:
+          example: myuser
+          selector:
+            text:
+        password:
+          example: myuser_pwd
+          selector:
+            text:
+              type: password
     file:
-      name: File
-      description: Local path to a GIF or H.264/MPEG-4 AVC video without sound.
       example: "/path/to/the/animation.gif"
       selector:
         text:
     caption:
-      name: Caption
-      description: The title of the animation.
       example: "My animation"
       selector:
         text:
-    username:
-      name: Username
-      description: Username for a URL which require HTTP authentication.
-      example: myuser
-      selector:
-        text:
-    password:
-      name: Password
-      description: Password (or bearer token) for a URL which require HTTP authentication.
-      example: myuser_pwd
-      selector:
-        text:
-    authentication:
-      name: Authentication method
-      description: Define which authentication method to use. Set to `digest` to use HTTP digest authentication, or `bearer_token` for OAuth 2.0 bearer token authentication. Defaults to `basic`.
-      default: digest
-      selector:
-        select:
-          options:
-            - "digest"
-            - "bearer_token"
-    target:
-      name: Target
-      description: An array of pre-authorized chat_ids to send the document to. If not present, first allowed chat_id is the default.
-      example: "[12345, 67890] or 12345"
-      selector:
-        object:
     parse_mode:
-      name: Parse Mode
-      description: "Parser for the message text."
       selector:
         select:
           options:
             - "html"
             - "markdown"
-            - "markdown2"
+            - "markdownv2"
+            - "plain_text"
+          translation_key: "parse_mode"
     disable_notification:
-      name: Disable notification
-      description: Sends the message silently. iOS users and Web users will not receive a notification, Android users will receive a notification with no sound.
       selector:
         boolean:
-    verify_ssl:
-      name: Verify SSL
-      description: Enable or disable SSL certificate verification. Set to false if you're downloading the file from a URL and you don't want to validate the SSL certificate of the server.
-      selector:
-        boolean:
-    timeout:
-      name: Timeout
-      description: Timeout for send sticker. Will help with timeout errors (poor internet connection, etc)
-      selector:
-        number:
-          min: 1
-          max: 3600
-          unit_of_measurement: seconds
     keyboard:
-      name: Keyboard
-      description: List of rows of commands, comma-separated, to make a custom keyboard.
       example: '["/command1, /command2", "/command3"]'
       selector:
-        object:
+        text:
+          multiple: true
     inline_keyboard:
-      name: Inline keyboard
-      description: List of rows of commands, comma-separated, to make a custom inline keyboard with buttons with associated callback data.
-      example: '["/button1, /button2", "/button3"] or [[["Text button1", "/button1"], ["Text button2", "/button2"]], [["Text button3", "/button3"]]]'
+      example:
+        '["/button1, /button2", "/button3"] or [[["Text button1", "/button1"],
+        ["Text button2", "/button2"]], [["Text button3", "/button3"]]]'
       selector:
         object:
+    message_tag:
+      example: "msg_to_edit"
+      selector:
+        text:
+    reply_to_message_id:
+      selector:
+        number:
+          mode: box
+    message_thread_id:
+      selector:
+        number:
+          mode: box
+    additional_fields:
+      collapsed: true
+      fields:
+        config_entry_id:
+          selector:
+            config_entry:
+              integration: telegram_bot
+        chat_id:
+          example: "[12345, 67890] or 12345"
+          selector:
+            text:
+              multiple: true
 
 send_video:
-  name: Send video
-  description: Send a video.
   fields:
+    entity_id:
+      selector:
+        entity:
+          filter:
+            domain: notify
+            integration: telegram_bot
+          multiple: true
+          reorder: true
     url:
-      name: URL
-      description: Remote path to a video.
       example: "http://example.org/path/to/the/video.mp4"
       selector:
         text:
+    url_options:
+      collapsed: true
+      fields:
+        verify_ssl:
+          default: true
+          selector:
+            boolean:
+        authentication:
+          selector:
+            select:
+              options:
+                - "basic"
+                - "digest"
+                - "bearer_token"
+              translation_key: "authentication"
+        username:
+          example: myuser
+          selector:
+            text:
+        password:
+          example: myuser_pwd
+          selector:
+            text:
+              type: password
     file:
-      name: File
-      description: Local path to a video.
       example: "/path/to/the/video.mp4"
       selector:
         text:
     caption:
-      name: Caption
-      description: The title of the video.
       example: "My video"
       selector:
         text:
-    username:
-      name: Username
-      description: Username for a URL which require HTTP authentication.
-      example: myuser
-      selector:
-        text:
-    password:
-      name: Password
-      description: Password (or bearer token) for a URL which require HTTP authentication.
-      example: myuser_pwd
-      selector:
-        text:
-    authentication:
-      name: Authentication method
-      description: Define which authentication method to use. Set to `digest` to use HTTP digest authentication, or `bearer_token` for OAuth 2.0 bearer token authentication. Defaults to `basic`.
-      default: digest
-      selector:
-        select:
-          options:
-            - "digest"
-            - "bearer_token"
-    target:
-      name: Target
-      description: An array of pre-authorized chat_ids to send the document to. If not present, first allowed chat_id is the default.
-      example: "[12345, 67890] or 12345"
-      selector:
-        object:
     parse_mode:
-      name: Parse mode
-      description: "Parser for the message text."
       selector:
         select:
           options:
             - "html"
             - "markdown"
-            - "markdown2"
+            - "markdownv2"
+            - "plain_text"
+          translation_key: "parse_mode"
     disable_notification:
-      name: Disable notification
-      description: Sends the message silently. iOS users and Web users will not receive a notification, Android users will receive a notification with no sound.
       selector:
         boolean:
-    verify_ssl:
-      name: Verify SSL
-      description: Enable or disable SSL certificate verification. Set to false if you're downloading the file from a URL and you don't want to validate the SSL certificate of the server.
-      selector:
-        boolean:
-    timeout:
-      name: Timeout
-      description: Timeout for send video. Will help with timeout errors (poor internet connection, etc)
-      selector:
-        number:
-          min: 1
-          max: 3600
-          unit_of_measurement: seconds
     keyboard:
-      name: Keyboard
-      description: List of rows of commands, comma-separated, to make a custom keyboard.
       example: '["/command1, /command2", "/command3"]'
       selector:
-        object:
+        text:
+          multiple: true
     inline_keyboard:
-      name: Inline keyboard
-      description: List of rows of commands, comma-separated, to make a custom inline keyboard with buttons with associated callback data.
-      example: '["/button1, /button2", "/button3"] or [[["Text button1", "/button1"], ["Text button2", "/button2"]], [["Text button3", "/button3"]]]'
+      example:
+        '["/button1, /button2", "/button3"] or [[["Text button1", "/button1"],
+        ["Text button2", "/button2"]], [["Text button3", "/button3"]]]'
       selector:
         object:
     message_tag:
-      name: Message tag
-      description: "Tag for sent message. In telegram_sent event data: {{trigger.event.data.message_tag}}"
       example: "msg_to_edit"
       selector:
         text:
+    reply_to_message_id:
+      selector:
+        number:
+          mode: box
+    message_thread_id:
+      selector:
+        number:
+          mode: box
+    additional_fields:
+      collapsed: true
+      fields:
+        config_entry_id:
+          selector:
+            config_entry:
+              integration: telegram_bot
+        chat_id:
+          example: "[12345, 67890] or 12345"
+          selector:
+            text:
+              multiple: true
 
 send_voice:
-  name: Send voice
-  description: Send a voice message.
   fields:
+    entity_id:
+      selector:
+        entity:
+          filter:
+            domain: notify
+            integration: telegram_bot
+          multiple: true
+          reorder: true
     url:
-      name: URL
-      description: Remote path to a voice message.
       example: "http://example.org/path/to/the/voice.opus"
       selector:
         text:
+    url_options:
+      collapsed: true
+      fields:
+        verify_ssl:
+          default: true
+          selector:
+            boolean:
+        authentication:
+          selector:
+            select:
+              options:
+                - "basic"
+                - "digest"
+                - "bearer_token"
+              translation_key: "authentication"
+        username:
+          example: myuser
+          selector:
+            text:
+        password:
+          example: myuser_pwd
+          selector:
+            text:
+              type: password
     file:
-      name: File
-      description: Local path to a voice message.
       example: "/path/to/the/voice.opus"
       selector:
         text:
     caption:
-      name: Caption
-      description: The title of the voice message.
       example: "My microphone recording"
       selector:
         text:
-    username:
-      name: Username
-      description: Username for a URL which require HTTP authentication.
-      example: myuser
-      selector:
-        text:
-    password:
-      name: Password
-      description: Password (or bearer token) for a URL which require HTTP authentication.
-      example: myuser_pwd
-      selector:
-        text:
-    authentication:
-      name: Authentication method
-      description: Define which authentication method to use. Set to `digest` to use HTTP digest authentication, or `bearer_token` for OAuth 2.0 bearer token authentication. Defaults to `basic`.
-      default: digest
-      selector:
-        select:
-          options:
-            - "digest"
-            - "bearer_token"
-    target:
-      name: Target
-      description: An array of pre-authorized chat_ids to send the document to. If not present, first allowed chat_id is the default.
-      example: "[12345, 67890] or 12345"
-      selector:
-        object:
     disable_notification:
-      name: Disable notification
-      description: Sends the message silently. iOS users and Web users will not receive a notification, Android users will receive a notification with no sound.
       selector:
         boolean:
-    verify_ssl:
-      name: Verify SSL
-      description: Enable or disable SSL certificate verification. Set to false if you're downloading the file from a URL and you don't want to validate the SSL certificate of the server.
-      selector:
-        boolean:
-    timeout:
-      name: Timeout
-      description: Timeout for send voice. Will help with timeout errors (poor internet connection, etc)
-      selector:
-        number:
-          min: 1
-          max: 3600
-          unit_of_measurement: seconds
     keyboard:
-      name: Keyboard
-      description: List of rows of commands, comma-separated, to make a custom keyboard.
       example: '["/command1, /command2", "/command3"]'
       selector:
-        object:
+        text:
+          multiple: true
     inline_keyboard:
-      name: Inline keyboard
-      description: List of rows of commands, comma-separated, to make a custom inline keyboard with buttons with associated callback data.
-      example: '["/button1, /button2", "/button3"] or [[["Text button1", "/button1"], ["Text button2", "/button2"]], [["Text button3", "/button3"]]]'
+      example:
+        '["/button1, /button2", "/button3"] or [[["Text button1", "/button1"],
+        ["Text button2", "/button2"]], [["Text button3", "/button3"]]]'
       selector:
         object:
     message_tag:
-      name: Message tag
-      description: "Tag for sent message. In telegram_sent event data: {{trigger.event.data.message_tag}}"
       example: "msg_to_edit"
       selector:
         text:
+    reply_to_message_id:
+      selector:
+        number:
+          mode: box
+    message_thread_id:
+      selector:
+        number:
+          mode: box
+    additional_fields:
+      collapsed: true
+      fields:
+        config_entry_id:
+          selector:
+            config_entry:
+              integration: telegram_bot
+        chat_id:
+          example: "[12345, 67890] or 12345"
+          selector:
+            text:
+              multiple: true
 
 send_document:
-  name: Send document
-  description: Send a document.
   fields:
+    entity_id:
+      selector:
+        entity:
+          filter:
+            domain: notify
+            integration: telegram_bot
+          multiple: true
+          reorder: true
     url:
-      name: URL
-      description: Remote path to a document.
       example: "http://example.org/path/to/the/document.odf"
       selector:
         text:
+    url_options:
+      collapsed: true
+      fields:
+        verify_ssl:
+          default: true
+          selector:
+            boolean:
+        authentication:
+          selector:
+            select:
+              options:
+                - "basic"
+                - "digest"
+                - "bearer_token"
+              translation_key: "authentication"
+        username:
+          example: myuser
+          selector:
+            text:
+        password:
+          example: myuser_pwd
+          selector:
+            text:
+              type: password
     file:
-      name: File
-      description: Local path to a document.
       example: "/tmp/whatever.odf"
       selector:
         text:
     caption:
-      name: Caption
-      description: The title of the document.
       example: Document Title xy
       selector:
         text:
-    username:
-      name: Username
-      description: Username for a URL which require HTTP authentication.
-      example: myuser
-      selector:
-        text:
-    password:
-      name: Password
-      description: Password (or bearer token) for a URL which require HTTP authentication.
-      example: myuser_pwd
-      selector:
-        text:
-    authentication:
-      name: Authentication method
-      description: Define which authentication method to use. Set to `digest` to use HTTP digest authentication, or `bearer_token` for OAuth 2.0 bearer token authentication. Defaults to `basic`.
-      default: digest
-      selector:
-        select:
-          options:
-            - "digest"
-            - "bearer_token"
-    target:
-      name: Target
-      description: An array of pre-authorized chat_ids to send the document to. If not present, first allowed chat_id is the default.
-      example: "[12345, 67890] or 12345"
-      selector:
-        object:
     parse_mode:
-      name: Parse mode
-      description: "Parser for the message text."
       selector:
         select:
           options:
             - "html"
             - "markdown"
-            - "markdown2"
+            - "markdownv2"
+            - "plain_text"
+          translation_key: "parse_mode"
     disable_notification:
-      name: Disable notification
-      description: Sends the message silently. iOS users and Web users will not receive a notification, Android users will receive a notification with no sound.
       selector:
         boolean:
-    verify_ssl:
-      name: Verify SSL
-      description: Enable or disable SSL certificate verification. Set to false if you're downloading the file from a URL and you don't want to validate the SSL certificate of the server.
-      selector:
-        boolean:
-    timeout:
-      name: Timeout
-      description: Timeout for send document. Will help with timeout errors (poor internet connection, etc)
-      selector:
-        number:
-          min: 1
-          max: 3600
-          unit_of_measurement: seconds
     keyboard:
-      name: Keyboard
-      description: List of rows of commands, comma-separated, to make a custom keyboard.
       example: '["/command1, /command2", "/command3"]'
       selector:
-        object:
+        text:
+          multiple: true
     inline_keyboard:
-      name: Inline keyboard
-      description: List of rows of commands, comma-separated, to make a custom inline keyboard with buttons with associated callback data.
-      example: '["/button1, /button2", "/button3"] or [[["Text button1", "/button1"], ["Text button2", "/button2"]], [["Text button3", "/button3"]]]'
+      example:
+        '["/button1, /button2", "/button3"] or [[["Text button1", "/button1"],
+        ["Text button2", "/button2"]], [["Text button3", "/button3"]]]'
       selector:
         object:
     message_tag:
-      name: Message tag
-      description: "Tag for sent message. In telegram_sent event data: {{trigger.event.data.message_tag}}"
       example: "msg_to_edit"
       selector:
         text:
+    reply_to_message_id:
+      selector:
+        number:
+          mode: box
+    message_thread_id:
+      selector:
+        number:
+          mode: box
+    additional_fields:
+      collapsed: true
+      fields:
+        config_entry_id:
+          selector:
+            config_entry:
+              integration: telegram_bot
+        chat_id:
+          example: "[12345, 67890] or 12345"
+          selector:
+            text:
+              multiple: true
 
 send_location:
-  name: Send location
-  description: Send a location.
   fields:
+    entity_id:
+      selector:
+        entity:
+          filter:
+            domain: notify
+            integration: telegram_bot
+          multiple: true
+          reorder: true
     latitude:
-      name: Latitude
-      description: The latitude to send.
       required: true
       selector:
         number:
@@ -631,8 +771,6 @@ send_location:
           step: 0.001
           unit_of_measurement: "°"
     longitude:
-      name: Longitude
-      description: The longitude to send.
       required: true
       selector:
         number:
@@ -640,255 +778,470 @@ send_location:
           max: 180
           step: 0.001
           unit_of_measurement: "°"
-    target:
-      name: Target
-      description: An array of pre-authorized chat_ids to send the location to. If not present, first allowed chat_id is the default.
-      example: "[12345, 67890] or 12345"
-      selector:
-        object:
     disable_notification:
-      name: Disable notification
-      description: Sends the message silently. iOS users and Web users will not receive a notification, Android users will receive a notification with no sound.
       selector:
         boolean:
-    timeout:
-      name: Timeout
-      description: Timeout for send photo. Will help with timeout errors (poor internet connection, etc)
-      selector:
-        number:
-          min: 1
-          max: 3600
-          unit_of_measurement: seconds
     keyboard:
-      name: Keyboard
-      description: List of rows of commands, comma-separated, to make a custom keyboard.
       example: '["/command1, /command2", "/command3"]'
       selector:
-        object:
+        text:
+          multiple: true
     inline_keyboard:
-      name: Inline keyboard
-      description: List of rows of commands, comma-separated, to make a custom inline keyboard with buttons with associated callback data.
-      example: '["/button1, /button2", "/button3"] or [[["Text button1", "/button1"], ["Text button2", "/button2"]], [["Text button3", "/button3"]]]'
+      example:
+        '["/button1, /button2", "/button3"] or [[["Text button1", "/button1"],
+        ["Text button2", "/button2"]], [["Text button3", "/button3"]]]'
       selector:
         object:
     message_tag:
-      name: Message tag
-      description: "Tag for sent message. In telegram_sent event data: {{trigger.event.data.message_tag}}"
       example: "msg_to_edit"
       selector:
         text:
+    reply_to_message_id:
+      selector:
+        number:
+          mode: box
+    message_thread_id:
+      selector:
+        number:
+          mode: box
+    additional_fields:
+      collapsed: true
+      fields:
+        config_entry_id:
+          selector:
+            config_entry:
+              integration: telegram_bot
+        chat_id:
+          example: "[12345, 67890] or 12345"
+          selector:
+            text:
+              multiple: true
 
 send_poll:
-  name: Send poll
-  description: Send a poll.
   fields:
-    target:
-      name: Target
-      description: An array of pre-authorized chat_ids to send the location to. If not present, first allowed chat_id is the default.
-      example: "[12345, 67890] or 12345"
+    entity_id:
       selector:
-        object:
+        entity:
+          filter:
+            domain: notify
+            integration: telegram_bot
+          multiple: true
+          reorder: true
     question:
-      name: Question
-      description: Poll question, 1-300 characters
       required: true
       selector:
         text:
     options:
-      name: Options
-      description: List of answer options, 2-10 strings 1-100 characters each
+      example: '["Option 1", "Option 2", "Option 3"]'
       required: true
       selector:
-        object:
+        text:
+          multiple: true
     is_anonymous:
-      name: Is Anonymous
-      description: If the poll needs to be anonymous, defaults to True
+      default: true
       selector:
         boolean:
     allows_multiple_answers:
-      name: Allow Multiple Answers
-      description: If the poll allows multiple answers, defaults to False
       selector:
         boolean:
     open_period:
-      name: Open Period
-      description: Amount of time in seconds the poll will be active after creation, 5-600.
       selector:
         number:
           min: 5
           max: 600
           unit_of_measurement: seconds
     disable_notification:
-      name: Disable notification
-      description: Sends the message silently. iOS users and Web users will not receive a notification, Android users will receive a notification with no sound.
       selector:
         boolean:
-    timeout:
-      name: Timeout
-      description: Timeout for send poll. Will help with timeout errors (poor internet connection, etc)
+    reply_to_message_id:
       selector:
         number:
-          min: 1
-          max: 3600
-          unit_of_measurement: seconds
+          mode: box
+    message_thread_id:
+      selector:
+        number:
+          mode: box
+    additional_fields:
+      collapsed: true
+      fields:
+        config_entry_id:
+          selector:
+            config_entry:
+              integration: telegram_bot
+        chat_id:
+          example: "[12345, 67890] or 12345"
+          selector:
+            text:
+              multiple: true
 
 edit_message:
-  name: Edit message
-  description: Edit a previously sent message.
   fields:
+    entity_id:
+      selector:
+        entity:
+          filter:
+            domain: notify
+            integration: telegram_bot
     message_id:
-      name: Message ID
-      description: id of the message to edit.
       required: true
       example: "{{ trigger.event.data.message.message_id }}"
       selector:
         text:
-    chat_id:
-      name: Chat ID
-      description: The chat_id where to edit the message.
-      required: true
-      example: 12345
-      selector:
-        text:
     message:
-      name: Message
-      description: Message body of the notification.
       example: The garage door has been open for 10 minutes.
       selector:
         text:
     title:
-      name: Title
-      description: Optional title for your notification. Will be composed as '%title\n%message'
       example: "Your Garage Door Friend"
       selector:
         text:
     parse_mode:
-      name: Parse mode
-      description: "Parser for the message text."
       selector:
         select:
           options:
             - "html"
             - "markdown"
-            - "markdown2"
+            - "markdownv2"
+            - "plain_text"
+          translation_key: "parse_mode"
     disable_web_page_preview:
-      name: Disable web page preview
-      description: Disables link previews for links in the message.
       selector:
         boolean:
     inline_keyboard:
-      name: Inline keyboard
-      description: List of rows of commands, comma-separated, to make a custom inline keyboard with buttons with associated callback data.
-      example: '["/button1, /button2", "/button3"] or [[["Text button1", "/button1"], ["Text button2", "/button2"]], [["Text button3", "/button3"]]]'
+      example:
+        '["/button1, /button2", "/button3"] or [[["Text button1", "/button1"],
+        ["Text button2", "/button2"]], [["Text button3", "/button3"]]]'
       selector:
         object:
+    additional_fields:
+      collapsed: true
+      fields:
+        config_entry_id:
+          selector:
+            config_entry:
+              integration: telegram_bot
+        chat_id:
+          example: "[12345, 67890] or 12345"
+          selector:
+            text:
+              multiple: true
 
-edit_caption:
-  name: Edit caption
-  description: Edit the caption of a previously sent message.
+edit_message_media:
   fields:
+    entity_id:
+      selector:
+        entity:
+          filter:
+            domain: notify
+            integration: telegram_bot
     message_id:
-      name: Message ID
-      description: id of the message to edit.
       required: true
       example: "{{ trigger.event.data.message.message_id }}"
       selector:
         text:
-    chat_id:
-      name: Chat ID
-      description: The chat_id where to edit the caption.
-      required: true
-      example: 12345
+    media_type:
+      selector:
+        select:
+          options:
+            - "animation"
+            - "audio"
+            - "document"
+            - "photo"
+            - "video"
+          translation_key: "media_type"
+    url:
+      example: "http://example.org/path/to/the/image.png"
+      selector:
+        text:
+    url_options:
+      collapsed: true
+      fields:
+        verify_ssl:
+          default: true
+          selector:
+            boolean:
+        authentication:
+          selector:
+            select:
+              options:
+                - "basic"
+                - "digest"
+                - "bearer_token"
+              translation_key: "authentication"
+        username:
+          example: myuser
+          selector:
+            text:
+        password:
+          example: myuser_pwd
+          selector:
+            text:
+              type: password
+    file:
+      example: "/path/to/the/image.png"
       selector:
         text:
     caption:
-      name: Caption
-      description: Message body of the notification.
+      example: Document Title xy
+      selector:
+        text:
+    inline_keyboard:
+      example:
+        '["/button1, /button2", "/button3"] or [[["Text button1", "/button1"],
+        ["Text button2", "/button2"]], [["Text button3", "/button3"]]]'
+      selector:
+        object:
+    additional_fields:
+      collapsed: true
+      fields:
+        config_entry_id:
+          selector:
+            config_entry:
+              integration: telegram_bot
+        chat_id:
+          example: "[12345, 67890] or 12345"
+          selector:
+            text:
+              multiple: true
+
+edit_caption:
+  fields:
+    entity_id:
+      selector:
+        entity:
+          filter:
+            domain: notify
+            integration: telegram_bot
+    message_id:
+      required: true
+      example: "{{ trigger.event.data.message.message_id }}"
+      selector:
+        text:
+    caption:
       required: true
       example: The garage door has been open for 10 minutes.
       selector:
         text:
     inline_keyboard:
-      name: Inline keyboard
-      description: List of rows of commands, comma-separated, to make a custom inline keyboard with buttons with associated callback data.
-      example: '["/button1, /button2", "/button3"] or [[["Text button1", "/button1"], ["Text button2", "/button2"]], [["Text button3", "/button3"]]]'
+      example:
+        '["/button1, /button2", "/button3"] or [[["Text button1", "/button1"],
+        ["Text button2", "/button2"]], [["Text button3", "/button3"]]]'
       selector:
         object:
+    additional_fields:
+      collapsed: true
+      fields:
+        config_entry_id:
+          selector:
+            config_entry:
+              integration: telegram_bot
+        chat_id:
+          example: "[12345, 67890] or 12345"
+          selector:
+            text:
+              multiple: true
 
 edit_replymarkup:
-  name: Edit reply markup
-  description: Edit the inline keyboard of a previously sent message.
   fields:
+    entity_id:
+      selector:
+        entity:
+          filter:
+            domain: notify
+            integration: telegram_bot
     message_id:
-      name: Message ID
-      description: id of the message to edit.
       required: true
       example: "{{ trigger.event.data.message.message_id }}"
       selector:
         text:
-    chat_id:
-      name: Chat ID
-      description: The chat_id where to edit the reply_markup.
-      required: true
-      example: 12345
-      selector:
-        text:
     inline_keyboard:
-      name: Inline keyboard
-      description: List of rows of commands, comma-separated, to make a custom inline keyboard with buttons with associated callback data.
       required: true
-      example: '["/button1, /button2", "/button3"] or [[["Text button1", "/button1"], ["Text button2", "/button2"]], [["Text button3", "/button3"]]]'
+      example:
+        '["/button1, /button2", "/button3"] or [[["Text button1", "/button1"],
+        ["Text button2", "/button2"]], [["Text button3", "/button3"]]]'
       selector:
         object:
+    additional_fields:
+      collapsed: true
+      fields:
+        config_entry_id:
+          selector:
+            config_entry:
+              integration: telegram_bot
+        chat_id:
+          example: "[12345, 67890] or 12345"
+          selector:
+            text:
+              multiple: true
 
 answer_callback_query:
-  name: Answer callback query
-  description: Respond to a callback query originated by clicking on an online keyboard button. The answer will be displayed to the user as a notification at the top of the chat screen or as an alert.
   fields:
+    config_entry_id:
+      selector:
+        config_entry:
+          integration: telegram_bot
     message:
-      name: Message
-      description: Unformatted text message body of the notification.
       required: true
       example: "OK, I'm listening"
       selector:
         text:
     callback_query_id:
-      name: Callback query ID
-      description: Unique id of the callback response.
       required: true
       example: "{{ trigger.event.data.id }}"
       selector:
         text:
     show_alert:
-      name: Show alert
-      description: Show a permanent notification.
       required: true
       selector:
         boolean:
-    timeout:
-      name: Timeout
-      description: Timeout for sending the answer. Will help with timeout errors (poor internet connection, etc)
-      selector:
-        number:
-          min: 1
-          max: 3600
-          unit_of_measurement: seconds
 
 delete_message:
-  name: Delete message
-  description: Delete a previously sent message.
   fields:
+    entity_id:
+      selector:
+        entity:
+          filter:
+            domain: notify
+            integration: telegram_bot
     message_id:
-      name: Message ID
-      description: id of the message to delete.
       required: true
       example: "{{ trigger.event.data.message.message_id }}"
       selector:
         text:
-    chat_id:
-      name: Chat ID
-      description: The chat_id where to delete the message.
+    additional_fields:
+      collapsed: true
+      fields:
+        config_entry_id:
+          selector:
+            config_entry:
+              integration: telegram_bot
+        chat_id:
+          example: "12345"
+          selector:
+            text:
+              multiple: true
+
+leave_chat:
+  fields:
+    entity_id:
+      selector:
+        entity:
+          filter:
+            domain: notify
+            integration: telegram_bot
+    additional_fields:
+      collapsed: true
+      fields:
+        config_entry_id:
+          selector:
+            config_entry:
+              integration: telegram_bot
+        chat_id:
+          example: "12345"
+          selector:
+            text:
+              multiple: true
+
+set_message_reaction:
+  fields:
+    entity_id:
+      selector:
+        entity:
+          filter:
+            domain: notify
+            integration: telegram_bot
+    message_id:
       required: true
-      example: 12345
+      example: 54321
       selector:
         text:
+    reaction:
+      required: true
+      example: 👍
+      selector:
+        text:
+    is_big:
+      required: false
+      selector:
+        boolean:
+    additional_fields:
+      collapsed: true
+      fields:
+        config_entry_id:
+          selector:
+            config_entry:
+              integration: telegram_bot
+        chat_id:
+          example: "12345"
+          selector:
+            text:
+              multiple: true
+
+download_file:
+  fields:
+    config_entry_id:
+      selector:
+        config_entry:
+          integration: telegram_bot
+    file_id:
+      required: true
+      example: "ABCD1234Efgh5678Ijkl90mnopQRStuvwx"
+      selector:
+        text:
+    directory_path:
+      required: false
+      default: "/config/telegram_bot"
+      selector:
+        text:
+    file_name:
+      required: false
+      example: "my_downloaded_file"
+      selector:
+        text:
+
+send_message_draft:
+  fields:
+    entity_id:
+      selector:
+        entity:
+          filter:
+            domain: notify
+            integration: telegram_bot
+          multiple: true
+          reorder: true
+    message_thread_id:
+      selector:
+        number:
+          mode: box
+    draft_id:
+      required: true
+      selector:
+        number:
+          mode: box
+          min: 1
+    message:
+      example: The garage door has been o
+      required: true
+      selector:
+        text:
+    parse_mode:
+      selector:
+        select:
+          options:
+            - "html"
+            - "markdown"
+            - "markdownv2"
+            - "plain_text"
+          translation_key: "parse_mode"
+    additional_fields:
+      collapsed: true
+      fields:
+        config_entry_id:
+          selector:
+            config_entry:
+              integration: telegram_bot
+        chat_id:
+          example: "[12345, 67890] or 12345"
+          selector:
+            text:
+              multiple: true

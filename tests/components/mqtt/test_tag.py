@@ -1,25 +1,27 @@
 """The tests for MQTT tag scanner."""
+
 import copy
 import json
-from unittest.mock import ANY, patch
+from typing import Any
+from unittest.mock import ANY, AsyncMock, patch
 
 import pytest
-
-from homeassistant.components.device_automation import DeviceAutomationType
-from homeassistant.components.mqtt.const import DOMAIN as MQTT_DOMAIN
-from homeassistant.const import Platform
-from homeassistant.helpers import device_registry as dr
-from homeassistant.setup import async_setup_component
-
-from .test_common import help_test_unload_config_entry
-
-from tests.common import (
+from pytest_homeassistant.common import (
     MockConfigEntry,
     async_fire_mqtt_message,
     async_get_device_automations,
-    mock_device_registry,
-    mock_registry,
 )
+from pytest_homeassistant.components.mqtt.common import help_test_unload_config_entry
+from pytest_homeassistant.typing import MqttMockHAClientGenerator, WebSocketGenerator
+
+from homeassistant.components import mqtt
+from homeassistant.components.device_automation import DeviceAutomationType
+from homeassistant.components.mqtt.const import DOMAIN
+from homeassistant.components.mqtt.models import DATA_MQTT
+from homeassistant.config_entries import ConfigEntryState
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr
+from homeassistant.setup import async_setup_component
 
 DEFAULT_CONFIG_DEVICE = {
     "device": {"identifiers": ["0AFFD2"]},
@@ -45,51 +47,51 @@ DEFAULT_TAG_SCAN_JSON = (
 )
 
 
-@pytest.fixture(autouse=True)
-def binary_sensor_only():
-    """Only setup the binary_sensor platform to speed up test."""
-    with patch("homeassistant.components.mqtt.PLATFORMS", [Platform.BINARY_SENSOR]):
-        yield
-
-
-@pytest.fixture
-def device_reg(hass):
-    """Return an empty, loaded, registry."""
-    return mock_device_registry(hass)
-
-
-@pytest.fixture
-def entity_reg(hass):
-    """Return an empty, loaded, registry."""
-    return mock_registry(hass)
-
-
-@pytest.fixture
-def tag_mock():
-    """Fixture to mock tag."""
-    with patch("homeassistant.components.tag.async_scan_tag") as mock_tag:
-        yield mock_tag
+def _get_device_for_config_entry(
+    device_registry: dr.DeviceRegistry,
+    config_entry_id: str,
+    *,
+    identifiers: set[tuple[str, str]] | None = None,
+    connections: set[tuple[str, str]] | None = None,
+) -> dr.DeviceEntry | None:
+    """Return the device for a config entry matching identifiers or connections."""
+    for device in device_registry.async_get_devices(
+        identifiers=identifiers, connections=connections
+    ):
+        if device.config_entry_id == config_entry_id:
+            return device
+    return None
 
 
 @pytest.mark.no_fail_on_log_exception
 async def test_discover_bad_tag(
-    hass, device_reg, entity_reg, mqtt_mock_entry_no_yaml_config, tag_mock
-):
+    hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
+    mqtt_mock_entry: MqttMockHAClientGenerator,
+    tag_mock: AsyncMock,
+) -> None:
     """Test bad discovery message."""
-    await mqtt_mock_entry_no_yaml_config()
+    await mqtt_mock_entry()
     config1 = copy.deepcopy(DEFAULT_CONFIG_DEVICE)
 
     # Test sending bad data
     data0 = '{ "device":{"identifiers":["0AFFD2"]}, "topics": "foobar/tag_scanned" }'
     async_fire_mqtt_message(hass, "homeassistant/tag/bla/config", data0)
     await hass.async_block_till_done()
-    assert device_reg.async_get_device({("mqtt", "0AFFD2")}) is None
+    assert (
+        device_registry.async_get_device_by_identifier(
+            ("mqtt", "0AFFD2"), hass.config_entries.async_entries("mqtt")[0].entry_id
+        )
+        is None
+    )
 
     # Test sending correct data
     async_fire_mqtt_message(hass, "homeassistant/tag/bla/config", json.dumps(config1))
     await hass.async_block_till_done()
 
-    device_entry = device_reg.async_get_device({("mqtt", "0AFFD2")})
+    device_entry = device_registry.async_get_device_by_identifier(
+        ("mqtt", "0AFFD2"), hass.config_entries.async_entries("mqtt")[0].entry_id
+    )
     # Fake tag scan.
     async_fire_mqtt_message(hass, "foobar/tag_scanned", DEFAULT_TAG_SCAN)
     await hass.async_block_till_done()
@@ -97,15 +99,20 @@ async def test_discover_bad_tag(
 
 
 async def test_if_fires_on_mqtt_message_with_device(
-    hass, device_reg, mqtt_mock_entry_no_yaml_config, tag_mock
-):
+    hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
+    mqtt_mock_entry: MqttMockHAClientGenerator,
+    tag_mock: AsyncMock,
+) -> None:
     """Test tag scanning, with device."""
-    await mqtt_mock_entry_no_yaml_config()
+    await mqtt_mock_entry()
     config = copy.deepcopy(DEFAULT_CONFIG_DEVICE)
 
     async_fire_mqtt_message(hass, "homeassistant/tag/bla1/config", json.dumps(config))
     await hass.async_block_till_done()
-    device_entry = device_reg.async_get_device({("mqtt", "0AFFD2")})
+    device_entry = device_registry.async_get_device_by_identifier(
+        ("mqtt", "0AFFD2"), hass.config_entries.async_entries("mqtt")[0].entry_id
+    )
 
     # Fake tag scan.
     async_fire_mqtt_message(hass, "foobar/tag_scanned", DEFAULT_TAG_SCAN)
@@ -114,10 +121,10 @@ async def test_if_fires_on_mqtt_message_with_device(
 
 
 async def test_if_fires_on_mqtt_message_without_device(
-    hass, device_reg, mqtt_mock_entry_no_yaml_config, tag_mock
-):
+    hass: HomeAssistant, mqtt_mock_entry: MqttMockHAClientGenerator, tag_mock: AsyncMock
+) -> None:
     """Test tag scanning, without device."""
-    await mqtt_mock_entry_no_yaml_config()
+    await mqtt_mock_entry()
     config = copy.deepcopy(DEFAULT_CONFIG)
 
     async_fire_mqtt_message(hass, "homeassistant/tag/bla1/config", json.dumps(config))
@@ -130,15 +137,20 @@ async def test_if_fires_on_mqtt_message_without_device(
 
 
 async def test_if_fires_on_mqtt_message_with_template(
-    hass, device_reg, mqtt_mock_entry_no_yaml_config, tag_mock
-):
+    hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
+    mqtt_mock_entry: MqttMockHAClientGenerator,
+    tag_mock: AsyncMock,
+) -> None:
     """Test tag scanning, with device."""
-    await mqtt_mock_entry_no_yaml_config()
+    await mqtt_mock_entry()
     config = copy.deepcopy(DEFAULT_CONFIG_JSON)
 
     async_fire_mqtt_message(hass, "homeassistant/tag/bla1/config", json.dumps(config))
     await hass.async_block_till_done()
-    device_entry = device_reg.async_get_device({("mqtt", "0AFFD2")})
+    device_entry = device_registry.async_get_device_by_identifier(
+        ("mqtt", "0AFFD2"), hass.config_entries.async_entries("mqtt")[0].entry_id
+    )
 
     # Fake tag scan.
     async_fire_mqtt_message(hass, "foobar/tag_scanned", DEFAULT_TAG_SCAN_JSON)
@@ -146,9 +158,11 @@ async def test_if_fires_on_mqtt_message_with_template(
     tag_mock.assert_called_once_with(ANY, DEFAULT_TAG_ID, device_entry.id)
 
 
-async def test_strip_tag_id(hass, device_reg, mqtt_mock_entry_no_yaml_config, tag_mock):
+async def test_strip_tag_id(
+    hass: HomeAssistant, mqtt_mock_entry: MqttMockHAClientGenerator, tag_mock: AsyncMock
+) -> None:
     """Test strip whitespace from tag_id."""
-    await mqtt_mock_entry_no_yaml_config()
+    await mqtt_mock_entry()
     config = copy.deepcopy(DEFAULT_CONFIG)
 
     async_fire_mqtt_message(hass, "homeassistant/tag/bla1/config", json.dumps(config))
@@ -161,10 +175,13 @@ async def test_strip_tag_id(hass, device_reg, mqtt_mock_entry_no_yaml_config, ta
 
 
 async def test_if_fires_on_mqtt_message_after_update_with_device(
-    hass, device_reg, mqtt_mock_entry_no_yaml_config, tag_mock
-):
+    hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
+    mqtt_mock_entry: MqttMockHAClientGenerator,
+    tag_mock: AsyncMock,
+) -> None:
     """Test tag scanning after update."""
-    await mqtt_mock_entry_no_yaml_config()
+    await mqtt_mock_entry()
     config1 = copy.deepcopy(DEFAULT_CONFIG_DEVICE)
     config1["some_future_option_1"] = "future_option_1"
     config2 = copy.deepcopy(DEFAULT_CONFIG_DEVICE)
@@ -173,7 +190,9 @@ async def test_if_fires_on_mqtt_message_after_update_with_device(
 
     async_fire_mqtt_message(hass, "homeassistant/tag/bla1/config", json.dumps(config1))
     await hass.async_block_till_done()
-    device_entry = device_reg.async_get_device({("mqtt", "0AFFD2")})
+    device_entry = device_registry.async_get_device_by_identifier(
+        ("mqtt", "0AFFD2"), hass.config_entries.async_entries("mqtt")[0].entry_id
+    )
 
     # Fake tag scan.
     async_fire_mqtt_message(hass, "foobar/tag_scanned", DEFAULT_TAG_SCAN)
@@ -207,11 +226,93 @@ async def test_if_fires_on_mqtt_message_after_update_with_device(
     tag_mock.assert_called_once_with(ANY, DEFAULT_TAG_ID, device_entry.id)
 
 
+async def test_invalid_update_keeps_current_config(
+    hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
+    mqtt_mock_entry: MqttMockHAClientGenerator,
+    tag_mock: AsyncMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test an invalid update is rejected again when it is received again."""
+    await mqtt_mock_entry()
+    async_fire_mqtt_message(
+        hass, "homeassistant/tag/bla1/config", json.dumps(DEFAULT_CONFIG_DEVICE)
+    )
+    await hass.async_block_till_done()
+    device_entry = device_registry.async_get_device_by_identifier(
+        ("mqtt", "0AFFD2"), hass.config_entries.async_entries("mqtt")[0].entry_id
+    )
+    assert device_entry is not None
+    update = json.dumps({**DEFAULT_CONFIG_DEVICE, "topic": "foobar/#/invalid"})
+    schema_error = (
+        "when processing MQTT discovery message topic: 'homeassistant/tag/bla1/config'"
+    )
+
+    async_fire_mqtt_message(hass, "homeassistant/tag/bla1/config", update)
+    await hass.async_block_till_done()
+    assert schema_error in caplog.text
+
+    caplog.clear()
+    async_fire_mqtt_message(hass, "homeassistant/tag/bla1/config", update)
+    await hass.async_block_till_done()
+    assert schema_error in caplog.text
+
+    # The current config is still active
+    async_fire_mqtt_message(hass, "foobar/tag_scanned", DEFAULT_TAG_SCAN)
+    await hass.async_block_till_done()
+    tag_mock.assert_called_once_with(ANY, DEFAULT_TAG_ID, device_entry.id)
+
+
+async def test_update_device_registration_error_keeps_current_config(
+    hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
+    mqtt_mock_entry: MqttMockHAClientGenerator,
+    tag_mock: AsyncMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test an update with a device that can not be registered keeps the config."""
+    await mqtt_mock_entry()
+    # The identifiers and connections below belong to these two devices
+    for object_id, device in (
+        ("a", {"identifiers": ["device_a"]}),
+        ("b", {"connections": [["mac", "02:5b:26:a8:dc:12"]]}),
+    ):
+        async_fire_mqtt_message(
+            hass,
+            f"homeassistant/tag/{object_id}/config",
+            json.dumps({"topic": f"{object_id}/tag", "device": device}),
+        )
+    config = {**DEFAULT_CONFIG_JSON, "device": {"identifiers": ["device_c"]}}
+    async_fire_mqtt_message(hass, "homeassistant/tag/bla1/config", json.dumps(config))
+    await hass.async_block_till_done()
+    device_entry = device_registry.async_get_device_by_identifier(
+        ("mqtt", "device_c"), hass.config_entries.async_entries("mqtt")[0].entry_id
+    )
+    assert device_entry is not None
+
+    update = {
+        "topic": "foobar/tag_scanned2",
+        "value_template": "{{ value_json.PN532.DATA }}",
+        "device": {
+            "identifiers": ["device_a"],
+            "connections": [["mac", "02:5b:26:a8:dc:12"]],
+        },
+    }
+    async_fire_mqtt_message(hass, "homeassistant/tag/bla1/config", json.dumps(update))
+    await hass.async_block_till_done()
+    assert "Unable to register MQTT device" in caplog.text
+
+    # The current topic and value template are still used
+    async_fire_mqtt_message(hass, "foobar/tag_scanned", DEFAULT_TAG_SCAN_JSON)
+    await hass.async_block_till_done()
+    tag_mock.assert_called_once_with(ANY, DEFAULT_TAG_ID, device_entry.id)
+
+
 async def test_if_fires_on_mqtt_message_after_update_without_device(
-    hass, device_reg, mqtt_mock_entry_no_yaml_config, tag_mock
-):
+    hass: HomeAssistant, mqtt_mock_entry: MqttMockHAClientGenerator, tag_mock: AsyncMock
+) -> None:
     """Test tag scanning after update."""
-    await mqtt_mock_entry_no_yaml_config()
+    await mqtt_mock_entry()
     config1 = copy.deepcopy(DEFAULT_CONFIG)
     config2 = copy.deepcopy(DEFAULT_CONFIG)
     config2["topic"] = "foobar/tag_scanned2"
@@ -252,18 +353,26 @@ async def test_if_fires_on_mqtt_message_after_update_without_device(
 
 
 async def test_if_fires_on_mqtt_message_after_update_with_template(
-    hass, device_reg, mqtt_mock_entry_no_yaml_config, tag_mock
-):
+    hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
+    mqtt_mock_entry: MqttMockHAClientGenerator,
+    tag_mock: AsyncMock,
+) -> None:
     """Test tag scanning after update."""
-    await mqtt_mock_entry_no_yaml_config()
+    await mqtt_mock_entry()
     config1 = copy.deepcopy(DEFAULT_CONFIG_JSON)
     config2 = copy.deepcopy(DEFAULT_CONFIG_JSON)
     config2["value_template"] = "{{ value_json.RDM6300.UID }}"
-    tag_scan_2 = '{"Time":"2020-09-28T17:02:10","RDM6300":{"UID":"E9F35959", "DATA":"ILOVETASMOTA"}}'
+    tag_scan_2 = (
+        '{"Time":"2020-09-28T17:02:10",'
+        '"RDM6300":{"UID":"E9F35959", "DATA":"ILOVETASMOTA"}}'
+    )
 
     async_fire_mqtt_message(hass, "homeassistant/tag/bla1/config", json.dumps(config1))
     await hass.async_block_till_done()
-    device_entry = device_reg.async_get_device({("mqtt", "0AFFD2")})
+    device_entry = device_registry.async_get_device_by_identifier(
+        ("mqtt", "0AFFD2"), hass.config_entries.async_entries("mqtt")[0].entry_id
+    )
 
     # Fake tag scan.
     async_fire_mqtt_message(hass, "foobar/tag_scanned", DEFAULT_TAG_SCAN_JSON)
@@ -298,15 +407,19 @@ async def test_if_fires_on_mqtt_message_after_update_with_template(
 
 
 async def test_no_resubscribe_same_topic(
-    hass, device_reg, mqtt_mock_entry_no_yaml_config
-):
+    hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
+    mqtt_mock_entry: MqttMockHAClientGenerator,
+) -> None:
     """Test subscription to topics without change."""
-    mqtt_mock = await mqtt_mock_entry_no_yaml_config()
+    mqtt_mock = await mqtt_mock_entry()
     config = copy.deepcopy(DEFAULT_CONFIG_DEVICE)
 
     async_fire_mqtt_message(hass, "homeassistant/tag/bla1/config", json.dumps(config))
     await hass.async_block_till_done()
-    assert device_reg.async_get_device({("mqtt", "0AFFD2")})
+    assert device_registry.async_get_device_by_identifier(
+        ("mqtt", "0AFFD2"), hass.config_entries.async_entries("mqtt")[0].entry_id
+    )
 
     call_count = mqtt_mock.async_subscribe.call_count
     async_fire_mqtt_message(hass, "homeassistant/tag/bla1/config", json.dumps(config))
@@ -315,15 +428,20 @@ async def test_no_resubscribe_same_topic(
 
 
 async def test_not_fires_on_mqtt_message_after_remove_by_mqtt_with_device(
-    hass, device_reg, mqtt_mock_entry_no_yaml_config, tag_mock
-):
+    hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
+    mqtt_mock_entry: MqttMockHAClientGenerator,
+    tag_mock: AsyncMock,
+) -> None:
     """Test tag scanning after removal."""
-    await mqtt_mock_entry_no_yaml_config()
+    await mqtt_mock_entry()
     config = copy.deepcopy(DEFAULT_CONFIG_DEVICE)
 
     async_fire_mqtt_message(hass, "homeassistant/tag/bla1/config", json.dumps(config))
     await hass.async_block_till_done()
-    device_entry = device_reg.async_get_device({("mqtt", "0AFFD2")})
+    device_entry = device_registry.async_get_device_by_identifier(
+        ("mqtt", "0AFFD2"), hass.config_entries.async_entries("mqtt")[0].entry_id
+    )
 
     # Fake tag scan.
     async_fire_mqtt_message(hass, "foobar/tag_scanned", DEFAULT_TAG_SCAN)
@@ -349,10 +467,10 @@ async def test_not_fires_on_mqtt_message_after_remove_by_mqtt_with_device(
 
 
 async def test_not_fires_on_mqtt_message_after_remove_by_mqtt_without_device(
-    hass, device_reg, mqtt_mock_entry_no_yaml_config, tag_mock
-):
+    hass: HomeAssistant, mqtt_mock_entry: MqttMockHAClientGenerator, tag_mock: AsyncMock
+) -> None:
     """Test tag scanning not firing after removal."""
-    await mqtt_mock_entry_no_yaml_config()
+    await mqtt_mock_entry()
     config = copy.deepcopy(DEFAULT_CONFIG)
 
     async_fire_mqtt_message(hass, "homeassistant/tag/bla1/config", json.dumps(config))
@@ -382,23 +500,25 @@ async def test_not_fires_on_mqtt_message_after_remove_by_mqtt_without_device(
 
 
 async def test_not_fires_on_mqtt_message_after_remove_from_registry(
-    hass,
-    hass_ws_client,
-    device_reg,
-    mqtt_mock_entry_no_yaml_config,
-    tag_mock,
-):
+    hass: HomeAssistant,
+    hass_ws_client: WebSocketGenerator,
+    device_registry: dr.DeviceRegistry,
+    mqtt_mock_entry: MqttMockHAClientGenerator,
+    tag_mock: AsyncMock,
+) -> None:
     """Test tag scanning after removal."""
     assert await async_setup_component(hass, "config", {})
     await hass.async_block_till_done()
-    await mqtt_mock_entry_no_yaml_config()
+    await mqtt_mock_entry()
     ws_client = await hass_ws_client(hass)
 
     config = copy.deepcopy(DEFAULT_CONFIG_DEVICE)
 
     async_fire_mqtt_message(hass, "homeassistant/tag/bla1/config", json.dumps(config))
     await hass.async_block_till_done()
-    device_entry = device_reg.async_get_device({("mqtt", "0AFFD2")})
+    device_entry = device_registry.async_get_device_by_identifier(
+        ("mqtt", "0AFFD2"), hass.config_entries.async_entries("mqtt")[0].entry_id
+    )
 
     # Fake tag scan.
     async_fire_mqtt_message(hass, "foobar/tag_scanned", DEFAULT_TAG_SCAN)
@@ -406,16 +526,7 @@ async def test_not_fires_on_mqtt_message_after_remove_from_registry(
     tag_mock.assert_called_once_with(ANY, DEFAULT_TAG_ID, device_entry.id)
 
     # Remove MQTT from the device
-    mqtt_config_entry = hass.config_entries.async_entries(MQTT_DOMAIN)[0]
-    await ws_client.send_json(
-        {
-            "id": 6,
-            "type": "config/device_registry/remove_config_entry",
-            "config_entry_id": mqtt_config_entry.entry_id,
-            "device_id": device_entry.id,
-        }
-    )
-    response = await ws_client.receive_json()
+    response = await ws_client.remove_device(device_entry.id)
     assert response["success"]
     tag_mock.reset_mock()
 
@@ -424,10 +535,13 @@ async def test_not_fires_on_mqtt_message_after_remove_from_registry(
     tag_mock.assert_not_called()
 
 
-async def test_entity_device_info_with_connection(hass, mqtt_mock_entry_no_yaml_config):
+async def test_entity_device_info_with_connection(
+    hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
+    mqtt_mock_entry: MqttMockHAClientGenerator,
+) -> None:
     """Test MQTT device registry integration."""
-    await mqtt_mock_entry_no_yaml_config()
-    registry = dr.async_get(hass)
+    await mqtt_mock_entry()
 
     data = json.dumps(
         {
@@ -438,6 +552,7 @@ async def test_entity_device_info_with_connection(hass, mqtt_mock_entry_no_yaml_
                 "name": "Beer",
                 "model": "Glass",
                 "hw_version": "rev1",
+                "serial_number": "1234deadbeef",
                 "sw_version": "0.1-beta",
             },
         }
@@ -445,8 +560,9 @@ async def test_entity_device_info_with_connection(hass, mqtt_mock_entry_no_yaml_
     async_fire_mqtt_message(hass, "homeassistant/tag/bla/config", data)
     await hass.async_block_till_done()
 
-    device = registry.async_get_device(
-        set(), {(dr.CONNECTION_NETWORK_MAC, "02:5b:26:a8:dc:12")}
+    device = device_registry.async_get_device_by_connection(
+        (dr.CONNECTION_NETWORK_MAC, "02:5b:26:a8:dc:12"),
+        hass.config_entries.async_entries("mqtt")[0].entry_id,
     )
     assert device is not None
     assert device.connections == {(dr.CONNECTION_NETWORK_MAC, "02:5b:26:a8:dc:12")}
@@ -454,13 +570,17 @@ async def test_entity_device_info_with_connection(hass, mqtt_mock_entry_no_yaml_
     assert device.name == "Beer"
     assert device.model == "Glass"
     assert device.hw_version == "rev1"
+    assert device.serial_number == "1234deadbeef"
     assert device.sw_version == "0.1-beta"
 
 
-async def test_entity_device_info_with_identifier(hass, mqtt_mock_entry_no_yaml_config):
+async def test_entity_device_info_with_identifier(
+    hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
+    mqtt_mock_entry: MqttMockHAClientGenerator,
+) -> None:
     """Test MQTT device registry integration."""
-    await mqtt_mock_entry_no_yaml_config()
-    registry = dr.async_get(hass)
+    await mqtt_mock_entry()
 
     data = json.dumps(
         {
@@ -471,6 +591,7 @@ async def test_entity_device_info_with_identifier(hass, mqtt_mock_entry_no_yaml_
                 "name": "Beer",
                 "model": "Glass",
                 "hw_version": "rev1",
+                "serial_number": "1234deadbeef",
                 "sw_version": "0.1-beta",
             },
         }
@@ -478,22 +599,59 @@ async def test_entity_device_info_with_identifier(hass, mqtt_mock_entry_no_yaml_
     async_fire_mqtt_message(hass, "homeassistant/tag/bla/config", data)
     await hass.async_block_till_done()
 
-    device = registry.async_get_device({("mqtt", "helloworld")})
+    device = device_registry.async_get_device_by_identifier(
+        ("mqtt", "helloworld"), hass.config_entries.async_entries("mqtt")[0].entry_id
+    )
     assert device is not None
     assert device.identifiers == {("mqtt", "helloworld")}
     assert device.manufacturer == "Whatever"
     assert device.name == "Beer"
     assert device.model == "Glass"
     assert device.hw_version == "rev1"
+    assert device.serial_number == "1234deadbeef"
     assert device.sw_version == "0.1-beta"
 
 
-async def test_entity_device_info_update(hass, mqtt_mock_entry_no_yaml_config):
-    """Test device registry update."""
-    await mqtt_mock_entry_no_yaml_config()
-    registry = dr.async_get(hass)
+async def test_entity_device_info_with_via_device(
+    hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
+    mqtt_mock_entry: MqttMockHAClientGenerator,
+) -> None:
+    """Test tag device registry integration links via_device_id."""
+    await mqtt_mock_entry()
+    mqtt_config_entry = hass.config_entries.async_entries(DOMAIN)[0]
+    hub = device_registry.async_get_or_create(
+        config_entry_id=mqtt_config_entry.entry_id,
+        identifiers={("mqtt", "hub-id")},
+        manufacturer="manufacturer",
+        model="hub",
+    )
 
-    config = {
+    data = json.dumps(
+        {
+            "topic": "test-topic",
+            "device": {"identifiers": ["helloworld"], "via_device": "hub-id"},
+        }
+    )
+    async_fire_mqtt_message(hass, "homeassistant/tag/bla/config", data)
+    await hass.async_block_till_done()
+
+    device = device_registry.async_get_device_by_identifier(
+        ("mqtt", "helloworld"), mqtt_config_entry.entry_id
+    )
+    assert device is not None
+    assert device.via_device_id == hub.id
+
+
+async def test_entity_device_info_update(
+    hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
+    mqtt_mock_entry: MqttMockHAClientGenerator,
+) -> None:
+    """Test device registry update."""
+    await mqtt_mock_entry()
+
+    config: dict[str, Any] = {
         "topic": "test-topic",
         "device": {
             "identifiers": ["helloworld"],
@@ -501,6 +659,7 @@ async def test_entity_device_info_update(hass, mqtt_mock_entry_no_yaml_config):
             "manufacturer": "Whatever",
             "name": "Beer",
             "model": "Glass",
+            "serial_number": "1234deadbeef",
             "sw_version": "0.1-beta",
         },
     }
@@ -509,7 +668,9 @@ async def test_entity_device_info_update(hass, mqtt_mock_entry_no_yaml_config):
     async_fire_mqtt_message(hass, "homeassistant/tag/bla/config", data)
     await hass.async_block_till_done()
 
-    device = registry.async_get_device({("mqtt", "helloworld")})
+    device = device_registry.async_get_device_by_identifier(
+        ("mqtt", "helloworld"), hass.config_entries.async_entries("mqtt")[0].entry_id
+    )
     assert device is not None
     assert device.name == "Beer"
 
@@ -518,18 +679,23 @@ async def test_entity_device_info_update(hass, mqtt_mock_entry_no_yaml_config):
     async_fire_mqtt_message(hass, "homeassistant/tag/bla/config", data)
     await hass.async_block_till_done()
 
-    device = registry.async_get_device({("mqtt", "helloworld")})
+    device = device_registry.async_get_device_by_identifier(
+        ("mqtt", "helloworld"), hass.config_entries.async_entries("mqtt")[0].entry_id
+    )
     assert device is not None
     assert device.name == "Milk"
 
 
 async def test_cleanup_tag(
-    hass, hass_ws_client, device_reg, entity_reg, mqtt_mock_entry_no_yaml_config
-):
+    hass: HomeAssistant,
+    hass_ws_client: WebSocketGenerator,
+    device_registry: dr.DeviceRegistry,
+    mqtt_mock_entry: MqttMockHAClientGenerator,
+) -> None:
     """Test tag discovery topic is cleaned when device is removed from registry."""
     assert await async_setup_component(hass, "config", {})
     await hass.async_block_till_done()
-    mqtt_mock = await mqtt_mock_entry_no_yaml_config()
+    mqtt_mock = await mqtt_mock_entry()
     ws_client = await hass_ws_client(hass)
 
     mqtt_entry = hass.config_entries.async_entries("mqtt")[0]
@@ -537,7 +703,7 @@ async def test_cleanup_tag(
     config_entry = MockConfigEntry(domain="test")
     config_entry.add_to_hass(hass)
 
-    device_reg.async_get_or_create(
+    device_registry.async_get_or_create(
         config_entry_id=config_entry.entry_id,
         connections=set(),
         identifiers={("mqtt", "helloworld")},
@@ -559,56 +725,80 @@ async def test_cleanup_tag(
     async_fire_mqtt_message(hass, "homeassistant/tag/bla2/config", data2)
     await hass.async_block_till_done()
 
-    # Verify device registry entries are created
-    device_entry1 = device_reg.async_get_device({("mqtt", "helloworld")})
+    # Verify device registry entries are created. Identifiers are unique per config
+    # entry, so the test config entry and MQTT get separate "helloworld" devices
+    device_entry1 = _get_device_for_config_entry(
+        device_registry,
+        config_entry.entry_id,
+        identifiers={("mqtt", "helloworld")},
+    )
     assert device_entry1 is not None
-    assert device_entry1.config_entries == {config_entry.entry_id, mqtt_entry.entry_id}
-    device_entry2 = device_reg.async_get_device({("mqtt", "hejhopp")})
+    assert device_entry1.config_entry_id == config_entry.entry_id
+    mqtt_device_entry1 = _get_device_for_config_entry(
+        device_registry,
+        mqtt_entry.entry_id,
+        identifiers={("mqtt", "helloworld")},
+    )
+    assert mqtt_device_entry1 is not None
+    assert mqtt_device_entry1.config_entry_id == mqtt_entry.entry_id
+    device_entry2 = device_registry.async_get_device_by_identifier(
+        ("mqtt", "hejhopp"), mqtt_entry.entry_id
+    )
     assert device_entry2 is not None
 
-    # Remove other config entry from the device
-    device_reg.async_update_device(
-        device_entry1.id, remove_config_entry_id=config_entry.entry_id
+    # Removing the test config entry's device leaves the MQTT device untouched
+    # and MQTT does not clear its discovery topic
+    device_registry.async_remove_device(device_entry1.id)
+    assert (
+        _get_device_for_config_entry(
+            device_registry,
+            config_entry.entry_id,
+            identifiers={("mqtt", "helloworld")},
+        )
+        is None
     )
-    device_entry1 = device_reg.async_get_device({("mqtt", "helloworld")})
-    assert device_entry1 is not None
-    assert device_entry1.config_entries == {mqtt_entry.entry_id}
-    device_entry2 = device_reg.async_get_device({("mqtt", "hejhopp")})
+    mqtt_device_entry1 = _get_device_for_config_entry(
+        device_registry,
+        mqtt_entry.entry_id,
+        identifiers={("mqtt", "helloworld")},
+    )
+    assert mqtt_device_entry1 is not None
+    assert mqtt_device_entry1.config_entry_id == mqtt_entry.entry_id
+    device_entry2 = device_registry.async_get_device_by_identifier(
+        ("mqtt", "hejhopp"), mqtt_entry.entry_id
+    )
     assert device_entry2 is not None
     mqtt_mock.async_publish.assert_not_called()
 
     # Remove MQTT from the device
-    mqtt_config_entry = hass.config_entries.async_entries(MQTT_DOMAIN)[0]
-    await ws_client.send_json(
-        {
-            "id": 6,
-            "type": "config/device_registry/remove_config_entry",
-            "config_entry_id": mqtt_config_entry.entry_id,
-            "device_id": device_entry1.id,
-        }
-    )
-    response = await ws_client.receive_json()
+    response = await ws_client.remove_device(mqtt_device_entry1.id)
     assert response["success"]
     await hass.async_block_till_done()
     await hass.async_block_till_done()
 
     # Verify device registry entry is cleared
-    device_entry1 = device_reg.async_get_device({("mqtt", "helloworld")})
+    device_entry1 = device_registry.async_get_device_by_identifier(
+        ("mqtt", "helloworld"), mqtt_entry.entry_id
+    )
     assert device_entry1 is None
-    device_entry2 = device_reg.async_get_device({("mqtt", "hejhopp")})
+    device_entry2 = device_registry.async_get_device_by_identifier(
+        ("mqtt", "hejhopp"), mqtt_entry.entry_id
+    )
     assert device_entry2 is not None
 
     # Verify retained discovery topic has been cleared
     mqtt_mock.async_publish.assert_called_once_with(
-        "homeassistant/tag/bla1/config", "", 0, True
+        "homeassistant/tag/bla1/config", None, 0, True, message_expiry_interval=None
     )
 
 
 async def test_cleanup_device(
-    hass, device_reg, entity_reg, mqtt_mock_entry_no_yaml_config
-):
+    hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
+    mqtt_mock_entry: MqttMockHAClientGenerator,
+) -> None:
     """Test removal from device registry when tag is removed."""
-    await mqtt_mock_entry_no_yaml_config()
+    await mqtt_mock_entry()
     config = {
         "topic": "test-topic",
         "device": {"identifiers": ["helloworld"]},
@@ -619,22 +809,32 @@ async def test_cleanup_device(
     await hass.async_block_till_done()
 
     # Verify device registry entry is created
-    device_entry = device_reg.async_get_device({("mqtt", "helloworld")})
+    device_entry = device_registry.async_get_device_by_identifier(
+        ("mqtt", "helloworld"), hass.config_entries.async_entries("mqtt")[0].entry_id
+    )
     assert device_entry is not None
 
     async_fire_mqtt_message(hass, "homeassistant/tag/bla/config", "")
     await hass.async_block_till_done()
 
     # Verify device registry entry is cleared
-    device_entry = device_reg.async_get_device({("mqtt", "helloworld")})
-    assert device_entry is None
+    assert (
+        device_registry.async_get_device_by_identifier(
+            ("mqtt", "helloworld"),
+            hass.config_entries.async_entries("mqtt")[0].entry_id,
+        )
+        is None
+    )
 
 
 async def test_cleanup_device_several_tags(
-    hass, device_reg, entity_reg, mqtt_mock_entry_no_yaml_config, tag_mock
-):
+    hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
+    mqtt_mock_entry: MqttMockHAClientGenerator,
+    tag_mock,
+) -> None:
     """Test removal from device registry when the last tag is removed."""
-    await mqtt_mock_entry_no_yaml_config()
+    await mqtt_mock_entry()
     config1 = {
         "topic": "test-topic1",
         "device": {"identifiers": ["helloworld"]},
@@ -651,14 +851,18 @@ async def test_cleanup_device_several_tags(
     await hass.async_block_till_done()
 
     # Verify device registry entry is created
-    device_entry = device_reg.async_get_device({("mqtt", "helloworld")})
+    device_entry = device_registry.async_get_device_by_identifier(
+        ("mqtt", "helloworld"), hass.config_entries.async_entries("mqtt")[0].entry_id
+    )
     assert device_entry is not None
 
     async_fire_mqtt_message(hass, "homeassistant/tag/bla1/config", "")
     await hass.async_block_till_done()
 
     # Verify device registry entry is not cleared
-    device_entry = device_reg.async_get_device({("mqtt", "helloworld")})
+    device_entry = device_registry.async_get_device_by_identifier(
+        ("mqtt", "helloworld"), hass.config_entries.async_entries("mqtt")[0].entry_id
+    )
     assert device_entry is not None
 
     # Fake tag scan.
@@ -671,18 +875,25 @@ async def test_cleanup_device_several_tags(
     await hass.async_block_till_done()
 
     # Verify device registry entry is cleared
-    device_entry = device_reg.async_get_device({("mqtt", "helloworld")})
-    assert device_entry is None
+    assert (
+        device_registry.async_get_device_by_identifier(
+            ("mqtt", "helloworld"),
+            hass.config_entries.async_entries("mqtt")[0].entry_id,
+        )
+        is None
+    )
 
 
 async def test_cleanup_device_with_entity_and_trigger_1(
-    hass, device_reg, entity_reg, mqtt_mock_entry_no_yaml_config
-):
+    hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
+    mqtt_mock_entry: MqttMockHAClientGenerator,
+) -> None:
     """Test removal from device registry for device with tag, entity and trigger.
 
     Tag removed first, then trigger and entity.
     """
-    await mqtt_mock_entry_no_yaml_config()
+    await mqtt_mock_entry()
     config1 = {
         "topic": "test-topic",
         "device": {"identifiers": ["helloworld"]},
@@ -714,7 +925,9 @@ async def test_cleanup_device_with_entity_and_trigger_1(
     await hass.async_block_till_done()
 
     # Verify device registry entry is created
-    device_entry = device_reg.async_get_device({("mqtt", "helloworld")})
+    device_entry = device_registry.async_get_device_by_identifier(
+        ("mqtt", "helloworld"), hass.config_entries.async_entries("mqtt")[0].entry_id
+    )
     assert device_entry is not None
 
     triggers = await async_get_device_automations(
@@ -726,7 +939,9 @@ async def test_cleanup_device_with_entity_and_trigger_1(
     await hass.async_block_till_done()
 
     # Verify device registry entry is not cleared
-    device_entry = device_reg.async_get_device({("mqtt", "helloworld")})
+    device_entry = device_registry.async_get_device_by_identifier(
+        ("mqtt", "helloworld"), hass.config_entries.async_entries("mqtt")[0].entry_id
+    )
     assert device_entry is not None
 
     async_fire_mqtt_message(hass, "homeassistant/device_automation/bla2/config", "")
@@ -736,18 +951,25 @@ async def test_cleanup_device_with_entity_and_trigger_1(
     await hass.async_block_till_done()
 
     # Verify device registry entry is cleared
-    device_entry = device_reg.async_get_device({("mqtt", "helloworld")})
-    assert device_entry is None
+    assert (
+        device_registry.async_get_device_by_identifier(
+            ("mqtt", "helloworld"),
+            hass.config_entries.async_entries("mqtt")[0].entry_id,
+        )
+        is None
+    )
 
 
 async def test_cleanup_device_with_entity2(
-    hass, device_reg, entity_reg, mqtt_mock_entry_no_yaml_config
-):
+    hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
+    mqtt_mock_entry: MqttMockHAClientGenerator,
+) -> None:
     """Test removal from device registry for device with tag, entity and trigger.
 
     Trigger and entity removed first, then tag.
     """
-    await mqtt_mock_entry_no_yaml_config()
+    await mqtt_mock_entry()
     config1 = {
         "topic": "test-topic",
         "device": {"identifiers": ["helloworld"]},
@@ -779,7 +1001,9 @@ async def test_cleanup_device_with_entity2(
     await hass.async_block_till_done()
 
     # Verify device registry entry is created
-    device_entry = device_reg.async_get_device({("mqtt", "helloworld")})
+    device_entry = device_registry.async_get_device_by_identifier(
+        ("mqtt", "helloworld"), hass.config_entries.async_entries("mqtt")[0].entry_id
+    )
     assert device_entry is not None
 
     triggers = await async_get_device_automations(
@@ -794,25 +1018,82 @@ async def test_cleanup_device_with_entity2(
     await hass.async_block_till_done()
 
     # Verify device registry entry is not cleared
-    device_entry = device_reg.async_get_device({("mqtt", "helloworld")})
+    device_entry = device_registry.async_get_device_by_identifier(
+        ("mqtt", "helloworld"), hass.config_entries.async_entries("mqtt")[0].entry_id
+    )
     assert device_entry is not None
 
     async_fire_mqtt_message(hass, "homeassistant/tag/bla1/config", "")
     await hass.async_block_till_done()
 
     # Verify device registry entry is cleared
-    device_entry = device_reg.async_get_device({("mqtt", "helloworld")})
-    assert device_entry is None
+    assert (
+        device_registry.async_get_device_by_identifier(
+            ("mqtt", "helloworld"),
+            hass.config_entries.async_entries("mqtt")[0].entry_id,
+        )
+        is None
+    )
 
 
-async def test_unload_entry(hass, device_reg, mqtt_mock, tag_mock, tmp_path) -> None:
+async def test_update_with_bad_config_not_breaks_discovery(
+    hass: HomeAssistant,
+    mqtt_mock_entry: MqttMockHAClientGenerator,
+    caplog: pytest.LogCaptureFixture,
+    tag_mock: AsyncMock,
+) -> None:
+    """Test a bad update does not break discovery."""
+    await mqtt_mock_entry()
+    config1 = {
+        "topic": "test-topic",
+        "device": {"identifiers": ["helloworld"]},
+    }
+    config2 = {
+        "topic": "test-topic",
+        "device": {"bad_key": "some bad value"},
+    }
+
+    config3 = {
+        "topic": "test-topic-update",
+        "device": {"identifiers": ["helloworld"]},
+    }
+
+    data1 = json.dumps(config1)
+    data2 = json.dumps(config2)
+    data3 = json.dumps(config3)
+
+    async_fire_mqtt_message(hass, "homeassistant/tag/bla1/config", data1)
+    await hass.async_block_till_done()
+
+    # Update with bad identifier
+    async_fire_mqtt_message(hass, "homeassistant/tag/bla1/config", data2)
+    await hass.async_block_till_done()
+    assert "not a valid option at 'device.bad_key'" in caplog.text
+
+    # Topic update
+    async_fire_mqtt_message(hass, "homeassistant/tag/bla1/config", data3)
+    await hass.async_block_till_done()
+
+    # Fake tag scan.
+    async_fire_mqtt_message(hass, "test-topic-update", "12345")
+
+    await hass.async_block_till_done()
+    tag_mock.assert_called_once_with(ANY, "12345", ANY)
+
+
+@pytest.mark.usefixtures("mqtt_mock")
+async def test_unload_entry(
+    hass: HomeAssistant, device_registry: dr.DeviceRegistry, tag_mock: AsyncMock
+) -> None:
     """Test unloading the MQTT entry."""
 
     config = copy.deepcopy(DEFAULT_CONFIG_DEVICE)
 
     async_fire_mqtt_message(hass, "homeassistant/tag/bla1/config", json.dumps(config))
     await hass.async_block_till_done()
-    device_entry = device_reg.async_get_device({("mqtt", "0AFFD2")})
+    device_entry = device_registry.async_get_device_by_identifier(
+        ("mqtt", "0AFFD2"), hass.config_entries.async_entries("mqtt")[0].entry_id
+    )
 
     # Fake tag scan, should be processed
     async_fire_mqtt_message(hass, "foobar/tag_scanned", DEFAULT_TAG_SCAN)
@@ -821,10 +1102,71 @@ async def test_unload_entry(hass, device_reg, mqtt_mock, tag_mock, tmp_path) -> 
 
     tag_mock.reset_mock()
 
-    await help_test_unload_config_entry(hass, tmp_path, {})
+    await help_test_unload_config_entry(hass)
     await hass.async_block_till_done()
 
     # Fake tag scan, should not be processed
     async_fire_mqtt_message(hass, "foobar/tag_scanned", DEFAULT_TAG_SCAN)
     await hass.async_block_till_done()
     tag_mock.assert_not_called()
+
+
+@pytest.mark.usefixtures("mqtt_client_mock")
+@patch("homeassistant.components.mqtt.client.DISCOVERY_COOLDOWN", 0.0)
+@patch("homeassistant.components.mqtt.client.INITIAL_SUBSCRIBE_COOLDOWN", 0.0)
+@patch("homeassistant.components.mqtt.client.SUBSCRIBE_COOLDOWN", 0.0)
+@patch("homeassistant.components.mqtt.client.UNSUBSCRIBE_COOLDOWN", 0.0)
+async def test_fires_once_after_entry_reload(
+    hass: HomeAssistant, device_registry: dr.DeviceRegistry, tag_mock: AsyncMock
+) -> None:
+    """Test a tag scanner fires once per message after the MQTT entry reloads."""
+    # Uses a real MQTT client, so subscriptions are restored on reload
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={mqtt.CONF_BROKER: "mock-broker"},
+        version=mqtt.CONFIG_ENTRY_VERSION,
+        minor_version=mqtt.CONFIG_ENTRY_MINOR_VERSION,
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    config = json.dumps(DEFAULT_CONFIG_DEVICE)
+    async_fire_mqtt_message(hass, "homeassistant/tag/bla1/config", config, retain=True)
+    await hass.async_block_till_done()
+    device_entry = device_registry.async_get_device_by_identifier(
+        ("mqtt", "0AFFD2"), entry.entry_id
+    )
+
+    client_before_reload = hass.data[DATA_MQTT].client
+    assert await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+    assert entry.state is ConfigEntryState.LOADED
+    assert hass.data[DATA_MQTT].client is not client_before_reload
+
+    # The broker replays the retained discovery payload after the reload
+    async_fire_mqtt_message(hass, "homeassistant/tag/bla1/config", config, retain=True)
+    await hass.async_block_till_done()
+
+    async_fire_mqtt_message(hass, "foobar/tag_scanned", DEFAULT_TAG_SCAN)
+    await hass.async_block_till_done()
+    tag_mock.assert_called_once_with(ANY, DEFAULT_TAG_ID, device_entry.id)
+
+
+@pytest.mark.usefixtures("mqtt_mock", "tag_mock")
+async def test_value_template_fails(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Test the rendering of MQTT value template fails."""
+    config = copy.deepcopy(DEFAULT_CONFIG_DEVICE)
+    config["value_template"] = "{{ value_json.some_var * 1 }}"
+    async_fire_mqtt_message(hass, "homeassistant/tag/bla1/config", json.dumps(config))
+    await hass.async_block_till_done()
+
+    async_fire_mqtt_message(hass, "foobar/tag_scanned", '{"some_var": null }')
+    await hass.async_block_till_done()
+
+    assert (
+        "TypeError: unsupported operand type(s) for *:"
+        " 'NoneType' and 'int' rendering template" in caplog.text
+    )

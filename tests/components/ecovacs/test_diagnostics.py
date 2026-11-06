@@ -1,0 +1,37 @@
+"""Tests for diagnostics data."""
+
+import pytest
+from pytest_homeassistant.common import MockConfigEntry
+from pytest_homeassistant.components.diagnostics import get_diagnostics_for_config_entry
+from pytest_homeassistant.typing import ClientSessionGenerator
+from syrupy.assertion import SnapshotAssertion
+from syrupy.filters import props
+
+from homeassistant.const import CONF_USERNAME
+from homeassistant.core import HomeAssistant
+
+from .const import (
+    ACCOUNT_CREDENTIALS_DATA,
+    STORED_ENTRY_DATA_CLOUD,
+    STORED_ENTRY_DATA_SELF_HOSTED,
+)
+
+
+@pytest.mark.parametrize(
+    "mock_config_entry_data",
+    [
+        STORED_ENTRY_DATA_CLOUD | ACCOUNT_CREDENTIALS_DATA,
+        STORED_ENTRY_DATA_SELF_HOSTED | ACCOUNT_CREDENTIALS_DATA,
+    ],
+    ids=lambda data: data[CONF_USERNAME],
+)
+async def test_diagnostics(
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    init_integration: MockConfigEntry,
+    snapshot: SnapshotAssertion,
+) -> None:
+    """Test diagnostics."""
+    assert await get_diagnostics_for_config_entry(
+        hass, hass_client, init_integration
+    ) == snapshot(exclude=props("entry_id", "created_at", "modified_at"))

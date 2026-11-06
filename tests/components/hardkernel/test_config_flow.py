@@ -1,11 +1,12 @@
 """Test the Hardkernel config flow."""
+
 from unittest.mock import patch
+
+from pytest_homeassistant.common import MockConfigEntry, MockModule, mock_integration
 
 from homeassistant.components.hardkernel.const import DOMAIN
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
-
-from tests.common import MockConfigEntry, MockModule, mock_integration
 
 
 async def test_config_flow(hass: HomeAssistant) -> None:
@@ -14,13 +15,13 @@ async def test_config_flow(hass: HomeAssistant) -> None:
 
     with patch(
         "homeassistant.components.hardkernel.async_setup_entry",
-        return_value=True,
+        return_value=None,
     ) as mock_setup_entry:
         result = await hass.config_entries.flow.async_init(
             DOMAIN, context={"source": "system"}
         )
 
-    assert result["type"] == FlowResultType.CREATE_ENTRY
+    assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["title"] == "Hardkernel"
     assert result["data"] == {}
     assert result["options"] == {}
@@ -47,12 +48,12 @@ async def test_config_flow_single_entry(hass: HomeAssistant) -> None:
 
     with patch(
         "homeassistant.components.hardkernel.async_setup_entry",
-        return_value=True,
+        return_value=None,
     ) as mock_setup_entry:
         result = await hass.config_entries.flow.async_init(
             DOMAIN, context={"source": "system"}
         )
 
-    assert result["type"] == FlowResultType.ABORT
+    assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "single_instance_allowed"
     mock_setup_entry.assert_not_called()

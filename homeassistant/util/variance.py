@@ -1,41 +1,37 @@
 """Util functions to help filter out similar results."""
-from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import datetime, timedelta
 import functools
-from typing import Any, TypeVar, overload
-
-T = TypeVar("T", int, float, datetime)
+from typing import Any, overload
 
 
 @overload
-def ignore_variance(
-    func: Callable[..., int], ignored_variance: int
-) -> Callable[..., int]:
-    ...
+def ignore_variance[**_P](
+    func: Callable[_P, int], ignored_variance: int
+) -> Callable[_P, int]: ...
 
 
 @overload
-def ignore_variance(
-    func: Callable[..., float], ignored_variance: float
-) -> Callable[..., float]:
-    ...
+def ignore_variance[**_P](
+    func: Callable[_P, float], ignored_variance: float
+) -> Callable[_P, float]: ...
 
 
 @overload
-def ignore_variance(
-    func: Callable[..., datetime], ignored_variance: timedelta
-) -> Callable[..., datetime]:
-    ...
+def ignore_variance[**_P](
+    func: Callable[_P, datetime], ignored_variance: timedelta
+) -> Callable[_P, datetime]: ...
 
 
-def ignore_variance(func: Callable[..., T], ignored_variance: Any) -> Callable[..., T]:
+def ignore_variance[**_P, _R: (int, float, datetime)](
+    func: Callable[_P, _R], ignored_variance: Any
+) -> Callable[_P, _R]:
     """Wrap a function that returns old result if new result does not vary enough."""
-    last_value: T | None = None
+    last_value: _R | None = None
 
     @functools.wraps(func)
-    def wrapper(*args: Any, **kwargs: Any) -> T:
+    def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
         nonlocal last_value
 
         value = func(*args, **kwargs)

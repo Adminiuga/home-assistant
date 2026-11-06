@@ -1,0 +1,194 @@
+"""Fixtures for OpenRouter integration tests."""
+
+from collections.abc import AsyncGenerator, Generator
+from dataclasses import dataclass
+from typing import Any
+from unittest.mock import AsyncMock, patch
+
+from openai.types.chat import ChatCompletionChunk
+from openai.types.chat.chat_completion_chunk import Choice as ChunkChoice, ChoiceDelta
+import pytest
+from pytest_homeassistant.common import MockConfigEntry, async_load_fixture
+from python_open_router import KeyData, ModelsDataWrapper
+
+from homeassistant.components.open_router.const import (
+    CONF_OUTPUT_MODALITIES,
+    CONF_PROMPT,
+    CONF_WEB_SEARCH,
+    DOMAIN,
+)
+from homeassistant.config_entries import ConfigSubentryData
+from homeassistant.const import CONF_API_KEY, CONF_LLM_HASS_API, CONF_MODEL
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import llm
+from homeassistant.setup import async_setup_component
+
+
+@pytest.fixture
+def mock_setup_entry() -> Generator[AsyncMock]:
+    """Override async_setup_entry."""
+    with patch(
+        "homeassistant.components.open_router.async_setup_entry",
+        return_value=None,
+    ) as mock_setup_entry:
+        yield mock_setup_entry
+
+
+@pytest.fixture
+def enable_assist() -> bool:
+    """Mock conversation subentry data."""
+    return False
+
+
+@pytest.fixture
+def web_search() -> bool:
+    """Mock web search setting."""
+    return False
+
+
+@pytest.fixture
+def conversation_subentry_data(enable_assist: bool, web_search: str) -> dict[str, Any]:
+    """Mock conversation subentry data."""
+    res: dict[str, Any] = {
+        CONF_MODEL: "openai/gpt-3.5-turbo",
+        CONF_PROMPT: "You are a helpful assistant.",
+        CONF_WEB_SEARCH: web_search,
+    }
+    if enable_assist:
+        res[CONF_LLM_HASS_API] = [llm.LLM_API_ASSIST]
+    return res
+
+
+@pytest.fixture
+def output_modalities() -> list[str]:
+    """Mock AI task output modalities."""
+    return ["text", "image"]
+
+
+@pytest.fixture
+def ai_task_data_subentry_data(output_modalities: list[str]) -> dict[str, Any]:
+    """Mock AI task subentry data."""
+    return {
+        CONF_MODEL: "google/gemini-2.5-flash-image",
+        CONF_OUTPUT_MODALITIES: output_modalities,
+    }
+
+
+@pytest.fixture
+def mock_config_entry(
+    hass: HomeAssistant,
+    conversation_subentry_data: dict[str, Any],
+    ai_task_data_subentry_data: dict[str, Any],
+) -> MockConfigEntry:
+    """Mock a config entry."""
+    return MockConfigEntry(
+        title="OpenRouter",
+        domain=DOMAIN,
+        data={
+            CONF_API_KEY: "bla",
+        },
+        version=1,
+        minor_version=4,
+        subentries_data=[
+            ConfigSubentryData(
+                data=conversation_subentry_data,
+                subentry_id="ABCDEF",
+                subentry_type="conversation",
+                title="GPT-3.5 Turbo",
+                unique_id=None,
+            ),
+            ConfigSubentryData(
+                data=ai_task_data_subentry_data,
+                subentry_id="ABCDEG",
+                subentry_type="ai_task_data",
+                title="Gemini 2.5 Flash Image",
+                unique_id=None,
+            ),
+        ],
+    )
+
+
+@dataclass
+class Model:
+    """Mock model data."""
+
+    id: str
+    name: str
+
+
+@pytest.fixture
+async def mock_openai_client() -> AsyncGenerator[AsyncMock]:
+    """Initialize integration."""
+    with patch("homeassistant.components.open_router.AsyncOpenAI") as mock_client:
+        client = mock_client.return_value
+        client.chat.completions.create = AsyncMock(
+            return_value=get_generator_from_data(
+                [
+                    ChatCompletionChunk.model_construct(
+                        id="chatcmpl-1234567890ABCDEFGHIJKLMNOPQRS",
+                        choices=[
+                            ChunkChoice.model_construct(
+                                index=0,
+                                delta=ChoiceDelta(
+                                    role="assistant",
+                                    content="Hello, how can I help you?",
+                                ),
+                                finish_reason="stop",
+                            )
+                        ],
+                        created=1700000000,
+                        model="gpt-3.5-turbo-0613",
+                        object="chat.completion.chunk",
+                        system_fingerprint=None,
+                    )
+                ]
+            )
+        )
+        yield client
+
+
+@pytest.fixture
+async def mock_open_router_client(hass: HomeAssistant) -> AsyncGenerator[AsyncMock]:
+    """Initialize integration."""
+    with patch(
+        "homeassistant.components.open_router.config_flow.OpenRouterClient",
+        autospec=True,
+    ) as mock_client:
+        client = mock_client.return_value
+        client.get_key_data.return_value = KeyData(
+            label="Test account",
+            usage=0,
+            is_provisioning_key=False,
+            limit_remaining=None,
+            is_free_tier=True,
+        )
+        models = await async_load_fixture(hass, "models.json", DOMAIN)
+        client.get_models.return_value = ModelsDataWrapper.from_json(models).data
+        yield client
+
+
+@pytest.fixture
+async def mock_open_router_client_setup(
+    hass: HomeAssistant,
+) -> AsyncGenerator[AsyncMock]:
+    """Mock the OpenRouter client used during entry setup and migration."""
+    with patch(
+        "homeassistant.components.open_router.OpenRouterClient",
+        autospec=True,
+    ) as mock_client:
+        client = mock_client.return_value
+        models = await async_load_fixture(hass, "models.json", DOMAIN)
+        client.get_models.return_value = ModelsDataWrapper.from_json(models).data
+        yield client
+
+
+@pytest.fixture(autouse=True)
+async def setup_ha(hass: HomeAssistant) -> None:
+    """Set up Home Assistant."""
+    assert await async_setup_component(hass, "homeassistant", {})
+
+
+async def get_generator_from_data[DataT](items: list[DataT]) -> AsyncGenerator[DataT]:
+    """Return async generator."""
+    for item in items:
+        yield item

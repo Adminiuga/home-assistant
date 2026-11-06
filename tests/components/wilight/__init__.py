@@ -1,22 +1,21 @@
 """Tests for the WiLight component."""
 
+from pytest_homeassistant.common import MockConfigEntry
 from pywilight.const import DOMAIN
 
-from homeassistant.components import ssdp
-from homeassistant.components.ssdp import (
-    ATTR_UPNP_MANUFACTURER,
-    ATTR_UPNP_MODEL_NAME,
-    ATTR_UPNP_MODEL_NUMBER,
-    ATTR_UPNP_SERIAL,
-)
 from homeassistant.components.wilight.config_flow import (
     CONF_MODEL_NAME,
     CONF_SERIAL_NUMBER,
 )
 from homeassistant.const import CONF_HOST
 from homeassistant.core import HomeAssistant
-
-from tests.common import MockConfigEntry
+from homeassistant.helpers.service_info.ssdp import (
+    ATTR_UPNP_MANUFACTURER,
+    ATTR_UPNP_MODEL_NAME,
+    ATTR_UPNP_MODEL_NUMBER,
+    ATTR_UPNP_SERIAL,
+    SsdpServiceInfo,
+)
 
 HOST = "127.0.0.1"
 WILIGHT_ID = "000000000099"
@@ -34,7 +33,7 @@ UPNP_MAC_ADDRESS = "5C:CF:7F:8B:CA:56"
 UPNP_MANUFACTURER_NOT_WILIGHT = "Test"
 CONF_COMPONENTS = "components"
 
-MOCK_SSDP_DISCOVERY_INFO_P_B = ssdp.SsdpServiceInfo(
+MOCK_SSDP_DISCOVERY_INFO_P_B = SsdpServiceInfo(
     ssdp_usn="mock_usn",
     ssdp_st="mock_st",
     ssdp_location=SSDP_LOCATION,
@@ -46,7 +45,7 @@ MOCK_SSDP_DISCOVERY_INFO_P_B = ssdp.SsdpServiceInfo(
     },
 )
 
-MOCK_SSDP_DISCOVERY_INFO_WRONG_MANUFACTURER = ssdp.SsdpServiceInfo(
+MOCK_SSDP_DISCOVERY_INFO_WRONG_MANUFACTURER = SsdpServiceInfo(
     ssdp_usn="mock_usn",
     ssdp_st="mock_st",
     ssdp_location=SSDP_LOCATION,
@@ -58,7 +57,7 @@ MOCK_SSDP_DISCOVERY_INFO_WRONG_MANUFACTURER = ssdp.SsdpServiceInfo(
     },
 )
 
-MOCK_SSDP_DISCOVERY_INFO_MISSING_MANUFACTURER = ssdp.SsdpServiceInfo(
+MOCK_SSDP_DISCOVERY_INFO_MISSING_MANUFACTURER = SsdpServiceInfo(
     ssdp_usn="mock_usn",
     ssdp_st="mock_st",
     ssdp_location=SSDP_LOCATION,

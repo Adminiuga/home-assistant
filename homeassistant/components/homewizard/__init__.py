@@ -1,93 +1,137 @@
 """The Homewizard integration."""
-import logging
 
-from homeassistant.config_entries import SOURCE_IMPORT, ConfigEntry
-from homeassistant.const import CONF_IP_ADDRESS
+from homewizard_energy import (
+    HomeWizardEnergy,
+    HomeWizardEnergyV1,
+    HomeWizardEnergyV2,
+    has_v2_api,
+)
+
+from homeassistant.config_entries import SOURCE_REAUTH
+from homeassistant.const import CONF_IP_ADDRESS, CONF_TOKEN
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
-from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.issue_registry import IssueSeverity, async_create_issue
 
 from .const import DOMAIN, PLATFORMS
-from .coordinator import HWEnergyDeviceUpdateCoordinator as Coordinator
+from .coordinator import HomeWizardConfigEntry, HWEnergyDeviceUpdateCoordinator
+from .entity import create_main_device_info
 
-_LOGGER = logging.getLogger(__name__)
 
-
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_setup_entry(hass: HomeAssistant, entry: HomeWizardConfigEntry) -> None:
     """Set up Homewizard from a config entry."""
 
-    _LOGGER.debug("__init__ async_setup_entry")
+    api: HomeWizardEnergy
 
-    # Migrate `homewizard_energy` (custom_component) to `homewizard`
-    if entry.source == SOURCE_IMPORT and "old_config_entry_id" in entry.data:
-        # Remove the old config entry ID from the entry data so we don't try this again
-        # on the next setup
-        data = entry.data.copy()
-        old_config_entry_id = data.pop("old_config_entry_id")
-
-        hass.config_entries.async_update_entry(entry, data=data)
-        _LOGGER.debug(
-            (
-                "Setting up imported homewizard_energy entry %s for the first time as "
-                "homewizard entry %s"
-            ),
-            old_config_entry_id,
-            entry.entry_id,
+    if token := entry.data.get(CONF_TOKEN):
+        api = HomeWizardEnergyV2(
+            entry.data[CONF_IP_ADDRESS],
+            token=token,
+            clientsession=async_get_clientsession(hass),
+        )
+    else:
+        api = HomeWizardEnergyV1(
+            entry.data[CONF_IP_ADDRESS],
+            clientsession=async_get_clientsession(hass),
         )
 
-        ent_reg = er.async_get(hass)
-        for entity in er.async_entries_for_config_entry(ent_reg, old_config_entry_id):
-            _LOGGER.debug("Removing %s", entity.entity_id)
-            ent_reg.async_remove(entity.entity_id)
+        await async_check_v2_support_and_create_issue(hass, entry)
 
-            _LOGGER.debug("Re-creating %s for the new config entry", entity.entity_id)
-            # We will precreate the entity so that any customizations can be preserved
-            new_entity = ent_reg.async_get_or_create(
-                entity.domain,
-                DOMAIN,
-                entity.unique_id,
-                suggested_object_id=entity.entity_id.split(".")[1],
-                disabled_by=entity.disabled_by,
-                config_entry=entry,
-                original_name=entity.original_name,
-                original_icon=entity.original_icon,
-            )
-            _LOGGER.debug("Re-created %s", new_entity.entity_id)
-
-            # If there are customizations on the old entity, apply them to the new one
-            if entity.name or entity.icon:
-                ent_reg.async_update_entity(
-                    new_entity.entity_id, name=entity.name, icon=entity.icon
-                )
-
-        # Remove the old config entry and now the entry is fully migrated
-        hass.async_create_task(hass.config_entries.async_remove(old_config_entry_id))
-
-    # Create coordinator
-    coordinator = Coordinator(hass, entry.data[CONF_IP_ADDRESS])
+    coordinator = HWEnergyDeviceUpdateCoordinator(hass, entry, api)
     try:
         await coordinator.async_config_entry_first_refresh()
+
     except ConfigEntryNotReady:
         await coordinator.api.close()
+
+        if coordinator.api_disabled:
+            entry.async_start_reauth(hass)
+
         raise
 
-    # Finalize
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+    entry.runtime_data = coordinator
 
+    # Abort reauth config flow if active
+    for progress_flow in hass.config_entries.flow.async_progress_by_handler(DOMAIN):
+        if (
+            "context" in progress_flow
+            and progress_flow["context"].get("source") == SOURCE_REAUTH
+        ):
+            hass.config_entries.flow.async_abort(progress_flow["flow_id"])
+
+    # Register the main device up front so external sub-device sensors can
+    # resolve it as their via_device parent regardless of entity add order.
+    if coordinator.data.device.serial is not None:
+        dr.async_get(hass).async_get_or_create_from_info(
+            config_entry_id=entry.entry_id,
+            device_info=create_main_device_info(coordinator),
+        )
+
+    # Finalize
+    entry.async_on_unload(coordinator.api.close)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    return True
 
-
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_unload_entry(hass: HomeAssistant, entry: HomeWizardConfigEntry) -> None:
     """Unload a config entry."""
-    _LOGGER.debug("__init__ async_unload_entry")
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)
 
-    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
-    if unload_ok:
-        config_data = hass.data[DOMAIN].pop(entry.entry_id)
-        await config_data.api.close()
+def get_main_device(
+    hass: HomeAssistant, entry: HomeWizardConfigEntry
+) -> dr.DeviceEntry | None:
+    """Helper function to get the main device for the config entry."""
+    device_registry = dr.async_get(hass)
+    device_entries = dr.async_entries_for_config_entry(
+        device_registry, config_entry_id=entry.entry_id
+    )
 
-    return unload_ok
+    if not device_entries:
+        return None
+
+    # Get first device that is not a sub-device, as this is the
+    # main device in HomeWizard. This is relevant for the P1
+    # Meter which may create sub-devices for external utility
+    # meters.
+    return next(
+        (device for device in device_entries if device.via_device_id is None), None
+    )
+
+
+async def async_check_v2_support_and_create_issue(
+    hass: HomeAssistant, entry: HomeWizardConfigEntry
+) -> None:
+    """Check if the device supports v2 and create an issue if not."""
+
+    if not await has_v2_api(entry.data[CONF_IP_ADDRESS], async_get_clientsession(hass)):
+        return
+
+    title = entry.title
+
+    # Try to get the name from the device registry
+    # This is to make it clearer which device needs
+    # reconfiguration, as the config entry title is kept default
+    # most of the time
+    if main_device := get_main_device(hass, entry):
+        device_name = main_device.name_by_user or main_device.name
+
+        if device_name and entry.title != device_name:
+            title = f"{entry.title} ({device_name})"
+
+    async_create_issue(
+        hass,
+        DOMAIN,
+        f"migrate_to_v2_api_{entry.entry_id}",
+        config_entry_id=entry.entry_id,
+        is_fixable=True,
+        is_persistent=False,
+        learn_more_url="https://home-assistant.io/integrations/homewizard/#which-button-do-i-need-to-press-to-configure-the-device",
+        translation_key="migrate_to_v2_api",
+        translation_placeholders={
+            "title": title,
+        },
+        severity=IssueSeverity.WARNING,
+        data={"entry_id": entry.entry_id},
+    )

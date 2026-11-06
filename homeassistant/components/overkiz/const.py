@@ -1,22 +1,54 @@
 """Constants for the Overkiz (by Somfy) integration."""
-from __future__ import annotations
 
 from datetime import timedelta
 import logging
 from typing import Final
 
-from pyoverkiz.enums import OverkizCommandParam, UIClass, UIWidget
+from pyoverkiz.enums import (
+    MeasuredValueType,
+    OverkizCommandParam,
+    Server,
+    UIClass,
+    UIWidget,
+)
 
-from homeassistant.const import Platform
+from homeassistant.const import (
+    DEGREE,
+    LIGHT_LUX,
+    Platform,
+    UnitOfElectricCurrent,
+    UnitOfElectricPotential,
+    UnitOfEnergy,
+    UnitOfIrradiance,
+    UnitOfLength,
+    UnitOfPower,
+    UnitOfPressure,
+    UnitOfRatio,
+    UnitOfSpeed,
+    UnitOfTemperature,
+    UnitOfTime,
+    UnitOfVolume,
+    UnitOfVolumeFlowRate,
+)
 
 DOMAIN: Final = "overkiz"
 LOGGER: logging.Logger = logging.getLogger(__package__)
 
+CONF_API_TYPE: Final = "api_type"
 CONF_HUB: Final = "hub"
-DEFAULT_HUB: Final = "somfy_europe"
+CONF_GATEWAY_ID: Final = "gateway_id"
+CONF_REFRESH_TOKEN: Final = "refresh_token"
+CONF_SITE_OID: Final = "site_oid"
+DEFAULT_SERVER: Final = Server.SOMFY
+DEFAULT_HOST: Final = "gateway-xxxx-xxxx-xxxx.local:8443"
 
 UPDATE_INTERVAL: Final = timedelta(seconds=30)
+UPDATE_INTERVAL_LOCAL: Final = timedelta(seconds=5)
 UPDATE_INTERVAL_ALL_ASSUMED_STATE: Final = timedelta(minutes=60)
+UPDATE_INTERVAL_SAUTER_SMART_CONTROL: Final = timedelta(seconds=25)
+# fetch_events allows 1 call per second, and refresh timing jitters, so leave margin.
+UPDATE_INTERVAL_EXECUTION: Final = timedelta(seconds=2)
+RATE_LIMIT_RETRY_AFTER: Final = timedelta(minutes=1)
 
 PLATFORMS: list[Platform] = [
     Platform.ALARM_CONTROL_PANEL,
@@ -24,6 +56,7 @@ PLATFORMS: list[Platform] = [
     Platform.BUTTON,
     Platform.CLIMATE,
     Platform.COVER,
+    Platform.FAN,
     Platform.LIGHT,
     Platform.LOCK,
     Platform.NUMBER,
@@ -60,27 +93,41 @@ OVERKIZ_DEVICE_TO_PLATFORM: dict[UIClass | UIWidget, Platform | None] = {
     UIClass.SWIMMING_POOL: Platform.SWITCH,
     UIClass.SWINGING_SHUTTER: Platform.COVER,
     UIClass.VENETIAN_BLIND: Platform.COVER,
+    UIClass.VENTILATION_SYSTEM: Platform.FAN,
     UIClass.WINDOW: Platform.COVER,
-    UIWidget.ALARM_PANEL_CONTROLLER: Platform.ALARM_CONTROL_PANEL,  # widgetName, uiClass is Alarm (not supported)
-    UIWidget.ATLANTIC_ELECTRICAL_HEATER: Platform.CLIMATE,  # widgetName, uiClass is HeatingSystem (not supported)
-    UIWidget.ATLANTIC_ELECTRICAL_HEATER_WITH_ADJUSTABLE_TEMPERATURE_SETPOINT: Platform.CLIMATE,  # widgetName, uiClass is HeatingSystem (not supported)
-    UIWidget.ATLANTIC_ELECTRICAL_TOWEL_DRYER: Platform.CLIMATE,  # widgetName, uiClass is HeatingSystem (not supported)
-    UIWidget.ATLANTIC_HEAT_RECOVERY_VENTILATION: Platform.CLIMATE,  # widgetName, uiClass is HeatingSystem (not supported)
-    UIWidget.ATLANTIC_PASS_APC_DHW: Platform.WATER_HEATER,  # widgetName, uiClass is WaterHeatingSystem (not supported)
-    UIWidget.ATLANTIC_PASS_APC_HEATING_AND_COOLING_ZONE: Platform.CLIMATE,  # widgetName, uiClass is HeatingSystem (not supported)
-    UIWidget.ATLANTIC_PASS_APC_ZONE_CONTROL: Platform.CLIMATE,  # widgetName, uiClass is HeatingSystem (not supported)
-    UIWidget.DOMESTIC_HOT_WATER_TANK: Platform.SWITCH,  # widgetName, uiClass is WaterHeatingSystem (not supported)
-    UIWidget.MY_FOX_ALARM_CONTROLLER: Platform.ALARM_CONTROL_PANEL,  # widgetName, uiClass is Alarm (not supported)
-    UIWidget.MY_FOX_SECURITY_CAMERA: Platform.SWITCH,  # widgetName, uiClass is Camera (not supported)
-    UIWidget.RTD_INDOOR_SIREN: Platform.SWITCH,  # widgetName, uiClass is Siren (not supported)
-    UIWidget.RTD_OUTDOOR_SIREN: Platform.SWITCH,  # widgetName, uiClass is Siren (not supported)
-    UIWidget.RTS_GENERIC: Platform.COVER,  # widgetName, uiClass is Generic (not supported)
-    UIWidget.SIREN_STATUS: None,  # widgetName, uiClass is Siren (siren)
-    UIWidget.SOMFY_THERMOSTAT: Platform.CLIMATE,  # widgetName, uiClass is HeatingSystem (not supported)
-    UIWidget.STATELESS_ALARM_CONTROLLER: Platform.SWITCH,  # widgetName, uiClass is Alarm (not supported)
-    UIWidget.STATEFUL_ALARM_CONTROLLER: Platform.ALARM_CONTROL_PANEL,  # widgetName, uiClass is Alarm (not supported)
-    UIWidget.STATELESS_EXTERIOR_HEATING: Platform.SWITCH,  # widgetName, uiClass is ExteriorHeatingSystem (not supported)
-    UIWidget.TSKALARM_CONTROLLER: Platform.ALARM_CONTROL_PANEL,  # widgetName, uiClass is Alarm (not supported)
+    UIWidget.ALARM_PANEL_CONTROLLER: Platform.ALARM_CONTROL_PANEL,
+    UIWidget.ATLANTIC_ELECTRICAL_HEATER: Platform.CLIMATE,
+    UIWidget.ATLANTIC_ELECTRICAL_HEATER_WITH_ADJUSTABLE_TEMPERATURE_SETPOINT: (
+        Platform.CLIMATE
+    ),
+    UIWidget.ATLANTIC_ELECTRICAL_TOWEL_DRYER: Platform.CLIMATE,
+    UIWidget.ATLANTIC_HEAT_RECOVERY_VENTILATION: Platform.CLIMATE,
+    UIWidget.ATLANTIC_PASS_APC_DHW: Platform.WATER_HEATER,
+    UIWidget.ATLANTIC_PASS_APC_HEAT_PUMP: Platform.CLIMATE,
+    UIWidget.ATLANTIC_PASS_APC_HEATING_AND_COOLING_ZONE: Platform.CLIMATE,
+    UIWidget.ATLANTIC_PASS_APC_HEATING_ZONE: Platform.CLIMATE,
+    UIWidget.ATLANTIC_PASS_APC_ZONE_CONTROL: Platform.CLIMATE,
+    UIWidget.DISCRETE_EXTERIOR_HEATING: Platform.SWITCH,
+    UIWidget.DOMESTIC_HOT_WATER_PRODUCTION: Platform.WATER_HEATER,
+    UIWidget.DOMESTIC_HOT_WATER_TANK: Platform.SWITCH,
+    UIWidget.EVO_HOME_CONTROLLER: Platform.CLIMATE,
+    UIWidget.HITACHI_AIR_TO_AIR_HEAT_PUMP: Platform.CLIMATE,
+    UIWidget.HITACHI_AIR_TO_WATER_HEATING_ZONE: Platform.CLIMATE,
+    UIWidget.HITACHI_DHW: Platform.WATER_HEATER,
+    UIWidget.MY_FOX_ALARM_CONTROLLER: Platform.ALARM_CONTROL_PANEL,
+    UIWidget.MY_FOX_SECURITY_CAMERA: Platform.SWITCH,
+    UIWidget.RTD_INDOOR_SIREN: Platform.SWITCH,
+    UIWidget.RTD_OUTDOOR_SIREN: Platform.SWITCH,
+    UIWidget.RTS_GENERIC: Platform.COVER,
+    UIWidget.SIREN_STATUS: None,
+    UIWidget.SOMFY_HEATING_TEMPERATURE_INTERFACE: Platform.CLIMATE,
+    UIWidget.SOMFY_THERMOSTAT: Platform.CLIMATE,
+    UIWidget.STATELESS_ALARM_CONTROLLER: Platform.SWITCH,
+    UIWidget.STATEFUL_ALARM_CONTROLLER: Platform.ALARM_CONTROL_PANEL,
+    UIWidget.STATELESS_EXTERIOR_HEATING: Platform.SWITCH,
+    UIWidget.THERMOSTAT_HEATING_TEMPERATURE_INTERFACE: Platform.CLIMATE,
+    UIWidget.TSK_ALARM_CONTROLLER: Platform.ALARM_CONTROL_PANEL,
+    UIWidget.VALVE_HEATING_TEMPERATURE_INTERFACE: Platform.CLIMATE,
 }
 
 # Map Overkiz camelCase to Home Assistant snake_case for translation
@@ -94,4 +141,55 @@ OVERKIZ_STATE_TO_TRANSLATION: dict[str, str] = {
     OverkizCommandParam.SAAC: "saac",
     OverkizCommandParam.SFC: "sfc",
     OverkizCommandParam.UPS: "ups",
+}
+
+OVERKIZ_UNIT_TO_HA: dict[str, str] = {
+    MeasuredValueType.ABSOLUTE_VALUE: "",
+    MeasuredValueType.ANGLE_IN_DEGREES: DEGREE,
+    MeasuredValueType.ANGULAR_SPEED_IN_DEGREES_PER_SECOND: (
+        f"{DEGREE}/{UnitOfTime.SECONDS}"
+    ),
+    MeasuredValueType.ELECTRICAL_ENERGY_IN_KWH: UnitOfEnergy.KILO_WATT_HOUR,
+    MeasuredValueType.ELECTRICAL_ENERGY_IN_WH: UnitOfEnergy.WATT_HOUR,
+    MeasuredValueType.ELECTRICAL_POWER_IN_KW: UnitOfPower.KILO_WATT,
+    MeasuredValueType.ELECTRICAL_POWER_IN_W: UnitOfPower.WATT,
+    MeasuredValueType.ELECTRIC_CURRENT_IN_AMPERE: UnitOfElectricCurrent.AMPERE,
+    MeasuredValueType.ELECTRIC_CURRENT_IN_MILLI_AMPERE: (
+        UnitOfElectricCurrent.MILLIAMPERE
+    ),
+    MeasuredValueType.ENERGY_IN_CAL: UnitOfEnergy.CALORIE,
+    MeasuredValueType.ENERGY_IN_KCAL: UnitOfEnergy.KILO_CALORIE,
+    MeasuredValueType.FLOW_IN_LITRE_PER_SECOND: (
+        f"{UnitOfVolume.LITERS}/{UnitOfTime.SECONDS}"
+    ),
+    MeasuredValueType.FLOW_IN_METER_CUBE_PER_HOUR: (
+        UnitOfVolumeFlowRate.CUBIC_METERS_PER_HOUR
+    ),
+    MeasuredValueType.FLOW_IN_METER_CUBE_PER_SECOND: (
+        f"{UnitOfVolume.CUBIC_METERS}/{UnitOfTime.SECONDS}"
+    ),
+    MeasuredValueType.FOSSIL_ENERGY_IN_WH: UnitOfEnergy.WATT_HOUR,
+    MeasuredValueType.GRADIENT_IN_PERCENTAGE_PER_SECOND: (
+        f"{UnitOfRatio.PERCENTAGE}/{UnitOfTime.SECONDS}"
+    ),
+    MeasuredValueType.LENGTH_IN_METER: UnitOfLength.METERS,
+    MeasuredValueType.LINEAR_SPEED_IN_METER_PER_SECOND: UnitOfSpeed.METERS_PER_SECOND,
+    MeasuredValueType.LUMINANCE_IN_LUX: LIGHT_LUX,
+    MeasuredValueType.PARTS_PER_BILLION: UnitOfRatio.PARTS_PER_BILLION,
+    MeasuredValueType.PARTS_PER_MILLION: UnitOfRatio.PARTS_PER_MILLION,
+    MeasuredValueType.PARTS_PER_QUADRILLION: "ppq",
+    MeasuredValueType.PARTS_PER_TRILLION: "ppt",
+    MeasuredValueType.POWER_PER_SQUARE_METER: UnitOfIrradiance.WATTS_PER_SQUARE_METER,
+    MeasuredValueType.PRESSURE_IN_HPA: UnitOfPressure.HPA,
+    MeasuredValueType.PRESSURE_IN_MILLI_BAR: UnitOfPressure.MBAR,
+    MeasuredValueType.RELATIVE_VALUE_IN_PERCENTAGE: UnitOfRatio.PERCENTAGE,
+    MeasuredValueType.TEMPERATURE_IN_CELCIUS: UnitOfTemperature.CELSIUS,
+    MeasuredValueType.TEMPERATURE_IN_KELVIN: UnitOfTemperature.KELVIN,
+    MeasuredValueType.TIME_IN_SECOND: UnitOfTime.SECONDS,
+    # MeasuredValueType.VECTOR_COORDINATE: "",
+    MeasuredValueType.VOLTAGE_IN_MILLI_VOLT: UnitOfElectricPotential.MILLIVOLT,
+    MeasuredValueType.VOLTAGE_IN_VOLT: UnitOfElectricPotential.VOLT,
+    MeasuredValueType.VOLUME_IN_CUBIC_METER: UnitOfVolume.CUBIC_METERS,
+    MeasuredValueType.VOLUME_IN_GALLON: UnitOfVolume.GALLONS,
+    MeasuredValueType.VOLUME_IN_LITER: UnitOfVolume.LITERS,
 }

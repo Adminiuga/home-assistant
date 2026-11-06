@@ -1,14 +1,14 @@
 """Tests for the Modern Forms sensor platform."""
+
 from datetime import datetime
 
+from pytest_homeassistant.test_util.aiohttp import AiohttpClientMocker
+
 from homeassistant.components.sensor import SensorDeviceClass
-from homeassistant.const import ATTR_DEVICE_CLASS, ATTR_ICON
+from homeassistant.const import ATTR_DEVICE_CLASS
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers import entity_registry as er
 
-from . import init_integration, modern_forms_timers_set_mock
-
-from tests.test_util.aiohttp import AiohttpClientMocker
+from . import init_integration, init_integration_gen4, modern_forms_timers_set_mock
 
 
 async def test_sensors(
@@ -18,19 +18,16 @@ async def test_sensors(
 
     # await init_integration(hass, aioclient_mock)
     await init_integration(hass, aioclient_mock)
-    er.async_get(hass)
 
     # Light timer remaining time
     state = hass.states.get("sensor.modernformsfan_light_sleep_time")
     assert state
-    assert state.attributes.get(ATTR_ICON) == "mdi:timer-outline"
     assert state.attributes.get(ATTR_DEVICE_CLASS) == SensorDeviceClass.TIMESTAMP
     assert state.state == "unknown"
 
     # Fan timer remaining time
     state = hass.states.get("sensor.modernformsfan_fan_sleep_time")
     assert state
-    assert state.attributes.get(ATTR_ICON) == "mdi:timer-outline"
     assert state.attributes.get(ATTR_DEVICE_CLASS) == SensorDeviceClass.TIMESTAMP
     assert state.state == "unknown"
 
@@ -42,18 +39,26 @@ async def test_active_sensors(
 
     # await init_integration(hass, aioclient_mock)
     await init_integration(hass, aioclient_mock, mock_type=modern_forms_timers_set_mock)
-    er.async_get(hass)
 
     # Light timer remaining time
     state = hass.states.get("sensor.modernformsfan_light_sleep_time")
     assert state
-    assert state.attributes.get(ATTR_ICON) == "mdi:timer-outline"
     assert state.attributes.get(ATTR_DEVICE_CLASS) == SensorDeviceClass.TIMESTAMP
     datetime.fromisoformat(state.state)
 
     # Fan timer remaining time
     state = hass.states.get("sensor.modernformsfan_fan_sleep_time")
     assert state
-    assert state.attributes.get(ATTR_ICON) == "mdi:timer-outline"
     assert state.attributes.get(ATTR_DEVICE_CLASS) == SensorDeviceClass.TIMESTAMP
     datetime.fromisoformat(state.state)
+
+
+async def test_no_sleep_timer_sensors_on_gen4(
+    hass: HomeAssistant,
+    aioclient_mock: AiohttpClientMocker,
+) -> None:
+    """Test the sleep-timer sensors aren't created for Gen4 fans."""
+    await init_integration_gen4(hass, aioclient_mock)
+
+    assert hass.states.get("sensor.modernformsfan_fan_sleep_time") is None
+    assert hass.states.get("sensor.modernformsfan_light_sleep_time") is None

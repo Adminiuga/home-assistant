@@ -1,10 +1,19 @@
 """Support for Keba notifications."""
+
+from typing import Any, override
+
 from homeassistant.components.notify import ATTR_DATA, BaseNotificationService
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
-from . import DOMAIN
+from .const import DOMAIN
 
 
-async def async_get_service(hass, config, discovery_info=None):
+async def async_get_service(
+    hass: HomeAssistant,
+    config: ConfigType,
+    discovery_info: DiscoveryInfoType | None = None,
+) -> KebaNotificationService:
     """Return the notify service."""
 
     client = hass.data[DOMAIN]
@@ -18,7 +27,8 @@ class KebaNotificationService(BaseNotificationService):
         """Initialize the service."""
         self._client = client
 
-    async def async_send_message(self, message="", **kwargs):
+    @override
+    async def async_send_message(self, message: str = "", **kwargs: Any) -> None:
         """Send the message."""
         text = message.replace(" ", "$")  # Will be translated back by the display
 

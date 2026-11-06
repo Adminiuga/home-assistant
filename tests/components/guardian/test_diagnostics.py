@@ -1,13 +1,22 @@
 """Test Guardian diagnostics."""
+
+from pytest_homeassistant.common import ANY, MockConfigEntry
+from pytest_homeassistant.components.diagnostics import get_diagnostics_for_config_entry
+from pytest_homeassistant.typing import ClientSessionGenerator
+
 from homeassistant.components.diagnostics import REDACTED
-from homeassistant.components.guardian import DOMAIN, GuardianData
+from homeassistant.components.guardian import GuardianData
+from homeassistant.core import HomeAssistant
 
-from tests.components.diagnostics import get_diagnostics_for_config_entry
 
-
-async def test_entry_diagnostics(hass, config_entry, hass_client, setup_guardian):
+async def test_entry_diagnostics(
+    hass: HomeAssistant,
+    config_entry: MockConfigEntry,
+    hass_client: ClientSessionGenerator,
+    setup_guardian: None,  # relies on config_entry fixture
+) -> None:
     """Test config entry diagnostics."""
-    data: GuardianData = hass.data[DOMAIN][config_entry.entry_id]
+    data: GuardianData = config_entry.runtime_data
 
     # Simulate the pairing of a paired sensor:
     await data.paired_sensor_manager.async_pair_sensor("AABBCCDDEEFF")
@@ -16,6 +25,7 @@ async def test_entry_diagnostics(hass, config_entry, hass_client, setup_guardian
         "entry": {
             "entry_id": config_entry.entry_id,
             "version": 1,
+            "minor_version": 1,
             "domain": "guardian",
             "title": REDACTED,
             "data": {
@@ -29,6 +39,10 @@ async def test_entry_diagnostics(hass, config_entry, hass_client, setup_guardian
             "source": "user",
             "unique_id": REDACTED,
             "disabled_by": None,
+            "created_at": ANY,
+            "modified_at": ANY,
+            "discovery_keys": {},
+            "subentries": [],
         },
         "data": {
             "valve_controller": {

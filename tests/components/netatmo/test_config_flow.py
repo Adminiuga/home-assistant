@@ -1,11 +1,15 @@
 """Test the Netatmo config flow."""
-from unittest.mock import patch
+
+from ipaddress import ip_address
+from unittest.mock import AsyncMock, patch
 
 from pyatmo.const import ALL_SCOPES
+import pytest
+from pytest_homeassistant.common import MockConfigEntry, start_reauth_flow
+from pytest_homeassistant.test_util.aiohttp import AiohttpClientMocker
+from pytest_homeassistant.typing import ClientSessionGenerator
 
-from homeassistant import config_entries, data_entry_flow, setup
-from homeassistant.components import zeroconf
-from homeassistant.components.netatmo import config_flow
+from homeassistant import config_entries
 from homeassistant.components.netatmo.const import (
     CONF_NEW_AREA,
     CONF_WEATHER_AREAS,
@@ -13,62 +17,68 @@ from homeassistant.components.netatmo.const import (
     OAUTH2_AUTHORIZE,
     OAUTH2_TOKEN,
 )
-from homeassistant.const import CONF_CLIENT_ID, CONF_CLIENT_SECRET
+from homeassistant.config_entries import ConfigEntryState
+from homeassistant.core import HomeAssistant
+from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers import config_entry_oauth2_flow
+from homeassistant.helpers.service_info.zeroconf import (
+    ATTR_PROPERTIES_ID,
+    ZeroconfServiceInfo,
+)
 
-from tests.common import MockConfigEntry
-
-CLIENT_ID = "1234"
-CLIENT_SECRET = "5678"
+from .conftest import CLIENT_ID
 
 VALID_CONFIG = {}
 
 
-async def test_abort_if_existing_entry(hass):
+async def test_abort_if_existing_entry(hass: HomeAssistant) -> None:
     """Check flow abort when an entry already exist."""
-    MockConfigEntry(domain=DOMAIN).add_to_hass(hass)
-
-    flow = config_flow.NetatmoFlowHandler()
-    flow.hass = hass
+    MockConfigEntry(domain=DOMAIN, unique_id=DOMAIN).add_to_hass(hass)
 
     result = await hass.config_entries.flow.async_init(
-        "netatmo", context={"source": config_entries.SOURCE_USER}
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
     )
-    assert result["type"] == data_entry_flow.FlowResultType.ABORT
+    assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "single_instance_allowed"
 
     result = await hass.config_entries.flow.async_init(
-        "netatmo",
+        DOMAIN,
         context={"source": config_entries.SOURCE_HOMEKIT},
-        data=zeroconf.ZeroconfServiceInfo(
-            host="0.0.0.0",
-            addresses=["0.0.0.0"],
+        data=ZeroconfServiceInfo(
+            ip_address=ip_address("192.168.1.5"),
+            ip_addresses=[ip_address("192.168.1.5")],
             hostname="mock_hostname",
             name="mock_name",
             port=None,
-            properties={zeroconf.ATTR_PROPERTIES_ID: "aa:bb:cc:dd:ee:ff"},
+            properties={ATTR_PROPERTIES_ID: "aa:bb:cc:dd:ee:ff"},
             type="mock_type",
         ),
     )
-    assert result["type"] == data_entry_flow.FlowResultType.ABORT
-    assert result["reason"] == "already_configured"
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "single_instance_allowed"
 
 
-async def test_full_flow(
-    hass, hass_client_no_auth, aioclient_mock, current_request_with_host
-):
-    """Check full flow."""
-    assert await setup.async_setup_component(
-        hass,
-        "netatmo",
-        {
-            "netatmo": {CONF_CLIENT_ID: CLIENT_ID, CONF_CLIENT_SECRET: CLIENT_SECRET},
-            "http": {"base_url": "https://example.com"},
-        },
-    )
+async def test_abort_if_legacy_entry_without_unique_id(hass: HomeAssistant) -> None:
+    """Check user flow aborts for a legacy entry that has no unique_id yet."""
+    MockConfigEntry(domain=DOMAIN, unique_id=None).add_to_hass(hass)
 
     result = await hass.config_entries.flow.async_init(
-        "netatmo", context={"source": config_entries.SOURCE_USER}
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "single_instance_allowed"
+
+
+@pytest.mark.usefixtures("current_request_with_host")
+async def test_full_flow(
+    hass: HomeAssistant,
+    hass_client_no_auth: ClientSessionGenerator,
+    aioclient_mock: AiohttpClientMocker,
+) -> None:
+    """Check full flow."""
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
     )
     state = config_entry_oauth2_flow._encode_jwt(
         hass,
@@ -102,7 +112,7 @@ async def test_full_flow(
     )
 
     with patch(
-        "homeassistant.components.netatmo.async_setup_entry", return_value=True
+        "homeassistant.components.netatmo.async_setup_entry", return_value=None
     ) as mock_setup:
         await hass.config_entries.flow.async_configure(result["flow_id"])
 
@@ -110,7 +120,7 @@ async def test_full_flow(
     assert len(mock_setup.mock_calls) == 1
 
 
-async def test_option_flow(hass):
+async def test_option_flow(hass: HomeAssistant) -> None:
     """Test config flow options."""
     valid_option = {
         "lat_ne": 32.91336,
@@ -142,33 +152,33 @@ async def test_option_flow(hass):
 
     result = await hass.config_entries.options.async_init(config_entry.entry_id)
 
-    assert result["type"] == data_entry_flow.FlowResultType.FORM
+    assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "public_weather_areas"
 
     result = await hass.config_entries.options.async_configure(
         result["flow_id"], user_input={CONF_NEW_AREA: "Home"}
     )
 
-    assert result["type"] == data_entry_flow.FlowResultType.FORM
+    assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "public_weather"
 
     result = await hass.config_entries.options.async_configure(
         result["flow_id"], user_input=valid_option
     )
 
-    assert result["type"] == data_entry_flow.FlowResultType.FORM
+    assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "public_weather_areas"
 
     result = await hass.config_entries.options.async_configure(
         result["flow_id"], user_input={}
     )
 
-    assert result["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
+    assert result["type"] is FlowResultType.CREATE_ENTRY
     for k, v in expected_result.items():
         assert config_entry.options[CONF_WEATHER_AREAS]["Home"][k] == v
 
 
-async def test_option_flow_wrong_coordinates(hass):
+async def test_option_flow_wrong_coordinates(hass: HomeAssistant) -> None:
     """Test config flow options with mixed up coordinates."""
     valid_option = {
         "lat_ne": 32.1234567,
@@ -200,47 +210,42 @@ async def test_option_flow_wrong_coordinates(hass):
 
     result = await hass.config_entries.options.async_init(config_entry.entry_id)
 
-    assert result["type"] == data_entry_flow.FlowResultType.FORM
+    assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "public_weather_areas"
 
     result = await hass.config_entries.options.async_configure(
         result["flow_id"], user_input={CONF_NEW_AREA: "Home"}
     )
 
-    assert result["type"] == data_entry_flow.FlowResultType.FORM
+    assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "public_weather"
 
     result = await hass.config_entries.options.async_configure(
         result["flow_id"], user_input=valid_option
     )
 
-    assert result["type"] == data_entry_flow.FlowResultType.FORM
+    assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "public_weather_areas"
 
     result = await hass.config_entries.options.async_configure(
         result["flow_id"], user_input={}
     )
 
-    assert result["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
+    assert result["type"] is FlowResultType.CREATE_ENTRY
     for k, v in expected_result.items():
         assert config_entry.options[CONF_WEATHER_AREAS]["Home"][k] == v
 
 
+@pytest.mark.usefixtures("current_request_with_host")
 async def test_reauth(
-    hass, hass_client_no_auth, aioclient_mock, current_request_with_host
-):
+    hass: HomeAssistant,
+    hass_client_no_auth: ClientSessionGenerator,
+    aioclient_mock: AiohttpClientMocker,
+) -> None:
     """Test initialization of the reauth flow."""
-    assert await setup.async_setup_component(
-        hass,
-        "netatmo",
-        {
-            "netatmo": {CONF_CLIENT_ID: CLIENT_ID, CONF_CLIENT_SECRET: CLIENT_SECRET},
-            "http": {"base_url": "https://example.com"},
-        },
-    )
 
     result = await hass.config_entries.flow.async_init(
-        "netatmo", context={"source": config_entries.SOURCE_USER}
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
     )
     state = config_entry_oauth2_flow._encode_jwt(
         hass,
@@ -274,22 +279,20 @@ async def test_reauth(
     )
 
     with patch(
-        "homeassistant.components.netatmo.async_setup_entry", return_value=True
+        "homeassistant.components.netatmo.async_setup_entry", return_value=None
     ) as mock_setup:
         await hass.config_entries.flow.async_configure(result["flow_id"])
         await hass.async_block_till_done()
 
     new_entry = hass.config_entries.async_entries(DOMAIN)[0]
 
-    assert new_entry.state == config_entries.ConfigEntryState.LOADED
+    assert new_entry.state is ConfigEntryState.LOADED
     assert len(hass.config_entries.async_entries(DOMAIN)) == 1
     assert len(mock_setup.mock_calls) == 1
 
     # Should show form
-    result = await hass.config_entries.flow.async_init(
-        "netatmo", context={"source": config_entries.SOURCE_REAUTH}
-    )
-    assert result["type"] == data_entry_flow.FlowResultType.FORM
+    result = await start_reauth_flow(hass, new_entry)
+    assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "reauth_confirm"
 
     # Confirm reauth flow
@@ -319,15 +322,95 @@ async def test_reauth(
 
     # Update entry
     with patch(
-        "homeassistant.components.netatmo.async_setup_entry", return_value=True
+        "homeassistant.components.netatmo.async_setup_entry", return_value=None
     ) as mock_setup:
         result3 = await hass.config_entries.flow.async_configure(result2["flow_id"])
         await hass.async_block_till_done()
 
     new_entry2 = hass.config_entries.async_entries(DOMAIN)[0]
 
-    assert result3["type"] == data_entry_flow.FlowResultType.ABORT
+    assert result3["type"] is FlowResultType.ABORT
     assert result3["reason"] == "reauth_successful"
-    assert new_entry2.state == config_entries.ConfigEntryState.LOADED
+    assert new_entry2.state is ConfigEntryState.LOADED
     assert len(hass.config_entries.async_entries(DOMAIN)) == 1
     assert len(mock_setup.mock_calls) == 1
+
+
+@pytest.mark.usefixtures("current_request_with_host")
+async def test_reconfigure(
+    hass: HomeAssistant,
+    hass_client_no_auth: ClientSessionGenerator,
+    aioclient_mock: AiohttpClientMocker,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test the reconfigure flow re-runs OAuth and updates the entry."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id=DOMAIN,
+        data={
+            "auth_implementation": DOMAIN,
+            "token": {"access_token": "old-access-token"},
+            "webhook_id": "mock-webhook-id",
+        },
+    )
+    entry.add_to_hass(hass)
+
+    async def _mock_setup_entry(hass: HomeAssistant, entry: MockConfigEntry) -> None:
+        # Netatmo registers an update listener on setup
+        entry.async_on_unload(entry.add_update_listener(AsyncMock()))
+
+    with patch(
+        "homeassistant.components.netatmo.async_setup_entry",
+        side_effect=_mock_setup_entry,
+    ):
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+    assert entry.state is ConfigEntryState.LOADED
+
+    result = await entry.start_reconfigure_flow(hass)
+    state = config_entry_oauth2_flow._encode_jwt(
+        hass,
+        {
+            "flow_id": result["flow_id"],
+            "redirect_uri": "https://example.com/auth/external/callback",
+        },
+    )
+
+    scope = "+".join(sorted(ALL_SCOPES))
+
+    assert result["url"] == (
+        f"{OAUTH2_AUTHORIZE}?response_type=code&client_id={CLIENT_ID}"
+        "&redirect_uri=https://example.com/auth/external/callback"
+        f"&state={state}&scope={scope}"
+    )
+
+    client = await hass_client_no_auth()
+    resp = await client.get(f"/auth/external/callback?code=abcd&state={state}")
+    assert resp.status == 200
+
+    aioclient_mock.post(
+        OAUTH2_TOKEN,
+        json={
+            "refresh_token": "new-refresh-token",
+            "access_token": "new-access-token",
+            "type": "Bearer",
+            "expires_in": 60,
+        },
+    )
+
+    with patch(
+        "homeassistant.components.netatmo.async_setup_entry",
+        side_effect=_mock_setup_entry,
+    ) as mock_setup:
+        result = await hass.config_entries.flow.async_configure(result["flow_id"])
+        await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    assert len(hass.config_entries.async_entries(DOMAIN)) == 1
+    assert entry.data["token"]["access_token"] == "new-access-token"
+    assert entry.data["token"]["refresh_token"] == "new-refresh-token"
+    assert entry.data["webhook_id"] == "mock-webhook-id"
+    assert entry.state is ConfigEntryState.LOADED
+    mock_setup.assert_called_once()
+    assert "has an update listener" not in caplog.text

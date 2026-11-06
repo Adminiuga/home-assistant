@@ -1,7 +1,10 @@
 {
   "domain": "yandextts",
   "name": "Yandex TTS",
-  "documentation": "https://www.home-assistant.io/integrations/yandextts",
+  "categories": ["ai_voice.speech"],
   "codeowners": [],
-  "iot_class": "cloud_push"
+  "connectivity": ["cloud"],
+  "documentation": "https://www.home-assistant.io/integrations/yandextts",
+  "iot_class": "cloud_push",
+  "quality_scale": "legacy"
 }

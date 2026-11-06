@@ -1,0 +1,350 @@
+"""Platform for Control4 Climate/Thermostat."""
+
+import logging
+from typing import Any, override
+
+from pyControl4.climate import C4Climate
+
+from homeassistant.components.climate import (
+    ATTR_TARGET_TEMP_HIGH,
+    ATTR_TARGET_TEMP_LOW,
+    ClimateEntity,
+    ClimateEntityFeature,
+    HVACAction,
+    HVACMode,
+)
+from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+
+from . import Control4ConfigEntry, get_items_of_category
+from .const import (
+    CONTROL4_COOL_SETPOINT_C,
+    CONTROL4_COOL_SETPOINT_F,
+    CONTROL4_CURRENT_TEMPERATURE_C,
+    CONTROL4_CURRENT_TEMPERATURE_F,
+    CONTROL4_ENTITY_TYPE,
+    CONTROL4_FAN_MODE,
+    CONTROL4_FAN_MODES_LIST,
+    CONTROL4_HEAT_SETPOINT_C,
+    CONTROL4_HEAT_SETPOINT_F,
+    CONTROL4_HUMIDITY,
+    CONTROL4_HVAC_MODE,
+    CONTROL4_HVAC_STATE,
+    CONTROL4_SCALE,
+)
+from .entity import Control4Entity
+
+_LOGGER = logging.getLogger(__name__)
+
+CONTROL4_CATEGORY = "comfort"
+
+# Map Control4 HVAC modes to Home Assistant
+C4_TO_HA_HVAC_MODE = {
+    "Off": HVACMode.OFF,
+    "Cool": HVACMode.COOL,
+    "Heat": HVACMode.HEAT,
+    "Auto": HVACMode.HEAT_COOL,
+}
+
+HA_TO_C4_HVAC_MODE = {v: k for k, v in C4_TO_HA_HVAC_MODE.items()}
+
+# Map Control4 HVAC states to Home Assistant HVAC actions
+C4_TO_HA_HVAC_ACTION = {
+    "off": HVACAction.OFF,
+    "heat": HVACAction.HEATING,
+    "cool": HVACAction.COOLING,
+    "idle": HVACAction.IDLE,
+    "dry": HVACAction.DRYING,
+    "fan": HVACAction.FAN,
+}
+
+
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: Control4ConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up Control4 thermostats from a config entry."""
+    runtime_data = entry.runtime_data
+
+    coordinator = runtime_data.climate_coordinator
+
+    items_of_category = await get_items_of_category(hass, entry, CONTROL4_CATEGORY)
+    entity_list = []
+    for item in items_of_category:
+        try:
+            if item["type"] == CONTROL4_ENTITY_TYPE:
+                item_name = item["name"]
+                item_id = item["id"]
+                item_parent_id = item["parentId"]
+                item_manufacturer = None
+                item_device_name = None
+                item_model = None
+
+                for parent_item in items_of_category:
+                    if parent_item["id"] == item_parent_id:
+                        item_manufacturer = parent_item.get("manufacturer")
+                        item_device_name = parent_item.get("roomName")
+                        item_model = parent_item.get("model")
+            else:
+                continue
+        except KeyError:
+            _LOGGER.exception(
+                "Unknown device properties received from Control4: %s",
+                item,
+            )
+            continue
+
+        # Skip if we don't have data for this thermostat
+        if item_id not in coordinator.data:
+            _LOGGER.warning(
+                "Couldn't get climate state data for %s (ID: %s), skipping setup",
+                item_name,
+                item_id,
+            )
+            continue
+
+        entity_list.append(
+            Control4Climate(
+                runtime_data,
+                coordinator,
+                item_name,
+                item_id,
+                item_device_name,
+                item_manufacturer,
+                item_model,
+                item_parent_id,
+            )
+        )
+
+    async_add_entities(entity_list)
+
+
+class Control4Climate(Control4Entity, ClimateEntity):
+    """Control4 climate entity."""
+
+    _attr_has_entity_name = True
+    _attr_translation_key = "thermostat"
+    _attr_hvac_modes = [HVACMode.OFF, HVACMode.HEAT, HVACMode.COOL, HVACMode.HEAT_COOL]
+
+    @property
+    @override
+    def available(self) -> bool:
+        """Return if entity is available."""
+        return super().available and self._thermostat_data is not None
+
+    def _create_api_object(self) -> C4Climate:
+        """Create a pyControl4 device object.
+
+        This exists so the director token used is always the
+        latest one, without needing to re-init the entire entity.
+        """
+        return C4Climate(self.runtime_data.director, self._idx)
+
+    @property
+    def _thermostat_data(self) -> dict[str, Any] | None:
+        """Return the thermostat data from the coordinator."""
+        return self.coordinator.data.get(self._idx)
+
+    @property
+    @override
+    def supported_features(self) -> ClimateEntityFeature:
+        """Return the list of supported features."""
+        features = (
+            ClimateEntityFeature.TARGET_TEMPERATURE
+            | ClimateEntityFeature.TARGET_TEMPERATURE_RANGE
+            | ClimateEntityFeature.TURN_ON
+            | ClimateEntityFeature.TURN_OFF
+        )
+        if self.fan_modes:
+            features |= ClimateEntityFeature.FAN_MODE
+        return features
+
+    @property
+    @override
+    def native_temperature_unit(self) -> str:
+        """Return the temperature unit based on the thermostat's SCALE setting."""
+        data = self._thermostat_data
+        if data is None:
+            return UnitOfTemperature.CELSIUS  # Default per HA conventions
+        if data.get(CONTROL4_SCALE) == "FAHRENHEIT":
+            return UnitOfTemperature.FAHRENHEIT
+        return UnitOfTemperature.CELSIUS
+
+    @property
+    def _cool_setpoint(self) -> float | None:
+        """Return the cooling setpoint from the appropriate variable."""
+        data = self._thermostat_data
+        if data is None:
+            return None
+        if self.native_temperature_unit == UnitOfTemperature.CELSIUS:
+            return data.get(CONTROL4_COOL_SETPOINT_C)
+        return data.get(CONTROL4_COOL_SETPOINT_F)
+
+    @property
+    def _heat_setpoint(self) -> float | None:
+        """Return the heating setpoint from the appropriate variable."""
+        data = self._thermostat_data
+        if data is None:
+            return None
+        if self.native_temperature_unit == UnitOfTemperature.CELSIUS:
+            return data.get(CONTROL4_HEAT_SETPOINT_C)
+        return data.get(CONTROL4_HEAT_SETPOINT_F)
+
+    @property
+    @override
+    def native_current_temperature(self) -> float | None:
+        """Return the current temperature."""
+        data = self._thermostat_data
+        if data is None:
+            return None
+        if self.native_temperature_unit == UnitOfTemperature.CELSIUS:
+            return data.get(CONTROL4_CURRENT_TEMPERATURE_C)
+        return data.get(CONTROL4_CURRENT_TEMPERATURE_F)
+
+    @property
+    @override
+    def current_humidity(self) -> int | None:
+        """Return the current humidity."""
+        data = self._thermostat_data
+        if data is None:
+            return None
+        humidity = data.get(CONTROL4_HUMIDITY)
+        try:
+            return int(humidity) if humidity is not None else None
+        except ValueError, TypeError:
+            return None
+
+    @property
+    @override
+    def hvac_mode(self) -> HVACMode:
+        """Return current HVAC mode."""
+        data = self._thermostat_data
+        if data is None:
+            return HVACMode.OFF
+        c4_mode = data.get(CONTROL4_HVAC_MODE) or ""
+        return C4_TO_HA_HVAC_MODE.get(c4_mode, HVACMode.OFF)
+
+    @property
+    @override
+    def hvac_action(self) -> HVACAction | None:
+        """Return current HVAC action."""
+        data = self._thermostat_data
+        if data is None:
+            return None
+        c4_state = data.get(CONTROL4_HVAC_STATE)
+        if c4_state is None:
+            return None
+        action = C4_TO_HA_HVAC_ACTION.get(str(c4_state).lower())
+        # Substring match for multi-stage systems that report
+        # e.g. "Stage 1 Heat", "Stage 2 Cool"
+        if action is None:
+            if "heat" in str(c4_state).lower():
+                action = HVACAction.HEATING
+            elif "cool" in str(c4_state).lower():
+                action = HVACAction.COOLING
+        if action is None:
+            _LOGGER.debug("Unknown HVAC state received from Control4: %s", c4_state)
+        return action
+
+    @property
+    @override
+    def native_target_temperature(self) -> float | None:
+        """Return the target temperature."""
+        hvac_mode = self.hvac_mode
+        if hvac_mode == HVACMode.COOL:
+            return self._cool_setpoint
+        if hvac_mode == HVACMode.HEAT:
+            return self._heat_setpoint
+        return None
+
+    @property
+    @override
+    def native_target_temperature_high(self) -> float | None:
+        """Return the high target temperature for auto mode."""
+        if self.hvac_mode == HVACMode.HEAT_COOL:
+            return self._cool_setpoint
+        return None
+
+    @property
+    @override
+    def native_target_temperature_low(self) -> float | None:
+        """Return the low target temperature for auto mode."""
+        if self.hvac_mode == HVACMode.HEAT_COOL:
+            return self._heat_setpoint
+        return None
+
+    @property
+    @override
+    def fan_mode(self) -> str | None:
+        """Return the current fan mode."""
+        data = self._thermostat_data
+        if data is None:
+            return None
+        c4_fan_mode = data.get(CONTROL4_FAN_MODE)
+        if c4_fan_mode is None:
+            return None
+        return c4_fan_mode.lower()
+
+    @property
+    @override
+    def fan_modes(self) -> list[str] | None:
+        """Return the list of available fan modes."""
+        data = self._thermostat_data
+        if data is None:
+            return None
+        modes = data.get(CONTROL4_FAN_MODES_LIST)
+        if not modes:
+            return None
+        return [m.strip().lower() for m in modes.split(",") if m.strip()]
+
+    @override
+    async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
+        """Set new target HVAC mode."""
+        c4_hvac_mode = HA_TO_C4_HVAC_MODE[hvac_mode]
+        c4_climate = self._create_api_object()
+        await c4_climate.set_hvac_mode(c4_hvac_mode)
+        await self.coordinator.async_request_refresh()
+
+    @override
+    async def async_set_temperature(self, **kwargs: Any) -> None:
+        """Set new target temperature."""
+        c4_climate = self._create_api_object()
+        low_temp = kwargs.get(ATTR_TARGET_TEMP_LOW)
+        high_temp = kwargs.get(ATTR_TARGET_TEMP_HIGH)
+        temp = kwargs.get(ATTR_TEMPERATURE)
+
+        # Handle temperature range for auto mode
+        if self.hvac_mode == HVACMode.HEAT_COOL:
+            if low_temp is not None:
+                if self.native_temperature_unit == UnitOfTemperature.CELSIUS:
+                    await c4_climate.set_heat_setpoint_c(low_temp)
+                else:
+                    await c4_climate.set_heat_setpoint_f(low_temp)
+            if high_temp is not None:
+                if self.native_temperature_unit == UnitOfTemperature.CELSIUS:
+                    await c4_climate.set_cool_setpoint_c(high_temp)
+                else:
+                    await c4_climate.set_cool_setpoint_f(high_temp)
+        # Handle single temperature setpoint
+        elif temp is not None:
+            if self.hvac_mode == HVACMode.COOL:
+                if self.native_temperature_unit == UnitOfTemperature.CELSIUS:
+                    await c4_climate.set_cool_setpoint_c(temp)
+                else:
+                    await c4_climate.set_cool_setpoint_f(temp)
+            elif self.hvac_mode == HVACMode.HEAT:
+                if self.native_temperature_unit == UnitOfTemperature.CELSIUS:
+                    await c4_climate.set_heat_setpoint_c(temp)
+                else:
+                    await c4_climate.set_heat_setpoint_f(temp)
+
+        await self.coordinator.async_request_refresh()
+
+    @override
+    async def async_set_fan_mode(self, fan_mode: str) -> None:
+        """Set new target fan mode."""
+        c4_climate = self._create_api_object()
+        await c4_climate.set_fan_mode(fan_mode.title())
+        await self.coordinator.async_request_refresh()

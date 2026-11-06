@@ -1,27 +1,26 @@
 """Reproduce an Lock state."""
-from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterable
 import logging
 from typing import Any
 
-from homeassistant.const import (
-    ATTR_ENTITY_ID,
-    SERVICE_LOCK,
-    SERVICE_UNLOCK,
-    STATE_LOCKED,
-    STATE_LOCKING,
-    STATE_UNLOCKED,
-    STATE_UNLOCKING,
-)
+from homeassistant.const import ATTR_ENTITY_ID
 from homeassistant.core import Context, HomeAssistant, State
 
-from . import DOMAIN
+from . import LockState
+from .const import DOMAIN, LockService
 
 _LOGGER = logging.getLogger(__name__)
 
-VALID_STATES = {STATE_LOCKED, STATE_UNLOCKED, STATE_LOCKING, STATE_UNLOCKING}
+VALID_STATES = {
+    LockState.LOCKED,
+    LockState.LOCKING,
+    LockState.OPEN,
+    LockState.OPENING,
+    LockState.UNLOCKED,
+    LockState.UNLOCKING,
+}
 
 
 async def _async_reproduce_state(
@@ -48,10 +47,12 @@ async def _async_reproduce_state(
 
     service_data = {ATTR_ENTITY_ID: state.entity_id}
 
-    if state.state in {STATE_LOCKED, STATE_LOCKING}:
-        service = SERVICE_LOCK
-    elif state.state in {STATE_UNLOCKED, STATE_UNLOCKING}:
-        service = SERVICE_UNLOCK
+    if state.state in {LockState.LOCKED, LockState.LOCKING}:
+        service = LockService.LOCK
+    elif state.state in {LockState.UNLOCKED, LockState.UNLOCKING}:
+        service = LockService.UNLOCK
+    elif state.state in {LockState.OPEN, LockState.OPENING}:
+        service = LockService.OPEN
 
     await hass.services.async_call(
         DOMAIN, service, service_data, context=context, blocking=True

@@ -1,5 +1,4 @@
 """Constants for the Open-Meteo integration."""
-from __future__ import annotations
 
 from datetime import timedelta
 import logging
@@ -24,13 +23,13 @@ SCAN_INTERVAL = timedelta(minutes=30)
 # World Meteorological Organization Weather Code
 # mapped to Home Assistant weather conditions.
 # https://www.weather.gov/tg/wmo
-WMO_TO_HA_CONDITION_MAP = {
+WMO_TO_HA_CONDITION_MAP: dict[int | None, str] = {
     0: ATTR_CONDITION_SUNNY,  # Clear sky
     1: ATTR_CONDITION_SUNNY,  # Mainly clear
     2: ATTR_CONDITION_PARTLYCLOUDY,  # Partly cloudy
     3: ATTR_CONDITION_CLOUDY,  # Overcast
     45: ATTR_CONDITION_FOG,  # Fog
-    48: ATTR_CONDITION_FOG,  # Depositing rime fog
+    48: ATTR_CONDITION_FOG,  # Depositing rime fog  # codespell:ignore rime
     51: ATTR_CONDITION_RAINY,  # Drizzle: Light intensity
     53: ATTR_CONDITION_RAINY,  # Drizzle: Moderate intensity
     55: ATTR_CONDITION_RAINY,  # Drizzle: Dense intensity

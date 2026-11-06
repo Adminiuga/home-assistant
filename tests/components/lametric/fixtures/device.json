@@ -12,7 +12,7 @@
   },
   "bluetooth": {
     "active": false,
-    "address": "AA:BB:CC:DD:EE:FF",
+    "address": "AA:BB:CC:DD:EE:EE",
     "available": true,
     "discoverable": true,
     "low_energy": {
@@ -40,6 +40,8 @@
       "modes": {
         "time_based": {
           "enabled": true,
+          "end_time": "06:30:00",
+          "local_end_time": "07:30:00",
           "local_start_time": "01:00:39",
           "start_time": "00:00:39"
         },

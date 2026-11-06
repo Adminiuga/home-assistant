@@ -1,12 +1,10 @@
-"""Support for config validation using voluptuous and Translate Trigger."""
-from __future__ import annotations
+"""Support for config validation using probatio and Translate Trigger."""
 
 import calendar
 import locale
-import re
 from typing import Any
 
-import voluptuous as vol
+import probatio
 
 
 def wilight_trigger(value: Any) -> str | None:
@@ -25,7 +23,7 @@ def wilight_trigger(value: Any) -> str | None:
     if (step == 2) & isinstance(value, str):
         step = 3
         err_desc = "String should only contain 8 decimals character"
-        if re.search(r"^([0-9]{8})$", value) is not None:
+        if len(value) == 8 and value.isdigit():
             step = 4
             err_desc = "First 3 character should be less than 128"
             result_128 = int(value[0:3]) < 128
@@ -43,12 +41,12 @@ def wilight_trigger(value: Any) -> str | None:
 
     if (step == 6) & result_60:
         step = 7
-        err_desc = "Active part shoul be less than 2"
+        err_desc = "Active part should be less than 2"
 
     if (step == 7) & result_2:
         return value
 
-    raise vol.Invalid(err_desc)
+    raise probatio.Invalid(err_desc)
 
 
 def wilight_to_hass_trigger(value: str | None) -> str | None:

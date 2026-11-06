@@ -1,7 +1,13 @@
 {
   "domain": "actiontec",
   "name": "Actiontec",
-  "documentation": "https://www.home-assistant.io/integrations/actiontec",
+  "categories": [
+    "computers_network.routers_network",
+    "presence_location.network_presence"
+  ],
   "codeowners": [],
-  "iot_class": "local_polling"
+  "connectivity": ["network"],
+  "documentation": "https://www.home-assistant.io/integrations/actiontec",
+  "iot_class": "local_polling",
+  "quality_scale": "legacy"
 }

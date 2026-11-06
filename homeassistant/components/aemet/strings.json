@@ -10,18 +10,30 @@
       "user": {
         "data": {
           "api_key": "[%key:common::config_flow::data::api_key%]",
-          "latitude": "[%key:common::config_flow::data::latitude%]",
-          "longitude": "[%key:common::config_flow::data::longitude%]",
+          "location": "[%key:common::config_flow::data::location%]",
           "name": "Name of the integration"
         },
-        "description": "To generate API key go to https://opendata.aemet.es/centrodedescargas/altaUsuario"
+        "description": "To generate API key go to {api_key_url}"
       }
+    }
+  },
+  "entity": {
+    "image": {
+      "weather_radar": {
+        "name": "Weather radar"
+      }
+    }
+  },
+  "exceptions": {
+    "town_not_found": {
+      "message": "No AEMET town found for coordinates {latitude}, {longitude}"
     }
   },
   "options": {
     "step": {
       "init": {
         "data": {
+          "radar_updates": "Gather data from AEMET weather radar",
           "station_updates": "Gather data from AEMET weather stations"
         }
       }

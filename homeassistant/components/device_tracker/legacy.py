@@ -1,40 +1,48 @@
 """Legacy device tracker classes."""
-from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Coroutine, Sequence
 from datetime import datetime, timedelta
 import hashlib
+import logging
 from types import ModuleType
-from typing import Any, Final, Protocol, final
+from typing import Any, Final, Protocol, final, override
 
 import attr
-import voluptuous as vol
+import probatio
+from propcache.api import cached_property
 
 from homeassistant import util
 from homeassistant.components import zone
-from homeassistant.config import async_log_exception, load_yaml_config_file
+from homeassistant.components.zone import ENTITY_ID_HOME
+from homeassistant.config import (
+    async_log_schema_error,
+    config_per_platform,
+    load_yaml_config_file,
+)
 from homeassistant.const import (
     ATTR_ENTITY_ID,
     ATTR_GPS_ACCURACY,
     ATTR_ICON,
-    ATTR_LATITUDE,
-    ATTR_LONGITUDE,
     ATTR_NAME,
     CONF_ICON,
     CONF_MAC,
     CONF_NAME,
     DEVICE_DEFAULT_NAME,
+    EVENT_HOMEASSISTANT_STOP,
     STATE_HOME,
     STATE_NOT_HOME,
+    EntityStateAttribute,
 )
-from homeassistant.core import HomeAssistant, ServiceCall, callback
+from homeassistant.core import Event, HomeAssistant, ServiceCall, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import (
-    config_per_platform,
     config_validation as cv,
-    discovery,
     entity_registry as er,
+    issue_registry as ir,
+)
+from homeassistant.helpers.entity_platform import (
+    async_create_platform_config_not_supported_issue,
 )
 from homeassistant.helpers.event import (
     async_track_time_interval,
@@ -42,8 +50,14 @@ from homeassistant.helpers.event import (
 )
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.typing import ConfigType, GPSType, StateType
-from homeassistant.setup import async_prepare_setup_platform, async_start_setup
+from homeassistant.setup import (
+    SetupPhases,
+    async_notify_setup_error,
+    async_prepare_setup_platform,
+    async_start_setup,
+)
 from homeassistant.util import dt as dt_util
+from homeassistant.util.async_ import create_eager_task
 from homeassistant.util.yaml import dump
 
 from .const import (
@@ -66,34 +80,42 @@ from .const import (
     LOGGER,
     PLATFORM_TYPE_LEGACY,
     SCAN_INTERVAL,
+    DeviceTrackerEntityStateAttribute,
     SourceType,
+    TrackerEntityStateAttribute,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 SERVICE_SEE: Final = "see"
 
 SOURCE_TYPES = [cls.value for cls in SourceType]
 
-NEW_DEVICE_DEFAULTS_SCHEMA = vol.Any(
+NEW_DEVICE_DEFAULTS_SCHEMA = probatio.Any(
     None,
-    vol.Schema({vol.Optional(CONF_TRACK_NEW, default=DEFAULT_TRACK_NEW): cv.boolean}),
+    probatio.Schema(
+        {probatio.Optional(CONF_TRACK_NEW, default=DEFAULT_TRACK_NEW): cv.boolean}
+    ),
 )
 PLATFORM_SCHEMA: Final = cv.PLATFORM_SCHEMA.extend(
     {
-        vol.Optional(CONF_SCAN_INTERVAL): cv.time_period,
-        vol.Optional(CONF_TRACK_NEW): cv.boolean,
-        vol.Optional(CONF_CONSIDER_HOME, default=DEFAULT_CONSIDER_HOME): vol.All(
-            cv.time_period, cv.positive_timedelta
-        ),
-        vol.Optional(CONF_NEW_DEVICE_DEFAULTS, default={}): NEW_DEVICE_DEFAULTS_SCHEMA,
+        probatio.Optional(CONF_SCAN_INTERVAL): cv.time_period,
+        probatio.Optional(CONF_TRACK_NEW): cv.boolean,
+        probatio.Optional(
+            CONF_CONSIDER_HOME, default=DEFAULT_CONSIDER_HOME
+        ): probatio.All(cv.time_period, cv.positive_timedelta),
+        probatio.Optional(
+            CONF_NEW_DEVICE_DEFAULTS, default={}
+        ): NEW_DEVICE_DEFAULTS_SCHEMA,
     }
 )
-PLATFORM_SCHEMA_BASE: Final[vol.Schema] = cv.PLATFORM_SCHEMA_BASE.extend(
+PLATFORM_SCHEMA_BASE: Final[probatio.Schema] = cv.PLATFORM_SCHEMA_BASE.extend(
     PLATFORM_SCHEMA.schema
 )
 
-SERVICE_SEE_PAYLOAD_SCHEMA: Final[vol.Schema] = vol.Schema(
-    vol.All(
-        cv.has_at_least_one_key(ATTR_MAC, ATTR_DEV_ID),
+SERVICE_SEE_PAYLOAD_SCHEMA: Final[probatio.Schema] = probatio.Schema(
+    probatio.All(
+        probatio.AtLeastOne(ATTR_MAC, ATTR_DEV_ID),
         {
             ATTR_MAC: cv.string,
             ATTR_DEV_ID: cv.string,
@@ -103,17 +125,19 @@ SERVICE_SEE_PAYLOAD_SCHEMA: Final[vol.Schema] = vol.Schema(
             ATTR_GPS_ACCURACY: cv.positive_int,
             ATTR_BATTERY: cv.positive_int,
             ATTR_ATTRIBUTES: dict,
-            ATTR_SOURCE_TYPE: vol.Coerce(SourceType),
+            ATTR_SOURCE_TYPE: probatio.Coerce(SourceType),
             ATTR_CONSIDER_HOME: cv.time_period,
             # Temp workaround for iOS app introduced in 0.65
-            vol.Optional("battery_status"): str,
-            vol.Optional("hostname"): str,
+            probatio.Optional("battery_status"): str,
+            probatio.Optional("hostname"): str,
         },
     )
 )
 
 YAML_DEVICES: Final = "known_devices.yaml"
 EVENT_NEW_DEVICE: Final = "device_tracker_new_device"
+
+DATA_LEGACY_TRACKERS: Final = "device_tracker.legacy_trackers"
 
 
 class SeeCallback(Protocol):
@@ -188,52 +212,82 @@ def see(
     hass.services.call(DOMAIN, SERVICE_SEE, data)
 
 
-async def async_setup_integration(hass: HomeAssistant, config: ConfigType) -> None:
+async def async_setup_integration(
+    hass: HomeAssistant,
+    config: ConfigType,
+    tracker_future: asyncio.Future[DeviceTracker],
+) -> None:
     """Set up the legacy integration."""
     tracker = await get_tracker(hass, config)
+    tracker_future.set_result(tracker)
 
-    legacy_platforms = await async_extract_config(hass, config)
-
-    setup_tasks = [
-        asyncio.create_task(legacy_platform.async_setup_legacy(hass, tracker))
-        for legacy_platform in legacy_platforms
-    ]
-
-    if setup_tasks:
-        await asyncio.wait(setup_tasks)
-
-    async def async_platform_discovered(
-        p_type: str, info: dict[str, Any] | None
-    ) -> None:
-        """Load a platform."""
-        platform = await async_create_platform_type(hass, config, p_type, {})
-
-        if platform is None or platform.type != PLATFORM_TYPE_LEGACY:
-            return
-
-        await platform.async_setup_legacy(hass, tracker, info)
-
-    discovery.async_listen_platform(hass, DOMAIN, async_platform_discovered)
-
-    # Clean up stale devices
-    async_track_utc_time_change(
-        hass, tracker.async_update_stale, second=range(0, 60, 5)
-    )
+    warned_called_see = False
 
     async def async_see_service(call: ServiceCall) -> None:
         """Service to see a device."""
+        nonlocal warned_called_see
+        if not warned_called_see:
+            _LOGGER.warning(
+                "The %s.%s action is deprecated and will be removed in "
+                "Home Assistant Core 2027.5",
+                DOMAIN,
+                SERVICE_SEE,
+            )
+            warned_called_see = True
+        # Recreate the issue on every call so it reappears if the user
+        # confirmed (deleted) it while still using the deprecated action.
+        docs_url = "https://www.home-assistant.io/integrations/template/#device-tracker"
+        ir.async_create_issue(
+            hass,
+            DOMAIN,
+            "deprecated_see_action",
+            breaks_in_ha_version="2027.5.0",
+            is_fixable=True,
+            is_persistent=True,
+            learn_more_url=docs_url,
+            severity=ir.IssueSeverity.WARNING,
+            translation_key="deprecated_see_action",
+            translation_placeholders={"docs_url": docs_url},
+        )
         # Temp workaround for iOS, introduced in 0.65
         data = dict(call.data)
         data.pop("hostname", None)
         data.pop("battery_status", None)
         await tracker.async_see(**data)
 
+    # Cannot be moved: actions are registered per legacy platform
+    # pylint: disable-next=home-assistant-action-registered-outside-services-module
     hass.services.async_register(
         DOMAIN, SERVICE_SEE, async_see_service, SERVICE_SEE_PAYLOAD_SCHEMA
     )
 
+    legacy_platforms = await async_extract_config(hass, config)
+
+    setup_tasks = [
+        create_eager_task(legacy_platform.async_setup_legacy(hass, tracker))
+        for legacy_platform in legacy_platforms
+    ]
+
+    if setup_tasks:
+        await asyncio.wait(setup_tasks)
+
+    # Clean up stale devices
+    cancel_update_stale = async_track_utc_time_change(
+        hass, tracker.async_update_stale, second=range(0, 60, 5)
+    )
+
     # restore
     await tracker.async_setup_tracked_device()
+
+    @callback
+    def _on_hass_stop(_: Event) -> None:
+        """Cleanup when Home Assistant stops.
+
+        Cancel the async_update_stale schedule.
+        """
+        cancel_update_stale()
+
+    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _on_hass_stop)
 
 
 @attr.s
@@ -251,7 +305,7 @@ class DeviceTrackerPlatform:
     platform: ModuleType = attr.ib()
     config: dict = attr.ib()
 
-    @property
+    @cached_property
     def type(self) -> str | None:
         """Return platform type."""
         methods, platform_type = self.LEGACY_SETUP, PLATFORM_TYPE_LEGACY
@@ -268,12 +322,29 @@ class DeviceTrackerPlatform:
     ) -> None:
         """Set up a legacy platform."""
         assert self.type == PLATFORM_TYPE_LEGACY
-        full_name = f"{DOMAIN}.{self.name}"
+        full_name = f"{self.name}.{DOMAIN}"
         LOGGER.info("Setting up %s", full_name)
-        with async_start_setup(hass, [full_name]):
+        with async_start_setup(
+            hass,
+            integration=self.name,
+            group=str(id(self.config)),
+            phase=SetupPhases.PLATFORM_SETUP,
+        ):
             try:
                 scanner = None
                 setup: bool | None = None
+
+                legacy_trackers = hass.data.setdefault(DATA_LEGACY_TRACKERS, set())
+                if full_name not in legacy_trackers:
+                    legacy_trackers.add(full_name)
+                    _LOGGER.warning(
+                        "The legacy device tracker platform %s is being set up; legacy "
+                        "device trackers are deprecated and will be removed in Home "
+                        "Assistant Core 2027.5, please migrate to an integration which "
+                        "uses a modern config entry based device tracker",
+                        full_name,
+                    )
+
                 if hasattr(self.platform, "async_get_scanner"):
                     scanner = await self.platform.async_get_scanner(
                         hass, {DOMAIN: self.config}
@@ -297,7 +368,7 @@ class DeviceTrackerPlatform:
                         discovery_info,
                     )
                 else:
-                    raise HomeAssistantError("Invalid legacy device_tracker platform.")
+                    raise HomeAssistantError("Invalid legacy device_tracker platform.")  # noqa: TRY301
 
                 if scanner is not None:
                     async_setup_scanner_platform(
@@ -312,7 +383,7 @@ class DeviceTrackerPlatform:
 
                 hass.config.components.add(full_name)
 
-            except Exception:  # pylint: disable=broad-except
+            except Exception:  # noqa: BLE001
                 LOGGER.exception(
                     "Error setting up platform %s %s", self.type, self.name
                 )
@@ -337,8 +408,8 @@ async def async_extract_config(
         if platform.type == PLATFORM_TYPE_LEGACY:
             legacy.append(platform)
         else:
-            raise ValueError(
-                f"Unable to determine type for {platform.name}: {platform.type}"
+            async_create_platform_config_not_supported_issue(
+                hass, platform.name, DOMAIN
             )
 
     return legacy
@@ -354,6 +425,27 @@ async def async_create_platform_type(
         return None
 
     return DeviceTrackerPlatform(p_type, platform, p_config)
+
+
+def _load_device_names_and_attributes(
+    scanner: DeviceScanner,
+    device_name_uses_executor: bool,
+    extra_attributes_uses_executor: bool,
+    seen: set[str],
+    found_devices: list[str],
+) -> tuple[dict[str, str | None], dict[str, dict[str, Any]]]:
+    """Load device names and attributes in a single executor job."""
+    host_name_by_mac: dict[str, str | None] = {}
+    extra_attributes_by_mac: dict[str, dict[str, Any]] = {}
+    for mac in found_devices:
+        if device_name_uses_executor and mac not in seen:
+            host_name_by_mac[mac] = scanner.get_device_name(mac)
+        if extra_attributes_uses_executor:
+            try:
+                extra_attributes_by_mac[mac] = scanner.get_extra_attributes(mac)
+            except NotImplementedError:
+                extra_attributes_by_mac[mac] = {}
+    return host_name_by_mac, extra_attributes_by_mac
 
 
 @callback
@@ -373,14 +465,16 @@ def async_setup_scanner_platform(
     scanner.hass = hass
 
     # Initial scan of each mac we also tell about host name for config
-    seen: Any = set()
+    seen: set[str] = set()
 
     async def async_device_tracker_scan(now: datetime | None) -> None:
         """Handle interval matches."""
         if update_lock.locked():
             LOGGER.warning(
-                "Updating device list from %s took longer than the scheduled "
-                "scan interval %s",
+                (
+                    "Updating device list from %s took longer than the scheduled "
+                    "scan interval %s"
+                ),
                 platform,
                 interval,
             )
@@ -389,15 +483,42 @@ def async_setup_scanner_platform(
         async with update_lock:
             found_devices = await scanner.async_scan_devices()
 
+        device_name_uses_executor = (
+            scanner.async_get_device_name.__func__  # type: ignore[attr-defined]
+            is DeviceScanner.async_get_device_name
+        )
+        extra_attributes_uses_executor = (
+            scanner.async_get_extra_attributes.__func__  # type: ignore[attr-defined]
+            is DeviceScanner.async_get_extra_attributes
+        )
+        host_name_by_mac: dict[str, str | None] = {}
+        extra_attributes_by_mac: dict[str, dict[str, Any]] = {}
+        if device_name_uses_executor or extra_attributes_uses_executor:
+            (
+                host_name_by_mac,
+                extra_attributes_by_mac,
+            ) = await hass.async_add_executor_job(
+                _load_device_names_and_attributes,
+                scanner,
+                device_name_uses_executor,
+                extra_attributes_uses_executor,
+                seen,
+                found_devices,
+            )
+
         for mac in found_devices:
             if mac in seen:
                 host_name = None
             else:
-                host_name = await scanner.async_get_device_name(mac)
+                host_name = host_name_by_mac.get(
+                    mac, await scanner.async_get_device_name(mac)
+                )
                 seen.add(mac)
 
             try:
-                extra_attributes = await scanner.async_get_extra_attributes(mac)
+                extra_attributes = extra_attributes_by_mac.get(
+                    mac, await scanner.async_get_extra_attributes(mac)
+                )
             except NotImplementedError:
                 extra_attributes = {}
 
@@ -411,18 +532,33 @@ def async_setup_scanner_platform(
                 },
             }
 
-            zone_home = hass.states.get(hass.components.zone.ENTITY_ID_HOME)
+            zone_home = hass.states.get(ENTITY_ID_HOME)
             if zone_home is not None:
                 kwargs["gps"] = [
-                    zone_home.attributes[ATTR_LATITUDE],
-                    zone_home.attributes[ATTR_LONGITUDE],
+                    zone_home.attributes[EntityStateAttribute.LATITUDE],
+                    zone_home.attributes[EntityStateAttribute.LONGITUDE],
                 ]
                 kwargs["gps_accuracy"] = 0
 
-            hass.async_create_task(async_see_device(**kwargs))
+            hass.async_create_task(async_see_device(**kwargs), eager_start=True)
 
-    async_track_time_interval(hass, async_device_tracker_scan, interval)
-    hass.async_create_task(async_device_tracker_scan(None))
+    cancel_legacy_scan = async_track_time_interval(
+        hass,
+        async_device_tracker_scan,
+        interval,
+        name=f"device_tracker {platform} legacy scan",
+    )
+    hass.async_create_task(async_device_tracker_scan(None), eager_start=True)
+
+    @callback
+    def _on_hass_stop(_: Event) -> None:
+        """Cleanup when Home Assistant stops.
+
+        Cancel the legacy scan.
+        """
+        cancel_legacy_scan()
+
+    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _on_hass_stop)
 
 
 async def get_tracker(hass: HomeAssistant, config: ConfigType) -> DeviceTracker:
@@ -438,8 +574,7 @@ async def get_tracker(hass: HomeAssistant, config: ConfigType) -> DeviceTracker:
         track_new = defaults.get(CONF_TRACK_NEW, DEFAULT_TRACK_NEW)
 
     devices = await async_load_config(yaml_path, hass, consider_home)
-    tracker = DeviceTracker(hass, consider_home, track_new, defaults, devices)
-    return tracker
+    return DeviceTracker(hass, consider_home, track_new, defaults, devices)
 
 
 class DeviceTracker:
@@ -602,7 +737,8 @@ class DeviceTracker:
         self.hass.async_create_task(
             self.async_update_config(
                 self.hass.config.path(YAML_DEVICES), dev_id, device
-            )
+            ),
+            eager_start=True,
         )
 
     async def async_update_config(self, path: str, dev_id: str, device: Device) -> None:
@@ -623,32 +759,35 @@ class DeviceTracker:
         """
         for device in self.devices.values():
             if (device.track and device.last_update_home) and device.stale(now):
-                self.hass.async_create_task(device.async_update_ha_state(True))
+                self.hass.async_create_task(
+                    device.async_update_ha_state(True), eager_start=True
+                )
 
     async def async_setup_tracked_device(self) -> None:
         """Set up all not exists tracked devices.
 
         This method is a coroutine.
         """
-
-        async def async_init_single_device(dev: Device) -> None:
-            """Init a single device_tracker entity."""
-            await dev.async_added_to_hass()
-            dev.async_write_ha_state()
-
-        tasks: list[asyncio.Task] = []
         for device in self.devices.values():
             if device.track and not device.last_seen:
-                tasks.append(
-                    self.hass.async_create_task(async_init_single_device(device))
-                )
+                # async_added_to_hass is unlikely to suspend so
+                # do not gather here to avoid unnecessary overhead
+                # of creating a task per device.
+                #
+                # We used to have the overhead of potentially loading
+                # restore state for each device here, but RestoreState
+                # is always loaded ahead of time now.
+                await device.async_added_to_hass()
+                device.async_write_ha_state()
 
-        if tasks:
-            await asyncio.wait(tasks)
 
-
+# pylint: disable-next=home-assistant-enforce-class-module
 class Device(RestoreEntity):
     """Base class for a tracked device."""
+
+    # This entity is legacy and does not have a platform.
+    # We can't fix this easily without breaking changes.
+    _no_platform_reported = True
 
     host_name: str | None = None
     location_name: str | None = None
@@ -706,30 +845,36 @@ class Device(RestoreEntity):
         self._attributes: dict[str, Any] = {}
 
     @property
+    @override
     def name(self) -> str:
         """Return the name of the entity."""
         return self.config_name or self.host_name or self.dev_id or DEVICE_DEFAULT_NAME
 
     @property
+    @override
     def state(self) -> str:
         """Return the state of the device."""
         return self._state
 
     @property
+    @override
     def entity_picture(self) -> str | None:
         """Return the picture of the device."""
         return self.config_picture
 
     @final
     @property
+    @override
     def state_attributes(self) -> dict[str, StateType]:
         """Return the device state attributes."""
-        attributes: dict[str, StateType] = {ATTR_SOURCE_TYPE: self.source_type}
+        attributes: dict[str, StateType] = {
+            DeviceTrackerEntityStateAttribute.SOURCE_TYPE: self.source_type
+        }
 
         if self.gps is not None:
-            attributes[ATTR_LATITUDE] = self.gps[0]
-            attributes[ATTR_LONGITUDE] = self.gps[1]
-            attributes[ATTR_GPS_ACCURACY] = self.gps_accuracy
+            attributes[EntityStateAttribute.LATITUDE] = self.gps[0]
+            attributes[EntityStateAttribute.LONGITUDE] = self.gps[1]
+            attributes[TrackerEntityStateAttribute.GPS_ACCURACY] = self.gps_accuracy
 
         if self.battery is not None:
             attributes[ATTR_BATTERY] = self.battery
@@ -737,11 +882,13 @@ class Device(RestoreEntity):
         return attributes
 
     @property
+    @override
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return device state attributes."""
         return self._attributes
 
     @property
+    @override
     def icon(self) -> str | None:
         """Return device icon."""
         return self._icon
@@ -775,7 +922,7 @@ class Device(RestoreEntity):
             try:
                 self.gps = float(gps[0]), float(gps[1])
                 self.gps_accuracy = gps_accuracy or 0
-            except (ValueError, TypeError, IndexError):
+            except ValueError, TypeError, IndexError:
                 self.gps = None
                 self.gps_accuracy = 0
                 LOGGER.warning("Could not parse gps value for %s: %s", self.dev_id, gps)
@@ -823,6 +970,7 @@ class Device(RestoreEntity):
             self._state = STATE_HOME
             self.last_update_home = True
 
+    @override
     async def async_added_to_hass(self) -> None:
         """Add an entity."""
         await super().async_added_to_hass()
@@ -833,17 +981,17 @@ class Device(RestoreEntity):
         self.last_seen = dt_util.utcnow()
 
         for attribute, var in (
-            (ATTR_SOURCE_TYPE, "source_type"),
-            (ATTR_GPS_ACCURACY, "gps_accuracy"),
+            (DeviceTrackerEntityStateAttribute.SOURCE_TYPE, "source_type"),
+            (TrackerEntityStateAttribute.GPS_ACCURACY, "gps_accuracy"),
             (ATTR_BATTERY, "battery"),
         ):
             if attribute in state.attributes:
                 setattr(self, var, state.attributes[attribute])
 
-        if ATTR_LONGITUDE in state.attributes:
+        if EntityStateAttribute.LONGITUDE in state.attributes:
             self.gps = (
-                state.attributes[ATTR_LATITUDE],
-                state.attributes[ATTR_LONGITUDE],
+                state.attributes[EntityStateAttribute.LATITUDE],
+                state.attributes[EntityStateAttribute.LONGITUDE],
             )
 
 
@@ -854,35 +1002,35 @@ class DeviceScanner:
 
     def scan_devices(self) -> list[str]:
         """Scan for devices."""
-        raise NotImplementedError()
+        raise NotImplementedError
 
     async def async_scan_devices(self) -> list[str]:
         """Scan for devices."""
-        assert (
-            self.hass is not None
-        ), "hass should be set by async_setup_scanner_platform"
+        assert self.hass is not None, (
+            "hass should be set by async_setup_scanner_platform"
+        )
         return await self.hass.async_add_executor_job(self.scan_devices)
 
     def get_device_name(self, device: str) -> str | None:
         """Get the name of a device."""
-        raise NotImplementedError()
+        raise NotImplementedError
 
     async def async_get_device_name(self, device: str) -> str | None:
         """Get the name of a device."""
-        assert (
-            self.hass is not None
-        ), "hass should be set by async_setup_scanner_platform"
+        assert self.hass is not None, (
+            "hass should be set by async_setup_scanner_platform"
+        )
         return await self.hass.async_add_executor_job(self.get_device_name, device)
 
     def get_extra_attributes(self, device: str) -> dict:
         """Get the extra attributes of a device."""
-        raise NotImplementedError()
+        raise NotImplementedError
 
     async def async_get_extra_attributes(self, device: str) -> dict:
         """Get the extra attributes of a device."""
-        assert (
-            self.hass is not None
-        ), "hass should be set by async_setup_scanner_platform"
+        assert self.hass is not None, (
+            "hass should be set by async_setup_scanner_platform"
+        )
         return await self.hass.async_add_executor_job(self.get_extra_attributes, device)
 
 
@@ -893,17 +1041,17 @@ async def async_load_config(
 
     This method is a coroutine.
     """
-    dev_schema = vol.Schema(
+    dev_schema = probatio.Schema(
         {
-            vol.Required(CONF_NAME): cv.string,
-            vol.Optional(CONF_ICON, default=None): vol.Any(None, cv.icon),
-            vol.Optional("track", default=False): cv.boolean,
-            vol.Optional(CONF_MAC, default=None): vol.Any(
-                None, vol.All(cv.string, vol.Upper)
+            probatio.Required(CONF_NAME): cv.string,
+            probatio.Optional(CONF_ICON, default=None): probatio.Any(None, cv.icon),
+            probatio.Optional("track", default=False): cv.boolean,
+            probatio.Optional(CONF_MAC, default=None): probatio.Any(
+                None, probatio.All(cv.string, probatio.Upper)
             ),
-            vol.Optional("gravatar", default=None): vol.Any(None, cv.string),
-            vol.Optional("picture", default=None): vol.Any(None, cv.string),
-            vol.Optional(CONF_CONSIDER_HOME, default=consider_home): vol.All(
+            probatio.Optional("gravatar", default=None): probatio.Any(None, cv.string),
+            probatio.Optional("picture", default=None): probatio.Any(None, cv.string),
+            probatio.Optional(CONF_CONSIDER_HOME, default=consider_home): probatio.All(
                 cv.time_period, cv.positive_timedelta
             ),
         }
@@ -924,8 +1072,9 @@ async def async_load_config(
         try:
             device = dev_schema(device)
             device["dev_id"] = cv.slugify(dev_id)
-        except vol.Invalid as exp:
-            async_log_exception(exp, dev_id, devices, hass)
+        except probatio.Invalid as exp:
+            async_log_schema_error(exp, dev_id, devices, hass)
+            async_notify_setup_error(hass, DOMAIN)
         else:
             result.append(Device(hass, **device))
     return result
@@ -947,6 +1096,19 @@ def update_config(path: str, dev_id: str, device: Device) -> None:
         out.write(dump(device_config))
 
 
+def remove_device_from_config(hass: HomeAssistant, device_id: str) -> None:
+    """Remove device from YAML configuration file."""
+    path = hass.config.path(YAML_DEVICES)
+    devices = load_yaml_config_file(path)
+    devices.pop(device_id)
+    dumped = dump(devices)
+
+    with open(path, "r+", encoding="utf8") as out:
+        out.seek(0)
+        out.truncate()
+        out.write(dumped)
+
+
 def get_gravatar_for_email(email: str) -> str:
     """Return an 80px Gravatar for the given email address.
 
@@ -954,6 +1116,6 @@ def get_gravatar_for_email(email: str) -> str:
     """
 
     return (
-        f"https://www.gravatar.com/avatar/"
+        "https://www.gravatar.com/avatar/"
         f"{hashlib.md5(email.encode('utf-8').lower()).hexdigest()}.jpg?s=80&d=wavatar"
     )

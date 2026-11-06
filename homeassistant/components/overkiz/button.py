@@ -1,69 +1,105 @@
 """Support for Overkiz (virtual) buttons."""
-from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import override
 
+from pyoverkiz.enums import OverkizCommand, OverkizCommandParam
+from pyoverkiz.models import SupportedAlias
 from pyoverkiz.types import StateType as OverkizStateType
 
-from homeassistant.components.button import ButtonEntity, ButtonEntityDescription
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.components.button import (
+    ButtonDeviceClass,
+    ButtonEntity,
+    ButtonEntityDescription,
+)
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity import EntityCategory
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from . import HomeAssistantOverkizData
-from .const import DOMAIN, IGNORED_OVERKIZ_DEVICES
-from .entity import OverkizDescriptiveEntity
+from . import OverkizDataConfigEntry
+from .const import IGNORED_OVERKIZ_DEVICES, LOGGER
+from .coordinator import OverkizDataUpdateCoordinator
+from .entity import OverkizDescriptiveEntity, OverkizEntity
 
 
-@dataclass
+@dataclass(frozen=True)
 class OverkizButtonDescription(ButtonEntityDescription):
     """Class to describe an Overkiz button."""
 
-    press_args: OverkizStateType | None = None
+    press_args: list[OverkizStateType] | None = None
 
 
 BUTTON_DESCRIPTIONS: list[OverkizButtonDescription] = [
     # My Position (cover, light)
     OverkizButtonDescription(
-        key="my",
+        key=OverkizCommand.MY,
         name="My position",
         icon="mdi:star",
     ),
     # Identify
     OverkizButtonDescription(
-        key="identify",  # startIdentify and identify are reversed... Swap this when fixed in API.
+        # startIdentify and identify are reversed... Swap this when fixed in API.
+        key=OverkizCommand.IDENTIFY,
         name="Start identify",
         icon="mdi:human-greeting-variant",
         entity_category=EntityCategory.DIAGNOSTIC,
         entity_registry_enabled_default=False,
     ),
     OverkizButtonDescription(
-        key="stopIdentify",
+        key=OverkizCommand.STOP_IDENTIFY,
         name="Stop identify",
         icon="mdi:human-greeting-variant",
         entity_category=EntityCategory.DIAGNOSTIC,
         entity_registry_enabled_default=False,
     ),
     OverkizButtonDescription(
-        key="startIdentify",  # startIdentify and identify are reversed... Swap this when fixed in API.
+        # startIdentify and identify are reversed... Swap this when fixed in API.
+        key=OverkizCommand.START_IDENTIFY,
         name="Identify",
         icon="mdi:human-greeting-variant",
         entity_category=EntityCategory.DIAGNOSTIC,
+        device_class=ButtonDeviceClass.IDENTIFY,
     ),
     # RTDIndoorSiren / RTDOutdoorSiren
-    OverkizButtonDescription(key="dingDong", name="Ding dong", icon="mdi:bell-ring"),
-    OverkizButtonDescription(key="bip", name="Bip", icon="mdi:bell-ring"),
     OverkizButtonDescription(
-        key="fastBipSequence", name="Fast bip sequence", icon="mdi:bell-ring"
+        key=OverkizCommand.DING_DONG, name="Ding dong", icon="mdi:bell-ring"
     ),
-    OverkizButtonDescription(key="ring", name="Ring", icon="mdi:bell-ring"),
-    # DynamicScreen (ogp:blind) uses goToAlias (id 1: favorite1) instead of 'my'
+    OverkizButtonDescription(key=OverkizCommand.BIP, name="Bip", icon="mdi:bell-ring"),
     OverkizButtonDescription(
-        key="goToAlias",
-        press_args="1",
-        name="My position",
-        icon="mdi:star",
+        key=OverkizCommand.FAST_BIP_SEQUENCE,
+        name="Fast bip sequence",
+        icon="mdi:bell-ring",
+    ),
+    OverkizButtonDescription(
+        key=OverkizCommand.RING, name="Ring", icon="mdi:bell-ring"
+    ),
+    OverkizButtonDescription(
+        key=OverkizCommand.CYCLE,
+        name="Toggle",
+        icon="mdi:sync",
+    ),
+    # DimmerOnOffLight (rts:DimmableLightRTSComponent)
+    OverkizButtonDescription(
+        key=OverkizCommand.STEP_POSITIVE,
+        name="Brightness up",
+        icon="mdi:brightness-7",
+        # step (0-127), execution duration (0-15, optional)
+        press_args=[5],
+    ),
+    OverkizButtonDescription(
+        key=OverkizCommand.STEP_NEGATIVE,
+        name="Brightness down",
+        icon="mdi:brightness-3",
+        # step (0-127), execution duration (0-15, optional)
+        press_args=[5],
+    ),
+    # SmokeSensor
+    OverkizButtonDescription(
+        key=OverkizCommand.CHECK_EVENT_TRIGGER,
+        press_args=[OverkizCommandParam.SHORT],
+        name="Test",
+        icon="mdi:smoke-detector",
+        entity_category=EntityCategory.DIAGNOSTIC,
     ),
 ]
 
@@ -71,14 +107,24 @@ SUPPORTED_COMMANDS = {
     description.key: description for description in BUTTON_DESCRIPTIONS
 }
 
+ALIAS_TYPES_WITH_TRANSLATION: set[str] = {
+    "favorite1",
+    "ventilation",
+    "partial",
+    "pedestrian",
+}
+
+
+PARALLEL_UPDATES = 0
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    entry: OverkizDataConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up the Overkiz button from a config entry."""
-    data: HomeAssistantOverkizData = hass.data[DOMAIN][entry.entry_id]
+    data = entry.runtime_data
     entities: list[ButtonEntity] = []
 
     for device in data.coordinator.data.values():
@@ -89,13 +135,15 @@ async def async_setup_entry(
             continue
 
         for command in device.definition.commands:
-            if description := SUPPORTED_COMMANDS.get(command.command_name):
+            # Target the most-featured id per alias type (same behavior as vendor app).
+            if command == OverkizCommand.GO_TO_ALIAS:
+                entities.extend(
+                    OverkizAliasButton(device.device_url, data.coordinator, alias)
+                    for alias in device.get_most_featured_aliases().values()
+                )
+            elif description := SUPPORTED_COMMANDS.get(command):
                 entities.append(
-                    OverkizButton(
-                        device.device_url,
-                        data.coordinator,
-                        description,
-                    )
+                    OverkizButton(device.device_url, data.coordinator, description)
                 )
 
     async_add_entities(entities)
@@ -106,12 +154,50 @@ class OverkizButton(OverkizDescriptiveEntity, ButtonEntity):
 
     entity_description: OverkizButtonDescription
 
+    @override
     async def async_press(self) -> None:
         """Handle the button press."""
-        if self.entity_description.press_args:
+        if (press_args := self.entity_description.press_args) is not None:
             await self.executor.async_execute_command(
-                self.entity_description.key, self.entity_description.press_args
+                self.entity_description.key, *press_args
             )
             return
 
         await self.executor.async_execute_command(self.entity_description.key)
+
+
+class OverkizAliasButton(OverkizEntity, ButtonEntity):
+    """Representation of an Overkiz goToAlias button."""
+
+    def __init__(
+        self,
+        device_url: str,
+        coordinator: OverkizDataUpdateCoordinator,
+        alias: SupportedAlias,
+    ) -> None:
+        """Initialize the alias button."""
+        super().__init__(device_url, coordinator)
+        self._alias = alias
+        # Keyed on alias type, as the most-featured id can change.
+        self._attr_unique_id = (
+            f"{self.device_url}-{OverkizCommand.GO_TO_ALIAS}_{alias.type}"
+        )
+
+        if alias.type in ALIAS_TYPES_WITH_TRANSLATION:
+            self._attr_translation_key = f"go_to_alias_{alias.type}"
+        else:
+            LOGGER.warning(
+                "Unsupported goToAlias type %s (%s) has been returned for %s",
+                alias.type,
+                alias.id,
+                device_url,
+            )
+            self._attr_name = f"{alias.type.capitalize()} position"
+            self._attr_icon = "mdi:star"
+
+    @override
+    async def async_press(self) -> None:
+        """Handle the button press."""
+        await self.executor.async_execute_command(
+            OverkizCommand.GO_TO_ALIAS, self._alias.id
+        )

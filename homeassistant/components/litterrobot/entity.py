@@ -1,74 +1,96 @@
 """Litter-Robot entities for common data and methods."""
-from __future__ import annotations
 
-from collections.abc import Iterable
-from typing import Generic, TypeVar
+from collections.abc import Awaitable, Callable, Coroutine
+from typing import Any, Concatenate, Generic, NoReturn, TypeVar, override
 
-from pylitterbot import Robot
+from pylitterbot import Pet, Robot
+from pylitterbot.exceptions import LitterRobotException
 from pylitterbot.robot import EVENT_UPDATE
 
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity import DeviceInfo, EntityDescription
-import homeassistant.helpers.entity_registry as er
-from homeassistant.helpers.update_coordinator import (
-    CoordinatorEntity,
-    DataUpdateCoordinator,
-)
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.entity import EntityDescription
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
-from .hub import LitterRobotHub
+from .coordinator import LitterRobotDataUpdateCoordinator
 
-_RobotT = TypeVar("_RobotT", bound=Robot)
+_WhiskerEntityT = TypeVar("_WhiskerEntityT", bound=Robot | Pet)
+
+
+def whisker_command[_WhiskerEntityT2: LitterRobotEntity, **_P](
+    func: Callable[Concatenate[_WhiskerEntityT2, _P], Awaitable[None]],
+) -> Callable[Concatenate[_WhiskerEntityT2, _P], Coroutine[Any, Any, None]]:
+    """Wrap a Whisker command to handle exceptions."""
+
+    async def handler(
+        self: _WhiskerEntityT2, *args: _P.args, **kwargs: _P.kwargs
+    ) -> None:
+        try:
+            await func(self, *args, **kwargs)
+        except LitterRobotException as ex:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="command_failed",
+                translation_placeholders={"error": str(ex)},
+            ) from ex
+
+    return handler
+
+
+def raise_update_failed(entity_id: str) -> NoReturn:
+    """Raise when the robot rejected an update without an error response."""
+    raise HomeAssistantError(
+        translation_domain=DOMAIN,
+        translation_key="update_failed",
+        translation_placeholders={"entity_id": entity_id},
+    )
+
+
+def get_device_info(whisker_entity: Robot | Pet) -> DeviceInfo:
+    """Get device info for a robot or pet."""
+    if isinstance(whisker_entity, Robot):
+        return DeviceInfo(
+            identifiers={(DOMAIN, whisker_entity.serial)},
+            manufacturer="Whisker",
+            model=whisker_entity.model,
+            name=whisker_entity.name,
+            serial_number=whisker_entity.serial,
+            sw_version=getattr(whisker_entity, "firmware", None),
+        )
+    breed = ", ".join(breed for breed in whisker_entity.breeds or [])
+    return DeviceInfo(
+        identifiers={(DOMAIN, whisker_entity.id)},
+        manufacturer="Whisker",
+        model=f"{breed} {whisker_entity.pet_type}".strip().capitalize(),
+        name=whisker_entity.name,
+    )
 
 
 class LitterRobotEntity(
-    CoordinatorEntity[DataUpdateCoordinator[bool]], Generic[_RobotT]
+    CoordinatorEntity[LitterRobotDataUpdateCoordinator],
+    Generic[_WhiskerEntityT],  # noqa: UP046
 ):
     """Generic Litter-Robot entity representing common data and methods."""
 
     _attr_has_entity_name = True
 
     def __init__(
-        self, robot: _RobotT, hub: LitterRobotHub, description: EntityDescription
+        self,
+        robot: _WhiskerEntityT,
+        coordinator: LitterRobotDataUpdateCoordinator,
+        description: EntityDescription,
     ) -> None:
         """Pass coordinator to CoordinatorEntity."""
-        super().__init__(hub.coordinator)
+        super().__init__(coordinator)
         self.robot = robot
-        self.hub = hub
         self.entity_description = description
-        self._attr_unique_id = f"{self.robot.serial}-{description.key}"
-        # The following can be removed in 2022.12 after adjusting names in entities appropriately
-        if description.name is not None:
-            self._attr_name = description.name.capitalize()
+        _id = robot.serial if isinstance(robot, Robot) else robot.id
+        self._attr_unique_id = f"{_id}-{description.key}"
+        self._attr_device_info = get_device_info(robot)
 
-    @property
-    def device_info(self) -> DeviceInfo:
-        """Return the device information for a Litter-Robot."""
-        assert self.robot.serial
-        return DeviceInfo(
-            identifiers={(DOMAIN, self.robot.serial)},
-            manufacturer="Litter-Robot",
-            model=self.robot.model,
-            name=self.robot.name,
-            sw_version=getattr(self.robot, "firmware", None),
-        )
-
+    @override
     async def async_added_to_hass(self) -> None:
         """Set up a listener for the entity."""
         await super().async_added_to_hass()
         self.async_on_remove(self.robot.on(EVENT_UPDATE, self.async_write_ha_state))
-
-
-def async_update_unique_id(
-    hass: HomeAssistant, domain: str, entities: Iterable[LitterRobotEntity[_RobotT]]
-) -> None:
-    """Update unique ID to be based on entity description key instead of name.
-
-    Introduced with release 2022.9.
-    """
-    ent_reg = er.async_get(hass)
-    for entity in entities:
-        old_unique_id = f"{entity.robot.serial}-{entity.entity_description.name}"
-        if entity_id := ent_reg.async_get_entity_id(domain, DOMAIN, old_unique_id):
-            new_unique_id = f"{entity.robot.serial}-{entity.entity_description.key}"
-            ent_reg.async_update_entity(entity_id, new_unique_id=new_unique_id)

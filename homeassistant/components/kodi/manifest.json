@@ -1,12 +1,15 @@
 {
   "domain": "kodi",
   "name": "Kodi",
-  "documentation": "https://www.home-assistant.io/integrations/kodi",
   "after_dependencies": ["media_source"],
-  "requirements": ["pykodi==0.2.7"],
-  "codeowners": ["@OnFreund", "@cgtobi"],
-  "zeroconf": ["_xbmc-jsonrpc-h._tcp.local."],
+  "categories": ["media_entertainment.tv_streaming"],
+  "codeowners": ["@OnFreund"],
   "config_flow": true,
+  "connectivity": ["network"],
+  "documentation": "https://www.home-assistant.io/integrations/kodi",
+  "integration_type": "service",
   "iot_class": "local_push",
-  "loggers": ["jsonrpc_async", "jsonrpc_base", "jsonrpc_websocket", "pykodi"]
+  "loggers": ["jsonrpc_async", "jsonrpc_base", "jsonrpc_websocket", "pykodi"],
+  "requirements": ["pykodi==0.2.7"],
+  "zeroconf": ["_xbmc-jsonrpc-h._tcp.local."]
 }

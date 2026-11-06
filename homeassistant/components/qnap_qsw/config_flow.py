@@ -1,34 +1,34 @@
 """Config flow for QNAP QSW."""
-from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, override
 
 from aioqsw.exceptions import LoginError, QswError
 from aioqsw.localapi import ConnectionOptions, QnapQswApi
-import voluptuous as vol
+import probatio
 
-from homeassistant import config_entries
-from homeassistant.components import dhcp
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_PASSWORD, CONF_URL, CONF_USERNAME
-from homeassistant.data_entry_flow import AbortFlow, FlowResult
+from homeassistant.data_entry_flow import AbortFlow
 from homeassistant.helpers import aiohttp_client
 from homeassistant.helpers.device_registry import format_mac
+from homeassistant.helpers.service_info.dhcp import DhcpServiceInfo
 
 from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
 
-class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
+class QNapQSWConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle config flow for a QNAP QSW device."""
 
     _discovered_mac: str | None = None
     _discovered_url: str | None = None
 
+    @override
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle the initial step."""
         errors = {}
 
@@ -61,22 +61,32 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="user",
-            data_schema=vol.Schema(
+            data_schema=probatio.Schema(
                 {
-                    vol.Required(CONF_URL): str,
-                    vol.Required(CONF_USERNAME): str,
-                    vol.Required(CONF_PASSWORD): str,
+                    probatio.Required(CONF_URL): str,
+                    probatio.Required(CONF_USERNAME): str,
+                    probatio.Required(probatio.Secret(CONF_PASSWORD)): str,
                 }
             ),
             errors=errors,
         )
 
-    async def async_step_dhcp(self, discovery_info: dhcp.DhcpServiceInfo) -> FlowResult:
+    @override
+    async def async_step_dhcp(
+        self, discovery_info: DhcpServiceInfo
+    ) -> ConfigFlowResult:
         """Handle DHCP discovery."""
         self._discovered_url = f"http://{discovery_info.ip}"
         self._discovered_mac = discovery_info.macaddress
 
         _LOGGER.debug("DHCP discovery detected QSW: %s", self._discovered_mac)
+
+        await self.async_set_unique_id(format_mac(self._discovered_mac))
+        self._abort_if_unique_id_configured(
+            updates={
+                CONF_URL: self._discovered_url,
+            }
+        )
 
         options = ConnectionOptions(self._discovered_url, "", "")
         qsw = QnapQswApi(aiohttp_client.async_get_clientsession(self.hass), options)
@@ -86,14 +96,11 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         except QswError as err:
             raise AbortFlow("cannot_connect") from err
 
-        await self.async_set_unique_id(format_mac(self._discovered_mac))
-        self._abort_if_unique_id_configured()
-
         return await self.async_step_discovered_connection()
 
     async def async_step_discovered_connection(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Confirm discovery."""
         errors = {}
         assert self._discovered_url is not None
@@ -120,10 +127,10 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="discovered_connection",
-            data_schema=vol.Schema(
+            data_schema=probatio.Schema(
                 {
-                    vol.Required(CONF_USERNAME): str,
-                    vol.Required(CONF_PASSWORD): str,
+                    probatio.Required(CONF_USERNAME): str,
+                    probatio.Required(probatio.Secret(CONF_PASSWORD)): str,
                 }
             ),
             errors=errors,

@@ -1,0 +1,182 @@
+"""Tests for the Alexa Devices notify platform."""
+
+from copy import deepcopy
+from unittest.mock import AsyncMock, patch
+
+from freezegun.api import FrozenDateTimeFactory
+import pytest
+from pytest_homeassistant.common import (
+    MockConfigEntry,
+    async_fire_time_changed,
+    snapshot_platform,
+)
+from syrupy.assertion import SnapshotAssertion
+
+from homeassistant.components.alexa_devices.coordinator import SCAN_INTERVAL
+from homeassistant.components.notify import (
+    ATTR_MESSAGE,
+    ATTR_TITLE,
+    DOMAIN as NOTIFY_DOMAIN,
+    SERVICE_SEND_MESSAGE,
+)
+from homeassistant.const import ATTR_ENTITY_ID, STATE_UNAVAILABLE, Platform
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
+from homeassistant.util import dt as dt_util
+
+from . import assert_device_removed_and_readded, setup_integration
+from .const import TEST_DEVICE_1, TEST_DEVICE_1_SN, TEST_DEVICE_2, TEST_DEVICE_2_SN
+
+
+@pytest.mark.usefixtures("entity_registry_enabled_by_default")
+async def test_all_entities(
+    hass: HomeAssistant,
+    snapshot: SnapshotAssertion,
+    mock_amazon_devices_client: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+    entity_registry: er.EntityRegistry,
+) -> None:
+    """Test all entities."""
+    with patch("homeassistant.components.alexa_devices.PLATFORMS", [Platform.NOTIFY]):
+        await setup_integration(hass, mock_config_entry)
+
+    await snapshot_platform(hass, entity_registry, snapshot, mock_config_entry.entry_id)
+
+
+@pytest.mark.parametrize(
+    ("mode", "service_data", "method", "expected_kwargs"),
+    [
+        pytest.param("speak", {}, "call_alexa_speak", {}, id="speak"),
+        pytest.param(
+            "announce",
+            {},
+            "call_alexa_announcement",
+            {"display_text": None},
+            id="announce",
+        ),
+        pytest.param(
+            "announce",
+            {ATTR_TITLE: "Test Title"},
+            "call_alexa_announcement",
+            {"display_text": "Test Title"},
+            id="announce_with_title",
+        ),
+    ],
+)
+async def test_notify_send_message(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    mock_amazon_devices_client: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+    mode: str,
+    service_data: dict[str, str],
+    method: str,
+    expected_kwargs: dict[str, str | None],
+) -> None:
+    """Test notify send message."""
+    await setup_integration(hass, mock_config_entry)
+
+    entity_id = f"notify.echo_test_{mode}"
+
+    now = dt_util.parse_datetime("2021-01-09 12:00:00+00:00")
+    assert now
+
+    freezer.move_to(now)
+    await hass.services.async_call(
+        NOTIFY_DOMAIN,
+        SERVICE_SEND_MESSAGE,
+        {
+            ATTR_ENTITY_ID: entity_id,
+            ATTR_MESSAGE: "Test Message",
+            **service_data,
+        },
+        blocking=True,
+    )
+
+    getattr(mock_amazon_devices_client, method).assert_called_once_with(
+        TEST_DEVICE_1, "Test Message", **expected_kwargs
+    )
+    assert (state := hass.states.get(entity_id))
+    assert state.state == now.isoformat()
+
+
+async def test_offline_device(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    mock_amazon_devices_client: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test offline device handling."""
+
+    entity_id = "notify.echo_test_announce"
+
+    mock_amazon_devices_client.get_devices_data.return_value[
+        TEST_DEVICE_1_SN
+    ].online = False
+
+    await setup_integration(hass, mock_config_entry)
+
+    assert (state := hass.states.get(entity_id))
+    assert state.state == STATE_UNAVAILABLE
+
+    mock_amazon_devices_client.get_devices_data.return_value[
+        TEST_DEVICE_1_SN
+    ].online = True
+
+    freezer.tick(SCAN_INTERVAL)
+    async_fire_time_changed(hass)
+    await hass.async_block_till_done()
+
+    assert (state := hass.states.get(entity_id))
+    assert state.state != STATE_UNAVAILABLE
+
+
+async def test_device_removed_and_readded(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    mock_amazon_devices_client: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test entities are recreated when a device is removed and re-added."""
+    await assert_device_removed_and_readded(
+        hass,
+        freezer,
+        mock_amazon_devices_client,
+        mock_config_entry,
+        entity_id="notify.echo_test_2_announce",
+        devices_with={TEST_DEVICE_1_SN: TEST_DEVICE_1, TEST_DEVICE_2_SN: TEST_DEVICE_2},
+        devices_without={TEST_DEVICE_1_SN: TEST_DEVICE_1},
+    )
+
+
+async def test_announce_unavailable_when_communications_off(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    mock_amazon_devices_client: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test announce entity availability when communication is disabled."""
+    await setup_integration(hass, mock_config_entry)
+
+    entity_id = "notify.echo_test_announce"
+
+    assert (state := hass.states.get(entity_id))
+    assert state.state != STATE_UNAVAILABLE
+
+    device_data = deepcopy(TEST_DEVICE_1)
+    device_data.communication_settings = {
+        "announcements": "ON",
+        "communications": "OFF",
+        "dropin": "All",
+    }
+
+    mock_amazon_devices_client.get_devices_data.return_value = {
+        TEST_DEVICE_1_SN: device_data
+    }
+
+    freezer.tick(SCAN_INTERVAL)
+    async_fire_time_changed(hass)
+    await hass.async_block_till_done()
+
+    assert (state := hass.states.get(entity_id))
+    assert state.state == STATE_UNAVAILABLE

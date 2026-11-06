@@ -1,5 +1,4 @@
 """Constants for the Fully Kiosk Browser integration."""
-from __future__ import annotations
 
 from datetime import timedelta
 import logging
@@ -22,9 +21,3 @@ MEDIA_SUPPORT_FULLYKIOSK = (
     | MediaPlayerEntityFeature.VOLUME_SET
     | MediaPlayerEntityFeature.BROWSE_MEDIA
 )
-
-SERVICE_LOAD_URL = "load_url"
-SERVICE_START_APPLICATION = "start_application"
-
-ATTR_URL = "url"
-ATTR_APPLICATION = "application"

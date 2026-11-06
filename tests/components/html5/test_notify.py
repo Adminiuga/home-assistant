@@ -1,20 +1,54 @@
 """Test HTML5 notify platform."""
+
+from collections.abc import Generator
 from http import HTTPStatus
 import json
-from unittest.mock import MagicMock, mock_open, patch
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
+import warnings
 
+from aiohttp import ClientError
 from aiohttp.hdrs import AUTHORIZATION
+import jwt.warnings
+import pytest
+from pytest_homeassistant.common import MockConfigEntry, snapshot_platform
+from pytest_homeassistant.typing import ClientSessionGenerator
+from pywebpush import WebPushException
+from syrupy.assertion import SnapshotAssertion
 
-import homeassistant.components.html5.notify as html5
+from homeassistant.components.html5 import DOMAIN, notify as html5
+from homeassistant.components.html5.const import ATTR_TAG
+from homeassistant.components.html5.http import ATTR_ACTION
+from homeassistant.components.html5.notify import ATTR_DISMISS, DEFAULT_TTL
+from homeassistant.components.html5.services import HTML5Service, HTML5ServiceArgument
+from homeassistant.components.notify import (
+    ATTR_MESSAGE,
+    ATTR_TITLE,
+    DOMAIN as NOTIFY_DOMAIN,
+    SERVICE_SEND_MESSAGE,
+)
+from homeassistant.config_entries import ConfigEntryState
+from homeassistant.const import (
+    ATTR_ENTITY_ID,
+    STATE_UNAVAILABLE,
+    STATE_UNKNOWN,
+    CommonServiceArgument,
+    Platform,
+)
+from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import entity_registry as er
 from homeassistant.setup import async_setup_component
 
 CONFIG_FILE = "file.conf"
 
 VAPID_CONF = {
-    "vapid_pub_key": "BJMA2gDZEkHaXRhf1fhY_"
-    + "QbKbhVIHlSJXI0bFyo0eJXnUPOjdgycCAbj-2bMKMKNKs"
-    + "_rM8JoSnyKGCXAY2dbONI",
+    "platform": "html5",
+    "vapid_pub_key": (
+        "BJMA2gDZEkHaXRhf1fhY_"
+        "QbKbhVIHlSJXI0bFyo0eJXnUPOjdgycCAbj-2bMKMKNKs"
+        "_rM8JoSnyKGCXAY2dbONI"
+    ),
     "vapid_prv_key": "ZwPgwKpESGuGLMZYU39vKgrekrWzCijo-LsBM3CZ9-c",
     "vapid_email": "someone@example.com",
 }
@@ -61,333 +95,224 @@ SUBSCRIPTION_5 = {
 REGISTER_URL = "/api/notify.html5"
 PUBLISH_URL = "/api/notify.html5/callback"
 
+VAPID_HEADERS = {
+    "Authorization": "vapid t=signed!!!",
+    "urgency": "normal",
+    "priority": "normal",
+}
 
-async def mock_client(hass, hass_client, registrations=None):
-    """Create a test client for HTML5 views."""
-    if registrations is None:
-        registrations = {}
 
+@pytest.fixture(autouse=True)
+def notify_only() -> Generator[None]:
+    """Enable only the notify platform."""
     with patch(
-        "homeassistant.components.html5.notify._load_config", return_value=registrations
+        "homeassistant.components.html5.PLATFORMS",
+        [Platform.NOTIFY],
     ):
-        await async_setup_component(hass, "notify", {"notify": {"platform": "html5"}})
-        await hass.async_block_till_done()
-
-    return await hass_client()
-
-
-class TestHtml5Notify:
-    """Tests for HTML5 notify platform."""
-
-    def test_get_service_with_no_json(self):
-        """Test empty json file."""
-        hass = MagicMock()
-
-        m = mock_open()
-        with patch("homeassistant.util.json.open", m, create=True):
-            service = html5.get_service(hass, {})
-
-        assert service is not None
-
-    @patch("homeassistant.components.html5.notify.WebPusher")
-    def test_dismissing_message(self, mock_wp):
-        """Test dismissing message."""
-        hass = MagicMock()
-
-        data = {"device": SUBSCRIPTION_1}
-
-        m = mock_open(read_data=json.dumps(data))
-        with patch("homeassistant.util.json.open", m, create=True):
-            service = html5.get_service(hass, {"gcm_sender_id": "100"})
-
-        assert service is not None
-
-        service.dismiss(target=["device", "non_existing"], data={"tag": "test"})
-
-        assert len(mock_wp.mock_calls) == 3
-
-        # WebPusher constructor
-        assert mock_wp.mock_calls[0][1][0] == SUBSCRIPTION_1["subscription"]
-        # Third mock_call checks the status_code of the response.
-        assert mock_wp.mock_calls[2][0] == "().send().status_code.__eq__"
-
-        # Call to send
-        payload = json.loads(mock_wp.mock_calls[1][1][0])
-
-        assert payload["dismiss"] is True
-        assert payload["tag"] == "test"
-
-    @patch("homeassistant.components.html5.notify.WebPusher")
-    def test_sending_message(self, mock_wp):
-        """Test sending message."""
-        hass = MagicMock()
-
-        data = {"device": SUBSCRIPTION_1}
-
-        m = mock_open(read_data=json.dumps(data))
-        with patch("homeassistant.util.json.open", m, create=True):
-            service = html5.get_service(hass, {"gcm_sender_id": "100"})
-
-        assert service is not None
-
-        service.send_message(
-            "Hello", target=["device", "non_existing"], data={"icon": "beer.png"}
-        )
-
-        assert len(mock_wp.mock_calls) == 3
-
-        # WebPusher constructor
-        assert mock_wp.mock_calls[0][1][0] == SUBSCRIPTION_1["subscription"]
-        # Third mock_call checks the status_code of the response.
-        assert mock_wp.mock_calls[2][0] == "().send().status_code.__eq__"
-
-        # Call to send
-        payload = json.loads(mock_wp.mock_calls[1][1][0])
-
-        assert payload["body"] == "Hello"
-        assert payload["icon"] == "beer.png"
-
-    @patch("homeassistant.components.html5.notify.WebPusher")
-    def test_gcm_key_include(self, mock_wp):
-        """Test if the gcm_key is only included for GCM endpoints."""
-        hass = MagicMock()
-
-        data = {"chrome": SUBSCRIPTION_1, "firefox": SUBSCRIPTION_2}
-
-        m = mock_open(read_data=json.dumps(data))
-        with patch("homeassistant.util.json.open", m, create=True):
-            service = html5.get_service(
-                hass, {"gcm_sender_id": "100", "gcm_api_key": "Y6i0JdZ0mj9LOaSI"}
-            )
-
-        assert service is not None
-
-        service.send_message("Hello", target=["chrome", "firefox"])
-
-        assert len(mock_wp.mock_calls) == 6
-
-        # WebPusher constructor
-        assert mock_wp.mock_calls[0][1][0] == SUBSCRIPTION_1["subscription"]
-        assert mock_wp.mock_calls[3][1][0] == SUBSCRIPTION_2["subscription"]
-
-        # Third mock_call checks the status_code of the response.
-        assert mock_wp.mock_calls[2][0] == "().send().status_code.__eq__"
-        assert mock_wp.mock_calls[5][0] == "().send().status_code.__eq__"
-
-        # Get the keys passed to the WebPusher's send method
-        assert mock_wp.mock_calls[1][2]["gcm_key"] is not None
-        assert mock_wp.mock_calls[4][2]["gcm_key"] is None
-
-    @patch("homeassistant.components.html5.notify.WebPusher")
-    def test_fcm_key_include(self, mock_wp):
-        """Test if the FCM header is included."""
-        hass = MagicMock()
-
-        data = {"chrome": SUBSCRIPTION_5}
-
-        m = mock_open(read_data=json.dumps(data))
-        with patch("homeassistant.util.json.open", m, create=True):
-            service = html5.get_service(hass, VAPID_CONF)
-
-        assert service is not None
-
-        service.send_message("Hello", target=["chrome"])
-
-        assert len(mock_wp.mock_calls) == 3
-        # WebPusher constructor
-        assert mock_wp.mock_calls[0][1][0] == SUBSCRIPTION_5["subscription"]
-
-        # Third mock_call checks the status_code of the response.
-        assert mock_wp.mock_calls[2][0] == "().send().status_code.__eq__"
-
-        # Get the keys passed to the WebPusher's send method
-        assert mock_wp.mock_calls[1][2]["headers"]["Authorization"] is not None
-
-    @patch("homeassistant.components.html5.notify.WebPusher")
-    def test_fcm_send_with_unknown_priority(self, mock_wp):
-        """Test if the gcm_key is only included for GCM endpoints."""
-        hass = MagicMock()
-
-        data = {"chrome": SUBSCRIPTION_5}
-
-        m = mock_open(read_data=json.dumps(data))
-        with patch("homeassistant.util.json.open", m, create=True):
-            service = html5.get_service(hass, VAPID_CONF)
-
-        assert service is not None
-
-        service.send_message("Hello", target=["chrome"], priority="undefined")
-
-        assert len(mock_wp.mock_calls) == 3
-        # WebPusher constructor
-        assert mock_wp.mock_calls[0][1][0] == SUBSCRIPTION_5["subscription"]
-
-        # Third mock_call checks the status_code of the response.
-        assert mock_wp.mock_calls[2][0] == "().send().status_code.__eq__"
-
-        # Get the keys passed to the WebPusher's send method
-        assert mock_wp.mock_calls[1][2]["headers"]["priority"] == "normal"
-
-    @patch("homeassistant.components.html5.notify.WebPusher")
-    def test_fcm_no_targets(self, mock_wp):
-        """Test if the gcm_key is only included for GCM endpoints."""
-        hass = MagicMock()
-
-        data = {"chrome": SUBSCRIPTION_5}
-
-        m = mock_open(read_data=json.dumps(data))
-        with patch("homeassistant.util.json.open", m, create=True):
-            service = html5.get_service(hass, VAPID_CONF)
-
-        assert service is not None
-
-        service.send_message("Hello")
-
-        assert len(mock_wp.mock_calls) == 3
-        # WebPusher constructor
-        assert mock_wp.mock_calls[0][1][0] == SUBSCRIPTION_5["subscription"]
-
-        # Third mock_call checks the status_code of the response.
-        assert mock_wp.mock_calls[2][0] == "().send().status_code.__eq__"
-
-        # Get the keys passed to the WebPusher's send method
-        assert mock_wp.mock_calls[1][2]["headers"]["priority"] == "normal"
-
-    @patch("homeassistant.components.html5.notify.WebPusher")
-    def test_fcm_additional_data(self, mock_wp):
-        """Test if the gcm_key is only included for GCM endpoints."""
-        hass = MagicMock()
-
-        data = {"chrome": SUBSCRIPTION_5}
-
-        m = mock_open(read_data=json.dumps(data))
-        with patch("homeassistant.util.json.open", m, create=True):
-            service = html5.get_service(hass, VAPID_CONF)
-
-        assert service is not None
-
-        service.send_message("Hello", data={"mykey": "myvalue"})
-
-        assert len(mock_wp.mock_calls) == 3
-        # WebPusher constructor
-        assert mock_wp.mock_calls[0][1][0] == SUBSCRIPTION_5["subscription"]
-
-        # Third mock_call checks the status_code of the response.
-        assert mock_wp.mock_calls[2][0] == "().send().status_code.__eq__"
-
-        # Get the keys passed to the WebPusher's send method
-        assert mock_wp.mock_calls[1][2]["headers"]["priority"] == "normal"
-
-
-def test_create_vapid_withoutvapid():
-    """Test creating empty vapid."""
-    resp = html5.create_vapid_headers(
-        vapid_email=None, vapid_private_key=None, subscription_info=None
-    )
-    assert resp is None
-
-
-async def test_registering_new_device_view(hass, hass_client):
+        yield
+
+
+@pytest.mark.usefixtures("load_config")
+async def test_registering_new_device_view(
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    config_entry: MockConfigEntry,
+    mock_save: MagicMock,
+) -> None:
     """Test that the HTML view works."""
-    client = await mock_client(hass, hass_client)
+    await async_setup_component(hass, "http", {})
 
-    with patch("homeassistant.components.html5.notify.save_json") as mock_save:
-        resp = await client.post(REGISTER_URL, data=json.dumps(SUBSCRIPTION_1))
+    config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert config_entry.state is ConfigEntryState.LOADED
+
+    client = await hass_client()
+
+    resp = await client.post(REGISTER_URL, data=json.dumps(SUBSCRIPTION_1))
 
     assert resp.status == HTTPStatus.OK
     assert len(mock_save.mock_calls) == 1
     assert mock_save.mock_calls[0][1][1] == {"unnamed device": SUBSCRIPTION_1}
 
 
-async def test_registering_new_device_view_with_name(hass, hass_client):
+@pytest.mark.usefixtures("load_config")
+async def test_registering_new_device_view_with_name(
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    config_entry: MockConfigEntry,
+    mock_save: MagicMock,
+) -> None:
     """Test that the HTML view works with name attribute."""
-    client = await mock_client(hass, hass_client)
+    await async_setup_component(hass, "http", {})
+
+    config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert config_entry.state is ConfigEntryState.LOADED
+
+    client = await hass_client()
 
     SUB_WITH_NAME = SUBSCRIPTION_1.copy()
     SUB_WITH_NAME["name"] = "test device"
 
-    with patch("homeassistant.components.html5.notify.save_json") as mock_save:
-        resp = await client.post(REGISTER_URL, data=json.dumps(SUB_WITH_NAME))
+    resp = await client.post(REGISTER_URL, data=json.dumps(SUB_WITH_NAME))
 
     assert resp.status == HTTPStatus.OK
     assert len(mock_save.mock_calls) == 1
     assert mock_save.mock_calls[0][1][1] == {"test device": SUBSCRIPTION_1}
 
 
-async def test_registering_new_device_expiration_view(hass, hass_client):
+@pytest.mark.usefixtures("load_config")
+async def test_registering_new_device_expiration_view(
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    config_entry: MockConfigEntry,
+    mock_save: MagicMock,
+) -> None:
     """Test that the HTML view works."""
-    client = await mock_client(hass, hass_client)
+    await async_setup_component(hass, "http", {})
 
-    with patch("homeassistant.components.html5.notify.save_json") as mock_save:
-        resp = await client.post(REGISTER_URL, data=json.dumps(SUBSCRIPTION_4))
+    config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert config_entry.state is ConfigEntryState.LOADED
+
+    client = await hass_client()
+
+    resp = await client.post(REGISTER_URL, data=json.dumps(SUBSCRIPTION_4))
 
     assert resp.status == HTTPStatus.OK
     assert mock_save.mock_calls[0][1][1] == {"unnamed device": SUBSCRIPTION_4}
 
 
-async def test_registering_new_device_fails_view(hass, hass_client):
+@pytest.mark.usefixtures("load_config")
+async def test_registering_new_device_fails_view(
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    config_entry: MockConfigEntry,
+    mock_save: MagicMock,
+) -> None:
     """Test subs. are not altered when registering a new device fails."""
-    registrations = {}
-    client = await mock_client(hass, hass_client, registrations)
+    await async_setup_component(hass, "http", {})
 
-    with patch(
-        "homeassistant.components.html5.notify.save_json",
-        side_effect=HomeAssistantError(),
-    ):
-        resp = await client.post(REGISTER_URL, data=json.dumps(SUBSCRIPTION_4))
+    config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert config_entry.state is ConfigEntryState.LOADED
+
+    client = await hass_client()
+    mock_save.side_effect = (HomeAssistantError(),)
+
+    resp = await client.post(REGISTER_URL, data=json.dumps(SUBSCRIPTION_4))
 
     assert resp.status == HTTPStatus.INTERNAL_SERVER_ERROR
-    assert registrations == {}
 
 
-async def test_registering_existing_device_view(hass, hass_client):
+@pytest.mark.usefixtures("load_config")
+async def test_registering_existing_device_view(
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    config_entry: MockConfigEntry,
+    mock_save: MagicMock,
+) -> None:
     """Test subscription is updated when registering existing device."""
-    registrations = {}
-    client = await mock_client(hass, hass_client, registrations)
+    await async_setup_component(hass, "http", {})
 
-    with patch("homeassistant.components.html5.notify.save_json") as mock_save:
-        await client.post(REGISTER_URL, data=json.dumps(SUBSCRIPTION_1))
-        resp = await client.post(REGISTER_URL, data=json.dumps(SUBSCRIPTION_4))
+    config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert config_entry.state is ConfigEntryState.LOADED
+
+    client = await hass_client()
+
+    await client.post(REGISTER_URL, data=json.dumps(SUBSCRIPTION_1))
+    resp = await client.post(REGISTER_URL, data=json.dumps(SUBSCRIPTION_4))
 
     assert resp.status == HTTPStatus.OK
-    assert mock_save.mock_calls[0][1][1] == {"unnamed device": SUBSCRIPTION_4}
-    assert registrations == {"unnamed device": SUBSCRIPTION_4}
+    mock_save.assert_called_with(
+        hass.config.path(html5.REGISTRATIONS_FILE), {"unnamed device": SUBSCRIPTION_4}
+    )
 
 
-async def test_registering_existing_device_view_with_name(hass, hass_client):
+@pytest.mark.usefixtures("load_config")
+async def test_registering_existing_device_view_with_name(
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    config_entry: MockConfigEntry,
+    mock_save: MagicMock,
+) -> None:
     """Test subscription is updated when reg'ing existing device with name."""
-    registrations = {}
-    client = await mock_client(hass, hass_client, registrations)
+    await async_setup_component(hass, "http", {})
+
+    config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert config_entry.state is ConfigEntryState.LOADED
+
+    client = await hass_client()
 
     SUB_WITH_NAME = SUBSCRIPTION_1.copy()
     SUB_WITH_NAME["name"] = "test device"
 
-    with patch("homeassistant.components.html5.notify.save_json") as mock_save:
-        await client.post(REGISTER_URL, data=json.dumps(SUB_WITH_NAME))
-        resp = await client.post(REGISTER_URL, data=json.dumps(SUBSCRIPTION_4))
+    await client.post(REGISTER_URL, data=json.dumps(SUB_WITH_NAME))
+    resp = await client.post(REGISTER_URL, data=json.dumps(SUBSCRIPTION_4))
 
     assert resp.status == HTTPStatus.OK
-    assert mock_save.mock_calls[0][1][1] == {"test device": SUBSCRIPTION_4}
-    assert registrations == {"test device": SUBSCRIPTION_4}
+
+    mock_save.assert_called_with(
+        hass.config.path(html5.REGISTRATIONS_FILE), {"test device": SUBSCRIPTION_4}
+    )
 
 
-async def test_registering_existing_device_fails_view(hass, hass_client):
+@pytest.mark.usefixtures("load_config")
+async def test_registering_existing_device_fails_view(
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    config_entry: MockConfigEntry,
+    mock_save: MagicMock,
+) -> None:
     """Test sub. is not updated when registering existing device fails."""
-    registrations = {}
-    client = await mock_client(hass, hass_client, registrations)
+    await async_setup_component(hass, "http", {})
 
-    with patch("homeassistant.components.html5.notify.save_json") as mock_save:
-        await client.post(REGISTER_URL, data=json.dumps(SUBSCRIPTION_1))
-        mock_save.side_effect = HomeAssistantError
-        resp = await client.post(REGISTER_URL, data=json.dumps(SUBSCRIPTION_4))
+    config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert config_entry.state is ConfigEntryState.LOADED
+
+    client = await hass_client()
+
+    await client.post(REGISTER_URL, data=json.dumps(SUBSCRIPTION_1))
+    mock_save.side_effect = HomeAssistantError
+    resp = await client.post(REGISTER_URL, data=json.dumps(SUBSCRIPTION_4))
 
     assert resp.status == HTTPStatus.INTERNAL_SERVER_ERROR
-    assert registrations == {"unnamed device": SUBSCRIPTION_1}
 
 
-async def test_registering_new_device_validation(hass, hass_client):
+@pytest.mark.usefixtures("load_config")
+async def test_registering_new_device_validation(
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    config_entry: MockConfigEntry,
+    mock_save: MagicMock,
+) -> None:
     """Test various errors when registering a new device."""
-    client = await mock_client(hass, hass_client)
+    await async_setup_component(hass, "http", {})
+
+    config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert config_entry.state is ConfigEntryState.LOADED
+
+    client = await hass_client()
 
     resp = await client.post(
         REGISTER_URL,
@@ -398,70 +323,123 @@ async def test_registering_new_device_validation(hass, hass_client):
     resp = await client.post(REGISTER_URL, data=json.dumps({"browser": "chrome"}))
     assert resp.status == HTTPStatus.BAD_REQUEST
 
-    with patch("homeassistant.components.html5.notify.save_json", return_value=False):
-        resp = await client.post(
-            REGISTER_URL,
-            data=json.dumps({"browser": "chrome", "subscription": "sub info"}),
-        )
+    mock_save.return_value = False
+    resp = await client.post(
+        REGISTER_URL,
+        data=json.dumps({"browser": "chrome", "subscription": "sub info"}),
+    )
     assert resp.status == HTTPStatus.BAD_REQUEST
 
 
-async def test_unregistering_device_view(hass, hass_client):
+async def test_unregistering_device_view(
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    config_entry: MockConfigEntry,
+    load_config: MagicMock,
+    mock_save: MagicMock,
+) -> None:
     """Test that the HTML unregister view works."""
-    registrations = {"some device": SUBSCRIPTION_1, "other device": SUBSCRIPTION_2}
-    client = await mock_client(hass, hass_client, registrations)
-
-    with patch("homeassistant.components.html5.notify.save_json") as mock_save:
-        resp = await client.delete(
-            REGISTER_URL,
-            data=json.dumps({"subscription": SUBSCRIPTION_1["subscription"]}),
-        )
-
-    assert resp.status == HTTPStatus.OK
-    assert len(mock_save.mock_calls) == 1
-    assert registrations == {"other device": SUBSCRIPTION_2}
-
-
-async def test_unregister_device_view_handle_unknown_subscription(hass, hass_client):
-    """Test that the HTML unregister view handles unknown subscriptions."""
-    registrations = {}
-    client = await mock_client(hass, hass_client, registrations)
-
-    with patch("homeassistant.components.html5.notify.save_json") as mock_save:
-        resp = await client.delete(
-            REGISTER_URL,
-            data=json.dumps({"subscription": SUBSCRIPTION_3["subscription"]}),
-        )
-
-    assert resp.status == HTTPStatus.OK, resp.response
-    assert registrations == {}
-    assert len(mock_save.mock_calls) == 0
-
-
-async def test_unregistering_device_view_handles_save_error(hass, hass_client):
-    """Test that the HTML unregister view handles save errors."""
-    registrations = {"some device": SUBSCRIPTION_1, "other device": SUBSCRIPTION_2}
-    client = await mock_client(hass, hass_client, registrations)
-
-    with patch(
-        "homeassistant.components.html5.notify.save_json",
-        side_effect=HomeAssistantError(),
-    ):
-        resp = await client.delete(
-            REGISTER_URL,
-            data=json.dumps({"subscription": SUBSCRIPTION_1["subscription"]}),
-        )
-
-    assert resp.status == HTTPStatus.INTERNAL_SERVER_ERROR, resp.response
-    assert registrations == {
+    load_config.return_value = {
         "some device": SUBSCRIPTION_1,
         "other device": SUBSCRIPTION_2,
     }
+    await async_setup_component(hass, "http", {})
+
+    config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert config_entry.state is ConfigEntryState.LOADED
+
+    client = await hass_client()
+
+    resp = await client.delete(
+        REGISTER_URL,
+        data=json.dumps({"subscription": SUBSCRIPTION_1["subscription"]}),
+    )
+
+    assert resp.status == HTTPStatus.OK
+    assert len(mock_save.mock_calls) == 1
+    mock_save.assert_called_once_with(
+        hass.config.path(html5.REGISTRATIONS_FILE), {"other device": SUBSCRIPTION_2}
+    )
 
 
-async def test_callback_view_no_jwt(hass, hass_client):
+@pytest.mark.usefixtures("load_config")
+async def test_unregister_device_view_handle_unknown_subscription(
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    config_entry: MockConfigEntry,
+    mock_save: MagicMock,
+) -> None:
+    """Test that the HTML unregister view handles unknown subscriptions."""
+    await async_setup_component(hass, "http", {})
+
+    config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert config_entry.state is ConfigEntryState.LOADED
+
+    client = await hass_client()
+
+    resp = await client.delete(
+        REGISTER_URL,
+        data=json.dumps({"subscription": SUBSCRIPTION_3["subscription"]}),
+    )
+
+    assert resp.status == HTTPStatus.OK, resp.response
+    assert len(mock_save.mock_calls) == 0
+
+
+async def test_unregistering_device_view_handles_save_error(
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    config_entry: MockConfigEntry,
+    load_config: MagicMock,
+    mock_save: MagicMock,
+) -> None:
+    """Test that the HTML unregister view handles save errors."""
+    load_config.return_value = {
+        "some device": SUBSCRIPTION_1,
+        "other device": SUBSCRIPTION_2,
+    }
+    await async_setup_component(hass, "http", {})
+
+    config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert config_entry.state is ConfigEntryState.LOADED
+
+    client = await hass_client()
+
+    mock_save.side_effect = HomeAssistantError()
+
+    resp = await client.delete(
+        REGISTER_URL,
+        data=json.dumps({"subscription": SUBSCRIPTION_1["subscription"]}),
+    )
+
+    assert resp.status == HTTPStatus.INTERNAL_SERVER_ERROR, resp.response
+
+
+@pytest.mark.usefixtures("load_config")
+async def test_callback_view_no_jwt(
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    config_entry: MockConfigEntry,
+) -> None:
     """Test that the notification callback view works without JWT."""
-    client = await mock_client(hass, hass_client)
+    await async_setup_component(hass, "http", {})
+
+    config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert config_entry.state is ConfigEntryState.LOADED
+
+    client = await hass_client()
     resp = await client.post(
         PUBLISH_URL,
         data=json.dumps(
@@ -472,33 +450,27 @@ async def test_callback_view_no_jwt(hass, hass_client):
     assert resp.status == HTTPStatus.UNAUTHORIZED
 
 
-async def test_callback_view_with_jwt(hass, hass_client):
+@pytest.mark.usefixtures("mock_jwt", "mock_uuid")
+@pytest.mark.freeze_time("2009-02-13T23:31:30.000Z")
+async def test_callback_view_with_jwt(
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    config_entry: MockConfigEntry,
+    load_config: MagicMock,
+) -> None:
     """Test that the notification callback view works with JWT."""
-    registrations = {"device": SUBSCRIPTION_1}
-    client = await mock_client(hass, hass_client, registrations)
+    load_config.return_value = {"device": SUBSCRIPTION_1}
+    await async_setup_component(hass, "http", {})
 
-    with patch("homeassistant.components.html5.notify.WebPusher") as mock_wp:
-        await hass.services.async_call(
-            "notify",
-            "notify",
-            {"message": "Hello", "target": ["device"], "data": {"icon": "beer.png"}},
-            blocking=True,
-        )
+    config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
 
-    assert len(mock_wp.mock_calls) == 3
+    assert config_entry.state is ConfigEntryState.LOADED
 
-    # WebPusher constructor
-    assert mock_wp.mock_calls[0][1][0] == SUBSCRIPTION_1["subscription"]
-    # Third mock_call checks the status_code of the response.
-    assert mock_wp.mock_calls[2][0] == "().send().status_code.__eq__"
+    client = await hass_client()
 
-    # Call to send
-    push_payload = json.loads(mock_wp.mock_calls[1][1][0])
-
-    assert push_payload["body"] == "Hello"
-    assert push_payload["icon"] == "beer.png"
-
-    bearer_token = "Bearer {}".format(push_payload["data"]["jwt"])
+    bearer_token = "Bearer JWT"
 
     resp = await client.post(
         PUBLISH_URL, json={"type": "push"}, headers={AUTHORIZATION: bearer_token}
@@ -509,64 +481,403 @@ async def test_callback_view_with_jwt(hass, hass_client):
     assert body == {"event": "push", "status": "ok"}
 
 
-async def test_send_fcm_without_targets(hass, hass_client):
-    """Test that the notification is send with FCM without targets."""
-    registrations = {"device": SUBSCRIPTION_5}
-    await mock_client(hass, hass_client, registrations)
-    with patch("homeassistant.components.html5.notify.WebPusher") as mock_wp:
-        await hass.services.async_call(
-            "notify",
-            "notify",
-            {"message": "Hello", "target": ["device"], "data": {"icon": "beer.png"}},
-            blocking=True,
-        )
+async def test_notify_platform(
+    hass: HomeAssistant,
+    config_entry: MockConfigEntry,
+    snapshot: SnapshotAssertion,
+    entity_registry: er.EntityRegistry,
+    load_config: MagicMock,
+) -> None:
+    """Test setup of the notify platform."""
+    load_config.return_value = {"my-desktop": SUBSCRIPTION_1}
+    config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
 
-    assert len(mock_wp.mock_calls) == 3
+    assert config_entry.state is ConfigEntryState.LOADED
 
-    # WebPusher constructor
-    assert mock_wp.mock_calls[0][1][0] == SUBSCRIPTION_5["subscription"]
-    # Third mock_call checks the status_code of the response.
-    assert mock_wp.mock_calls[2][0] == "().send().status_code.__eq__"
+    await snapshot_platform(hass, entity_registry, snapshot, config_entry.entry_id)
 
 
-async def test_send_fcm_expired(hass, hass_client):
-    """Test that the FCM target is removed when expired."""
-    registrations = {"device": SUBSCRIPTION_5}
-    await mock_client(hass, hass_client, registrations)
+@pytest.mark.usefixtures("mock_jwt", "mock_uuid")
+@pytest.mark.freeze_time("2009-02-13T23:31:30.000Z")
+async def test_send_message(
+    hass: HomeAssistant,
+    config_entry: MockConfigEntry,
+    webpush_async: AsyncMock,
+    load_config: MagicMock,
+) -> None:
+    """Test sending a message."""
+    load_config.return_value = {"my-desktop": SUBSCRIPTION_1}
 
-    with (
-        patch("homeassistant.components.html5.notify.WebPusher") as mock_wp,
-        patch("homeassistant.components.html5.notify.save_json"),
-    ):
-        mock_wp().send().status_code = 410
-        await hass.services.async_call(
-            "notify",
-            "notify",
-            {"message": "Hello", "target": ["device"], "data": {"icon": "beer.png"}},
-            blocking=True,
-        )
-    # "device" should be removed when expired.
-    assert "device" not in registrations
+    config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert config_entry.state is ConfigEntryState.LOADED
+
+    state = hass.states.get("notify.my_desktop")
+    assert state
+    assert state.state == STATE_UNKNOWN
+
+    await hass.services.async_call(
+        NOTIFY_DOMAIN,
+        SERVICE_SEND_MESSAGE,
+        {
+            ATTR_ENTITY_ID: "notify.my_desktop",
+            ATTR_MESSAGE: "World",
+            ATTR_TITLE: "Hello",
+        },
+        blocking=True,
+    )
+
+    state = hass.states.get("notify.my_desktop")
+    assert state
+    assert state.state == "2009-02-13T23:31:30+00:00"
+
+    webpush_async.assert_awaited_once()
+    assert webpush_async.await_args
+    _, payload, _, _ = webpush_async.await_args.args
+    assert json.loads(payload) == {
+        "title": "Hello",
+        "body": "World",
+        "badge": "/static/images/notification-badge.png",
+        "icon": "/static/icons/favicon-192x192.png",
+        "tag": "12345678-1234-5678-1234-567812345678",
+        "timestamp": 1234567890000,
+        "data": {"jwt": "JWT"},
+    }
 
 
-async def test_send_fcm_expired_save_fails(hass, hass_client):
-    """Test that the FCM target remains after expiry if save_json fails."""
-    registrations = {"device": SUBSCRIPTION_5}
-    await mock_client(hass, hass_client, registrations)
-
-    with (
-        patch("homeassistant.components.html5.notify.WebPusher") as mock_wp,
-        patch(
-            "homeassistant.components.html5.notify.save_json",
-            side_effect=HomeAssistantError(),
+@pytest.mark.parametrize(
+    ("exception", "translation_key"),
+    [
+        (
+            WebPushException("", response=Mock(status=HTTPStatus.IM_A_TEAPOT)),
+            "request_error",
         ),
-    ):
-        mock_wp().send().status_code = 410
+        (
+            WebPushException("", response=Mock(status=HTTPStatus.GONE)),
+            "channel_expired",
+        ),
+        (
+            ClientError,
+            "connection_error",
+        ),
+    ],
+)
+@pytest.mark.parametrize("domain", [NOTIFY_DOMAIN, DOMAIN])
+@pytest.mark.usefixtures("mock_jwt", "mock_uuid", "mock_save")
+@pytest.mark.freeze_time("2009-02-13T23:31:30.000Z")
+async def test_send_message_exceptions(
+    hass: HomeAssistant,
+    config_entry: MockConfigEntry,
+    webpush_async: AsyncMock,
+    load_config: MagicMock,
+    exception: Exception,
+    translation_key: str,
+    domain: str,
+) -> None:
+    """Test sending a message with exceptions."""
+    load_config.return_value = {"my-desktop": SUBSCRIPTION_1}
+
+    config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert config_entry.state is ConfigEntryState.LOADED
+
+    webpush_async.side_effect = exception
+
+    with pytest.raises(HomeAssistantError) as e:
         await hass.services.async_call(
-            "notify",
-            "notify",
-            {"message": "Hello", "target": ["device"], "data": {"icon": "beer.png"}},
+            domain,
+            SERVICE_SEND_MESSAGE,
+            {
+                ATTR_ENTITY_ID: "notify.my_desktop",
+                ATTR_MESSAGE: "World",
+                ATTR_TITLE: "Hello",
+            },
             blocking=True,
         )
-    # "device" should still exist if save fails.
-    assert "device" in registrations
+    assert e.value.translation_key == translation_key
+
+
+@pytest.mark.usefixtures("mock_jwt", "mock_uuid")
+@pytest.mark.freeze_time("2009-02-13T23:31:30.000Z")
+async def test_send_message_save_fails(
+    hass: HomeAssistant,
+    config_entry: MockConfigEntry,
+    webpush_async: AsyncMock,
+    load_config: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+    mock_save: MagicMock,
+) -> None:
+    """Test sending a message with channel expired but saving registration fails."""
+    load_config.return_value = {"my-desktop": SUBSCRIPTION_1}
+
+    config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert config_entry.state is ConfigEntryState.LOADED
+
+    webpush_async.side_effect = (
+        WebPushException("", response=Mock(status=HTTPStatus.GONE)),
+    )
+    mock_save.side_effect = HomeAssistantError
+    with pytest.raises(HomeAssistantError) as e:
+        await hass.services.async_call(
+            NOTIFY_DOMAIN,
+            SERVICE_SEND_MESSAGE,
+            {
+                ATTR_ENTITY_ID: "notify.my_desktop",
+                ATTR_MESSAGE: "World",
+                ATTR_TITLE: "Hello",
+            },
+            blocking=True,
+        )
+    assert e.value.translation_key == "channel_expired"
+
+    assert "Error saving registration" in caplog.text
+
+
+@pytest.mark.usefixtures("mock_jwt", "mock_uuid", "mock_save")
+@pytest.mark.freeze_time("2009-02-13T23:31:30.000Z")
+async def test_send_message_unavailable(
+    hass: HomeAssistant,
+    config_entry: MockConfigEntry,
+    webpush_async: AsyncMock,
+    load_config: MagicMock,
+) -> None:
+    """Test sending a message with channel expired and entity goes unavailable."""
+    load_config.return_value = {"my-desktop": SUBSCRIPTION_1}
+
+    config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert config_entry.state is ConfigEntryState.LOADED
+
+    webpush_async.side_effect = (
+        WebPushException("", response=Mock(status=HTTPStatus.GONE)),
+    )
+    with pytest.raises(HomeAssistantError) as e:
+        await hass.services.async_call(
+            NOTIFY_DOMAIN,
+            SERVICE_SEND_MESSAGE,
+            {
+                ATTR_ENTITY_ID: "notify.my_desktop",
+                ATTR_MESSAGE: "World",
+                ATTR_TITLE: "Hello",
+            },
+            blocking=True,
+        )
+    assert e.value.translation_key == "channel_expired"
+
+    state = hass.states.get("notify.my_desktop")
+    assert state
+    assert state.state == STATE_UNAVAILABLE
+
+
+@pytest.mark.parametrize(
+    ("service_data", "expected_payload", "expected_ttl", "expected_headers"),
+    [
+        ({HTML5ServiceArgument.MESSAGE: "World"}, {"body": "World"}, DEFAULT_TTL, None),
+        (
+            {HTML5ServiceArgument.ICON: "/static/icons/favicon-192x192.png"},
+            {"icon": "/static/icons/favicon-192x192.png"},
+            DEFAULT_TTL,
+            None,
+        ),
+        (
+            {HTML5ServiceArgument.BADGE: "/static/images/notification-badge.png"},
+            {"badge": "/static/images/notification-badge.png"},
+            DEFAULT_TTL,
+            None,
+        ),
+        (
+            {HTML5ServiceArgument.IMAGE: "/static/images/image.jpg"},
+            {"image": "/static/images/image.jpg"},
+            DEFAULT_TTL,
+            None,
+        ),
+        (
+            {HTML5ServiceArgument.TAG: "message-group-1"},
+            {"tag": "message-group-1"},
+            DEFAULT_TTL,
+            None,
+        ),
+        ({HTML5ServiceArgument.DIR: "rtl"}, {"dir": "rtl"}, DEFAULT_TTL, None),
+        ({HTML5ServiceArgument.RENOTIFY: True}, {"renotify": True}, DEFAULT_TTL, None),
+        ({HTML5ServiceArgument.SILENT: True}, {"silent": True}, DEFAULT_TTL, None),
+        (
+            {HTML5ServiceArgument.REQUIRE_INTERACTION: True},
+            {"requireInteraction": True},
+            DEFAULT_TTL,
+            None,
+        ),
+        (
+            {HTML5ServiceArgument.VIBRATE: [200, 100, 200]},
+            {"vibrate": [200, 100, 200]},
+            DEFAULT_TTL,
+            None,
+        ),
+        ({HTML5ServiceArgument.LANG: "es-419"}, {"lang": "es-419"}, DEFAULT_TTL, None),
+        (
+            {HTML5ServiceArgument.TIMESTAMP: "1970-01-01 00:00:00"},
+            {"timestamp": 0},
+            DEFAULT_TTL,
+            None,
+        ),
+        ({HTML5ServiceArgument.TTL: {"days": 28}}, {}, 2419200, None),
+        ({HTML5ServiceArgument.TTL: {"seconds": 0}}, {}, 0, None),
+        (
+            {HTML5ServiceArgument.URGENCY: "high"},
+            {},
+            DEFAULT_TTL,
+            {"Urgency": "high"},
+        ),
+        (
+            {
+                HTML5ServiceArgument.ACTIONS: [
+                    {
+                        ATTR_ACTION: "callback-event",
+                        HTML5ServiceArgument.TITLE: "Callback Event",
+                        HTML5ServiceArgument.ICON: "/static/icons/favicon-192x192.png",
+                    }
+                ]
+            },
+            {
+                "actions": [
+                    {
+                        "action": "callback-event",
+                        "title": "Callback Event",
+                        "icon": "/static/icons/favicon-192x192.png",
+                    }
+                ]
+            },
+            DEFAULT_TTL,
+            None,
+        ),
+        (
+            {HTML5ServiceArgument.DATA: {"customKey": "customValue"}},
+            {"data": {"jwt": "JWT", "customKey": "customValue"}},
+            DEFAULT_TTL,
+            None,
+        ),
+    ],
+)
+@pytest.mark.usefixtures("mock_jwt", "mock_uuid")
+@pytest.mark.freeze_time("2009-02-13T23:31:30.000Z")
+async def test_html5_send_message(
+    hass: HomeAssistant,
+    config_entry: MockConfigEntry,
+    webpush_async: AsyncMock,
+    load_config: MagicMock,
+    service_data: dict[str, Any],
+    expected_payload: dict[str, Any],
+    expected_ttl: int,
+    expected_headers: dict[str, Any] | None,
+) -> None:
+    """Test sending a message via html5.send_message action."""
+    load_config.return_value = {"my-desktop": SUBSCRIPTION_1}
+
+    config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert config_entry.state is ConfigEntryState.LOADED
+
+    state = hass.states.get("notify.my_desktop")
+    assert state
+    assert state.state == STATE_UNKNOWN
+
+    await hass.services.async_call(
+        DOMAIN,
+        HTML5Service.SEND_MESSAGE,
+        {
+            CommonServiceArgument.ENTITY_ID: "notify.my_desktop",
+            HTML5ServiceArgument.TITLE: "Hello",
+            **service_data,
+        },
+        blocking=True,
+    )
+
+    state = hass.states.get("notify.my_desktop")
+    assert state
+    assert state.state == "2009-02-13T23:31:30+00:00"
+
+    webpush_async.assert_awaited_once()
+    assert webpush_async.await_args
+    _, payload, _, _ = webpush_async.await_args.args
+    assert json.loads(payload) == {
+        "title": "Hello",
+        "tag": "12345678-1234-5678-1234-567812345678",
+        "timestamp": 1234567890000,
+        "data": {"jwt": "JWT"},
+        **expected_payload,
+    }
+
+    assert webpush_async.await_args.kwargs["ttl"] == expected_ttl
+    assert webpush_async.await_args.kwargs["headers"] == expected_headers
+
+
+@pytest.mark.parametrize(
+    ("service_data", "expected_payload"),
+    [
+        (
+            {HTML5ServiceArgument.TAG: "message-group-1"},
+            {ATTR_DISMISS: True, ATTR_TAG: "message-group-1"},
+        ),
+        (
+            {},
+            {ATTR_DISMISS: True, ATTR_TAG: ""},
+        ),
+    ],
+)
+@pytest.mark.usefixtures("mock_jwt", "mock_uuid")
+@pytest.mark.freeze_time("2009-02-13T23:31:30.000Z")
+async def test_html5_dismiss_message(
+    hass: HomeAssistant,
+    config_entry: MockConfigEntry,
+    webpush_async: AsyncMock,
+    load_config: MagicMock,
+    service_data: dict[str, Any],
+    expected_payload: dict[str, Any],
+) -> None:
+    """Test dismissing a message via html5.dismiss_message action."""
+    load_config.return_value = {"my-desktop": SUBSCRIPTION_1}
+
+    config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert config_entry.state is ConfigEntryState.LOADED
+
+    await hass.services.async_call(
+        DOMAIN,
+        HTML5Service.DISMISS_MESSAGE,
+        {
+            CommonServiceArgument.ENTITY_ID: "notify.my_desktop",
+            **service_data,
+        },
+        blocking=True,
+    )
+
+    webpush_async.assert_awaited_once()
+    assert webpush_async.await_args
+    _, payload, _, _ = webpush_async.await_args.args
+    assert json.loads(payload) == {
+        "timestamp": 1234567890000,
+        "data": {"jwt": "JWT"},
+        **expected_payload,
+    }
+
+
+def test_add_jwt_no_insecure_key_warning() -> None:
+    """Test that add_jwt does not emit InsecureKeyLengthWarning for short keys."""
+    short_key = "c2hvcnRfa2V5X2hlcmU="
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", jwt.warnings.InsecureKeyLengthWarning)
+        html5.add_jwt(1234567890, "device", "tag", short_key)

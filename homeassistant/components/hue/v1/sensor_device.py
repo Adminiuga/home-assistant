@@ -1,14 +1,14 @@
 """Support for the Philips Hue sensor devices."""
-from homeassistant.helpers import entity
 
-from ..const import (
-    CONF_ALLOW_UNREACHABLE,
-    DEFAULT_ALLOW_UNREACHABLE,
-    DOMAIN as HUE_DOMAIN,
-)
+from typing import override
+
+from homeassistant.helpers import device_registry as dr, entity
+from homeassistant.helpers.device_registry import DeviceInfo
+
+from ..const import CONF_ALLOW_UNREACHABLE, DEFAULT_ALLOW_UNREACHABLE, DOMAIN
 
 
-class GenericHueDevice(entity.Entity):
+class GenericHueDevice(entity.Entity):  # pylint: disable=home-assistant-enforce-class-module
     """Representation of a Hue device."""
 
     def __init__(self, sensor, name, bridge, primary_sensor=None):
@@ -32,11 +32,13 @@ class GenericHueDevice(entity.Entity):
         return self.unique_id[:23]
 
     @property
+    @override
     def unique_id(self):
         """Return the ID of this Hue sensor."""
         return self.sensor.uniqueid
 
     @property
+    @override
     def name(self):
         """Return a friendly name for the sensor."""
         return self._name
@@ -47,16 +49,21 @@ class GenericHueDevice(entity.Entity):
         return self.primary_sensor.raw.get("swupdate", {}).get("state")
 
     @property
-    def device_info(self) -> entity.DeviceInfo:
+    @override
+    def device_info(self) -> DeviceInfo:
         """Return the device info.
 
         Links individual entities together in the hass device registry.
         """
-        return entity.DeviceInfo(
-            identifiers={(HUE_DOMAIN, self.device_id)},
+        return DeviceInfo(
+            identifiers={(DOMAIN, self.device_id)},
             manufacturer=self.primary_sensor.manufacturername,
             model=(self.primary_sensor.productname or self.primary_sensor.modelid),
             name=self.primary_sensor.name,
             sw_version=self.primary_sensor.swversion,
-            via_device=(HUE_DOMAIN, self.bridge.api.config.bridgeid),
+            via_device_id=dr.async_get_device_id_by_identifier(
+                self.bridge.hass,
+                (DOMAIN, self.bridge.api.config.bridgeid),
+                config_entry_id=self.bridge.config_entry.entry_id,
+            ),
         )

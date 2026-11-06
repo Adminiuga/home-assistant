@@ -1,46 +1,43 @@
 """Sensor component that handles additional Tomorrowio data for your location."""
-from __future__ import annotations
 
 from abc import abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, override
 
 from pytomorrowio.const import (
     HealthConcernType,
     PollenIndex,
     PrecipitationType,
     PrimaryPollutantType,
+    UVDescription,
 )
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
     SensorEntity,
     SensorEntityDescription,
+    SensorStateClass,
 )
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.config_entries import ConfigSubentry
 from homeassistant.const import (
-    CONCENTRATION_MICROGRAMS_PER_CUBIC_METER,
-    CONCENTRATION_PARTS_PER_MILLION,
     CONF_API_KEY,
-    CONF_NAME,
-    IRRADIATION_BTUS_PER_HOUR_SQUARE_FOOT,
-    IRRADIATION_WATTS_PER_SQUARE_METER,
-    PERCENTAGE,
+    CONF_LOCATION,
+    UnitOfDensity,
+    UnitOfIrradiance,
     UnitOfLength,
     UnitOfPressure,
+    UnitOfRatio,
     UnitOfSpeed,
     UnitOfTemperature,
 )
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.util import slugify
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.util.unit_conversion import DistanceConverter, SpeedConverter
 from homeassistant.util.unit_system import US_CUSTOMARY_SYSTEM
 
-from . import TomorrowioDataUpdateCoordinator, TomorrowioEntity
 from .const import (
-    DOMAIN,
+    SUBENTRY_TYPE_LOCATION,
     TMRW_ATTR_CARBON_MONOXIDE,
     TMRW_ATTR_CHINA_AQI,
     TMRW_ATTR_CHINA_HEALTH_CONCERN,
@@ -65,14 +62,19 @@ from .const import (
     TMRW_ATTR_PRESSURE_SURFACE_LEVEL,
     TMRW_ATTR_SOLAR_GHI,
     TMRW_ATTR_SULPHUR_DIOXIDE,
+    TMRW_ATTR_UV_HEALTH_CONCERN,
+    TMRW_ATTR_UV_INDEX,
     TMRW_ATTR_WIND_GUST,
 )
+from .coordinator import TomorrowioConfigEntry, TomorrowioDataUpdateCoordinator
+from .entity import TomorrowioEntity, async_get_base_unique_id
 
 
-@dataclass
+@dataclass(frozen=True)
 class TomorrowioSensorEntityDescription(SensorEntityDescription):
     """Describes a Tomorrow.io sensor entity."""
 
+    attribute: str = ""
     unit_imperial: str | None = None
     unit_metric: str | None = None
     multiplication_factor: Callable[[float], float] | float | None = None
@@ -89,49 +91,64 @@ class TomorrowioSensorEntityDescription(SensorEntityDescription):
                 "they must both be None"
             )
 
+        if self.value_map is not None:
+            options = [item.name.lower() for item in self.value_map]
+            object.__setattr__(self, "device_class", SensorDeviceClass.ENUM)
+            object.__setattr__(self, "options", options)
+
 
 # From https://cfpub.epa.gov/ncer_abstracts/index.cfm/fuseaction/display.files/fileID/14285
 # x ug/m^3 = y ppb * molecular weight / 24.45
-def convert_ppb_to_ugm3(molecular_weight: int | float) -> Callable[[float], float]:
+def convert_ppb_to_ugm3(molecular_weight: float) -> Callable[[float], float]:
     """Return function to convert ppb to ug/m^3."""
     return lambda x: (x * molecular_weight) / 24.45
 
 
 SENSOR_TYPES = (
     TomorrowioSensorEntityDescription(
-        key=TMRW_ATTR_FEELS_LIKE,
-        name="Feels Like",
+        key="feels_like",
+        translation_key="feels_like",
+        attribute=TMRW_ATTR_FEELS_LIKE,
         native_unit_of_measurement=UnitOfTemperature.CELSIUS,
         device_class=SensorDeviceClass.TEMPERATURE,
+        state_class=SensorStateClass.MEASUREMENT,
     ),
     TomorrowioSensorEntityDescription(
-        key=TMRW_ATTR_DEW_POINT,
-        name="Dew Point",
+        key="dew_point",
+        translation_key="dew_point",
+        attribute=TMRW_ATTR_DEW_POINT,
         native_unit_of_measurement=UnitOfTemperature.CELSIUS,
         device_class=SensorDeviceClass.TEMPERATURE,
+        state_class=SensorStateClass.MEASUREMENT,
     ),
     # Data comes in as hPa
     TomorrowioSensorEntityDescription(
-        key=TMRW_ATTR_PRESSURE_SURFACE_LEVEL,
-        name="Pressure (Surface Level)",
+        key="pressure_surface_level",
+        attribute=TMRW_ATTR_PRESSURE_SURFACE_LEVEL,
         native_unit_of_measurement=UnitOfPressure.HPA,
         device_class=SensorDeviceClass.PRESSURE,
+        state_class=SensorStateClass.MEASUREMENT,
     ),
     # Data comes in as W/m^2, convert to BTUs/(hr * ft^2) for imperial
     # https://www.theunitconverter.com/watt-square-meter-to-btu-hour-square-foot-conversion/
     TomorrowioSensorEntityDescription(
-        key=TMRW_ATTR_SOLAR_GHI,
-        name="Global Horizontal Irradiance",
-        unit_imperial=IRRADIATION_BTUS_PER_HOUR_SQUARE_FOOT,
-        unit_metric=IRRADIATION_WATTS_PER_SQUARE_METER,
+        key="global_horizontal_irradiance",
+        attribute=TMRW_ATTR_SOLAR_GHI,
+        unit_imperial=UnitOfIrradiance.BTUS_PER_HOUR_SQUARE_FOOT,
+        unit_metric=UnitOfIrradiance.WATTS_PER_SQUARE_METER,
         imperial_conversion=(1 / 3.15459),
+        device_class=SensorDeviceClass.IRRADIANCE,
+        state_class=SensorStateClass.MEASUREMENT,
     ),
     # Data comes in as km, convert to miles for imperial
     TomorrowioSensorEntityDescription(
-        key=TMRW_ATTR_CLOUD_BASE,
-        name="Cloud Base",
+        key="cloud_base",
+        translation_key="cloud_base",
+        attribute=TMRW_ATTR_CLOUD_BASE,
         unit_imperial=UnitOfLength.MILES,
         unit_metric=UnitOfLength.KILOMETERS,
+        device_class=SensorDeviceClass.DISTANCE,
+        state_class=SensorStateClass.MEASUREMENT,
         imperial_conversion=lambda val: DistanceConverter.convert(
             val,
             UnitOfLength.KILOMETERS,
@@ -140,10 +157,13 @@ SENSOR_TYPES = (
     ),
     # Data comes in as km, convert to miles for imperial
     TomorrowioSensorEntityDescription(
-        key=TMRW_ATTR_CLOUD_CEILING,
-        name="Cloud Ceiling",
+        key="cloud_ceiling",
+        translation_key="cloud_ceiling",
+        attribute=TMRW_ATTR_CLOUD_CEILING,
         unit_imperial=UnitOfLength.MILES,
         unit_metric=UnitOfLength.KILOMETERS,
+        device_class=SensorDeviceClass.DISTANCE,
+        state_class=SensorStateClass.MEASUREMENT,
         imperial_conversion=lambda val: DistanceConverter.convert(
             val,
             UnitOfLength.KILOMETERS,
@@ -151,153 +171,179 @@ SENSOR_TYPES = (
         ),
     ),
     TomorrowioSensorEntityDescription(
-        key=TMRW_ATTR_CLOUD_COVER,
-        name="Cloud Cover",
-        native_unit_of_measurement=PERCENTAGE,
+        key="cloud_cover",
+        translation_key="cloud_cover",
+        attribute=TMRW_ATTR_CLOUD_COVER,
+        native_unit_of_measurement=UnitOfRatio.PERCENTAGE,
     ),
     # Data comes in as m/s, convert to mi/h for imperial
     TomorrowioSensorEntityDescription(
-        key=TMRW_ATTR_WIND_GUST,
-        name="Wind Gust",
+        key="wind_gust",
+        translation_key="wind_gust",
+        attribute=TMRW_ATTR_WIND_GUST,
         unit_imperial=UnitOfSpeed.MILES_PER_HOUR,
         unit_metric=UnitOfSpeed.METERS_PER_SECOND,
+        device_class=SensorDeviceClass.SPEED,
+        state_class=SensorStateClass.MEASUREMENT,
         imperial_conversion=lambda val: SpeedConverter.convert(
             val, UnitOfSpeed.METERS_PER_SECOND, UnitOfSpeed.MILES_PER_HOUR
         ),
     ),
     TomorrowioSensorEntityDescription(
-        key=TMRW_ATTR_PRECIPITATION_TYPE,
-        name="Precipitation Type",
+        key="precipitation_type",
+        translation_key="precipitation_type",
+        attribute=TMRW_ATTR_PRECIPITATION_TYPE,
         value_map=PrecipitationType,
-        device_class="tomorrowio__precipitation_type",
-        icon="mdi:weather-snowy-rainy",
     ),
-    # Data comes in as ppb, convert to µg/m^3
+    # Data comes in as ppb, convert to μg/m^3
     # Molecular weight of Ozone is 48
     TomorrowioSensorEntityDescription(
-        key=TMRW_ATTR_OZONE,
-        name="Ozone",
-        native_unit_of_measurement=CONCENTRATION_MICROGRAMS_PER_CUBIC_METER,
+        key="ozone",
+        attribute=TMRW_ATTR_OZONE,
+        native_unit_of_measurement=UnitOfDensity.MICROGRAMS_PER_CUBIC_METER,
         multiplication_factor=convert_ppb_to_ugm3(48),
         device_class=SensorDeviceClass.OZONE,
+        state_class=SensorStateClass.MEASUREMENT,
     ),
     TomorrowioSensorEntityDescription(
-        key=TMRW_ATTR_PARTICULATE_MATTER_25,
-        name="Particulate Matter < 2.5 μm",
-        native_unit_of_measurement=CONCENTRATION_MICROGRAMS_PER_CUBIC_METER,
+        key="particulate_matter_2_5_mm",
+        attribute=TMRW_ATTR_PARTICULATE_MATTER_25,
+        native_unit_of_measurement=UnitOfDensity.MICROGRAMS_PER_CUBIC_METER,
         device_class=SensorDeviceClass.PM25,
+        state_class=SensorStateClass.MEASUREMENT,
     ),
     TomorrowioSensorEntityDescription(
-        key=TMRW_ATTR_PARTICULATE_MATTER_10,
-        name="Particulate Matter < 10 μm",
-        native_unit_of_measurement=CONCENTRATION_MICROGRAMS_PER_CUBIC_METER,
+        key="particulate_matter_10_mm",
+        attribute=TMRW_ATTR_PARTICULATE_MATTER_10,
+        native_unit_of_measurement=UnitOfDensity.MICROGRAMS_PER_CUBIC_METER,
         device_class=SensorDeviceClass.PM10,
+        state_class=SensorStateClass.MEASUREMENT,
     ),
-    # Data comes in as ppb, convert to µg/m^3
+    # Data comes in as ppb, convert to μg/m^3
     # Molecular weight of Nitrogen Dioxide is 46.01
     TomorrowioSensorEntityDescription(
-        key=TMRW_ATTR_NITROGEN_DIOXIDE,
-        name="Nitrogen Dioxide",
-        native_unit_of_measurement=CONCENTRATION_MICROGRAMS_PER_CUBIC_METER,
+        key="nitrogen_dioxide",
+        attribute=TMRW_ATTR_NITROGEN_DIOXIDE,
+        native_unit_of_measurement=UnitOfDensity.MICROGRAMS_PER_CUBIC_METER,
         multiplication_factor=convert_ppb_to_ugm3(46.01),
         device_class=SensorDeviceClass.NITROGEN_DIOXIDE,
+        state_class=SensorStateClass.MEASUREMENT,
     ),
     # Data comes in as ppb, convert to ppm
     TomorrowioSensorEntityDescription(
-        key=TMRW_ATTR_CARBON_MONOXIDE,
-        name="Carbon Monoxide",
-        native_unit_of_measurement=CONCENTRATION_PARTS_PER_MILLION,
+        key="carbon_monoxide",
+        attribute=TMRW_ATTR_CARBON_MONOXIDE,
+        native_unit_of_measurement=UnitOfRatio.PARTS_PER_MILLION,
         multiplication_factor=1 / 1000,
         device_class=SensorDeviceClass.CO,
+        state_class=SensorStateClass.MEASUREMENT,
     ),
-    # Data comes in as ppb, convert to µg/m^3
+    # Data comes in as ppb, convert to μg/m^3
     # Molecular weight of Sulphur Dioxide is 64.07
     TomorrowioSensorEntityDescription(
-        key=TMRW_ATTR_SULPHUR_DIOXIDE,
-        name="Sulphur Dioxide",
-        native_unit_of_measurement=CONCENTRATION_MICROGRAMS_PER_CUBIC_METER,
+        key="sulphur_dioxide",
+        attribute=TMRW_ATTR_SULPHUR_DIOXIDE,
+        native_unit_of_measurement=UnitOfDensity.MICROGRAMS_PER_CUBIC_METER,
         multiplication_factor=convert_ppb_to_ugm3(64.07),
         device_class=SensorDeviceClass.SULPHUR_DIOXIDE,
+        state_class=SensorStateClass.MEASUREMENT,
     ),
     TomorrowioSensorEntityDescription(
-        key=TMRW_ATTR_EPA_AQI,
-        name="US EPA Air Quality Index",
+        key="us_epa_air_quality_index",
+        translation_key="us_epa_air_quality_index",
+        attribute=TMRW_ATTR_EPA_AQI,
         device_class=SensorDeviceClass.AQI,
+        state_class=SensorStateClass.MEASUREMENT,
     ),
     TomorrowioSensorEntityDescription(
-        key=TMRW_ATTR_EPA_PRIMARY_POLLUTANT,
-        name="US EPA Primary Pollutant",
+        key="us_epa_primary_pollutant",
+        translation_key="primary_pollutant",
+        attribute=TMRW_ATTR_EPA_PRIMARY_POLLUTANT,
         value_map=PrimaryPollutantType,
     ),
     TomorrowioSensorEntityDescription(
-        key=TMRW_ATTR_EPA_HEALTH_CONCERN,
-        name="US EPA Health Concern",
+        key="us_epa_health_concern",
+        translation_key="health_concern",
+        attribute=TMRW_ATTR_EPA_HEALTH_CONCERN,
         value_map=HealthConcernType,
-        device_class="tomorrowio__health_concern",
-        icon="mdi:hospital",
     ),
     TomorrowioSensorEntityDescription(
-        key=TMRW_ATTR_CHINA_AQI,
-        name="China MEP Air Quality Index",
+        key="china_mep_air_quality_index",
+        translation_key="china_mep_air_quality_index",
+        attribute=TMRW_ATTR_CHINA_AQI,
         device_class=SensorDeviceClass.AQI,
     ),
     TomorrowioSensorEntityDescription(
-        key=TMRW_ATTR_CHINA_PRIMARY_POLLUTANT,
-        name="China MEP Primary Pollutant",
+        key="china_mep_primary_pollutant",
+        translation_key="china_mep_primary_pollutant",
+        attribute=TMRW_ATTR_CHINA_PRIMARY_POLLUTANT,
         value_map=PrimaryPollutantType,
     ),
     TomorrowioSensorEntityDescription(
-        key=TMRW_ATTR_CHINA_HEALTH_CONCERN,
-        name="China MEP Health Concern",
+        key="china_mep_health_concern",
+        translation_key="china_mep_health_concern",
+        attribute=TMRW_ATTR_CHINA_HEALTH_CONCERN,
         value_map=HealthConcernType,
-        device_class="tomorrowio__health_concern",
-        icon="mdi:hospital",
     ),
     TomorrowioSensorEntityDescription(
-        key=TMRW_ATTR_POLLEN_TREE,
-        name="Tree Pollen Index",
+        key="tree_pollen_index",
+        translation_key="pollen_index",
+        attribute=TMRW_ATTR_POLLEN_TREE,
         value_map=PollenIndex,
-        device_class="tomorrowio__pollen_index",
-        icon="mdi:flower-pollen",
     ),
     TomorrowioSensorEntityDescription(
-        key=TMRW_ATTR_POLLEN_WEED,
-        name="Weed Pollen Index",
+        key="weed_pollen_index",
+        translation_key="weed_pollen_index",
+        attribute=TMRW_ATTR_POLLEN_WEED,
         value_map=PollenIndex,
-        device_class="tomorrowio__pollen_index",
-        icon="mdi:flower-pollen",
     ),
     TomorrowioSensorEntityDescription(
-        key=TMRW_ATTR_POLLEN_GRASS,
-        name="Grass Pollen Index",
+        key="grass_pollen_index",
+        translation_key="grass_pollen_index",
+        attribute=TMRW_ATTR_POLLEN_GRASS,
         value_map=PollenIndex,
-        device_class="tomorrowio__pollen_index",
-        icon="mdi:flower-pollen",
     ),
     TomorrowioSensorEntityDescription(
-        TMRW_ATTR_FIRE_INDEX,
-        name="Fire Index",
-        icon="mdi:fire",
+        key="fire_index",
+        translation_key="fire_index",
+        attribute=TMRW_ATTR_FIRE_INDEX,
+    ),
+    TomorrowioSensorEntityDescription(
+        key="uv_index",
+        translation_key="uv_index",
+        attribute=TMRW_ATTR_UV_INDEX,
+        state_class=SensorStateClass.MEASUREMENT,
+    ),
+    TomorrowioSensorEntityDescription(
+        key="uv_radiation_health_concern",
+        translation_key="uv_radiation_health_concern",
+        attribute=TMRW_ATTR_UV_HEALTH_CONCERN,
+        value_map=UVDescription,
     ),
 )
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    config_entry: TomorrowioConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up a config entry."""
-    coordinator = hass.data[DOMAIN][config_entry.data[CONF_API_KEY]]
-    entities = [
-        TomorrowioSensorEntity(hass, config_entry, coordinator, 4, description)
-        for description in SENSOR_TYPES
-    ]
-    async_add_entities(entities)
+    coordinator = config_entry.runtime_data
+    for subentry in config_entry.get_subentries_of_type(SUBENTRY_TYPE_LOCATION):
+        async_add_entities(
+            (
+                TomorrowioSensorEntity(
+                    hass, config_entry, subentry, coordinator, 4, description
+                )
+                for description in SENSOR_TYPES
+            ),
+            config_subentry_id=subentry.subentry_id,
+        )
 
 
 def handle_conversion(
-    value: float | int, conversion: Callable[[float], float] | float
+    value: float, conversion: Callable[[float], float] | float
 ) -> float:
     """Handle conversion of a value based on conversion type."""
     if callable(conversion):
@@ -315,18 +361,16 @@ class BaseTomorrowioSensorEntity(TomorrowioEntity, SensorEntity):
     def __init__(
         self,
         hass: HomeAssistant,
-        config_entry: ConfigEntry,
+        config_entry: TomorrowioConfigEntry,
+        subentry: ConfigSubentry,
         coordinator: TomorrowioDataUpdateCoordinator,
         api_version: int,
         description: TomorrowioSensorEntityDescription,
     ) -> None:
         """Initialize Tomorrow.io Sensor Entity."""
-        super().__init__(config_entry, coordinator, api_version)
+        super().__init__(config_entry, subentry, coordinator, api_version)
         self.entity_description = description
-        self._attr_name = f"{self._config_entry.data[CONF_NAME]} - {description.name}"
-        self._attr_unique_id = (
-            f"{self._config_entry.unique_id}_{slugify(description.name)}"
-        )
+        self._attr_unique_id = f"{async_get_base_unique_id(config_entry.data[CONF_API_KEY], subentry.data[CONF_LOCATION])}_{description.key}"
         if self.entity_description.native_unit_of_measurement is None:
             self._attr_native_unit_of_measurement = description.unit_metric
             if hass.config.units is US_CUSTOMARY_SYSTEM:
@@ -338,6 +382,7 @@ class BaseTomorrowioSensorEntity(TomorrowioEntity, SensorEntity):
         """Return the raw state."""
 
     @property
+    @override
     def native_value(self) -> str | int | float | None:
         """Return the state."""
         state = self._state
@@ -369,8 +414,9 @@ class TomorrowioSensorEntity(BaseTomorrowioSensorEntity):
     """Sensor entity that talks to Tomorrow.io v4 API to retrieve non-weather data."""
 
     @property
+    @override
     def _state(self) -> int | float | None:
         """Return the raw state."""
-        val = self._get_current_property(self.entity_description.key)
+        val = self._get_current_property(self.entity_description.attribute)
         assert not isinstance(val, str)
         return val

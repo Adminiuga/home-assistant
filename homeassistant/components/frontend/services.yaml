@@ -1,28 +1,17 @@
 # Describes the format for available frontend services
 
 set_theme:
-  name: Set theme
-  description: Set a theme unless the client selected per-device theme.
   fields:
     name:
-      name: Theme
-      description: Name of a predefined theme
-      required: true
+      required: false
       example: "default"
       selector:
         theme:
-    mode:
-      name: Mode
-      description: The mode the theme is for.
-      default: "light"
+          include_default: true
+    name_dark:
+      required: false
+      example: "default"
       selector:
-        select:
-          options:
-            - label: "Dark"
-              value: "dark"
-            - label: "Light"
-              value: "light"
-
+        theme:
+          include_default: true
 reload_themes:
-  name: Reload themes
-  description: Reload themes from YAML configuration.

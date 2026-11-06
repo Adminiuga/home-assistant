@@ -1,12 +1,14 @@
 """Config flow for Panasonic Viera TV integration."""
+
 from functools import partial
 import logging
+from typing import Any, override
 from urllib.error import URLError
 
 from panasonic_viera import TV_TYPE_ENCRYPTED, RemoteControl, SOAPError
-import voluptuous as vol
+import probatio
 
-from homeassistant import config_entries
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_HOST, CONF_NAME, CONF_PIN, CONF_PORT
 
 from .const import (
@@ -25,46 +27,55 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 
-class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
+def _create_remote_and_get_device_info(
+    host: str, port: int
+) -> tuple[RemoteControl, dict[str, Any]]:
+    """Create the remote and fetch the device info."""
+    remote = RemoteControl(host, port)
+    return remote, remote.get_device_info()
+
+
+class PanasonicVieraConfigFlow(ConfigFlow, domain=DOMAIN):
     """Config flow for Panasonic Viera."""
 
     VERSION = 1
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize the Panasonic Viera config flow."""
-        self._data = {
+        self._data: dict[str, Any] = {
             CONF_HOST: None,
-            CONF_NAME: None,
             CONF_PORT: None,
             CONF_ON_ACTION: None,
             ATTR_DEVICE_INFO: None,
         }
 
-        self._remote = None
+        self._remote: RemoteControl | None = None
 
-    async def async_step_user(self, user_input=None):
+    @override
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle the initial step."""
-        errors = {}
+        errors: dict[str, str] = {}
 
         if user_input is not None:
             await self.async_load_data(user_input)
             try:
-                self._remote = await self.hass.async_add_executor_job(
-                    partial(RemoteControl, self._data[CONF_HOST], self._data[CONF_PORT])
-                )
-
-                self._data[ATTR_DEVICE_INFO] = await self.hass.async_add_executor_job(
-                    self._remote.get_device_info
+                remote, device_info = await self.hass.async_add_executor_job(
+                    _create_remote_and_get_device_info,
+                    self._data[CONF_HOST],
+                    self._data[CONF_PORT],
                 )
             except (URLError, SOAPError, OSError) as err:
                 _LOGGER.error("Could not establish remote connection: %s", err)
                 errors["base"] = "cannot_connect"
-            except Exception as err:  # pylint: disable=broad-except
-                _LOGGER.exception("An unknown error occurred: %s", err)
+            except Exception:
+                _LOGGER.exception("An unknown error occurred")
                 return self.async_abort(reason="unknown")
-
-            if "base" not in errors:
-                await self.async_set_unique_id(self._data[ATTR_DEVICE_INFO][ATTR_UDN])
+            else:
+                self._remote = remote
+                self._data[ATTR_DEVICE_INFO] = device_info
+                await self.async_set_unique_id(device_info[ATTR_UDN])
                 self._abort_if_unique_id_configured()
 
                 if self._data[CONF_NAME] == DEFAULT_NAME:
@@ -72,7 +83,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         ATTR_FRIENDLY_NAME
                     ].replace("_", " ")
 
-                if self._remote.type == TV_TYPE_ENCRYPTED:
+                if remote.type == TV_TYPE_ENCRYPTED:
                     return await self.async_step_pairing()
 
                 return self.async_create_entry(
@@ -82,28 +93,25 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="user",
-            data_schema=vol.Schema(
+            data_schema=probatio.Schema(
                 {
-                    vol.Required(
+                    probatio.Required(
                         CONF_HOST,
                         default=self._data[CONF_HOST]
                         if self._data[CONF_HOST] is not None
                         else "",
-                    ): str,
-                    vol.Optional(
-                        CONF_NAME,
-                        default=self._data[CONF_NAME]
-                        if self._data[CONF_NAME] is not None
-                        else DEFAULT_NAME,
                     ): str,
                 }
             ),
             errors=errors,
         )
 
-    async def async_step_pairing(self, user_input=None):
+    async def async_step_pairing(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle the pairing step."""
-        errors = {}
+        errors: dict[str, str] = {}
+        assert self._remote is not None
 
         if user_input is not None:
             pin = user_input[CONF_PIN]
@@ -117,8 +125,8 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             except (URLError, OSError) as err:
                 _LOGGER.error("The remote connection was lost: %s", err)
                 return self.async_abort(reason="cannot_connect")
-            except Exception as err:  # pylint: disable=broad-except
-                _LOGGER.exception("Unknown error: %s", err)
+            except Exception:
+                _LOGGER.exception("Unknown error")
                 return self.async_abort(reason="unknown")
 
             if "base" not in errors:
@@ -141,30 +149,31 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         except (URLError, SOAPError, OSError) as err:
             _LOGGER.error("The remote connection was lost: %s", err)
             return self.async_abort(reason="cannot_connect")
-        except Exception as err:  # pylint: disable=broad-except
-            _LOGGER.exception("Unknown error: %s", err)
+        except Exception:
+            _LOGGER.exception("Unknown error")
             return self.async_abort(reason="unknown")
 
         return self.async_show_form(
             step_id="pairing",
-            data_schema=vol.Schema({vol.Required(CONF_PIN): str}),
+            data_schema=probatio.Schema(
+                {probatio.Required(probatio.Secret(CONF_PIN)): str}
+            ),
             errors=errors,
         )
 
-    async def async_step_import(self, import_config):
+    async def async_step_import(self, import_data: dict[str, Any]) -> ConfigFlowResult:
         """Import a config entry from configuration.yaml."""
-        return await self.async_step_user(user_input=import_config)
+        return await self.async_step_user(user_input=import_data)
 
-    async def async_load_data(self, config):
+    async def async_load_data(self, config: dict[str, Any]) -> None:
         """Load the data."""
         self._data = config
 
-        self._data[CONF_PORT] = (
-            self._data[CONF_PORT] if CONF_PORT in self._data else DEFAULT_PORT
-        )
-        self._data[CONF_ON_ACTION] = (
-            self._data[CONF_ON_ACTION] if CONF_ON_ACTION in self._data else None
-        )
+        self._data[CONF_NAME] = self._data.get(CONF_NAME, DEFAULT_NAME)
+        self._data[CONF_PORT] = self._data.get(CONF_PORT, DEFAULT_PORT)
+        self._data[CONF_ON_ACTION] = self._data.get(CONF_ON_ACTION)
 
+        # Uses the host/IP value from CONF_HOST as unique ID, which is no longer allowed
+        # pylint: disable-next=home-assistant-unique-id-ip-based
         await self.async_set_unique_id(self._data[CONF_HOST])
         self._abort_if_unique_id_configured()

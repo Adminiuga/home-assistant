@@ -1,59 +1,31 @@
 """Support for LaMetric time."""
-import voluptuous as vol
 
 from homeassistant.components import notify as hass_notify
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_CLIENT_ID, CONF_CLIENT_SECRET, CONF_NAME, Platform
+from homeassistant.const import CONF_NAME, Platform
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers import discovery
-import homeassistant.helpers.config_validation as cv
-from homeassistant.helpers.issue_registry import IssueSeverity, async_create_issue
+from homeassistant.helpers import config_validation as cv, discovery
 from homeassistant.helpers.typing import ConfigType
 
 from .const import DOMAIN, PLATFORMS
-from .coordinator import LaMetricDataUpdateCoordinator
+from .coordinator import LaMetricConfigEntry, LaMetricDataUpdateCoordinator
 from .services import async_setup_services
 
-CONFIG_SCHEMA = vol.Schema(
-    vol.All(
-        cv.deprecated(DOMAIN),
-        {
-            DOMAIN: vol.Schema(
-                {
-                    vol.Required(CONF_CLIENT_ID): cv.string,
-                    vol.Required(CONF_CLIENT_SECRET): cv.string,
-                }
-            )
-        },
-    ),
-    extra=vol.ALLOW_EXTRA,
-)
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the LaMetric integration."""
     async_setup_services(hass)
-    hass.data[DOMAIN] = {"hass_config": config}
-    if DOMAIN in config:
-        async_create_issue(
-            hass,
-            DOMAIN,
-            "manual_migration",
-            breaks_in_ha_version="2022.9.0",
-            is_fixable=False,
-            severity=IssueSeverity.ERROR,
-            translation_key="manual_migration",
-        )
 
     return True
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_setup_entry(hass: HomeAssistant, entry: LaMetricConfigEntry) -> None:
     """Set up LaMetric from a config entry."""
     coordinator = LaMetricDataUpdateCoordinator(hass, entry)
     await coordinator.async_config_entry_first_refresh()
 
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+    entry.runtime_data = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     # Set up notify platform, no entry support for notify component yet,
@@ -64,15 +36,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             Platform.NOTIFY,
             DOMAIN,
             {CONF_NAME: coordinator.data.name, "entry_id": entry.entry_id},
-            hass.data[DOMAIN]["hass_config"],
+            {},
         )
     )
-    return True
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_unload_entry(hass: HomeAssistant, entry: LaMetricConfigEntry) -> None:
     """Unload LaMetric config entry."""
-    if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
-        del hass.data[DOMAIN][entry.entry_id]
-        await hass_notify.async_reload(hass, DOMAIN)
-    return unload_ok
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)
+    await hass_notify.async_reload(hass, DOMAIN)

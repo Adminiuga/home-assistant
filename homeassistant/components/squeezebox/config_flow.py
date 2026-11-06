@@ -1,150 +1,285 @@
-"""Config flow for Logitech Squeezebox integration."""
+"""Config flow for Squeezebox integration."""
+
 import asyncio
+from collections.abc import Mapping
 from http import HTTPStatus
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, override
 
+import probatio
 from pysqueezebox import Server, async_discover
-import voluptuous as vol
 
-from homeassistant import config_entries, data_entry_flow
-from homeassistant.components import dhcp
 from homeassistant.components.media_player import DOMAIN as MP_DOMAIN
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult, OptionsFlow
 from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_PORT, CONF_USERNAME
+from homeassistant.core import callback
+from homeassistant.data_entry_flow import AbortFlow
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.device_registry import format_mac
-from homeassistant.helpers.entity_registry import async_get
+from homeassistant.helpers.selector import (
+    NumberSelector,
+    NumberSelectorConfig,
+    NumberSelectorMode,
+)
+from homeassistant.helpers.service_info.dhcp import DhcpServiceInfo
 
-from .const import DEFAULT_PORT, DOMAIN
+from . import SqueezeboxConfigEntry
+from .const import (
+    CONF_BROWSE_LIMIT,
+    CONF_HTTPS,
+    CONF_SERVER_LIST,
+    CONF_VOLUME_STEP,
+    DEFAULT_BROWSE_LIMIT,
+    DEFAULT_PORT,
+    DEFAULT_VOLUME_STEP,
+    DOMAIN,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
 TIMEOUT = 5
 
 
-def _base_schema(discovery_info=None):
-    """Generate base schema."""
-    base_schema = {}
-    if discovery_info and CONF_HOST in discovery_info:
-        base_schema.update(
-            {
-                vol.Required(
-                    CONF_HOST,
-                    description={"suggested_value": discovery_info[CONF_HOST]},
-                ): str,
-            }
-        )
-    else:
-        base_schema.update({vol.Required(CONF_HOST): str})
+FULL_EDIT_SCHEMA = probatio.Schema(
+    {
+        probatio.Required(CONF_HOST): str,
+        probatio.Required(CONF_PORT, default=DEFAULT_PORT): int,
+        probatio.Optional(CONF_USERNAME): str,
+        probatio.Optional(probatio.Secret(CONF_PASSWORD)): str,
+        probatio.Optional(CONF_HTTPS, default=False): bool,
+    }
+)
 
-    if discovery_info and CONF_PORT in discovery_info:
-        base_schema.update(
-            {
-                vol.Required(
-                    CONF_PORT,
-                    default=DEFAULT_PORT,
-                    description={"suggested_value": discovery_info[CONF_PORT]},
-                ): int,
-            }
-        )
-    else:
-        base_schema.update({vol.Required(CONF_PORT, default=DEFAULT_PORT): int})
-    base_schema.update(
-        {vol.Optional(CONF_USERNAME): str, vol.Optional(CONF_PASSWORD): str}
-    )
-    return vol.Schema(base_schema)
+SHORT_EDIT_SCHEMA = probatio.Schema(
+    {
+        probatio.Optional(CONF_USERNAME): str,
+        probatio.Optional(probatio.Secret(CONF_PASSWORD)): str,
+        probatio.Optional(CONF_HTTPS, default=False): bool,
+    }
+)
+
+REAUTH_SCHEMA = probatio.Schema(
+    {
+        probatio.Optional(CONF_USERNAME): str,
+        probatio.Optional(probatio.Secret(CONF_PASSWORD)): str,
+    }
+)
 
 
-class SqueezeboxConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
-    """Handle a config flow for Logitech Squeezebox."""
+class SqueezeboxConfigFlow(ConfigFlow, domain=DOMAIN):
+    """Handle a config flow for Squeezebox."""
 
     VERSION = 1
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize an instance of the squeezebox config flow."""
-        self.data_schema = _base_schema()
-        self.discovery_info = None
+        self.discovery_task: asyncio.Task | None = None
+        self.discovered_servers: list[dict[str, Any]] = []
+        self.chosen_server: dict[str, Any] = {}
 
-    async def _discover(self, uuid=None):
+    @staticmethod
+    @callback
+    @override
+    def async_get_options_flow(
+        config_entry: SqueezeboxConfigEntry,
+    ) -> OptionsFlowHandler:
+        """Get the options flow for this handler."""
+        return OptionsFlowHandler()
+
+    async def _discover(self) -> None:
         """Discover an unconfigured LMS server."""
-        self.discovery_info = None
-        discovery_event = asyncio.Event()
+        # Reset discovery state to avoid stale or duplicate servers across runs
+        self.discovered_servers = []
+        self.chosen_server = {}
+        _discovery_task: asyncio.Task | None = None
 
-        def _discovery_callback(server):
+        def _discovery_callback(server: Server) -> None:
+            _discovery_info: dict[str, Any] | None = {}
             if server.uuid:
                 # ignore already configured uuids
                 for entry in self._async_current_entries():
                     if entry.unique_id == server.uuid:
                         return
-                self.discovery_info = {
+                _discovery_info = {
                     CONF_HOST: server.host,
                     CONF_PORT: int(server.port),
                     "uuid": server.uuid,
+                    "name": server.name,
                 }
-                _LOGGER.debug("Discovered server: %s", self.discovery_info)
-                discovery_event.set()
 
-        discovery_task = self.hass.async_create_task(
+                _LOGGER.debug(
+                    "Discovered server: %s, creating discovery_info %s",
+                    server,
+                    _discovery_info,
+                )
+                if _discovery_info not in self.discovered_servers:
+                    self.discovered_servers.append(_discovery_info)
+
+        _discovery_task = self.hass.async_create_task(
             async_discover(_discovery_callback)
         )
 
-        await discovery_event.wait()
-        discovery_task.cancel()  # stop searching as soon as we find server
+        await asyncio.sleep(TIMEOUT)
 
-        # update with suggested values from discovery
-        self.data_schema = _base_schema(self.discovery_info)
+        _LOGGER.debug("Discovered Servers %s", self.discovered_servers)
+        _discovery_task.cancel()
 
-    async def _validate_input(self, data):
-        """
-        Validate the user input allows us to connect.
-
-        Retrieve unique id and abort if already configured.
-        """
+    async def _async_query_status(
+        self, data: Mapping[str, Any]
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        """Query the server status, returning the status or an error key."""
         server = Server(
             async_get_clientsession(self.hass),
             data[CONF_HOST],
             data[CONF_PORT],
             data.get(CONF_USERNAME),
             data.get(CONF_PASSWORD),
+            https=data.get(CONF_HTTPS, False),
         )
 
         try:
             status = await server.async_query("serverstatus")
             if not status:
                 if server.http_status == HTTPStatus.UNAUTHORIZED:
-                    return "invalid_auth"
-                return "cannot_connect"
-        except Exception:  # pylint: disable=broad-except
-            return "unknown"
+                    return None, "invalid_auth"
+                return None, "cannot_connect"
+        except Exception:
+            _LOGGER.exception("Unknown exception while validating connection")
+            return None, "unknown"
 
-        if "uuid" in status:
-            await self.async_set_unique_id(status["uuid"])
-            self._abort_if_unique_id_configured()
+        if "uuid" not in status:
+            _LOGGER.exception("Discovered server did not provide a uuid")
+            return None, "missing_uuid"
 
-    async def async_step_user(self, user_input=None):
-        """Handle a flow initialized by the user."""
-        errors = {}
-        if user_input and CONF_HOST in user_input:
-            # update with host provided by user
-            self.data_schema = _base_schema(user_input)
-            return await self.async_step_edit()
+        return status, None
 
-        # no host specified, see if we can discover an unconfigured LMS server
-        try:
-            await asyncio.wait_for(self._discover(), timeout=TIMEOUT)
-            return await self.async_step_edit()
-        except asyncio.TimeoutError:
-            errors["base"] = "no_server_found"
+    async def _validate_input(self, data: dict[str, Any]) -> str | None:
+        """Validate the user input allows us to connect.
 
-        # display the form
+        Retrieve unique id and abort if already configured.
+        """
+        status, error = await self._async_query_status(data)
+        if status is None:
+            return error
+
+        await self.async_set_unique_id(status["uuid"])
+        self._abort_if_unique_id_configured()
+
+        return None
+
+    async def async_step_reauth(
+        self, entry_data: Mapping[str, Any]
+    ) -> ConfigFlowResult:
+        """Handle reauthentication when credentials are rejected."""
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Ask for new credentials."""
+        entry = self._get_reauth_entry()
+        self.context["title_placeholders"] = {"host": entry.data[CONF_HOST]}
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            new_data = {
+                **entry.data,
+                CONF_USERNAME: user_input.get(CONF_USERNAME),
+                CONF_PASSWORD: user_input.get(CONF_PASSWORD),
+            }
+            status, error = await self._async_query_status(new_data)
+            if status is None:
+                errors["base"] = error or "unknown"
+            else:
+                await self.async_set_unique_id(status["uuid"])
+                self._abort_if_unique_id_mismatch()
+                return self.async_update_reload_and_abort(entry, data=new_data)
+
         return self.async_show_form(
-            step_id="user",
-            data_schema=vol.Schema({vol.Optional(CONF_HOST): str}),
+            step_id="reauth_confirm",
+            data_schema=self.add_suggested_values_to_schema(
+                REAUTH_SCHEMA, {CONF_USERNAME: entry.data.get(CONF_USERNAME)}
+            ),
+            description_placeholders={"host": entry.data[CONF_HOST]},
             errors=errors,
         )
 
-    async def async_step_edit(self, user_input=None):
+    async def async_step_choose_server(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Choose manual or discover flow."""
+        _chosen_host: str
+
+        if user_input:
+            _chosen_host = user_input[CONF_SERVER_LIST]
+            for _server in self.discovered_servers:
+                if _chosen_host == _server[CONF_HOST]:
+                    self.chosen_server[CONF_HOST] = _chosen_host
+                    self.chosen_server[CONF_PORT] = _server[CONF_PORT]
+                    self.chosen_server[CONF_HTTPS] = False
+            return await self.async_step_edit_discovered()
+
+        _options = {
+            _server[CONF_HOST]: f"{_server['name']} ({_server[CONF_HOST]})"
+            for _server in self.discovered_servers
+        }
+        return self.async_show_form(
+            step_id="choose_server",
+            data_schema=probatio.Schema(
+                {probatio.Required(CONF_SERVER_LIST): probatio.In(_options)}
+            ),
+        )
+
+    @override
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle a flow initialized by the user."""
+
+        return self.async_show_menu(
+            step_id="user", menu_options=["start_discovery", "edit"]
+        )
+
+    async def async_step_discovery_failed(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle a failed discovery."""
+
+        return self.async_show_menu(step_id="discovery_failed", menu_options=["edit"])
+
+    async def async_step_start_discovery(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle a flow initialized by the user."""
+
+        if not self.discovery_task:
+            self.discovery_task = self.hass.async_create_task(self._discover())
+
+        if self.discovery_task.done():
+            self.discovery_task.cancel()
+            self.discovery_task = None
+            # Sleep to allow task cancellation to complete
+
+            await asyncio.sleep(0.1)
+
+            return self.async_show_progress_done(
+                next_step_id="choose_server"
+                if self.discovered_servers
+                else "discovery_failed"
+            )
+
+        return self.async_show_progress(
+            step_id="start_discovery",
+            progress_action="start_discovery",
+            progress_task=self.discovery_task,
+        )
+
+    async def async_step_edit(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Edit a discovered or manually inputted server."""
+
         errors = {}
         if user_input:
             error = await self._validate_input(user_input)
@@ -155,49 +290,160 @@ class SqueezeboxConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             errors["base"] = error
 
         return self.async_show_form(
-            step_id="edit", data_schema=self.data_schema, errors=errors
+            step_id="edit",
+            data_schema=FULL_EDIT_SCHEMA,
+            errors=errors,
         )
 
-    async def async_step_integration_discovery(self, discovery_info):
+    async def async_step_edit_discovered(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Edit a discovered or manually inputted server."""
+
+        if not (await self._validate_input(self.chosen_server)):
+            # Attempt to connect with default data successful
+            return self.async_create_entry(
+                title=self.chosen_server[CONF_HOST], data=self.chosen_server
+            )
+        errors = {}
+        if user_input:
+            user_input[CONF_HOST] = self.chosen_server[CONF_HOST]
+            user_input[CONF_PORT] = self.chosen_server[CONF_PORT]
+            error = await self._validate_input(user_input)
+            if not error:
+                return self.async_create_entry(
+                    title=user_input[CONF_HOST], data=user_input
+                )
+            errors["base"] = error
+
+        return self.async_show_form(
+            step_id="edit_discovered",
+            description_placeholders={
+                "host": self.chosen_server[CONF_HOST],
+                "port": self.chosen_server[CONF_PORT],
+            },
+            data_schema=SHORT_EDIT_SCHEMA,
+            errors=errors,
+        )
+
+    async def async_step_edit_integration_discovered(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Edit a discovered or manually inputted server."""
+
+        errors = {}
+        if user_input:
+            user_input[CONF_HOST] = self.chosen_server[CONF_HOST]
+            user_input[CONF_PORT] = self.chosen_server[CONF_PORT]
+            error = await self._validate_input(user_input)
+            if not error:
+                return self.async_create_entry(
+                    title=user_input[CONF_HOST], data=user_input
+                )
+            errors["base"] = error
+        return self.async_show_form(
+            step_id="edit_integration_discovered",
+            description_placeholders={
+                "desc": (
+                    f"LMS Host: {self.chosen_server[CONF_HOST]},"
+                    f" Port: {self.chosen_server[CONF_PORT]}"
+                )
+            },
+            data_schema=SHORT_EDIT_SCHEMA,
+            errors=errors,
+        )
+
+    @override
+    async def async_step_integration_discovery(
+        self, _discovery_info: dict[str, Any]
+    ) -> ConfigFlowResult:
         """Handle discovery of a server."""
-        _LOGGER.debug("Reached server discovery flow with info: %s", discovery_info)
-        if "uuid" in discovery_info:
-            await self.async_set_unique_id(discovery_info.pop("uuid"))
+        _LOGGER.debug("Reached server discovery flow with info: %s", _discovery_info)
+        if "uuid" in _discovery_info:
+            await self.async_set_unique_id(_discovery_info.pop("uuid"))
             self._abort_if_unique_id_configured()
         else:
             # attempt to connect to server and determine uuid. will fail if
             # password required
-            error = await self._validate_input(discovery_info)
+            error = await self._validate_input(_discovery_info)
             if error:
                 await self._async_handle_discovery_without_unique_id()
 
-        # update schema with suggested values from discovery
-        self.data_schema = _base_schema(discovery_info)
+        self.context.update(
+            {"title_placeholders": {"host": _discovery_info[CONF_HOST]}}
+        )
+        self.chosen_server = _discovery_info
+        return await self.async_step_edit_integration_discovered()
 
-        self.context.update({"title_placeholders": {"host": discovery_info[CONF_HOST]}})
-
-        return await self.async_step_edit()
-
+    @override
     async def async_step_dhcp(
-        self, discovery_info: dhcp.DhcpServiceInfo
-    ) -> data_entry_flow.FlowResult:
+        self, _discovery_info: DhcpServiceInfo
+    ) -> ConfigFlowResult:
         """Handle dhcp discovery of a Squeezebox player."""
         _LOGGER.debug(
-            "Reached dhcp discovery of a player with info: %s", discovery_info
+            "Reached dhcp discovery of a player with info: %s", _discovery_info
         )
-        await self.async_set_unique_id(format_mac(discovery_info.macaddress))
+        await self.async_set_unique_id(format_mac(_discovery_info.macaddress))
         self._abort_if_unique_id_configured()
 
         _LOGGER.debug("Configuring dhcp player with unique id: %s", self.unique_id)
 
-        registry = async_get(self.hass)
+        registry = er.async_get(self.hass)
 
         if TYPE_CHECKING:
             assert self.unique_id
-        # if we have detected this player, do nothing. if not, there must be a server out there for us to configure, so start the normal user flow (which tries to autodetect server)
+        # if we have detected this player, do nothing. if not,
+        # there must be a server out there for us to configure,
+        # so start the normal user flow (which tries to
+        # autodetect server)
         if registry.async_get_entity_id(MP_DOMAIN, DOMAIN, self.unique_id) is not None:
             # this player is already known, so do nothing other than mark as configured
-            raise data_entry_flow.AbortFlow("already_configured")
+            raise AbortFlow("already_configured")
 
         # if the player is unknown, then we likely need to configure its server
         return await self.async_step_user()
+
+
+OPTIONS_SCHEMA = probatio.Schema(
+    {
+        probatio.Required(CONF_BROWSE_LIMIT): probatio.All(
+            NumberSelector(
+                NumberSelectorConfig(min=1, max=65534, mode=NumberSelectorMode.BOX)
+            ),
+            probatio.Coerce(int),
+        ),
+        probatio.Required(CONF_VOLUME_STEP): probatio.All(
+            NumberSelector(
+                NumberSelectorConfig(min=1, max=20, mode=NumberSelectorMode.SLIDER)
+            ),
+            probatio.Coerce(int),
+        ),
+    }
+)
+
+
+class OptionsFlowHandler(OptionsFlow):
+    """Options Flow Handler."""
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Options Flow Steps."""
+
+        if user_input is not None:
+            return self.async_create_entry(title="", data=user_input)
+
+        return self.async_show_form(
+            step_id="init",
+            data_schema=self.add_suggested_values_to_schema(
+                OPTIONS_SCHEMA,
+                {
+                    CONF_BROWSE_LIMIT: self.config_entry.options.get(
+                        CONF_BROWSE_LIMIT, DEFAULT_BROWSE_LIMIT
+                    ),
+                    CONF_VOLUME_STEP: self.config_entry.options.get(
+                        CONF_VOLUME_STEP, DEFAULT_VOLUME_STEP
+                    ),
+                },
+            ),
+        )

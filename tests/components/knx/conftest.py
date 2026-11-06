@@ -1,18 +1,36 @@
 """Conftest for the KNX integration."""
+
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Generator, Iterator
+import contextlib
+from typing import Any
 from unittest.mock import DEFAULT, AsyncMock, Mock, patch
 
+from knx_telegram_store import (
+    BufferedMemoryStore,
+    BufferedPostgresStore,
+    BufferedSqliteStore,
+)
 import pytest
+from pytest_homeassistant.common import MockConfigEntry, async_load_json_object_fixture
+from pytest_homeassistant.typing import WebSocketGenerator
 from xknx import XKNX
-from xknx.core import XknxConnectionState
+from xknx.core import XknxConnectionState, XknxConnectionType
 from xknx.dpt import DPTArray, DPTBinary
 from xknx.io import DEFAULT_MCAST_GRP, DEFAULT_MCAST_PORT
-from xknx.telegram import Telegram, TelegramDirection
+from xknx.telegram import Telegram, TelegramDirection, tpci
 from xknx.telegram.address import GroupAddress, IndividualAddress
-from xknx.telegram.apci import APCI, GroupValueRead, GroupValueResponse, GroupValueWrite
+from xknx.telegram.apci import (
+    APCI,
+    GroupValueRead,
+    GroupValueResponse,
+    GroupValueWrite,
+    SecureAPDU,
+)
 
+from homeassistant.components.knx import telegrams as knx_telegrams
 from homeassistant.components.knx.const import (
     CONF_KNX_AUTOMATIC,
     CONF_KNX_CONNECTION_TYPE,
@@ -23,12 +41,78 @@ from homeassistant.components.knx.const import (
     CONF_KNX_MCAST_PORT,
     CONF_KNX_RATE_LIMIT,
     CONF_KNX_STATE_UPDATER,
-    DOMAIN as KNX_DOMAIN,
+    CONF_KNX_TELEGRAM_DB_BACKEND,
+    CONF_KNX_TELEGRAM_DB_LOAD_HOURS,
+    CONF_KNX_TELEGRAM_DB_RETENTION_DAYS,
+    DEFAULT_ROUTING_IA,
+    DOMAIN,
+    KNX_TELEGRAM_BACKEND_SQLITE,
+    KNX_TELEGRAM_DB_RETENTION_DEFAULT,
+    KNX_TELEGRAM_LOAD_HOURS_DEFAULT,
 )
+from homeassistant.components.knx.project import STORAGE_KEY as KNX_PROJECT_STORAGE_KEY
+from homeassistant.components.knx.storage.config_store import (
+    STORAGE_KEY as KNX_CONFIG_STORAGE_KEY,
+)
+from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.typing import ConfigType
 from homeassistant.setup import async_setup_component
 
-from tests.common import MockConfigEntry
+from . import KnxEntityGenerator, KnxSuggestionGetter
+
+
+class _TestTelegramStore(BufferedMemoryStore):
+    """Drop-in for the SQL-backed stores that keeps telegrams in memory.
+
+    Avoids the per-test cost of creating a SQLAlchemy engine and an aiosqlite
+    background thread. Accepts (and ignores) the ``db_path``/``dsn`` and
+    ``retention_days`` arguments the integration passes to the SQL stores.
+    """
+
+    def __init__(
+        self,
+        *_args: Any,
+        flush_interval: float = 1.0,
+        max_buffer_size: int = 10000,
+        **_kwargs: Any,
+    ) -> None:
+        """Initialize the in-memory test store."""
+        super().__init__(flush_interval=flush_interval, max_buffer_size=max_buffer_size)
+
+
+@contextlib.contextmanager
+def _patch_telegram_store(*, real_store: bool) -> Generator:
+    """Choose the telegram store the integration builds during setup.
+
+    Default (``real_store=False``): swap in the fast in-memory store so tests
+    that don't care about telegram history skip SQLite engine and aiosqlite
+    thread setup. ``real_store=True``: build the real SQLite store (kept
+    in-memory) and the real PostgreSQL store, for tests that exercise the
+    database backends.
+    """
+    if not real_store:
+        with (
+            patch.object(knx_telegrams, "BufferedSqliteStore", _TestTelegramStore),
+            patch.object(knx_telegrams, "BufferedPostgresStore", _TestTelegramStore),
+        ):
+            yield
+        return
+
+    original_init = BufferedSqliteStore.__init__
+
+    def mocked_init(self, db_path: str, *args: Any, **kwargs: Any) -> None:
+        original_init(self, ":memory:", *args, **kwargs)
+
+    # Restore the real store classes (the autouse fixture points them at the
+    # in-memory store) and keep the SQLite database in-memory.
+    with (
+        patch.object(knx_telegrams, "BufferedSqliteStore", BufferedSqliteStore),
+        patch.object(knx_telegrams, "BufferedPostgresStore", BufferedPostgresStore),
+        patch.object(BufferedSqliteStore, "__init__", mocked_init),
+    ):
+        yield
 
 
 class KNXTestKit:
@@ -36,14 +120,20 @@ class KNXTestKit:
 
     INDIVIDUAL_ADDRESS = "1.2.3"
 
-    def __init__(self, hass: HomeAssistant, mock_config_entry: MockConfigEntry):
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        mock_config_entry: MockConfigEntry,
+        hass_storage: dict[str, Any],
+    ) -> None:
         """Init KNX test helper class."""
         self.hass: HomeAssistant = hass
         self.mock_config_entry: MockConfigEntry = mock_config_entry
+        self.hass_storage: dict[str, Any] = hass_storage
         self.xknx: XKNX
-        # outgoing telegrams will be put in the Queue instead of sent to the interface
+        # outgoing telegrams will be put in the List instead of sent to the interface
         # telegrams to an InternalGroupAddress won't be queued here
-        self._outgoing_telegrams: asyncio.Queue = asyncio.Queue()
+        self._outgoing_telegrams: list[Telegram] = []
 
     def assert_state(self, entity_id: str, state: str, **attributes) -> None:
         """Assert the state of an entity."""
@@ -52,26 +142,47 @@ class KNXTestKit:
         for attribute, value in attributes.items():
             assert test_state.attributes.get(attribute) == value
 
-    async def setup_integration(self, config):
-        """Create the KNX integration."""
+    async def setup_integration(
+        self,
+        yaml_config: ConfigType | None = None,
+        config_store_fixture: str | None = None,
+        add_entry_to_hass: bool = True,
+        state_updater: bool = True,
+        real_telegram_store: bool = False,
+        wait_for_telegram_store: bool = True,
+    ) -> None:
+        """Create the KNX integration.
+
+        By default a fast in-memory telegram store is used. Tests that exercise
+        the SQLite/PostgreSQL telegram backends pass ``real_telegram_store=True``
+        to build the real SQLite store (kept in-memory).
+
+        The telegram store initializes in a background task. By default setup
+        waits for it so tests see an initialized store; tests that exercise
+        that window pass ``wait_for_telegram_store=False``.
+        """
 
         async def patch_xknx_start():
             """Patch `xknx.start` for unittests."""
             # after XKNX.__init__() to not overwrite it by the config entry again
             # before StateUpdater starts to avoid slow down of tests
             self.xknx.rate_limit = 0
-            # set XknxConnectionState.CONNECTED to avoid `unavailable` entities at startup
+            # set XknxConnectionState.CONNECTED to avoid `unavailable`
+            # entities at startup
             # and start StateUpdater. This would be awaited on normal startup too.
-            await self.xknx.connection_manager.connection_state_changed(
-                XknxConnectionState.CONNECTED
+            self.xknx.connection_manager.connection_state_changed(
+                state=XknxConnectionState.CONNECTED,
+                connection_type=XknxConnectionType.TUNNEL_TCP,
             )
+            await self.hass.async_block_till_done()
 
         def knx_ip_interface_mock():
             """Create a xknx knx ip interface mock."""
             mock = Mock()
             mock.start = AsyncMock(side_effect=patch_xknx_start)
             mock.stop = AsyncMock()
-            mock.send_telegram = AsyncMock(side_effect=self._outgoing_telegrams.put)
+            mock.stop_reconnect = AsyncMock()
+            mock.gateway_info = AsyncMock()
             return mock
 
         def fish_xknx(*args, **kwargs):
@@ -79,38 +190,66 @@ class KNXTestKit:
             self.xknx = args[0]
             return DEFAULT
 
-        with patch(
-            "xknx.xknx.knx_interface_factory",
-            return_value=knx_ip_interface_mock(),
-            side_effect=fish_xknx,
-        ):
+        if config_store_fixture:
+            self.hass_storage[
+                KNX_CONFIG_STORAGE_KEY
+            ] = await async_load_json_object_fixture(
+                self.hass, config_store_fixture, DOMAIN
+            )
+
+        if add_entry_to_hass:
             self.mock_config_entry.add_to_hass(self.hass)
-            await async_setup_component(self.hass, KNX_DOMAIN, {KNX_DOMAIN: config})
-            await self.hass.async_block_till_done()
+
+        # capture outgoing telegrams for assertion instead of sending to socket
+        # before l_data_confirmation would be awaited in xknx
+        patch(
+            "xknx.cemi.cemi_handler.CEMIHandler.send_telegram",
+            side_effect=self._outgoing_telegrams.append,
+        ).start()  # keep patched for the whole test run
+
+        knx_config = {DOMAIN: yaml_config or {}}
+        with (
+            _patch_telegram_store(real_store=real_telegram_store),
+            patch(
+                "xknx.xknx.knx_interface_factory",
+                return_value=knx_ip_interface_mock(),
+                side_effect=fish_xknx,
+            ),
+        ):
+            state_updater_patcher = patch(
+                "xknx.xknx.StateUpdater.register_remote_value"
+            )
+            if not state_updater:
+                state_updater_patcher.start()
+
+            await async_setup_component(self.hass, DOMAIN, knx_config)
+            await self.hass.async_block_till_done(
+                wait_background_tasks=wait_for_telegram_store
+            )
+            # remove patch after setup so state_updater can be tested
+            state_updater_patcher.stop()
 
     ########################
     # Telegram counter tests
     ########################
 
     def _list_remaining_telegrams(self) -> str:
-        """Return a string containing remaining outgoing telegrams in test Queue. One per line."""
-        remaining_telegrams = []
-        while not self._outgoing_telegrams.empty():
-            remaining_telegrams.append(self._outgoing_telegrams.get_nowait())
-        return "\n".join(map(str, remaining_telegrams))
+        """Return a string containing remaining outgoing telegrams in test List."""
+        return "\n".join(map(str, self._outgoing_telegrams))
 
     async def assert_no_telegram(self) -> None:
-        """Assert if every telegram in test Queue was checked."""
+        """Assert if every telegram in test List was checked."""
         await self.hass.async_block_till_done()
-        assert self._outgoing_telegrams.empty(), (
-            f"Found remaining unasserted Telegrams: {self._outgoing_telegrams.qsize()}\n"
+        remaining_telegram_count = len(self._outgoing_telegrams)
+        assert not remaining_telegram_count, (
+            f"Found remaining unasserted Telegrams: {remaining_telegram_count}\n"
             f"{self._list_remaining_telegrams()}"
         )
 
     async def assert_telegram_count(self, count: int) -> None:
-        """Assert outgoing telegram count in test Queue."""
+        """Assert outgoing telegram count in test List."""
         await self.hass.async_block_till_done()
-        actual_count = self._outgoing_telegrams.qsize()
+        actual_count = len(self._outgoing_telegrams)
         assert actual_count == count, (
             f"Outgoing telegrams: {actual_count} - Expected: {count}\n"
             f"{self._list_remaining_telegrams()}"
@@ -125,46 +264,79 @@ class KNXTestKit:
         group_address: str,
         payload: int | tuple[int, ...] | None,
         apci_type: type[APCI],
+        ignore_order: bool = False,
     ) -> None:
-        """Assert outgoing telegram. One by one in timely order."""
+        """Assert outgoing telegram. Optionally in timely order."""
         await self.xknx.telegrams.join()
-        await self.hass.async_block_till_done()
-        try:
-            telegram = self._outgoing_telegrams.get_nowait()
-        except asyncio.QueueEmpty:
+        if not self._outgoing_telegrams:
             raise AssertionError(
                 f"No Telegram found. Expected: {apci_type.__name__} -"
                 f" {group_address} - {payload}"
             )
+        _expected_ga = GroupAddress(group_address)
 
-        assert isinstance(
-            telegram.payload, apci_type
-        ), f"APCI type mismatch in {telegram} - Expected: {apci_type.__name__}"
+        if ignore_order:
+            for telegram in self._outgoing_telegrams:
+                if (
+                    telegram.destination_address == _expected_ga
+                    and isinstance(telegram.payload, apci_type)
+                    and (payload is None or telegram.payload.value.value == payload)
+                ):
+                    self._outgoing_telegrams.remove(telegram)
+                    return
+            raise AssertionError(
+                f"Telegram not found. Expected: {apci_type.__name__} -"
+                f" {group_address} - {payload}"
+                f"\nUnasserted telegrams:\n{self._list_remaining_telegrams()}"
+            )
 
-        assert (
-            str(telegram.destination_address) == group_address
-        ), f"Group address mismatch in {telegram} - Expected: {group_address}"
-
+        telegram = self._outgoing_telegrams.pop(0)
+        assert isinstance(telegram.payload, apci_type), (
+            f"APCI type mismatch in {telegram} - Expected: {apci_type.__name__}"
+        )
+        assert telegram.destination_address == _expected_ga, (
+            f"Group address mismatch in {telegram} - Expected: {group_address}"
+        )
         if payload is not None:
             assert (
-                telegram.payload.value.value == payload  # type: ignore
+                telegram.payload.value.value == payload  # type: ignore[attr-defined]
             ), f"Payload mismatch in {telegram} - Expected: {payload}"
 
-    async def assert_read(self, group_address: str) -> None:
-        """Assert outgoing GroupValueRead telegram. One by one in timely order."""
-        await self.assert_telegram(group_address, None, GroupValueRead)
+    async def assert_read(
+        self,
+        group_address: str,
+        response: int | tuple[int, ...] | None = None,
+        ignore_order: bool = False,
+    ) -> None:
+        """Assert outgoing GroupValueRead telegram. Optionally in timely order.
+
+        Optionally inject incoming GroupValueResponse telegram after reception.
+        """
+        await self.assert_telegram(group_address, None, GroupValueRead, ignore_order)
+        if response is not None:
+            await self.receive_response(group_address, response)
 
     async def assert_response(
-        self, group_address: str, payload: int | tuple[int, ...]
+        self,
+        group_address: str,
+        payload: int | tuple[int, ...],
+        ignore_order: bool = False,
     ) -> None:
-        """Assert outgoing GroupValueResponse telegram. One by one in timely order."""
-        await self.assert_telegram(group_address, payload, GroupValueResponse)
+        """Assert outgoing GroupValueResponse telegram. Optionally in timely order."""
+        await self.assert_telegram(
+            group_address, payload, GroupValueResponse, ignore_order
+        )
 
     async def assert_write(
-        self, group_address: str, payload: int | tuple[int, ...]
+        self,
+        group_address: str,
+        payload: int | tuple[int, ...],
+        ignore_order: bool = False,
     ) -> None:
-        """Assert outgoing GroupValueWrite telegram. One by one in timely order."""
-        await self.assert_telegram(group_address, payload, GroupValueWrite)
+        """Assert outgoing GroupValueWrite telegram. Optionally in timely order."""
+        await self.assert_telegram(
+            group_address, payload, GroupValueWrite, ignore_order
+        )
 
     ####################
     # Incoming telegrams
@@ -177,39 +349,77 @@ class KNXTestKit:
             return DPTBinary(payload)
         return DPTArray(payload)
 
-    async def _receive_telegram(self, group_address: str, payload: APCI) -> None:
+    async def _receive_telegram(
+        self,
+        group_address: str,
+        payload: APCI,
+        source: str | None = None,
+    ) -> None:
         """Inject incoming KNX telegram."""
         self.xknx.telegrams.put_nowait(
             Telegram(
                 destination_address=GroupAddress(group_address),
                 direction=TelegramDirection.INCOMING,
                 payload=payload,
-                source_address=IndividualAddress(self.INDIVIDUAL_ADDRESS),
+                source_address=IndividualAddress(source or self.INDIVIDUAL_ADDRESS),
             )
         )
         await self.xknx.telegrams.join()
         await self.hass.async_block_till_done()
 
-    async def receive_read(
-        self,
-        group_address: str,
-    ) -> None:
+    async def receive_read(self, group_address: str, source: str | None = None) -> None:
         """Inject incoming GroupValueRead telegram."""
-        await self._receive_telegram(group_address, GroupValueRead())
+        await self._receive_telegram(
+            group_address,
+            GroupValueRead(),
+            source=source,
+        )
 
     async def receive_response(
-        self, group_address: str, payload: int | tuple[int, ...]
+        self,
+        group_address: str,
+        payload: int | tuple[int, ...],
+        source: str | None = None,
     ) -> None:
         """Inject incoming GroupValueResponse telegram."""
         payload_value = self._payload_value(payload)
-        await self._receive_telegram(group_address, GroupValueResponse(payload_value))
+        await self._receive_telegram(
+            group_address,
+            GroupValueResponse(payload_value),
+            source=source,
+        )
+        await asyncio.sleep(0)  # advance loop to allow StateUpdater to process
 
     async def receive_write(
-        self, group_address: str, payload: int | tuple[int, ...]
+        self,
+        group_address: str,
+        payload: int | tuple[int, ...],
+        source: str | None = None,
     ) -> None:
         """Inject incoming GroupValueWrite telegram."""
         payload_value = self._payload_value(payload)
-        await self._receive_telegram(group_address, GroupValueWrite(payload_value))
+        await self._receive_telegram(
+            group_address,
+            GroupValueWrite(payload_value),
+            source=source,
+        )
+
+    def receive_data_secure_issue(
+        self,
+        group_address: str,
+        source: str | None = None,
+    ) -> None:
+        """Inject incoming telegram with undecodable data secure payload."""
+        telegram = Telegram(
+            destination_address=GroupAddress(group_address),
+            direction=TelegramDirection.INCOMING,
+            source_address=IndividualAddress(source or self.INDIVIDUAL_ADDRESS),
+            tpci=tpci.TDataGroup(),
+            payload=SecureAPDU.from_knx(
+                bytes.fromhex("03f110002446cfef4ac085e7092ab062b44d")
+            ),
+        )
+        self.xknx.telegram_queue.received_data_secure_group_key_issue(telegram)
 
 
 @pytest.fixture
@@ -217,21 +427,128 @@ def mock_config_entry() -> MockConfigEntry:
     """Return the default mocked config entry."""
     return MockConfigEntry(
         title="KNX",
-        domain=KNX_DOMAIN,
+        domain=DOMAIN,
+        version=2,
         data={
             CONF_KNX_CONNECTION_TYPE: CONF_KNX_AUTOMATIC,
-            CONF_KNX_RATE_LIMIT: CONF_KNX_DEFAULT_RATE_LIMIT,
-            CONF_KNX_STATE_UPDATER: CONF_KNX_DEFAULT_STATE_UPDATER,
             CONF_KNX_MCAST_PORT: DEFAULT_MCAST_PORT,
             CONF_KNX_MCAST_GRP: DEFAULT_MCAST_GRP,
-            CONF_KNX_INDIVIDUAL_ADDRESS: XKNX.DEFAULT_ADDRESS,
+            CONF_KNX_INDIVIDUAL_ADDRESS: DEFAULT_ROUTING_IA,
+        },
+        options={
+            CONF_KNX_RATE_LIMIT: CONF_KNX_DEFAULT_RATE_LIMIT,
+            CONF_KNX_STATE_UPDATER: CONF_KNX_DEFAULT_STATE_UPDATER,
+            CONF_KNX_TELEGRAM_DB_RETENTION_DAYS: KNX_TELEGRAM_DB_RETENTION_DEFAULT,
+            CONF_KNX_TELEGRAM_DB_LOAD_HOURS: KNX_TELEGRAM_LOAD_HOURS_DEFAULT,
+            CONF_KNX_TELEGRAM_DB_BACKEND: KNX_TELEGRAM_BACKEND_SQLITE,
         },
     )
 
 
 @pytest.fixture
-async def knx(request, hass, mock_config_entry: MockConfigEntry):
+async def knx(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    hass_storage: dict[str, Any],
+):
     """Create a KNX TestKit instance."""
-    knx_test_kit = KNXTestKit(hass, mock_config_entry)
+    knx_test_kit = KNXTestKit(hass, mock_config_entry, hass_storage)
     yield knx_test_kit
     await knx_test_kit.assert_no_telegram()
+
+
+@pytest.fixture
+async def project_data(hass: HomeAssistant) -> dict[str, Any]:
+    """Return the fixture project data."""
+    return await async_load_json_object_fixture(hass, "project.json", DOMAIN)
+
+
+@pytest.fixture
+async def load_knxproj(
+    project_data: dict[str, Any], hass_storage: dict[str, Any]
+) -> None:
+    """Mock KNX project data."""
+    hass_storage[KNX_PROJECT_STORAGE_KEY] = {
+        "version": 1,
+        "data": project_data,
+    }
+
+
+@pytest.fixture
+async def create_ui_entity(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    hass_ws_client: WebSocketGenerator,
+    hass_storage: dict[str, Any],
+) -> KnxEntityGenerator:
+    """Return a helper to create KNX entities via WS.
+
+    The KNX integration must be set up before using the helper.
+    """
+    ws_client = await hass_ws_client(hass)
+
+    async def _create_ui_entity(
+        platform: Platform,
+        knx_data: dict[str, Any],
+        entity_data: dict[str, Any] | None = None,
+    ) -> er.RegistryEntry:
+        """Create a KNX entity from WS with given configuration."""
+        if entity_data is None:
+            entity_data = {"name": "Test"}
+
+        await ws_client.send_json_auto_id(
+            {
+                "type": "knx/create_entity",
+                "platform": platform,
+                "data": {
+                    "entity": entity_data,
+                    "knx": knx_data,
+                },
+            }
+        )
+        res = await ws_client.receive_json()
+        assert res["success"], res
+        assert res["result"]["success"] is True, res["result"]
+        entity_id = res["result"]["entity_id"]
+
+        entity = entity_registry.async_get(entity_id)
+        assert entity
+        return entity
+
+    return _create_ui_entity
+
+
+@pytest.fixture
+async def get_entity_suggestions(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator
+) -> KnxSuggestionGetter:
+    """Return a helper to query entity suggestions via WS.
+
+    The KNX integration must be set up before using the helper.
+    """
+    ws_client = await hass_ws_client(hass)
+
+    async def _get_entity_suggestions(**filters: Any) -> dict[str, Any]:
+        """Return the result of `knx/get_entity_suggestions` with given filters."""
+        await ws_client.send_json_auto_id(
+            {"type": "knx/get_entity_suggestions"} | filters
+        )
+        res = await ws_client.receive_json()
+        assert res["success"], res
+        return res["result"]
+
+    return _get_entity_suggestions
+
+
+@pytest.fixture(autouse=True)
+def mock_knx_telegram_store() -> Iterator[None]:
+    """Default every integration setup to the fast in-memory telegram store.
+
+    The real SQLite store creates a SQLAlchemy engine and an aiosqlite thread
+    on every setup/teardown, which the hundreds of tests that never touch
+    telegram history shouldn't pay for. Tests that do exercise the database
+    backends pass ``real_telegram_store=True`` to ``setup_integration``, which
+    overrides this for the duration of setup.
+    """
+    with _patch_telegram_store(real_store=False):
+        yield

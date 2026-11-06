@@ -1,37 +1,127 @@
 {
-  "options": {
+  "config": {
+    "abort": {
+      "already_configured": "[%key:common::config_flow::abort::already_configured_device%]",
+      "link_local_address": "Link local addresses are not supported",
+      "not_doorbird_device": "This device is not a DoorBird",
+      "not_ipv4_address": "Only IPv4 addresses are supported",
+      "wrong_device": "Device MAC address does not match"
+    },
+    "error": {
+      "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]",
+      "invalid_auth": "[%key:common::config_flow::error::invalid_auth%]",
+      "unknown": "[%key:common::config_flow::error::unknown%]"
+    },
+    "flow_title": "{name} ({host})",
     "step": {
-      "init": {
+      "reauth_confirm": {
         "data": {
-          "events": "Comma separated list of events."
+          "password": "[%key:common::config_flow::data::password%]",
+          "username": "[%key:common::config_flow::data::username%]"
+        },
+        "description": "Re-authenticate DoorBird device {name} at {host}"
+      },
+      "user": {
+        "data": {
+          "host": "[%key:common::config_flow::data::host%]",
+          "name": "Device name",
+          "password": "[%key:common::config_flow::data::password%]",
+          "username": "[%key:common::config_flow::data::username%]"
         },
         "data_description": {
-          "events": "Add an comma separated event name for each event you wish to track. After entering them here, use the DoorBird app to assign them to a specific event.\n\nExample: somebody_pressed_the_button, motion"
+          "host": "The hostname or IP address of your DoorBird device."
         }
       }
     }
   },
-  "config": {
-    "step": {
-      "user": {
-        "data": {
-          "password": "[%key:common::config_flow::data::password%]",
-          "host": "[%key:common::config_flow::data::host%]",
-          "name": "Device Name",
-          "username": "[%key:common::config_flow::data::username%]"
+  "entity": {
+    "button": {
+      "ir": {
+        "name": "IR"
+      },
+      "reset_favorites": {
+        "name": "Reset favorites"
+      }
+    },
+    "camera": {
+      "last_motion": {
+        "name": "Last motion"
+      },
+      "last_ring": {
+        "name": "Last ring"
+      },
+      "live": {
+        "name": "Live"
+      }
+    },
+    "event": {
+      "doorbell": {
+        "state_attributes": {
+          "event_type": {
+            "state": {
+              "ring": "Ring"
+            }
+          }
+        }
+      },
+      "motion": {
+        "state_attributes": {
+          "event_type": {
+            "state": {
+              "motion": "Motion"
+            }
+          }
         }
       }
     },
-    "abort": {
-      "already_configured": "[%key:common::config_flow::abort::already_configured_device%]",
-      "link_local_address": "Link local addresses are not supported",
-      "not_doorbird_device": "This device is not a DoorBird"
+    "image": {
+      "last_motion": {
+        "name": "[%key:component::doorbird::entity::camera::last_motion::name%]"
+      },
+      "last_ring": {
+        "name": "[%key:component::doorbird::entity::camera::last_ring::name%]"
+      }
+    }
+  },
+  "issues": {
+    "deprecated_camera_last_motion": {
+      "description": "The `{entity_id}` ({entity_name}) camera entity is deprecated and has been replaced by the **Last motion** image entity on the same device, which shows the same still image and updates the moment a motion event fires. The image entity relies on the DoorBird calling Home Assistant, so make sure the events are set up as described in the [integration documentation]({docs_url}).\n\nUpdate any dashboards, templates, automations or scripts to use the image entity, then disable `{entity_id}` and it is removed automatically on the next restart or reload of the integration.",
+      "title": "The DoorBird last motion camera is deprecated"
     },
-    "flow_title": "{name} ({host})",
-    "error": {
-      "invalid_auth": "[%key:common::config_flow::error::invalid_auth%]",
-      "unknown": "[%key:common::config_flow::error::unknown%]",
-      "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]"
+    "deprecated_camera_last_motion_scripts": {
+      "description": "The `{entity_id}` ({entity_name}) camera entity is deprecated and has been replaced by the **Last motion** image entity on the same device, which shows the same still image and updates the moment a motion event fires. The image entity relies on the DoorBird calling Home Assistant, so make sure the events are set up as described in the [integration documentation]({docs_url}).\n\nIt is still used in the following automations or scripts:\n{items}\n\nUpdate them to use the image entity, then disable `{entity_id}` and it is removed automatically on the next restart or reload of the integration.",
+      "title": "[%key:component::doorbird::issues::deprecated_camera_last_motion::title%]"
+    },
+    "deprecated_camera_last_ring": {
+      "description": "The `{entity_id}` ({entity_name}) camera entity is deprecated and has been replaced by the **Last ring** image entity on the same device, which shows the same still image and updates the moment a doorbell ring event fires. The image entity relies on the DoorBird calling Home Assistant, so make sure the events are set up as described in the [integration documentation]({docs_url}).\n\nUpdate any dashboards, templates, automations or scripts to use the image entity, then disable `{entity_id}` and it is removed automatically on the next restart or reload of the integration.",
+      "title": "The DoorBird last ring camera is deprecated"
+    },
+    "deprecated_camera_last_ring_scripts": {
+      "description": "The `{entity_id}` ({entity_name}) camera entity is deprecated and has been replaced by the **Last ring** image entity on the same device, which shows the same still image and updates the moment a doorbell ring event fires. The image entity relies on the DoorBird calling Home Assistant, so make sure the events are set up as described in the [integration documentation]({docs_url}).\n\nIt is still used in the following automations or scripts:\n{items}\n\nUpdate them to use the image entity, then disable `{entity_id}` and it is removed automatically on the next restart or reload of the integration.",
+      "title": "[%key:component::doorbird::issues::deprecated_camera_last_ring::title%]"
+    },
+    "error_registering_events": {
+      "fix_flow": {
+        "step": {
+          "confirm": {
+            "description": "Configuring DoorBird {name} failed with error: `{error}`. Please enable the API Operator permission for the DoorBird user and continue to reload the integration.",
+            "title": "[%key:component::doorbird::issues::error_registering_events::title%]"
+          }
+        }
+      },
+      "title": "DoorBird {name} configuration failure"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "data": {
+          "events": "Comma-separated list of events."
+        },
+        "data_description": {
+          "events": "Add a comma-separated event name for each event you wish to track. After entering them here, use the DoorBird app to assign them to a specific event.\n\nExample: somebody_pressed_the_button, motion"
+        }
+      }
     }
   }
 }

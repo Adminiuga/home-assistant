@@ -1,13 +1,12 @@
 """Tests for the awair component."""
 
-
 from unittest.mock import patch
 
-from homeassistant.components.awair import DOMAIN
+from pytest_homeassistant.common import MockConfigEntry
+
+from homeassistant.components.awair.const import DOMAIN
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-
-from tests.common import MockConfigEntry
 
 
 async def setup_awair(hass: HomeAssistant, fixtures, unique_id, data) -> ConfigEntry:

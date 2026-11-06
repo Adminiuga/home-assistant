@@ -1,0 +1,177 @@
+"""The Lunatone integration."""
+
+import logging
+import re
+from typing import Final
+
+from lunatone_rest_api_client import Auth, DALIScan, Devices, Info, Sensors
+from lunatone_rest_api_client.models import DeviceCapabilities
+
+from homeassistant.const import CONF_URL, Platform
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryError
+from homeassistant.helpers import device_registry as dr, entity_registry as er
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+
+from .config_flow import LunatoneConfigFlow
+from .const import DOMAIN, MANUFACTURER
+from .coordinator import (
+    LunatoneConfigEntry,
+    LunatoneData,
+    LunatoneDevicesDataUpdateCoordinator,
+    LunatoneInfoDataUpdateCoordinator,
+    LunatoneScanDataUpdateCoordinator,
+    LunatoneSensorsDataUpdateCoordinator,
+    find_devices,
+    remove_devices,
+)
+
+_LOGGER = logging.getLogger(__name__)
+PLATFORMS: Final[list[Platform]] = [
+    Platform.BINARY_SENSOR,
+    Platform.LIGHT,
+    Platform.SENSOR,
+]
+
+
+async def _update_unique_id(
+    hass: HomeAssistant, entry: LunatoneConfigEntry, new_unique_id: str
+) -> None:
+    _LOGGER.debug("Update unique ID")
+
+    # Update all associated entities
+    entity_registry = er.async_get(hass)
+    entities = er.async_entries_for_config_entry(entity_registry, entry.entry_id)
+
+    for entity in entities:
+        parts = list(entity.unique_id.partition("-"))
+        parts[0] = new_unique_id
+
+        entity_registry.async_update_entity(
+            entity.entity_id, new_unique_id="".join(parts)
+        )
+
+    # Update all associated devices
+    device_registry = dr.async_get(hass)
+    devices = dr.async_entries_for_config_entry(device_registry, entry.entry_id)
+
+    for device in devices:
+        identifier = device.identifiers.pop()
+        parts = list(identifier[1].partition("-"))
+        parts[0] = new_unique_id
+
+        device_registry.async_update_device(
+            device.id, new_identifiers={(identifier[0], "".join(parts))}
+        )
+
+    # Update the config entry itself
+    hass.config_entries.async_update_entry(
+        entry,
+        unique_id=new_unique_id,
+        minor_version=LunatoneConfigFlow.MINOR_VERSION,
+        version=LunatoneConfigFlow.VERSION,
+    )
+
+    _LOGGER.debug("Update of unique ID successful")
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: LunatoneConfigEntry) -> None:
+    """Set up Lunatone from a config entry."""
+    auth_api = Auth(async_get_clientsession(hass), entry.data[CONF_URL])
+
+    info_api = Info(auth_api)
+    coordinator_info = LunatoneInfoDataUpdateCoordinator(hass, entry, info_api)
+    await coordinator_info.async_config_entry_first_refresh()
+
+    if info_api.data is None:
+        raise ConfigEntryError(
+            translation_domain=DOMAIN, translation_key="missing_device_info"
+        )
+
+    if info_api.data.uid is not None:
+        new_unique_id = info_api.data.uid.replace("-", "")
+        if new_unique_id != entry.unique_id:
+            await _update_unique_id(hass, entry, new_unique_id)
+            coordinator_info.previous_devices = {
+                f"{new_unique_id}-line{line_id}"
+                for line_id in coordinator_info.data.lines
+            }
+
+    assert entry.unique_id
+
+    device_registry = dr.async_get(hass)
+
+    device_registry.async_get_or_create(
+        config_entry_id=entry.entry_id,
+        identifiers={(DOMAIN, entry.unique_id)},
+        name=info_api.data.name,
+        manufacturer=MANUFACTURER,
+        sw_version=info_api.data.version,
+        hw_version=coordinator_info.data.device.pcb,
+        configuration_url=entry.data[CONF_URL],
+        serial_number=str(info_api.data.device.serial),
+        model=info_api.data.product_name,
+        model_id=(
+            f"{coordinator_info.data.device.article_number}{coordinator_info.data.article_suffix}"
+        ),
+    )
+
+    for line_id, line_info in info_api.data.lines.items():
+        line_unique_id = f"{entry.unique_id}-line{line_id}"
+
+        device_info = dr.DeviceInfo(
+            identifiers={(DOMAIN, line_unique_id)},
+            translation_key="dali_line",
+            translation_placeholders={"line_id": str(line_id)},
+            via_device_id=dr.async_get_device_id_by_identifier(
+                hass, (DOMAIN, entry.unique_id), config_entry_id=entry.entry_id
+            ),
+        )
+        if line_info.device.serial != info_api.data.device.serial:
+            device_info.serial_number = str(line_info.device.serial)
+            device_info.hw_version = line_info.device.pcb
+            device_info.model_id = (
+                f"{line_info.device.article_number}{line_info.device.article_info}"
+            )
+
+        device_registry.async_get_or_create_from_info(
+            config_entry_id=entry.entry_id, device_info=device_info
+        )
+
+    devices_api = Devices(auth_api, info_api.data.version)
+    coordinator_devices = LunatoneDevicesDataUpdateCoordinator(hass, entry, devices_api)
+    await coordinator_devices.async_config_entry_first_refresh()
+
+    dali_scan_api = DALIScan(auth_api)
+    coordinator_scan = LunatoneScanDataUpdateCoordinator(hass, entry, dali_scan_api)
+    await coordinator_scan.async_config_entry_first_refresh()
+
+    coordinator_sensors = None
+    if DeviceCapabilities.SENSORS in info_api.data.device_capabilities:
+        sensors_api = Sensors(auth_api)
+        coordinator_sensors = LunatoneSensorsDataUpdateCoordinator(
+            hass, entry, sensors_api
+        )
+        await coordinator_sensors.async_config_entry_first_refresh()
+    else:
+        # Remove potentially orphaned devices
+        device_registry = dr.async_get(hass)
+        devices = find_devices(
+            device_registry,
+            entry.entry_id,
+            re.compile(rf"{re.escape(entry.unique_id)}-line\d+-d24-address\d+"),
+        )
+        remove_devices(device_registry, entry.entry_id, devices)
+
+    entry.runtime_data = LunatoneData(
+        coordinator_info,
+        coordinator_devices,
+        coordinator_scan,
+        coordinator_sensors,
+    )
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: LunatoneConfigEntry) -> None:
+    """Unload a config entry."""
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)

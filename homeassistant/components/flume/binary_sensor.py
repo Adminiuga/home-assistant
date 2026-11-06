@@ -1,22 +1,18 @@
 """Flume binary sensors."""
-from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import override
 
 from homeassistant.components.binary_sensor import (
     BinarySensorDeviceClass,
     BinarySensorEntity,
     BinarySensorEntityDescription,
 )
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity import EntityCategory
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from .const import (
-    DOMAIN,
-    FLUME_AUTH,
-    FLUME_DEVICES,
     FLUME_TYPE_BRIDGE,
     FLUME_TYPE_SENSOR,
     KEY_DEVICE_ID,
@@ -27,6 +23,7 @@ from .const import (
     NOTIFICATION_LEAK_DETECTED,
 )
 from .coordinator import (
+    FlumeConfigEntry,
     FlumeDeviceConnectionUpdateCoordinator,
     FlumeNotificationDataUpdateCoordinator,
 )
@@ -34,63 +31,62 @@ from .entity import FlumeEntity
 from .util import get_valid_flume_devices
 
 BINARY_SENSOR_DESCRIPTION_CONNECTED = BinarySensorEntityDescription(
-    name="Connected",
-    key="connected",
+    key="connected", device_class=BinarySensorDeviceClass.CONNECTIVITY
 )
 
+BINARY_SENSOR_DESCRIPTION_LOW_BATTERY = BinarySensorEntityDescription(
+    key="low_battery",
+    entity_category=EntityCategory.DIAGNOSTIC,
+    device_class=BinarySensorDeviceClass.BATTERY,
+)
 
-@dataclass
-class FlumeBinarySensorRequiredKeysMixin:
-    """Mixin for required keys."""
+# Levels reported by the devices endpoint. Unlisted values map to unknown
+# rather than to a healthy battery.
+BATTERY_LEVEL_IS_LOW = {"low": True, "medium": False, "high": False}
+
+
+@dataclass(frozen=True, kw_only=True)
+class FlumeBinarySensorEntityDescription(BinarySensorEntityDescription):
+    """Describes a binary sensor entity."""
 
     event_rule: str
-
-
-@dataclass
-class FlumeBinarySensorEntityDescription(
-    BinarySensorEntityDescription, FlumeBinarySensorRequiredKeysMixin
-):
-    """Describes a binary sensor entity."""
 
 
 FLUME_BINARY_NOTIFICATION_SENSORS: tuple[FlumeBinarySensorEntityDescription, ...] = (
     FlumeBinarySensorEntityDescription(
         key="leak",
-        name="Leak detected",
+        translation_key="leak",
         entity_category=EntityCategory.DIAGNOSTIC,
         event_rule=NOTIFICATION_LEAK_DETECTED,
-        icon="mdi:pipe-leak",
     ),
     FlumeBinarySensorEntityDescription(
         key="flow",
-        name="High flow",
+        translation_key="flow",
         entity_category=EntityCategory.DIAGNOSTIC,
         event_rule=NOTIFICATION_HIGH_FLOW,
-        icon="mdi:waves",
     ),
 )
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    config_entry: FlumeConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up a Flume binary sensor.."""
-    flume_domain_data = hass.data[DOMAIN][config_entry.entry_id]
-    flume_auth = flume_domain_data[FLUME_AUTH]
-    flume_devices = flume_domain_data[FLUME_DEVICES]
+    flume_domain_data = config_entry.runtime_data
+    flume_devices = flume_domain_data.devices
 
     flume_entity_list: list[
-        FlumeNotificationBinarySensor | FlumeConnectionBinarySensor
+        FlumeNotificationBinarySensor
+        | FlumeConnectionBinarySensor
+        | FlumeLowBatteryBinarySensor
     ] = []
 
     connection_coordinator = FlumeDeviceConnectionUpdateCoordinator(
-        hass=hass, flume_devices=flume_devices
+        hass=hass, config_entry=config_entry, flume_devices=flume_devices
     )
-    notification_coordinator = FlumeNotificationDataUpdateCoordinator(
-        hass=hass, auth=flume_auth
-    )
+    notification_coordinator = flume_domain_data.notifications_coordinator
     flume_devices = get_valid_flume_devices(flume_devices)
     for device in flume_devices:
         device_id = device[KEY_DEVICE_ID]
@@ -109,6 +105,15 @@ async def async_setup_entry(
         if device[KEY_DEVICE_TYPE] != FLUME_TYPE_SENSOR:
             continue
 
+        flume_entity_list.append(
+            FlumeLowBatteryBinarySensor(
+                coordinator=connection_coordinator,
+                description=BINARY_SENSOR_DESCRIPTION_LOW_BATTERY,
+                device_id=device_id,
+                location_name=device_location_name,
+            )
+        )
+
         # Build notification sensors
         flume_entity_list.extend(
             [
@@ -125,13 +130,15 @@ async def async_setup_entry(
     async_add_entities(flume_entity_list)
 
 
-class FlumeNotificationBinarySensor(FlumeEntity, BinarySensorEntity):
+class FlumeNotificationBinarySensor(
+    FlumeEntity[FlumeNotificationDataUpdateCoordinator], BinarySensorEntity
+):
     """Binary sensor class."""
 
     entity_description: FlumeBinarySensorEntityDescription
-    coordinator: FlumeNotificationDataUpdateCoordinator
 
     @property
+    @override
     def is_on(self) -> bool:
         """Return on state."""
         return bool(
@@ -144,15 +151,30 @@ class FlumeNotificationBinarySensor(FlumeEntity, BinarySensorEntity):
         )
 
 
-class FlumeConnectionBinarySensor(FlumeEntity, BinarySensorEntity):
+class FlumeLowBatteryBinarySensor(
+    FlumeEntity[FlumeDeviceConnectionUpdateCoordinator], BinarySensorEntity
+):
+    """Binary sensor class for the sensor battery level."""
+
+    @property
+    @override
+    def is_on(self) -> bool | None:
+        """Return True when the device reports a low battery."""
+        return BATTERY_LEVEL_IS_LOW.get(
+            self.coordinator.battery_level.get(self.device_id, "")
+        )
+
+
+class FlumeConnectionBinarySensor(
+    FlumeEntity[FlumeDeviceConnectionUpdateCoordinator], BinarySensorEntity
+):
     """Binary Sensor class for WIFI Connection status."""
 
-    entity_description: FlumeBinarySensorEntityDescription
-    coordinator: FlumeDeviceConnectionUpdateCoordinator
     _attr_entity_category = EntityCategory.DIAGNOSTIC
     _attr_device_class = BinarySensorDeviceClass.CONNECTIVITY
 
     @property
+    @override
     def is_on(self) -> bool:
         """Return connection status."""
         return bool(

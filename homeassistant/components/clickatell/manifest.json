@@ -1,7 +1,10 @@
 {
   "domain": "clickatell",
   "name": "Clickatell",
-  "documentation": "https://www.home-assistant.io/integrations/clickatell",
+  "categories": ["messaging_notifications.email_sms_calls"],
   "codeowners": [],
-  "iot_class": "cloud_push"
+  "connectivity": ["cloud"],
+  "documentation": "https://www.home-assistant.io/integrations/clickatell",
+  "iot_class": "cloud_push",
+  "quality_scale": "legacy"
 }

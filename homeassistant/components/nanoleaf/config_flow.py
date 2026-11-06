@@ -1,20 +1,29 @@
 """Config flow for Nanoleaf integration."""
-from __future__ import annotations
 
 from collections.abc import Mapping
 import logging
 import os
-from typing import Any, Final, cast
+from typing import Any, Final, cast, override
 
-from aionanoleaf import InvalidToken, Nanoleaf, Unauthorized, Unavailable
-import voluptuous as vol
+from aionanoleaf2 import AuthError, Nanoleaf, NanoleafError, Unauthorized
+import probatio
 
-from homeassistant import config_entries
-from homeassistant.components import ssdp, zeroconf
+from homeassistant.config_entries import (
+    SOURCE_REAUTH,
+    SOURCE_USER,
+    ConfigFlow,
+    ConfigFlowResult,
+)
 from homeassistant.const import CONF_HOST, CONF_TOKEN
-from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from homeassistant.util.json import load_json, save_json
+from homeassistant.helpers.json import save_json
+from homeassistant.helpers.service_info.ssdp import SsdpServiceInfo
+from homeassistant.helpers.service_info.zeroconf import (
+    ATTR_PROPERTIES_ID,
+    ZeroconfServiceInfo,
+)
+from homeassistant.util.json import JsonObjectType, JsonValueType, load_json_object
+from homeassistant.util.network import is_ipv4_address
 
 from .const import DOMAIN
 
@@ -23,31 +32,28 @@ _LOGGER = logging.getLogger(__name__)
 # For discovery integration import
 CONFIG_FILE: Final = ".nanoleaf.conf"
 
-USER_SCHEMA: Final = vol.Schema(
+USER_SCHEMA: Final = probatio.Schema(
     {
-        vol.Required(CONF_HOST): str,
+        probatio.Required(CONF_HOST): str,
     }
 )
 
 
-class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
+class NanoleafConfigFlow(ConfigFlow, domain=DOMAIN):
     """Nanoleaf config flow."""
 
-    reauth_entry: config_entries.ConfigEntry | None = None
+    nanoleaf: Nanoleaf
+
+    # For discovery integration import
+    discovery_conf: JsonObjectType
+    device_id: str
 
     VERSION = 1
 
-    def __init__(self) -> None:
-        """Initialize a Nanoleaf flow."""
-        self.nanoleaf: Nanoleaf
-
-        # For discovery integration import
-        self.discovery_conf: dict
-        self.device_id: str
-
+    @override
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle Nanoleaf flow initiated by the user."""
         if user_input is None:
             return self.async_show_form(
@@ -59,16 +65,17 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
         try:
             await self.nanoleaf.authorize()
-        except Unavailable:
+        except Unauthorized:
+            # Pairing mode is not active yet: the link step explains how to enable it
+            pass
+        except NanoleafError:
             return self.async_show_form(
                 step_id="user",
                 data_schema=USER_SCHEMA,
                 errors={"base": "cannot_connect"},
                 last_step=False,
             )
-        except Unauthorized:
-            pass
-        except Exception:  # pylint: disable=broad-except
+        except Exception:
             _LOGGER.exception("Unknown error connecting to Nanoleaf")
             return self.async_show_form(
                 step_id="user",
@@ -78,43 +85,93 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             )
         return await self.async_step_link()
 
-    async def async_step_reauth(self, entry_data: Mapping[str, Any]) -> FlowResult:
+    async def async_step_reauth(
+        self, entry_data: Mapping[str, Any]
+    ) -> ConfigFlowResult:
         """Handle Nanoleaf reauth flow if token is invalid."""
-        self.reauth_entry = cast(
-            config_entries.ConfigEntry,
-            self.hass.config_entries.async_get_entry(self.context["entry_id"]),
-        )
         self.nanoleaf = Nanoleaf(
             async_get_clientsession(self.hass), entry_data[CONF_HOST]
         )
-        self.context["title_placeholders"] = {"name": self.reauth_entry.title}
+        self.context["title_placeholders"] = {"name": self._get_reauth_entry().title}
         return await self.async_step_link()
 
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle reconfiguration of the Nanoleaf host."""
+        errors: dict[str, str] = {}
+        reconfigure_entry = self._get_reconfigure_entry()
+
+        if user_input is not None:
+            nanoleaf = Nanoleaf(
+                async_get_clientsession(self.hass),
+                user_input[CONF_HOST],
+                reconfigure_entry.data[CONF_TOKEN],
+            )
+            try:
+                await nanoleaf.get_info()
+            except AuthError:
+                errors["base"] = "invalid_token"
+            except NanoleafError:
+                errors["base"] = "cannot_connect"
+            except Exception:
+                _LOGGER.exception("Unknown error connecting to Nanoleaf")
+                errors["base"] = "unknown"
+            else:
+                await self.async_set_unique_id(nanoleaf.name)
+                self._abort_if_unique_id_mismatch()
+                return self.async_update_reload_and_abort(
+                    reconfigure_entry,
+                    data_updates={CONF_HOST: user_input[CONF_HOST]},
+                )
+
+        return self.async_show_form(
+            step_id="reconfigure",
+            data_schema=self.add_suggested_values_to_schema(
+                USER_SCHEMA, user_input or reconfigure_entry.data
+            ),
+            errors=errors,
+        )
+
+    @override
     async def async_step_zeroconf(
-        self, discovery_info: zeroconf.ZeroconfServiceInfo
-    ) -> FlowResult:
+        self, discovery_info: ZeroconfServiceInfo
+    ) -> ConfigFlowResult:
         """Handle Nanoleaf Zeroconf discovery."""
         _LOGGER.debug("Zeroconf discovered: %s", discovery_info)
         return await self._async_homekit_zeroconf_discovery_handler(discovery_info)
 
+    @override
     async def async_step_homekit(
-        self, discovery_info: zeroconf.ZeroconfServiceInfo
-    ) -> FlowResult:
+        self, discovery_info: ZeroconfServiceInfo
+    ) -> ConfigFlowResult:
         """Handle Nanoleaf Homekit discovery."""
         _LOGGER.debug("Homekit discovered: %s", discovery_info)
         return await self._async_homekit_zeroconf_discovery_handler(discovery_info)
 
     async def _async_homekit_zeroconf_discovery_handler(
-        self, discovery_info: zeroconf.ZeroconfServiceInfo
-    ) -> FlowResult:
+        self, discovery_info: ZeroconfServiceInfo
+    ) -> ConfigFlowResult:
         """Handle Nanoleaf Homekit and Zeroconf discovery."""
-        return await self._async_discovery_handler(
+        # A discovery message can contain several addresses. Prefer a usable IPv4.
+        host = next(
+            (
+                str(ip)
+                for ip in discovery_info.ip_addresses
+                if ip.version == 4 and not ip.is_link_local and not ip.is_unspecified
+            ),
             discovery_info.host,
+        )
+        return await self._async_discovery_handler(
+            host,
             discovery_info.name.replace(f".{discovery_info.type}", ""),
-            discovery_info.properties[zeroconf.ATTR_PROPERTIES_ID],
+            discovery_info.properties[ATTR_PROPERTIES_ID],
         )
 
-    async def async_step_ssdp(self, discovery_info: ssdp.SsdpServiceInfo) -> FlowResult:
+    @override
+    async def async_step_ssdp(
+        self, discovery_info: SsdpServiceInfo
+    ) -> ConfigFlowResult:
         """Handle Nanoleaf SSDP discovery."""
         _LOGGER.debug("SSDP discovered: %s", discovery_info)
         return await self._async_discovery_handler(
@@ -125,27 +182,37 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     async def _async_discovery_handler(
         self, host: str, name: str, device_id: str
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle Nanoleaf discovery."""
         # The name is unique and printed on the device and cannot be changed.
-        await self.async_set_unique_id(name)
-        self._abort_if_unique_id_configured({CONF_HOST: host})
+        existing_entry = await self.async_set_unique_id(name)
+        updates: dict[str, str] | None = {CONF_HOST: host}
+        if (
+            existing_entry is not None
+            and is_ipv4_address(existing_entry.data.get(CONF_HOST, ""))
+            and not is_ipv4_address(host)
+        ):
+            # A discovery message can announce a device with IPv6 addresses only.
+            # It must not replace the IPv4 host of an existing entry, otherwise the
+            # entry is reloaded every time the host flips between IPv6 and IPv4.
+            updates = None
+        self._abort_if_unique_id_configured(updates)
 
         # Import from discovery integration
         self.device_id = device_id
-        self.discovery_conf = cast(
-            dict,
-            await self.hass.async_add_executor_job(
-                load_json, self.hass.config.path(CONFIG_FILE)
-            ),
+        self.discovery_conf = await self.hass.async_add_executor_job(
+            load_json_object, self.hass.config.path(CONFIG_FILE)
         )
-        auth_token: str | None = self.discovery_conf.get(self.device_id, {}).get(
-            "token",  # >= 2021.4
-            self.discovery_conf.get(host, {}).get("token"),  # < 2021.4
-        )
+
+        auth_token: JsonValueType = None
+        if device_conf := self.discovery_conf.get(self.device_id):  # >= 2021.4
+            auth_token = cast(JsonObjectType, device_conf).get("token")
+        if not auth_token and (host_conf := self.discovery_conf.get(host)):  # < 2021.4
+            auth_token = cast(JsonObjectType, host_conf).get("token")
+
         if auth_token is not None:
             self.nanoleaf = Nanoleaf(
-                async_get_clientsession(self.hass), host, auth_token
+                async_get_clientsession(self.hass), host, cast(str, auth_token)
             )
             _LOGGER.warning(
                 "Importing Nanoleaf %s from the discovery integration", name
@@ -157,7 +224,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     async def async_step_link(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle Nanoleaf link step."""
         if user_input is None:
             return self.async_show_form(step_id="link")
@@ -168,43 +235,40 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             return self.async_show_form(
                 step_id="link", errors={"base": "not_allowing_new_tokens"}
             )
-        except Unavailable:
+        except NanoleafError:
             return self.async_abort(reason="cannot_connect")
-        except Exception:  # pylint: disable=broad-except
+        except Exception:
             _LOGGER.exception("Unknown error authorizing Nanoleaf")
             return self.async_show_form(step_id="link", errors={"base": "unknown"})
 
-        if self.reauth_entry is not None:
-            self.hass.config_entries.async_update_entry(
-                self.reauth_entry,
-                data={
-                    **self.reauth_entry.data,
-                    CONF_TOKEN: self.nanoleaf.auth_token,
-                },
+        if self.source == SOURCE_REAUTH:
+            return self.async_update_reload_and_abort(
+                self._get_reauth_entry(),
+                data_updates={CONF_TOKEN: self.nanoleaf.auth_token},
             )
-            await self.hass.config_entries.async_reload(self.reauth_entry.entry_id)
-            return self.async_abort(reason="reauth_successful")
 
         return await self.async_setup_finish()
 
     async def async_setup_finish(
         self, discovery_integration_import: bool = False
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Finish Nanoleaf config flow."""
         try:
             await self.nanoleaf.get_info()
-        except Unavailable:
-            return self.async_abort(reason="cannot_connect")
-        except InvalidToken:
+        except AuthError:
             return self.async_abort(reason="invalid_token")
-        except Exception:  # pylint: disable=broad-except
+        except NanoleafError:
+            return self.async_abort(reason="cannot_connect")
+        except Exception:
             _LOGGER.exception(
                 "Unknown error connecting with Nanoleaf at %s", self.nanoleaf.host
             )
             return self.async_abort(reason="unknown")
         name = self.nanoleaf.name
 
-        await self.async_set_unique_id(name)
+        await self.async_set_unique_id(
+            name, raise_on_progress=self.source != SOURCE_USER
+        )
         self._abort_if_unique_id_configured({CONF_HOST: self.nanoleaf.host})
 
         if discovery_integration_import:
@@ -212,7 +276,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 self.discovery_conf.pop(self.nanoleaf.host)
             if self.device_id in self.discovery_conf:
                 self.discovery_conf.pop(self.device_id)
-            _LOGGER.info(
+            _LOGGER.debug(
                 "Successfully imported Nanoleaf %s from the discovery integration",
                 name,
             )

@@ -1,76 +1,76 @@
 """Control binary sensor instances."""
+
+import asyncio
 from datetime import timedelta
 import logging
+from typing import override
 
 from ProgettiHWSW.input import Input
-import async_timeout
 
 from homeassistant.components.binary_sensor import BinarySensorEntity
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.update_coordinator import (
     CoordinatorEntity,
     DataUpdateCoordinator,
 )
 
-from . import setup_input
-from .const import DEFAULT_POLLING_INTERVAL_SEC, DOMAIN
+from . import ProgettiHWSWConfigEntry, setup_input
+from .const import DEFAULT_POLLING_INTERVAL_SEC
 
-_LOGGER = logging.getLogger(DOMAIN)
+_LOGGER = logging.getLogger(__name__)
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    config_entry: ProgettiHWSWConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up the binary sensors from a config entry."""
-    board_api = hass.data[DOMAIN][config_entry.entry_id]
+    board_api = config_entry.runtime_data
     input_count = config_entry.data["input_count"]
-    binary_sensors = []
 
     async def async_update_data():
         """Fetch data from API endpoint of board."""
-        async with async_timeout.timeout(5):
+        async with asyncio.timeout(5):
             return await board_api.get_inputs()
 
     coordinator = DataUpdateCoordinator(
         hass,
         _LOGGER,
+        config_entry=config_entry,
         name="binary_sensor",
         update_method=async_update_data,
         update_interval=timedelta(seconds=DEFAULT_POLLING_INTERVAL_SEC),
     )
     await coordinator.async_refresh()
 
-    for i in range(1, int(input_count) + 1):
-        binary_sensors.append(
-            ProgettihwswBinarySensor(
-                coordinator,
-                f"Input #{i}",
-                setup_input(board_api, i),
-            )
+    async_add_entities(
+        ProgettihwswBinarySensor(
+            coordinator,
+            f"Input #{i}",
+            setup_input(board_api, i),
+            config_entry.entry_id,
+            config_entry.data["host"],
         )
-
-    async_add_entities(binary_sensors)
+        for i in range(1, int(input_count) + 1)
+    )
 
 
 class ProgettihwswBinarySensor(CoordinatorEntity, BinarySensorEntity):
     """Represent a binary sensor."""
 
-    def __init__(self, coordinator, name, sensor: Input):
+    def __init__(
+        self, coordinator, name, sensor: Input, entry_id: str, host: str
+    ) -> None:
         """Set initializing values."""
         super().__init__(coordinator)
-        self._name = name
+        self._attr_name = name
         self._sensor = sensor
+        self._attr_unique_id = f"{entry_id}_{host}_input_{sensor.id}"
 
     @property
-    def name(self):
-        """Return the sensor name."""
-        return self._name
-
-    @property
-    def is_on(self):
+    @override
+    def is_on(self) -> bool:
         """Get sensor state."""
-        return self.coordinator.data[self._sensor.id]
+        return self.coordinator.data[self._sensor.id - 1]

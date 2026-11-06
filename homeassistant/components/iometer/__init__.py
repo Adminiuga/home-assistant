@@ -1,0 +1,35 @@
+"""The IOmeter integration."""
+
+from iometer import IOmeterSSEClient
+
+from homeassistant.const import CONF_HOST, Platform
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+
+from .coordinator import IOmeterConfigEntry, IOMeterCoordinator
+
+PLATFORMS: list[Platform] = [Platform.BINARY_SENSOR, Platform.SENSOR]
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: IOmeterConfigEntry) -> None:
+    """Set up IOmeter from a config entry."""
+    host = entry.data[CONF_HOST]
+    session = async_get_clientsession(hass)
+    client = IOmeterSSEClient(host=host, session=session)
+
+    coordinator = IOMeterCoordinator(hass, entry, client)
+    await coordinator.async_start()
+    try:
+        await coordinator.async_config_entry_first_refresh()
+    except Exception:
+        await coordinator.async_stop()
+        raise
+
+    entry.runtime_data = coordinator
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    entry.async_on_unload(coordinator.async_stop)
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: IOmeterConfigEntry) -> None:
+    """Unload a config entry."""
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)

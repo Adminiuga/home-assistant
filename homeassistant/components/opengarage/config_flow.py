@@ -1,17 +1,15 @@
 """Config flow for OpenGarage integration."""
-from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, override
 
 import aiohttp
 import opengarage
-import voluptuous as vol
+import probatio
 
-from homeassistant import config_entries
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_HOST, CONF_PORT, CONF_VERIFY_SSL
 from homeassistant.core import HomeAssistant
-from homeassistant.data_entry_flow import FlowResult
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.device_registry import format_mac
@@ -20,12 +18,12 @@ from .const import CONF_DEVICE_KEY, DEFAULT_PORT, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
-STEP_USER_DATA_SCHEMA = vol.Schema(
+STEP_USER_DATA_SCHEMA = probatio.Schema(
     {
-        vol.Required(CONF_DEVICE_KEY): str,
-        vol.Required(CONF_HOST, default="http://"): str,
-        vol.Optional(CONF_PORT, default=DEFAULT_PORT): int,
-        vol.Optional(CONF_VERIFY_SSL, default=False): bool,
+        probatio.Required(probatio.Secret(CONF_DEVICE_KEY)): str,
+        probatio.Required(CONF_HOST, default="http://"): str,
+        probatio.Optional(CONF_PORT, default=DEFAULT_PORT): int,
+        probatio.Optional(CONF_VERIFY_SSL, default=False): bool,
     }
 )
 
@@ -53,14 +51,15 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
     return {"title": status.get("name"), "unique_id": format_mac(status["mac"])}
 
 
-class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
+class OpenGarageConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for OpenGarage."""
 
     VERSION = 1
 
+    @override
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle the initial step."""
         if user_input is None:
             return self.async_show_form(
@@ -75,7 +74,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             errors["base"] = "cannot_connect"
         except InvalidAuth:
             errors["base"] = "invalid_auth"
-        except Exception:  # pylint: disable=broad-except
+        except Exception:
             _LOGGER.exception("Unexpected exception")
             errors["base"] = "unknown"
         else:

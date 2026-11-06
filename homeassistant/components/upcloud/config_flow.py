@@ -1,25 +1,22 @@
 """Config flow for UpCloud."""
 
-from __future__ import annotations
-
 import logging
-from typing import Any
+from typing import Any, override
 
+import probatio
 import requests.exceptions
 import upcloud_api
-import voluptuous as vol
 
-from homeassistant import config_entries
-from homeassistant.const import CONF_PASSWORD, CONF_SCAN_INTERVAL, CONF_USERNAME
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import callback
-from homeassistant.data_entry_flow import FlowResult
 
-from .const import DEFAULT_SCAN_INTERVAL, DOMAIN
+from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
 
-class UpCloudConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
+class UpCloudConfigFlow(ConfigFlow, domain=DOMAIN):
     """UpCloud config flow."""
 
     VERSION = 1
@@ -27,9 +24,10 @@ class UpCloudConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     username: str
     password: str
 
+    @override
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle user initiated flow."""
         if user_input is None:
             return self._async_show_form(step_id="user")
@@ -55,6 +53,9 @@ class UpCloudConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 step_id="user", user_input=user_input, errors=errors
             )
 
+        self._abort_if_unique_id_configured(
+            updates={CONF_PASSWORD: user_input[CONF_PASSWORD]}
+        )
         return self.async_create_entry(title=user_input[CONF_USERNAME], data=user_input)
 
     @callback
@@ -63,56 +64,22 @@ class UpCloudConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         step_id: str,
         user_input: dict[str, Any] | None = None,
         errors: dict[str, str] | None = None,
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Show our form."""
         if user_input is None:
             user_input = {}
         return self.async_show_form(
             step_id=step_id,
-            data_schema=vol.Schema(
+            data_schema=probatio.Schema(
                 {
-                    vol.Required(
+                    probatio.Required(
                         CONF_USERNAME, default=user_input.get(CONF_USERNAME, "")
                     ): str,
-                    vol.Required(
-                        CONF_PASSWORD, default=user_input.get(CONF_PASSWORD, "")
+                    probatio.Required(
+                        probatio.Secret(CONF_PASSWORD),
+                        default=user_input.get(CONF_PASSWORD, ""),
                     ): str,
                 }
             ),
             errors=errors or {},
         )
-
-    @staticmethod
-    @callback
-    def async_get_options_flow(
-        config_entry: config_entries.ConfigEntry,
-    ) -> UpCloudOptionsFlow:
-        """Get options flow."""
-        return UpCloudOptionsFlow(config_entry)
-
-
-class UpCloudOptionsFlow(config_entries.OptionsFlow):
-    """UpCloud options flow."""
-
-    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
-        """Initialize options flow."""
-        self.config_entry = config_entry
-
-    async def async_step_init(
-        self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
-        """Handle options flow."""
-
-        if user_input is not None:
-            return self.async_create_entry(title="", data=user_input)
-
-        data_schema = vol.Schema(
-            {
-                vol.Optional(
-                    CONF_SCAN_INTERVAL,
-                    default=self.config_entry.options.get(CONF_SCAN_INTERVAL)
-                    or DEFAULT_SCAN_INTERVAL.total_seconds(),
-                ): vol.All(vol.Coerce(int), vol.Range(min=30)),
-            }
-        )
-        return self.async_show_form(step_id="init", data_schema=data_schema)

@@ -1,30 +1,35 @@
 """Common methods for SleepIQ."""
-from __future__ import annotations
 
 from collections.abc import Generator
-from unittest.mock import MagicMock, create_autospec, patch
+from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
 
 from asyncsleepiq import (
+    BED_PRESETS,
+    CoreTemps,
+    FootWarmingTemps,
     Side,
+    SleepData,
     SleepIQActuator,
     SleepIQBed,
+    SleepIQCoreClimate,
+    SleepIQFootWarmer,
     SleepIQFoundation,
     SleepIQLight,
     SleepIQPreset,
     SleepIQSleeper,
 )
 import pytest
+from pytest_homeassistant.common import MockConfigEntry
 
 from homeassistant.components.sleepiq import DOMAIN
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant
 from homeassistant.setup import async_setup_component
 
-from tests.common import MockConfigEntry
-
 BED_ID = "123456"
 BED_NAME = "Test Bed"
 BED_NAME_LOWER = BED_NAME.lower().replace(" ", "_")
+CORE_CLIMATE_TIME = 240
 SLEEPER_L_ID = "98765"
 SLEEPER_R_ID = "43219"
 SLEEPER_L_NAME = "SleeperL"
@@ -33,11 +38,21 @@ SLEEPER_L_NAME_LOWER = SLEEPER_L_NAME.lower().replace(" ", "_")
 SLEEPER_R_NAME_LOWER = SLEEPER_R_NAME.lower().replace(" ", "_")
 PRESET_L_STATE = "Watch TV"
 PRESET_R_STATE = "Flat"
+FOOT_WARM_TIME = 120
 
 SLEEPIQ_CONFIG = {
     CONF_USERNAME: "user@email.com",
     CONF_PASSWORD: "password",
 }
+
+
+@pytest.fixture
+def mock_setup_entry() -> Generator[AsyncMock]:
+    """Override async_setup_entry."""
+    with patch(
+        "homeassistant.components.sleepiq.async_setup_entry", return_value=None
+    ) as mock_setup_entry:
+        yield mock_setup_entry
 
 
 @pytest.fixture
@@ -57,17 +72,43 @@ def mock_bed() -> MagicMock:
     sleeper_l.name = SLEEPER_L_NAME
     sleeper_l.in_bed = True
     sleeper_l.sleep_number = 40
+    sleeper_l.fav_sleep_number = 50
     sleeper_l.pressure = 1000
     sleeper_l.sleeper_id = SLEEPER_L_ID
+    sleeper_l.sleep_data = SleepData(
+        duration=28800,  # 8 hours in seconds
+        sleep_score=85,
+        heart_rate=60,
+        respiratory_rate=14,
+        hrv=68,
+    )
 
     sleeper_r.side = Side.RIGHT
     sleeper_r.name = SLEEPER_R_NAME
     sleeper_r.in_bed = False
     sleeper_r.sleep_number = 80
+    sleeper_r.fav_sleep_number = 65
     sleeper_r.pressure = 1400
     sleeper_r.sleeper_id = SLEEPER_R_ID
+    sleeper_r.sleep_data = SleepData(
+        duration=25200,  # 7 hours in seconds
+        sleep_score=78,
+        heart_rate=65,
+        respiratory_rate=15,
+        hrv=72,
+    )
 
     bed.foundation = create_autospec(SleepIQFoundation)
+    bed.foundation.type = "splitKing"
+    bed.foundation.features = {
+        "boardIsASingle": False,
+        "hasMassageAndLight": False,
+        "hasFootControl": False,
+        "hasFootWarming": True,
+        "hasUnderbedLight": True,
+        "leftUnderbedLightPMW": False,
+        "rightUnderbedLightPMW": False,
+    }
     light_1 = create_autospec(SleepIQLight)
     light_1.outlet_id = 1
     light_1.is_on = False
@@ -76,13 +117,15 @@ def mock_bed() -> MagicMock:
     light_2.is_on = False
     bed.foundation.lights = [light_1, light_2]
 
+    bed.foundation.foot_warmers = []
+    bed.foundation.core_climates = []
     return bed
 
 
 @pytest.fixture
 def mock_asyncsleepiq_single_foundation(
     mock_bed: MagicMock,
-) -> Generator[MagicMock, None, None]:
+) -> Generator[MagicMock]:
     """Mock an AsyncSleepIQ object with a single foundation."""
     with patch("homeassistant.components.sleepiq.AsyncSleepIQ", autospec=True) as mock:
         client = mock.return_value
@@ -109,11 +152,15 @@ def mock_asyncsleepiq_single_foundation(
         preset.preset = PRESET_R_STATE
         preset.side = Side.NONE
         preset.side_full = "Right"
+        preset.options = BED_PRESETS
+
+        mock_bed.foundation.foot_warmers = []
+        mock_bed.foundation.core_climates = []
         yield client
 
 
 @pytest.fixture
-def mock_asyncsleepiq(mock_bed: MagicMock) -> Generator[MagicMock, None, None]:
+def mock_asyncsleepiq(mock_bed: MagicMock) -> Generator[MagicMock]:
     """Mock an AsyncSleepIQ object with a split foundation."""
     with patch("homeassistant.components.sleepiq.AsyncSleepIQ", autospec=True) as mock:
         client = mock.return_value
@@ -148,10 +195,36 @@ def mock_asyncsleepiq(mock_bed: MagicMock) -> Generator[MagicMock, None, None]:
         preset_l.preset = PRESET_L_STATE
         preset_l.side = Side.LEFT
         preset_l.side_full = "Left"
+        preset_l.options = BED_PRESETS
 
         preset_r.preset = PRESET_R_STATE
         preset_r.side = Side.RIGHT
         preset_r.side_full = "Right"
+        preset_r.options = BED_PRESETS
+
+        foot_warmer_l = create_autospec(SleepIQFootWarmer)
+        foot_warmer_r = create_autospec(SleepIQFootWarmer)
+        mock_bed.foundation.foot_warmers = [foot_warmer_l, foot_warmer_r]
+
+        foot_warmer_l.side = Side.LEFT
+        foot_warmer_l.timer = FOOT_WARM_TIME
+        foot_warmer_l.temperature = FootWarmingTemps.MEDIUM
+
+        foot_warmer_r.side = Side.RIGHT
+        foot_warmer_r.timer = FOOT_WARM_TIME
+        foot_warmer_r.temperature = FootWarmingTemps.OFF
+
+        core_climate_l = create_autospec(SleepIQCoreClimate)
+        core_climate_r = create_autospec(SleepIQCoreClimate)
+        mock_bed.foundation.core_climates = [core_climate_l, core_climate_r]
+
+        core_climate_l.side = Side.LEFT
+        core_climate_l.timer = CORE_CLIMATE_TIME
+        core_climate_l.temperature = CoreTemps.COOLING_PULL_MED
+
+        core_climate_r.side = Side.RIGHT
+        core_climate_r.timer = CORE_CLIMATE_TIME
+        core_climate_r.temperature = CoreTemps.OFF
 
         yield client
 

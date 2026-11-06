@@ -1,9 +1,16 @@
 {
   "domain": "opnsense",
-  "name": "OPNSense",
+  "name": "OPNsense",
+  "categories": [
+    "presence_location.network_presence",
+    "computers_network.routers_network"
+  ],
+  "codeowners": ["@HarlemSquirrel", "@Snuffy2"],
+  "config_flow": true,
+  "connectivity": ["network"],
   "documentation": "https://www.home-assistant.io/integrations/opnsense",
-  "requirements": ["pyopnsense==0.2.0"],
-  "codeowners": ["@mtreinish"],
+  "integration_type": "hub",
   "iot_class": "local_polling",
-  "loggers": ["pbr", "pyopnsense"]
+  "loggers": ["aiopnsense"],
+  "requirements": ["aiopnsense==1.0.10"]
 }

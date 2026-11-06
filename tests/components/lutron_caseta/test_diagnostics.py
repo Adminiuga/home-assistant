@@ -1,6 +1,10 @@
 """Test the Lutron Caseta diagnostics."""
 
-from unittest.mock import ANY, patch
+from unittest.mock import ANY
+
+from pytest_homeassistant.common import MockConfigEntry
+from pytest_homeassistant.components.diagnostics import get_diagnostics_for_config_entry
+from pytest_homeassistant.typing import ClientSessionGenerator
 
 from homeassistant.components.lutron_caseta import DOMAIN
 from homeassistant.components.lutron_caseta.const import (
@@ -9,14 +13,14 @@ from homeassistant.components.lutron_caseta.const import (
     CONF_KEYFILE,
 )
 from homeassistant.const import CONF_HOST
+from homeassistant.core import HomeAssistant
 
-from . import MockBridge
-
-from tests.common import MockConfigEntry
-from tests.components.diagnostics import get_diagnostics_for_config_entry
+from . import MockBridge, async_setup_integration
 
 
-async def test_diagnostics(hass, hass_client) -> None:
+async def test_diagnostics(
+    hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
     """Test generating diagnostics for lutron_caseta."""
     config_entry = MockConfigEntry(
         domain=DOMAIN,
@@ -30,12 +34,7 @@ async def test_diagnostics(hass, hass_client) -> None:
     )
     config_entry.add_to_hass(hass)
 
-    with patch(
-        "homeassistant.components.lutron_caseta.Smartbridge.create_tls",
-        return_value=MockBridge(can_connect=True),
-    ):
-        await hass.config_entries.async_setup(config_entry.entry_id)
-        await hass.async_block_till_done()
+    await async_setup_integration(hass, MockBridge, config_entry.entry_id)
 
     diag = await get_diagnostics_for_config_entry(hass, hass_client, config_entry)
     assert diag == {
@@ -149,6 +148,19 @@ async def test_diagnostics(hass, hass_client) -> None:
                     "tilt": None,
                     "area": "1025",
                 },
+                "902": {
+                    "device_id": "902",
+                    "current_state": 0,
+                    "fan_speed": None,
+                    "zone": "901",
+                    "name": "Kitchen_Other Lights",
+                    "button_groups": None,
+                    "type": "WallDimmer",
+                    "model": None,
+                    "serial": 5442322,
+                    "tilt": None,
+                    "area": "1025",
+                },
                 "9": {
                     "device_id": "9",
                     "current_state": -1,
@@ -181,6 +193,7 @@ async def test_diagnostics(hass, hass_client) -> None:
             },
             "occupancy_groups": {},
             "scenes": {},
+            "smart_away_state": "",
         },
         "entry": {
             "data": {"ca_certs": "", "certfile": "", "host": "1.1.1.1", "keyfile": ""},
@@ -200,7 +213,7 @@ async def test_diagnostics(hass, hass_client) -> None:
                     "parent_keypad": "9",
                 },
                 "1372": {
-                    "button_name": "Kitchen " "Pendants",
+                    "button_name": "Kitchen Pendants",
                     "leap_button_number": 3,
                     "led_device_id": "1362",
                     "lutron_device_id": "1372",
@@ -214,16 +227,16 @@ async def test_diagnostics(hass, hass_client) -> None:
                     "buttons": ["1372"],
                     "device_info": {
                         "identifiers": [["lutron_caseta", 66286451]],
-                        "manufacturer": "Lutron " "Electronics " "Co., " "Inc",
-                        "model": "RRST-W3RL-XX " "(SunnataKeypad)",
-                        "name": "Hallway " "Main " "Stairs " "Position 1 " "Keypad",
+                        "manufacturer": "Lutron Electronics Co., Inc",
+                        "model": "RRST-W3RL-XX (SunnataKeypad)",
+                        "name": "Hallway Main Stairs Position 1 Keypad",
                         "suggested_area": "Hallway",
-                        "via_device": ["lutron_caseta", 1234],
+                        "via_device_id": ANY,
                     },
                     "dr_device_id": ANY,
                     "lutron_device_id": "1355",
                     "model": "RRST-W3RL-XX",
-                    "name": "Main Stairs Position 1 " "Keypad",
+                    "name": "Main Stairs Position 1 Keypad",
                     "serial": 66286451,
                     "type": "SunnataKeypad",
                 },
@@ -233,11 +246,11 @@ async def test_diagnostics(hass, hass_client) -> None:
                     "buttons": ["111"],
                     "device_info": {
                         "identifiers": [["lutron_caseta", 68551522]],
-                        "manufacturer": "Lutron " "Electronics " "Co., " "Inc",
-                        "model": "PJ2-3BRL-GXX-X01 " "(Pico3ButtonRaiseLower)",
-                        "name": "Dining Room " "Pico",
-                        "suggested_area": "Dining " "Room",
-                        "via_device": ["lutron_caseta", 1234],
+                        "manufacturer": "Lutron Electronics Co., Inc",
+                        "model": "PJ2-3BRL-GXX-X01 (Pico3ButtonRaiseLower)",
+                        "name": "Dining Room Pico",
+                        "suggested_area": "Dining Room",
+                        "via_device_id": ANY,
                     },
                     "dr_device_id": ANY,
                     "lutron_device_id": "9",

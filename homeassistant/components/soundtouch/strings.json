@@ -1,27 +1,87 @@
 {
   "config": {
-    "step": {
-      "user": {
-        "data": {
-          "host": "[%key:common::config_flow::data::host%]"
-        }
-      },
-      "zeroconf_confirm": {
-        "title": "Confirm adding Bose SoundTouch device",
-        "description": "You are about to add the SoundTouch device named `{name}` to Home Assistant."
-      }
+    "abort": {
+      "already_configured": "[%key:common::config_flow::abort::already_configured_device%]",
+      "unique_id_mismatch": "Please ensure you reconfigure against the same device."
     },
     "error": {
       "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]"
     },
-    "abort": {
-      "already_configured": "[%key:common::config_flow::abort::already_configured_device%]"
+    "step": {
+      "reconfigure": {
+        "data": {
+          "host": "[%key:common::config_flow::data::host%]"
+        },
+        "data_description": {
+          "host": "[%key:component::soundtouch::config::step::user::data_description::host%]"
+        }
+      },
+      "user": {
+        "data": {
+          "host": "[%key:common::config_flow::data::host%]"
+        },
+        "data_description": {
+          "host": "The hostname or IP address of your Bose SoundTouch device."
+        }
+      },
+      "zeroconf_confirm": {
+        "description": "You are about to add the SoundTouch device named `{name}` to Home Assistant.",
+        "title": "Confirm adding Bose SoundTouch device"
+      }
     }
   },
-  "issues": {
-    "deprecated_yaml": {
-      "title": "The Bose SoundTouch YAML configuration is being removed",
-      "description": "Configuring Bose SoundTouch using YAML is being removed.\n\nYour existing YAML configuration has been imported into the UI automatically.\n\nRemove the Bose SoundTouch YAML configuration from your configuration.yaml file and restart Home Assistant to fix this issue."
+  "services": {
+    "add_zone_slave": {
+      "description": "Adds media players to a SoundTouch multi-room zone.",
+      "fields": {
+        "master": {
+          "description": "The media player entity that is coordinating the multi-room zone. Platform dependent.",
+          "name": "[%key:component::soundtouch::services::create_zone::fields::master::name%]"
+        },
+        "slaves": {
+          "description": "The media player entities to add to the existing zone.",
+          "name": "[%key:component::soundtouch::services::create_zone::fields::slaves::name%]"
+        }
+      },
+      "name": "Add zone follower"
+    },
+    "create_zone": {
+      "description": "Creates a SoundTouch multi-room zone.",
+      "fields": {
+        "master": {
+          "description": "The media player entity that will coordinate the multi-room zone. Platform dependent.",
+          "name": "Leader"
+        },
+        "slaves": {
+          "description": "The media player entities to add to the new zone.",
+          "name": "Follower"
+        }
+      },
+      "name": "Create zone"
+    },
+    "play_everywhere": {
+      "description": "Plays on all Bose SoundTouch devices.",
+      "fields": {
+        "master": {
+          "description": "The media player entity that will coordinate the grouping. Platform dependent. It is a shortcut for creating a multi-room zone with all devices.",
+          "name": "Leader"
+        }
+      },
+      "name": "Play everywhere"
+    },
+    "remove_zone_slave": {
+      "description": "Removes media players from a SoundTouch multi-room zone.",
+      "fields": {
+        "master": {
+          "description": "[%key:component::soundtouch::services::add_zone_slave::fields::master::description%]",
+          "name": "[%key:component::soundtouch::services::create_zone::fields::master::name%]"
+        },
+        "slaves": {
+          "description": "The media player entities to remove from the existing zone.",
+          "name": "[%key:component::soundtouch::services::create_zone::fields::slaves::name%]"
+        }
+      },
+      "name": "Remove zone follower"
     }
   }
 }

@@ -1,18 +1,27 @@
 """Tests for the coordinator of the WLED integration."""
+
 import asyncio
 from collections.abc import Callable
 from copy import deepcopy
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
+from freezegun.api import FrozenDateTimeFactory
 import pytest
+from pytest_homeassistant.common import (
+    MockConfigEntry,
+    async_fire_time_changed,
+    async_load_json_object_fixture,
+)
 from wled import (
     Device as WLEDDevice,
-    WLEDConnectionClosed,
+    WLEDConnectionClosedError,
     WLEDConnectionError,
     WLEDError,
+    WLEDUnsupportedVersionError,
 )
 
-from homeassistant.components.wled.const import SCAN_INTERVAL
+from homeassistant.components.wled.const import DOMAIN, SCAN_INTERVAL
+from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import (
     EVENT_HOMEASSISTANT_STOP,
     STATE_OFF,
@@ -20,9 +29,6 @@ from homeassistant.const import (
     STATE_UNAVAILABLE,
 )
 from homeassistant.core import HomeAssistant
-import homeassistant.util.dt as dt_util
-
-from tests.common import MockConfigEntry, async_fire_time_changed
 
 
 async def test_not_supporting_websocket(
@@ -32,43 +38,51 @@ async def test_not_supporting_websocket(
     assert mock_wled.connect.call_count == 0
 
 
-@pytest.mark.parametrize("mock_wled", ["wled/rgb_websocket.json"], indirect=True)
+@pytest.mark.parametrize("device_fixture", ["rgb_websocket"])
 async def test_websocket_already_connected(
-    hass: HomeAssistant, init_integration: MockConfigEntry, mock_wled: MagicMock
+    hass: HomeAssistant,
+    init_integration: MockConfigEntry,
+    mock_wled: MagicMock,
+    freezer: FrozenDateTimeFactory,
 ) -> None:
     """Ensure no a second WebSocket connection is made, if already connected."""
     assert mock_wled.connect.call_count == 1
 
     mock_wled.connected = True
-    async_fire_time_changed(hass, dt_util.utcnow() + SCAN_INTERVAL)
+
+    freezer.tick(SCAN_INTERVAL)
+    async_fire_time_changed(hass)
     await hass.async_block_till_done()
 
     assert mock_wled.connect.call_count == 1
 
 
-@pytest.mark.parametrize("mock_wled", ["wled/rgb_websocket.json"], indirect=True)
+@pytest.mark.parametrize("device_fixture", ["rgb_websocket"])
 async def test_websocket_connect_error_no_listen(
     hass: HomeAssistant,
     init_integration: MockConfigEntry,
     mock_wled: MagicMock,
+    freezer: FrozenDateTimeFactory,
 ) -> None:
     """Ensure we don't start listening if WebSocket connection failed."""
     assert mock_wled.connect.call_count == 1
     assert mock_wled.listen.call_count == 1
 
     mock_wled.connect.side_effect = WLEDConnectionError
-    async_fire_time_changed(hass, dt_util.utcnow() + SCAN_INTERVAL)
+    freezer.tick(SCAN_INTERVAL)
+    async_fire_time_changed(hass)
     await hass.async_block_till_done()
 
     assert mock_wled.connect.call_count == 2
     assert mock_wled.listen.call_count == 1
 
 
-@pytest.mark.parametrize("mock_wled", ["wled/rgb_websocket.json"], indirect=True)
+@pytest.mark.parametrize("device_fixture", ["rgb_websocket"])
 async def test_websocket(
     hass: HomeAssistant,
     init_integration: MockConfigEntry,
     mock_wled: MagicMock,
+    freezer: FrozenDateTimeFactory,
 ) -> None:
     """Test WebSocket connection."""
     state = hass.states.get("light.wled_websocket")
@@ -95,7 +109,8 @@ async def test_websocket(
     hass.bus = mock_bus
 
     # Next refresh it should connect
-    async_fire_time_changed(hass, dt_util.utcnow() + SCAN_INTERVAL)
+    freezer.tick(SCAN_INTERVAL)
+    async_fire_time_changed(hass)
     callback = await connection_connected
 
     # Connected to WebSocket, disconnect not called
@@ -113,8 +128,10 @@ async def test_websocket(
     assert mock_bus.async_listen_once.return_value.call_count == 0
 
     # Send update from WebSocket
+    # Note we may still update() during websocket setup
+    # so update it too.
+    mock_wled.update.return_value.state.on = False
     updated_device = deepcopy(mock_wled.update.return_value)
-    updated_device.state.on = False
     callback(updated_device)
     await hass.async_block_till_done()
 
@@ -123,8 +140,16 @@ async def test_websocket(
     assert state
     assert state.state == STATE_OFF
 
-    # Resolve Future with a connection losed.
-    connection_finished.set_exception(WLEDConnectionClosed)
+    # Listening for changes on websocket, polling is suspended
+    num_updates_before_websocket = mock_wled.update.call_count
+    for _scans in range(4):
+        freezer.tick(SCAN_INTERVAL)
+        async_fire_time_changed(hass)
+        await hass.async_block_till_done()
+    assert mock_wled.update.call_count == num_updates_before_websocket
+
+    # Resolve Future with a closed connection.
+    connection_finished.set_exception(WLEDConnectionClosedError)
     await hass.async_block_till_done()
 
     # Disconnect called, unsubbed Home Assistant stop listener
@@ -137,11 +162,12 @@ async def test_websocket(
     assert state.state == STATE_OFF
 
 
-@pytest.mark.parametrize("mock_wled", ["wled/rgb_websocket.json"], indirect=True)
+@pytest.mark.parametrize("device_fixture", ["rgb_websocket"])
 async def test_websocket_error(
     hass: HomeAssistant,
     init_integration: MockConfigEntry,
     mock_wled: MagicMock,
+    freezer: FrozenDateTimeFactory,
 ) -> None:
     """Test WebSocket connection erroring out, marking lights unavailable."""
     state = hass.states.get("light.wled_websocket")
@@ -156,24 +182,40 @@ async def test_websocket_error(
         await connection_finished
 
     mock_wled.listen.side_effect = connect
-    async_fire_time_changed(hass, dt_util.utcnow() + SCAN_INTERVAL)
+    freezer.tick(SCAN_INTERVAL)
+    async_fire_time_changed(hass)
     await connection_connected
 
-    # Resolve Future with an error.
+    # Resolve listen() with an error. This causes polling
+    # to take over so fail polling update() too
+    mock_wled.update.side_effect = WLEDError
+    mock_wled.listen.side_effect = WLEDError
     connection_finished.set_exception(WLEDError)
     await hass.async_block_till_done()
 
     # Light no longer available as an error occurred
+    # and polling couldn't take over.
     state = hass.states.get("light.wled_websocket")
     assert state
     assert state.state == STATE_UNAVAILABLE
 
+    # Light becomes available after polling takes over
+    mock_wled.update.side_effect = None
+    freezer.tick(SCAN_INTERVAL)
+    async_fire_time_changed(hass)
+    await hass.async_block_till_done()
 
-@pytest.mark.parametrize("mock_wled", ["wled/rgb_websocket.json"], indirect=True)
+    state = hass.states.get("light.wled_websocket")
+    assert state
+    assert state.state == STATE_ON
+
+
+@pytest.mark.parametrize("device_fixture", ["rgb_websocket"])
 async def test_websocket_disconnect_on_home_assistant_stop(
     hass: HomeAssistant,
     init_integration: MockConfigEntry,
     mock_wled: MagicMock,
+    freezer: FrozenDateTimeFactory,
 ) -> None:
     """Ensure WebSocket is disconnected when Home Assistant stops."""
     assert mock_wled.disconnect.call_count == 1
@@ -185,7 +227,8 @@ async def test_websocket_disconnect_on_home_assistant_stop(
         await connection_finished
 
     mock_wled.listen.side_effect = connect
-    async_fire_time_changed(hass, dt_util.utcnow() + SCAN_INTERVAL)
+    freezer.tick(SCAN_INTERVAL)
+    async_fire_time_changed(hass)
     await connection_connected
 
     assert mock_wled.disconnect.call_count == 1
@@ -194,3 +237,87 @@ async def test_websocket_disconnect_on_home_assistant_stop(
     await hass.async_block_till_done()
     await hass.async_block_till_done()
     assert mock_wled.disconnect.call_count == 2
+
+
+async def test_fail_when_other_device(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_wled: MagicMock,
+) -> None:
+    """Ensure entry fails to setup when mac mismatch."""
+    device = mock_wled.update.return_value
+    device.info.mac_address = "invalid"
+
+    mock_config_entry.add_to_hass(hass)
+
+    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+
+    await hass.async_block_till_done()
+
+    assert mock_config_entry.state is ConfigEntryState.SETUP_ERROR
+    assert mock_config_entry.reason
+    assert (
+        "MAC address does not match the configured device." in mock_config_entry.reason
+    )
+
+
+async def test_fail_when_unsupported_version(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_wled: MagicMock,
+) -> None:
+    """Ensure entry fails to setup when unsupported version."""
+    mock_wled.update.side_effect = WLEDUnsupportedVersionError(
+        "Unsupported firmware version 0.14.0-b1. Minimum required version is 0.14.0. "
+        "Please update your WLED device."
+    )
+
+    mock_config_entry.add_to_hass(hass)
+
+    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+
+    await hass.async_block_till_done()
+
+    assert mock_config_entry.state is ConfigEntryState.SETUP_ERROR
+    assert mock_config_entry.reason
+    assert (
+        "The WLED device's firmware version is not supported:"
+        in mock_config_entry.reason
+    )
+    assert "0.14.0-b1" in mock_config_entry.reason
+
+
+@pytest.mark.parametrize("device_fixture", ["rgb_websocket"])
+async def test_websocket_update_with_other_led_setup(
+    hass: HomeAssistant,
+    init_integration: MockConfigEntry,
+    mock_wled: MagicMock,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Ensure an LED setup change pushed over the WebSocket sets up again."""
+    connection_connected = asyncio.Future()
+    connection_finished = asyncio.Future()
+    push: Callable[[WLEDDevice], None] | None = None
+
+    async def connect(callback: Callable[[WLEDDevice], None]):
+        nonlocal push
+        push = callback
+        connection_connected.set_result(None)
+        await connection_finished
+
+    mock_wled.listen.side_effect = connect
+    freezer.tick(SCAN_INTERVAL)
+    async_fire_time_changed(hass)
+    await connection_connected
+    assert push is not None
+
+    # The segment is now on an RGBW output; the library updates in place.
+    data = await async_load_json_object_fixture(hass, "rgb_websocket.json", DOMAIN)
+    data["info"]["leds"]["seglc"] = [3]
+    device = mock_wled.update.return_value
+    device.update_from_dict(data)
+    with patch.object(hass.config_entries, "async_schedule_reload") as reload:
+        push(device)
+
+    reload.assert_called_once_with(init_integration.entry_id)
+    connection_finished.set_result(None)

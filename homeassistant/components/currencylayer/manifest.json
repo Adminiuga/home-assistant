@@ -1,7 +1,10 @@
 {
   "domain": "currencylayer",
   "name": "currencylayer",
-  "documentation": "https://www.home-assistant.io/integrations/currencylayer",
+  "categories": ["finance"],
   "codeowners": [],
-  "iot_class": "cloud_polling"
+  "connectivity": ["cloud"],
+  "documentation": "https://www.home-assistant.io/integrations/currencylayer",
+  "iot_class": "cloud_polling",
+  "quality_scale": "legacy"
 }

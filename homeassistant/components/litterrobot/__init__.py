@@ -1,59 +1,132 @@
 """The Litter-Robot integration."""
-from __future__ import annotations
 
-from pylitterbot import FeederRobot, LitterRobot, LitterRobot3, Robot
+import itertools
+import logging
 
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant
+from pylitterbot import Account
+from pylitterbot.exceptions import LitterRobotException, LitterRobotLoginException
+
+from homeassistant.const import (
+    CONF_PASSWORD,
+    CONF_USERNAME,
+    EVENT_HOMEASSISTANT_STOP,
+    Platform,
+)
+from homeassistant.core import Event, HomeAssistant
+from homeassistant.exceptions import ConfigEntryError, ConfigEntryNotReady
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.device_registry import AnyDeviceEntry
+from homeassistant.helpers.typing import ConfigType
 
 from .const import DOMAIN
-from .hub import LitterRobotHub
+from .coordinator import LitterRobotConfigEntry, LitterRobotDataUpdateCoordinator
+from .services import async_setup_services
 
-PLATFORMS_BY_TYPE = {
-    Robot: (
-        Platform.BINARY_SENSOR,
-        Platform.SELECT,
-        Platform.SENSOR,
-        Platform.SWITCH,
-    ),
-    LitterRobot: (Platform.VACUUM,),
-    LitterRobot3: (Platform.BUTTON,),
-    FeederRobot: (Platform.BUTTON,),
-}
+_LOGGER = logging.getLogger(__name__)
 
-
-def get_platforms_for_robots(robots: list[Robot]) -> set[Platform]:
-    """Get platforms for robots."""
-    return {
-        platform
-        for robot in robots
-        for robot_type, platforms in PLATFORMS_BY_TYPE.items()
-        if isinstance(robot, robot_type)
-        for platform in platforms
-    }
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+PLATFORMS = [
+    Platform.BINARY_SENSOR,
+    Platform.BUTTON,
+    Platform.LIGHT,
+    Platform.SELECT,
+    Platform.SENSOR,
+    Platform.SWITCH,
+    Platform.TIME,
+    Platform.UPDATE,
+    Platform.VACUUM,
+]
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Set up Litter-Robot from a config entry."""
-    hass.data.setdefault(DOMAIN, {})
-    hub = hass.data[DOMAIN][entry.entry_id] = LitterRobotHub(hass, entry.data)
-    await hub.login(load_robots=True, subscribe_for_updates=True)
-
-    if platforms := get_platforms_for_robots(hub.account.robots):
-        await hass.config_entries.async_forward_entry_setups(entry, platforms)
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Set up the component."""
+    async_setup_services(hass)
     return True
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_migrate_entry(
+    hass: HomeAssistant, entry: LitterRobotConfigEntry
+) -> None:
+    """Migrate old entry."""
+    _LOGGER.debug(
+        "Migrating configuration from version %s.%s",
+        entry.version,
+        entry.minor_version,
+    )
+
+    if entry.minor_version < 2:
+        account = Account(websession=async_get_clientsession(hass))
+        try:
+            await account.connect(
+                username=entry.data[CONF_USERNAME],
+                password=entry.data[CONF_PASSWORD],
+            )
+            user_id = account.user_id
+        except LitterRobotLoginException as ex:
+            raise ConfigEntryError(
+                translation_domain=DOMAIN, translation_key="invalid_credentials"
+            ) from ex
+        except LitterRobotException as ex:
+            raise ConfigEntryNotReady(
+                translation_domain=DOMAIN, translation_key="migration_cannot_connect"
+            ) from ex
+        finally:
+            await account.disconnect()
+
+        if user_id and not hass.config_entries.async_entry_for_domain_unique_id(
+            DOMAIN, user_id
+        ):
+            hass.config_entries.async_update_entry(
+                entry, unique_id=user_id, minor_version=2
+            )
+        else:
+            hass.config_entries.async_update_entry(entry, minor_version=2)
+
+    _LOGGER.debug(
+        "Migration to configuration version %s.%s successful",
+        entry.version,
+        entry.minor_version,
+    )
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: LitterRobotConfigEntry) -> None:
+    """Set up Litter-Robot from a config entry."""
+    coordinator = LitterRobotDataUpdateCoordinator(hass, entry)
+
+    # Entries are not unloaded at shutdown, and the first refresh already starts
+    # the account's WebSocket monitor.
+    async def _async_disconnect_account(event: Event) -> None:
+        await coordinator.account.disconnect()
+
+    entry.async_on_unload(
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _async_disconnect_account)
+    )
+
+    await coordinator.async_config_entry_first_refresh()
+    entry.runtime_data = coordinator
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+
+async def async_unload_entry(
+    hass: HomeAssistant, entry: LitterRobotConfigEntry
+) -> None:
     """Unload a config entry."""
-    hub: LitterRobotHub = hass.data[DOMAIN][entry.entry_id]
-    await hub.account.disconnect()
+    await entry.runtime_data.account.disconnect()
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)
 
-    platforms = get_platforms_for_robots(hub.account.robots)
-    unload_ok = await hass.config_entries.async_unload_platforms(entry, platforms)
 
-    if unload_ok:
-        hass.data[DOMAIN].pop(entry.entry_id)
-
-    return unload_ok
+async def async_remove_config_entry_device(
+    hass: HomeAssistant, entry: LitterRobotConfigEntry, device_entry: AnyDeviceEntry
+) -> bool:
+    """Remove a config entry from a device."""
+    return not any(
+        identifier
+        for identifier in device_entry.identifiers
+        if identifier[0] == DOMAIN
+        for _id in itertools.chain(
+            (robot.serial for robot in entry.runtime_data.account.robots),
+            (pet.id for pet in entry.runtime_data.account.pets),
+        )
+        if _id == identifier[1]
+    )

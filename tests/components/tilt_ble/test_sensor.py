@@ -1,19 +1,17 @@
 """Test the Tilt Hydrometer BLE sensors."""
 
-from __future__ import annotations
+from pytest_homeassistant.common import MockConfigEntry
+from pytest_homeassistant.components.bluetooth import inject_bluetooth_service_info
 
-from homeassistant.components.sensor import ATTR_STATE_CLASS
+from homeassistant.components.sensor import ATTR_STATE_CLASS, async_rounded_state
 from homeassistant.components.tilt_ble.const import DOMAIN
 from homeassistant.const import ATTR_FRIENDLY_NAME, ATTR_UNIT_OF_MEASUREMENT
 from homeassistant.core import HomeAssistant
 
 from . import TILT_GREEN_SERVICE_INFO
 
-from tests.common import MockConfigEntry
-from tests.components.bluetooth import inject_bluetooth_service_info
 
-
-async def test_sensors(hass: HomeAssistant):
+async def test_sensors(hass: HomeAssistant) -> None:
     """Test setting up creates the sensors."""
     entry = MockConfigEntry(
         domain=DOMAIN,
@@ -35,7 +33,10 @@ async def test_sensors(hass: HomeAssistant):
     assert temp_sensor is not None
 
     temp_sensor_attribtes = temp_sensor.attributes
-    assert temp_sensor.state == "21"
+    assert (
+        async_rounded_state(hass, "sensor.tilt_green_temperature", temp_sensor)
+        == "21.1"
+    )
     assert temp_sensor_attribtes[ATTR_FRIENDLY_NAME] == "Tilt Green Temperature"
     assert temp_sensor_attribtes[ATTR_UNIT_OF_MEASUREMENT] == "°C"
     assert temp_sensor_attribtes[ATTR_STATE_CLASS] == "measurement"

@@ -1,11 +1,13 @@
 {
   "domain": "totalconnect",
   "name": "Total Connect",
-  "documentation": "https://www.home-assistant.io/integrations/totalconnect",
-  "requirements": ["total_connect_client==2022.10"],
-  "dependencies": [],
+  "categories": ["security_safety.alarm_systems"],
   "codeowners": ["@austinmroczek"],
   "config_flow": true,
+  "connectivity": ["cloud"],
+  "documentation": "https://www.home-assistant.io/integrations/totalconnect",
+  "integration_type": "hub",
   "iot_class": "cloud_polling",
-  "loggers": ["total_connect_client"]
+  "loggers": ["total_connect_client"],
+  "requirements": ["total-connect-client==2026.9"]
 }

@@ -1,0 +1,196 @@
+"""Support for functionality to download files."""
+
+from enum import StrEnum
+from http import HTTPStatus
+import os
+import re
+
+import probatio
+import requests
+
+from homeassistant.core import HomeAssistant, ServiceCall, callback
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.service import async_register_admin_service
+from homeassistant.util import raise_if_invalid_filename, raise_if_invalid_path
+
+from .const import (
+    CONF_DOWNLOAD_DIR,
+    DOMAIN,
+    DOWNLOAD_COMPLETED_EVENT,
+    DOWNLOAD_FAILED_EVENT,
+    LOGGER,
+)
+
+
+class DownloaderService(StrEnum):
+    """Store keys for Downloader services."""
+
+    DOWNLOAD_FILE = "download_file"
+
+
+class DownloaderServiceArgument(StrEnum):
+    """Store keys for Downloader service arguments."""
+
+    FILENAME = "filename"
+    HEADERS = "headers"
+    OVERWRITE = "overwrite"
+    SUBDIR = "subdir"
+    URL = "url"
+
+
+async def download_file(service: ServiceCall) -> None:
+    """Download file specified in the URL."""
+
+    if not (entries := service.hass.config_entries.async_loaded_entries(DOMAIN)):
+        raise ServiceValidationError(
+            translation_domain=DOMAIN, translation_key="not_loaded"
+        )
+    entry = entries[0]
+    download_path = entry.data[CONF_DOWNLOAD_DIR]
+    url: str = service.data[DownloaderServiceArgument.URL]
+    subdir: str | None = service.data.get(DownloaderServiceArgument.SUBDIR)
+    target_filename: str | None = service.data.get(DownloaderServiceArgument.FILENAME)
+    overwrite: bool = service.data[DownloaderServiceArgument.OVERWRITE]
+    headers: dict[str, str] = service.data[DownloaderServiceArgument.HEADERS]
+
+    if subdir:
+        # Check the path
+        try:
+            raise_if_invalid_path(subdir)
+        except ValueError as err:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="subdir_invalid",
+                translation_placeholders={"subdir": subdir},
+            ) from err
+        if os.path.isabs(subdir):
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="subdir_not_relative",
+                translation_placeholders={"subdir": subdir},
+            )
+
+    def do_download() -> None:
+        """Download the file."""
+        final_path = None
+        filename = target_filename
+        try:
+            req = requests.get(url, stream=True, headers=headers, timeout=10)
+
+            if req.status_code != HTTPStatus.OK:
+                LOGGER.warning(
+                    "Downloading '%s' failed, status_code=%d", url, req.status_code
+                )
+                service.hass.bus.fire(
+                    f"{DOMAIN}_{DOWNLOAD_FAILED_EVENT}",
+                    {"url": url, "filename": filename},
+                )
+
+            else:
+                if filename is None and "content-disposition" in req.headers:
+                    if match := re.search(
+                        r"filename=(\S+)", req.headers["content-disposition"]
+                    ):
+                        filename = match.group(1).strip("'\" ")
+
+                if not filename:
+                    filename = os.path.basename(url).strip()
+
+                if not filename:
+                    filename = "ha_download"
+
+                # Check the filename
+                raise_if_invalid_filename(filename)
+
+                # Do we want to download to subdir, create if needed
+                if subdir:
+                    subdir_path = os.path.join(download_path, subdir)
+
+                    # Ensure subdir exist
+                    os.makedirs(subdir_path, exist_ok=True)
+
+                    final_path = os.path.join(subdir_path, filename)
+
+                else:
+                    final_path = os.path.join(download_path, filename)
+
+                path, ext = os.path.splitext(final_path)
+
+                # If file exist append a number.
+                # We test filename, filename_2..
+                if not overwrite:
+                    tries = 1
+                    final_path = path + ext
+                    while os.path.isfile(final_path):
+                        tries += 1
+
+                        final_path = f"{path}_{tries}.{ext}"
+
+                LOGGER.debug("%s -> %s", url, final_path)
+
+                with open(final_path, "wb") as fil:
+                    fil.writelines(req.iter_content(1024))
+
+                LOGGER.debug("Downloading of %s done", url)
+                service.hass.bus.fire(
+                    f"{DOMAIN}_{DOWNLOAD_COMPLETED_EVENT}",
+                    {"url": url, "filename": filename},
+                )
+
+        except requests.exceptions.ConnectionError as err:
+            service.hass.bus.fire(
+                f"{DOMAIN}_{DOWNLOAD_FAILED_EVENT}",
+                {"url": url, "filename": filename},
+            )
+
+            # Remove file if we started downloading but failed
+            if final_path and os.path.isfile(final_path):
+                os.remove(final_path)
+
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="connection_error",
+                translation_placeholders={"url": url},
+            ) from err
+        except ValueError as err:
+            service.hass.bus.fire(
+                f"{DOMAIN}_{DOWNLOAD_FAILED_EVENT}",
+                {"url": url, "filename": filename},
+            )
+
+            # Remove file if we started downloading but failed
+            if final_path and os.path.isfile(final_path):
+                os.remove(final_path)
+
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="invalid_value",
+                translation_placeholders={"url": url},
+            ) from err
+
+    await service.hass.async_add_executor_job(do_download)
+
+
+@callback
+def async_setup_services(hass: HomeAssistant) -> None:
+    """Register the services for the downloader component."""
+    async_register_admin_service(
+        hass,
+        DOMAIN,
+        DownloaderService.DOWNLOAD_FILE,
+        download_file,
+        schema=probatio.Schema(
+            {
+                probatio.Optional(DownloaderServiceArgument.FILENAME): cv.string,
+                probatio.Optional(DownloaderServiceArgument.SUBDIR): cv.string,
+                probatio.Required(DownloaderServiceArgument.URL): cv.url,
+                probatio.Optional(
+                    DownloaderServiceArgument.OVERWRITE, default=False
+                ): cv.boolean,
+                probatio.Optional(
+                    DownloaderServiceArgument.HEADERS, default=dict
+                ): probatio.Schema({cv.string: cv.string}),
+            }
+        ),
+    )

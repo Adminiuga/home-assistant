@@ -1,8 +1,11 @@
 {
   "domain": "bayesian",
   "name": "Bayesian",
-  "documentation": "https://www.home-assistant.io/integrations/bayesian",
+  "categories": ["helpers.calculate_value"],
   "codeowners": ["@HarvsG"],
-  "quality_scale": "internal",
-  "iot_class": "local_polling"
+  "config_flow": true,
+  "documentation": "https://www.home-assistant.io/integrations/bayesian",
+  "integration_type": "service",
+  "iot_class": "calculated",
+  "quality_scale": "internal"
 }

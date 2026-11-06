@@ -1,21 +1,21 @@
 """Support for interface with a Ziggo Mediabox XL."""
-from __future__ import annotations
 
 import logging
 import socket
+from typing import override
 
-import voluptuous as vol
+import probatio
 from ziggo_mediabox_xl import ZiggoMediaboxXL
 
 from homeassistant.components.media_player import (
-    PLATFORM_SCHEMA,
+    PLATFORM_SCHEMA as MEDIA_PLAYER_PLATFORM_SCHEMA,
     MediaPlayerEntity,
     MediaPlayerEntityFeature,
     MediaPlayerState,
 )
 from homeassistant.const import CONF_HOST, CONF_NAME
 from homeassistant.core import HomeAssistant
-import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
@@ -23,8 +23,8 @@ _LOGGER = logging.getLogger(__name__)
 
 DATA_KNOWN_DEVICES = "ziggo_mediabox_xl_known_devices"
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
-    {vol.Required(CONF_HOST): cv.string, vol.Optional(CONF_NAME): cv.string}
+PLATFORM_SCHEMA = MEDIA_PLAYER_PLATFORM_SCHEMA.extend(
+    {probatio.Required(CONF_HOST): cv.string, probatio.Optional(CONF_NAME): cv.string}
 )
 
 
@@ -62,11 +62,10 @@ def setup_platform(
             # Check if a connection can be established to the device.
             if mediabox.test_connection():
                 connection_successful = True
+            elif manual_config:
+                _LOGGER.error("Can't connect to %s", host)
             else:
-                if manual_config:
-                    _LOGGER.info("Can't connect to %s", host)
-                else:
-                    _LOGGER.error("Can't connect to %s", host)
+                _LOGGER.error("Can't connect to %s", host)
             # When the device is in eco mode it's not connected to the network
             # so it needs to be added anyway if it's configured manually.
             if manual_config or connection_successful:
@@ -77,7 +76,7 @@ def setup_platform(
         except OSError as error:
             _LOGGER.error("Can't connect to %s: %s", host, error)
     else:
-        _LOGGER.info("Ignoring duplicate Ziggo Mediabox XL %s", host)
+        _LOGGER.warning("Ignoring duplicate Ziggo Mediabox XL %s", host)
     add_entities(hosts, True)
 
 
@@ -98,25 +97,24 @@ class ZiggoMediaboxXLDevice(MediaPlayerEntity):
         """Initialize the device."""
         self._mediabox = mediabox
         self._host = host
-        self._name = name
-        self._available = available
-        self._state = None
+        self._attr_name = name
+        self._attr_available = available
 
     def update(self) -> None:
         """Retrieve the state of the device."""
         try:
             if self._mediabox.test_connection():
                 if self._mediabox.turned_on():
-                    if self._state != MediaPlayerState.PAUSED:
-                        self._state = MediaPlayerState.PLAYING
+                    if self.state != MediaPlayerState.PAUSED:
+                        self._attr_state = MediaPlayerState.PLAYING
                 else:
-                    self._state = MediaPlayerState.OFF
-                self._available = True
+                    self._attr_state = MediaPlayerState.OFF
+                self._attr_available = True
             else:
-                self._available = False
+                self._attr_available = False
         except OSError:
             _LOGGER.error("Couldn't fetch state from %s", self._host)
-            self._available = False
+            self._attr_available = False
 
     def send_keys(self, keys):
         """Send keys to the device and handle exceptions."""
@@ -126,64 +124,57 @@ class ZiggoMediaboxXLDevice(MediaPlayerEntity):
             _LOGGER.error("Couldn't send keys to %s", self._host)
 
     @property
-    def name(self):
-        """Return the name of the device."""
-        return self._name
-
-    @property
-    def state(self):
-        """Return the state of the device."""
-        return self._state
-
-    @property
-    def available(self):
-        """Return True if the device is available."""
-        return self._available
-
-    @property
-    def source_list(self):
+    @override
+    def source_list(self) -> list[str]:
         """List of available sources (channels)."""
         return [
             self._mediabox.channels()[c]
             for c in sorted(self._mediabox.channels().keys())
         ]
 
+    @override
     def turn_on(self) -> None:
         """Turn the media player on."""
         self.send_keys(["POWER"])
 
+    @override
     def turn_off(self) -> None:
         """Turn off media player."""
         self.send_keys(["POWER"])
 
+    @override
     def media_play(self) -> None:
         """Send play command."""
         self.send_keys(["PLAY"])
-        self._state = MediaPlayerState.PLAYING
+        self._attr_state = MediaPlayerState.PLAYING
 
+    @override
     def media_pause(self) -> None:
         """Send pause command."""
         self.send_keys(["PAUSE"])
-        self._state = MediaPlayerState.PAUSED
+        self._attr_state = MediaPlayerState.PAUSED
 
     def media_play_pause(self) -> None:
         """Simulate play pause media player."""
         self.send_keys(["PAUSE"])
-        if self._state == MediaPlayerState.PAUSED:
-            self._state = MediaPlayerState.PLAYING
+        if self.state == MediaPlayerState.PAUSED:
+            self._attr_state = MediaPlayerState.PLAYING
         else:
-            self._state = MediaPlayerState.PAUSED
+            self._attr_state = MediaPlayerState.PAUSED
 
+    @override
     def media_next_track(self) -> None:
         """Channel up."""
         self.send_keys(["CHAN_UP"])
-        self._state = MediaPlayerState.PLAYING
+        self._attr_state = MediaPlayerState.PLAYING
 
+    @override
     def media_previous_track(self) -> None:
         """Channel down."""
         self.send_keys(["CHAN_DOWN"])
-        self._state = MediaPlayerState.PLAYING
+        self._attr_state = MediaPlayerState.PLAYING
 
+    @override
     def select_source(self, source):
         """Select the channel."""
         if str(source).isdigit():
@@ -201,4 +192,4 @@ class ZiggoMediaboxXLDevice(MediaPlayerEntity):
             return
 
         self.send_keys([f"NUM_{digit}" for digit in str(digits)])
-        self._state = MediaPlayerState.PLAYING
+        self._attr_state = MediaPlayerState.PLAYING

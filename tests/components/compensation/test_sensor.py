@@ -1,177 +1,319 @@
 """The tests for the integration sensor platform."""
 
+from typing import Any
+from unittest.mock import patch
+
+import pytest
+from pytest_homeassistant.common import (
+    MockConfigEntry,
+    assert_platform_setup_creates_issue,
+    assert_setup_component,
+    get_fixture_path,
+)
+
+from homeassistant import config as hass_config
 from homeassistant.components.compensation.const import CONF_PRECISION, DOMAIN
 from homeassistant.components.compensation.sensor import ATTR_COEFFICIENTS
-from homeassistant.components.sensor import DOMAIN as SENSOR_DOMAIN
+from homeassistant.components.sensor import (
+    ATTR_STATE_CLASS,
+    DOMAIN as SENSOR_DOMAIN,
+    SensorDeviceClass,
+    SensorStateClass,
+)
 from homeassistant.const import (
+    ATTR_DEVICE_CLASS,
     ATTR_UNIT_OF_MEASUREMENT,
     EVENT_HOMEASSISTANT_START,
     EVENT_STATE_CHANGED,
+    SERVICE_RELOAD,
+    STATE_UNAVAILABLE,
     STATE_UNKNOWN,
+    UnitOfTemperature,
 )
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er, issue_registry as ir
 from homeassistant.setup import async_setup_component
 
+TEST_OBJECT_ID = "test_compensation"
+TEST_ENTITY_ID = "sensor.test_compensation"
+TEST_SOURCE = "sensor.uncompensated"
 
-async def test_linear_state(hass):
+TEST_BASE_CONFIG = {
+    "source": TEST_SOURCE,
+    "data_points": [
+        [1.0, 2.0],
+        [2.0, 3.0],
+    ],
+    "precision": 2,
+}
+TEST_CONFIG = {
+    "name": TEST_OBJECT_ID,
+    "unit_of_measurement": "a",
+    **TEST_BASE_CONFIG,
+}
+
+
+async def test_platform_config_creates_issue(
+    hass: HomeAssistant,
+    issue_registry: ir.IssueRegistry,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test invalid platform config creates issue and logs a warning."""
+    await assert_platform_setup_creates_issue(
+        hass,
+        SENSOR_DOMAIN,
+        DOMAIN,
+        issue_registry,
+        caplog,
+    )
+
+
+async def async_setup_compensation(hass: HomeAssistant, config: dict[str, Any]) -> None:
+    """Do setup of a compensation integration sensor."""
+    with assert_setup_component(1, DOMAIN):
+        assert await async_setup_component(
+            hass,
+            DOMAIN,
+            {DOMAIN: {"test": config}},
+        )
+
+    await hass.async_block_till_done()
+    await hass.async_start()
+    await hass.async_block_till_done()
+
+
+@pytest.fixture
+async def setup_compensation(hass: HomeAssistant, config: dict[str, Any]) -> None:
+    """Do setup of a compensation integration sensor."""
+    await async_setup_compensation(hass, config)
+
+
+@pytest.fixture
+async def setup_compensation_with_limits(
+    hass: HomeAssistant,
+    config: dict[str, Any],
+    upper: bool,
+    lower: bool,
+):
+    """Do setup of a compensation integration sensor with extra config."""
+    await async_setup_compensation(
+        hass,
+        {
+            **config,
+            "lower_limit": lower,
+            "upper_limit": upper,
+        },
+    )
+
+
+@pytest.fixture
+async def caplog_setup_text(caplog: pytest.LogCaptureFixture) -> str:
+    """Return setup log of integration."""
+    return caplog.text
+
+
+@pytest.mark.parametrize("config", [TEST_CONFIG])
+@pytest.mark.usefixtures("setup_compensation")
+async def test_linear_state(hass: HomeAssistant, config: dict[str, Any]) -> None:
     """Test compensation sensor state."""
-    config = {
-        "compensation": {
-            "test": {
-                "source": "sensor.uncompensated",
-                "data_points": [
-                    [1.0, 2.0],
-                    [2.0, 3.0],
-                ],
-                "precision": 2,
-                "unit_of_measurement": "a",
-            }
-        }
-    }
-    expected_entity_id = "sensor.compensation_sensor_uncompensated"
-
-    assert await async_setup_component(hass, DOMAIN, config)
-    assert await async_setup_component(hass, SENSOR_DOMAIN, config)
-    await hass.async_block_till_done()
-
     hass.bus.async_fire(EVENT_HOMEASSISTANT_START)
-    entity_id = config[DOMAIN]["test"]["source"]
-    hass.states.async_set(entity_id, 4, {})
+    hass.states.async_set(TEST_SOURCE, 4, {})
     await hass.async_block_till_done()
 
-    state = hass.states.get(expected_entity_id)
+    state = hass.states.get(TEST_ENTITY_ID)
     assert state is not None
 
-    assert round(float(state.state), config[DOMAIN]["test"][CONF_PRECISION]) == 5.0
+    assert round(float(state.state), config[CONF_PRECISION]) == 5.0
 
     assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) == "a"
 
     coefs = [round(v, 1) for v in state.attributes.get(ATTR_COEFFICIENTS)]
     assert coefs == [1.0, 1.0]
 
-    hass.states.async_set(entity_id, "foo", {})
+    hass.states.async_set(TEST_SOURCE, "foo", {})
     await hass.async_block_till_done()
 
-    state = hass.states.get(expected_entity_id)
+    state = hass.states.get(TEST_ENTITY_ID)
     assert state is not None
 
     assert state.state == STATE_UNKNOWN
 
 
-async def test_linear_state_from_attribute(hass):
-    """Test compensation sensor state that pulls from attribute."""
-    config = {
-        "compensation": {
-            "test": {
-                "source": "sensor.uncompensated",
-                "attribute": "value",
-                "data_points": [
-                    [1.0, 2.0],
-                    [2.0, 3.0],
-                ],
-                "precision": 2,
-            }
-        }
-    }
-    expected_entity_id = "sensor.compensation_sensor_uncompensated_value"
+async def test_initial_state_from_existing_source(hass: HomeAssistant) -> None:
+    """Test the sensor uses the source state that exists before setup."""
+    hass.states.async_set(TEST_SOURCE, 4, {})
 
-    assert await async_setup_component(hass, DOMAIN, config)
-    assert await async_setup_component(hass, SENSOR_DOMAIN, config)
+    await async_setup_compensation(hass, TEST_CONFIG)
+
+    state = hass.states.get(TEST_ENTITY_ID)
+    assert state is not None
+    assert state.state == "5.0"
+
+
+async def test_config_entry_initial_state_from_existing_source(
+    hass: HomeAssistant, mock_config_entry: MockConfigEntry
+) -> None:
+    """Test the config entry sensor uses the source state that exists before setup."""
+    hass.states.async_set(TEST_SOURCE, "5")
+    mock_config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(mock_config_entry.entry_id)
     await hass.async_block_till_done()
 
+    state = hass.states.get("sensor.my_compensation")
+    assert state is not None
+    assert state.state == "6.0"
+
+
+async def test_device_id(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    mock_config_entry: MockConfigEntry,
+    sensor_entity_entry: er.RegistryEntry,
+) -> None:
+    """Test the config entry sensor is linked to the source entity's device."""
+    mock_config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    compensation_entity = entity_registry.async_get("sensor.mock_title_my_compensation")
+    assert compensation_entity is not None
+    assert compensation_entity.device_id == sensor_entity_entry.device_id
+
+
+@pytest.mark.usefixtures("sensor_entity_entry")
+async def test_device_id_yaml(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test no device is set for a YAML-configured sensor."""
+    await async_setup_compensation(hass, {**TEST_CONFIG, "unique_id": "yaml"})
+
+    compensation_entity = entity_registry.async_get(TEST_ENTITY_ID)
+    assert compensation_entity is not None
+    assert compensation_entity.device_id is None
+    assert "attempts to attach a device to an entity" not in caplog.text
+
+
+@pytest.mark.parametrize("config", [{"name": TEST_OBJECT_ID, **TEST_BASE_CONFIG}])
+@pytest.mark.usefixtures("setup_compensation")
+async def test_attributes_come_from_source(hass: HomeAssistant) -> None:
+    """Test compensation sensor state."""
+    hass.bus.async_fire(EVENT_HOMEASSISTANT_START)
+    hass.states.async_set(
+        TEST_SOURCE,
+        4,
+        {
+            ATTR_DEVICE_CLASS: SensorDeviceClass.TEMPERATURE,
+            ATTR_UNIT_OF_MEASUREMENT: UnitOfTemperature.CELSIUS,
+            ATTR_STATE_CLASS: SensorStateClass.MEASUREMENT,
+        },
+    )
+    await hass.async_block_till_done()
+
+    state = hass.states.get(TEST_ENTITY_ID)
+    assert state is not None
+    assert state.state == "5.0"
+    assert state.attributes[ATTR_DEVICE_CLASS] == SensorDeviceClass.TEMPERATURE
+    assert state.attributes[ATTR_UNIT_OF_MEASUREMENT] == UnitOfTemperature.CELSIUS
+    assert state.attributes[ATTR_STATE_CLASS] == SensorStateClass.MEASUREMENT
+
+
+@pytest.mark.parametrize("config", [{"attribute": "value", **TEST_CONFIG}])
+@pytest.mark.usefixtures("setup_compensation")
+async def test_linear_state_from_attribute(
+    hass: HomeAssistant, config: dict[str, Any]
+) -> None:
+    """Test compensation sensor state that pulls from attribute."""
     hass.bus.async_fire(EVENT_HOMEASSISTANT_START)
 
-    entity_id = config[DOMAIN]["test"]["source"]
-    hass.states.async_set(entity_id, 3, {"value": 4})
+    hass.states.async_set(TEST_SOURCE, 3, {"value": 4})
     await hass.async_block_till_done()
 
-    state = hass.states.get(expected_entity_id)
+    state = hass.states.get(TEST_ENTITY_ID)
     assert state is not None
 
-    assert round(float(state.state), config[DOMAIN]["test"][CONF_PRECISION]) == 5.0
+    assert round(float(state.state), config[CONF_PRECISION]) == 5.0
 
     coefs = [round(v, 1) for v in state.attributes.get(ATTR_COEFFICIENTS)]
     assert coefs == [1.0, 1.0]
 
-    hass.states.async_set(entity_id, 3, {"value": "bar"})
+    hass.states.async_set(TEST_SOURCE, 3, {"value": "bar"})
     await hass.async_block_till_done()
 
-    state = hass.states.get(expected_entity_id)
+    state = hass.states.get(TEST_ENTITY_ID)
     assert state is not None
 
     assert state.state == STATE_UNKNOWN
 
 
-async def test_quadratic_state(hass):
+@pytest.mark.parametrize(
+    "config",
+    [
+        {
+            "name": TEST_OBJECT_ID,
+            "source": TEST_SOURCE,
+            "data_points": [
+                [50, 3.3],
+                [50, 2.8],
+                [50, 2.9],
+                [70, 2.3],
+                [70, 2.6],
+                [70, 2.1],
+                [80, 2.5],
+                [80, 2.9],
+                [80, 2.4],
+                [90, 3.0],
+                [90, 3.1],
+                [90, 2.8],
+                [100, 3.3],
+                [100, 3.5],
+                [100, 3.0],
+            ],
+            "degree": 2,
+            "precision": 3,
+        },
+    ],
+)
+@pytest.mark.usefixtures("setup_compensation")
+async def test_quadratic_state(hass: HomeAssistant, config: dict[str, Any]) -> None:
     """Test 3 degree polynominial compensation sensor."""
-    config = {
-        "compensation": {
-            "test": {
-                "source": "sensor.temperature",
-                "data_points": [
-                    [50, 3.3],
-                    [50, 2.8],
-                    [50, 2.9],
-                    [70, 2.3],
-                    [70, 2.6],
-                    [70, 2.1],
-                    [80, 2.5],
-                    [80, 2.9],
-                    [80, 2.4],
-                    [90, 3.0],
-                    [90, 3.1],
-                    [90, 2.8],
-                    [100, 3.3],
-                    [100, 3.5],
-                    [100, 3.0],
-                ],
-                "degree": 2,
-                "precision": 3,
-            }
-        }
-    }
-    assert await async_setup_component(hass, DOMAIN, config)
-    await hass.async_block_till_done()
-    await hass.async_start()
+    hass.states.async_set(TEST_SOURCE, 43.2, {})
     await hass.async_block_till_done()
 
-    entity_id = config[DOMAIN]["test"]["source"]
-    hass.states.async_set(entity_id, 43.2, {})
-    await hass.async_block_till_done()
-
-    state = hass.states.get("sensor.compensation_sensor_temperature")
+    state = hass.states.get(TEST_ENTITY_ID)
 
     assert state is not None
 
-    assert round(float(state.state), config[DOMAIN]["test"][CONF_PRECISION]) == 3.327
+    assert round(float(state.state), config[CONF_PRECISION]) == 3.327
 
 
-async def test_numpy_errors(hass, caplog):
+@pytest.mark.parametrize(
+    "config",
+    [
+        {
+            "source": TEST_SOURCE,
+            "data_points": [
+                [0.0, 1.0],
+                [0.0, 1.0],
+            ],
+        },
+    ],
+)
+@pytest.mark.usefixtures("setup_compensation")
+async def test_numpy_errors(hass: HomeAssistant, caplog_setup_text) -> None:
     """Tests bad polyfits."""
-    config = {
-        "compensation": {
-            "test": {
-                "source": "sensor.uncompensated",
-                "data_points": [
-                    [0.0, 1.0],
-                    [0.0, 1.0],
-                ],
-            },
-        }
-    }
-    await async_setup_component(hass, DOMAIN, config)
-    await hass.async_block_till_done()
-    await hass.async_start()
-    await hass.async_block_till_done()
-
-    assert "invalid value encountered in divide" in caplog.text
+    assert "invalid value encountered in divide" in caplog_setup_text
 
 
-async def test_datapoints_greater_than_degree(hass, caplog):
+async def test_datapoints_greater_than_degree(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
     """Tests 3 bad data points."""
     config = {
         "compensation": {
             "test": {
-                "source": "sensor.uncompensated",
+                "source": TEST_SOURCE,
                 "data_points": [
                     [1.0, 2.0],
                     [2.0, 3.0],
@@ -188,32 +330,145 @@ async def test_datapoints_greater_than_degree(hass, caplog):
     assert "data_points must have at least 3 data_points" in caplog.text
 
 
-async def test_new_state_is_none(hass):
+@pytest.mark.parametrize("config", [TEST_CONFIG])
+@pytest.mark.usefixtures("setup_compensation")
+async def test_new_state_is_none(hass: HomeAssistant) -> None:
     """Tests catch for empty new states."""
-    config = {
-        "compensation": {
-            "test": {
-                "source": "sensor.uncompensated",
-                "data_points": [
-                    [1.0, 2.0],
-                    [2.0, 3.0],
-                ],
-                "precision": 2,
-                "unit_of_measurement": "a",
+    last_changed = hass.states.get(TEST_ENTITY_ID).last_changed
+    hass.bus.async_fire(EVENT_STATE_CHANGED, event_data={"entity_id": TEST_SOURCE})
+    assert last_changed == hass.states.get(TEST_ENTITY_ID).last_changed
+
+
+@pytest.mark.parametrize(
+    ("lower", "upper"),
+    [
+        (True, False),
+        (False, True),
+        (True, True),
+    ],
+)
+@pytest.mark.parametrize(
+    "config",
+    [
+        {
+            "name": TEST_OBJECT_ID,
+            "source": TEST_SOURCE,
+            "data_points": [
+                [1.0, 0.0],
+                [3.0, 2.0],
+                [2.0, 1.0],
+            ],
+            "precision": 2,
+            "unit_of_measurement": "a",
+        },
+    ],
+)
+@pytest.mark.usefixtures("setup_compensation_with_limits")
+async def test_limits(hass: HomeAssistant, lower: bool, upper: bool) -> None:
+    """Test compensation sensor state."""
+    hass.states.async_set(TEST_SOURCE, 0, {})
+    await hass.async_block_till_done()
+    state = hass.states.get(TEST_ENTITY_ID)
+    value = 0.0 if lower else -1.0
+    assert float(state.state) == value
+
+    hass.states.async_set(TEST_SOURCE, 5, {})
+    await hass.async_block_till_done()
+    state = hass.states.get(TEST_ENTITY_ID)
+    value = 2.0 if upper else 4.0
+    assert float(state.state) == value
+
+
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        (TEST_BASE_CONFIG, "sensor.compensation_sensor_uncompensated"),
+        (
+            {"attribute": "value", **TEST_BASE_CONFIG},
+            "sensor.compensation_sensor_uncompensated_value",
+        ),
+    ],
+)
+@pytest.mark.usefixtures("setup_compensation")
+async def test_default_name(hass: HomeAssistant, expected: str) -> None:
+    """Test default configuration name."""
+    assert hass.states.get(expected) is not None
+
+
+@pytest.mark.parametrize("config", [TEST_CONFIG])
+@pytest.mark.parametrize(
+    ("source_state", "expected"),
+    [(STATE_UNKNOWN, STATE_UNKNOWN), (STATE_UNAVAILABLE, STATE_UNAVAILABLE)],
+)
+@pytest.mark.usefixtures("setup_compensation")
+async def test_non_numerical_states_from_source_entity(
+    hass: HomeAssistant, config: dict[str, Any], source_state: str, expected: str
+) -> None:
+    """Test non-numerical states from source entity."""
+    hass.bus.async_fire(EVENT_HOMEASSISTANT_START)
+    hass.states.async_set(TEST_SOURCE, source_state)
+    await hass.async_block_till_done()
+
+    state = hass.states.get(TEST_ENTITY_ID)
+    assert state is not None
+    assert state.state == expected
+
+    hass.states.async_set(TEST_SOURCE, 4)
+    await hass.async_block_till_done()
+
+    state = hass.states.get(TEST_ENTITY_ID)
+    assert state is not None
+    assert round(float(state.state), config[CONF_PRECISION]) == 5.0
+
+    hass.states.async_set(TEST_SOURCE, source_state)
+    await hass.async_block_till_done()
+
+    state = hass.states.get(TEST_ENTITY_ID)
+    assert state is not None
+    assert state.state == expected
+
+
+async def test_source_state_none(hass: HomeAssistant) -> None:
+    """Test is source sensor state is null and sets state to STATE_UNKNOWN."""
+    await async_setup_component(
+        hass,
+        "template",
+        {
+            "template": {
+                "sensor": {
+                    "name": "uncompensated",
+                    "state": "{{ states.sensor.test_state.state }}",
+                },
             }
-        }
-    }
-    expected_entity_id = "sensor.compensation_sensor_uncompensated"
-
-    await async_setup_component(hass, DOMAIN, config)
-    await hass.async_block_till_done()
-    await hass.async_start()
-    await hass.async_block_till_done()
-
-    last_changed = hass.states.get(expected_entity_id).last_changed
-
-    hass.bus.async_fire(
-        EVENT_STATE_CHANGED, event_data={"entity_id": "sensor.uncompensated"}
+        },
     )
+    await async_setup_compensation(hass, TEST_CONFIG)
 
-    assert last_changed == hass.states.get(expected_entity_id).last_changed
+    hass.states.async_set("sensor.test_state", 4)
+
+    await hass.async_block_till_done()
+    state = hass.states.get(TEST_SOURCE)
+    assert state.state == "4"
+
+    await hass.async_block_till_done()
+    state = hass.states.get(TEST_ENTITY_ID)
+    assert state.state == "5.0"
+
+    # Force Template Reload
+    yaml_path = get_fixture_path("sensor_configuration.yaml", "template")
+    with patch.object(hass_config, "YAML_CONFIG_FILE", yaml_path):
+        await hass.services.async_call(
+            "template",
+            SERVICE_RELOAD,
+            {},
+            blocking=True,
+        )
+        await hass.async_block_till_done()
+
+    # Template state gets to None
+    state = hass.states.get(TEST_SOURCE)
+    assert state is None
+
+    # Filter sensor ignores None state setting state to STATE_UNKNOWN
+    state = hass.states.get(TEST_ENTITY_ID)
+    assert state.state == STATE_UNKNOWN

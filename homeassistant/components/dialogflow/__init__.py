@@ -1,8 +1,9 @@
 """Support for Dialogflow webhook."""
+
 import logging
 
 from aiohttp import web
-import voluptuous as vol
+import probatio
 
 from homeassistant.components import webhook
 from homeassistant.config_entries import ConfigEntry
@@ -17,7 +18,7 @@ _LOGGER = logging.getLogger(__name__)
 
 SOURCE = "Home Assistant Dialogflow"
 
-CONFIG_SCHEMA = vol.Schema({DOMAIN: {}}, extra=vol.ALLOW_EXTRA)
+CONFIG_SCHEMA = probatio.Schema({DOMAIN: {}}, extra=probatio.ALLOW_EXTRA)
 
 V1 = 1
 V2 = 2
@@ -27,7 +28,9 @@ class DialogFlowError(HomeAssistantError):
     """Raised when a DialogFlow error happens."""
 
 
-async def handle_webhook(hass, webhook_id, request):
+async def handle_webhook(
+    hass: HomeAssistant, webhook_id: str, request: web.Request
+) -> web.Response | None:
     """Handle incoming webhook with Dialogflow requests."""
     message = await request.json()
 
@@ -35,7 +38,7 @@ async def handle_webhook(hass, webhook_id, request):
 
     try:
         response = await async_handle_message(hass, message)
-        return b"" if response is None else web.json_response(response)
+        return None if response is None else web.json_response(response)
 
     except DialogFlowError as err:
         _LOGGER.warning(str(err))
@@ -64,18 +67,16 @@ async def handle_webhook(hass, webhook_id, request):
         )
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Configure based on config entry."""
     webhook.async_register(
         hass, DOMAIN, "DialogFlow", entry.data[CONF_WEBHOOK_ID], handle_webhook
     )
-    return True
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Unload a config entry."""
     webhook.async_unregister(hass, entry.data[CONF_WEBHOOK_ID])
-    return True
 
 
 async_remove_entry = config_entry_flow.webhook_async_remove_entry
@@ -100,22 +101,25 @@ def get_api_version(message):
     if message.get("responseId") is not None:
         return V2
 
+    raise ValueError(f"Unable to extract API version from message: {message}")
+
 
 async def async_handle_message(hass, message):
     """Handle a DialogFlow message."""
     _api_version = get_api_version(message)
     if _api_version is V1:
         _LOGGER.warning(
-            "Dialogflow V1 API will be removed on October 23, 2019. Please change your DialogFlow settings to use the V2 api"
+            "Dialogflow V1 API will be removed on October 23, 2019. Please change your"
+            " DialogFlow settings to use the V2 api"
         )
         req = message.get("result")
         if req.get("actionIncomplete", True):
-            return
+            return None
 
     elif _api_version is V2:
         req = message.get("queryResult")
         if req.get("allRequiredParamsPresent", False) is False:
-            return
+            return None
 
     action = req.get("action", "")
     parameters = req.get("parameters").copy()
@@ -169,3 +173,5 @@ class DialogflowResponse:
 
         if self.api_version is V2:
             return {"fulfillmentText": self.speech, "source": SOURCE}
+
+        raise ValueError(f"Invalid API version: {self.api_version}")

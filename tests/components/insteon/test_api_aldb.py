@@ -1,12 +1,15 @@
 """Test the Insteon All-Link Database APIs."""
 
-import json
+from typing import Any
 from unittest.mock import patch
 
 from pyinsteon import pub
 from pyinsteon.address import Address
-from pyinsteon.topics import ALDB_STATUS_CHANGED, DEVICE_LINK_CONTROLLER_CREATED
+from pyinsteon.constants import ALDBStatus
+from pyinsteon.topics import ALDB_LINK_CHANGED, ALDB_STATUS_CHANGED
 import pytest
+from pytest_homeassistant.common import MockConfigEntry, load_json_object_fixture
+from pytest_homeassistant.typing import MockHAClientWebSocket, WebSocketGenerator
 
 from homeassistant.components import insteon
 from homeassistant.components.insteon.api import async_load_api
@@ -17,20 +20,30 @@ from homeassistant.components.insteon.api.aldb import (
     TYPE,
 )
 from homeassistant.components.insteon.api.device import INSTEON_DEVICE_NOT_FOUND
+from homeassistant.components.insteon.const import DOMAIN
+from homeassistant.core import HomeAssistant
 
+from .const import MOCK_USER_INPUT_PLM
 from .mock_devices import MockDevices
 
-from tests.common import load_fixture
 
-
-@pytest.fixture(name="aldb_data", scope="session")
+@pytest.fixture(name="aldb_data", scope="module")
 def aldb_data_fixture():
     """Load the controller state fixture data."""
-    return json.loads(load_fixture("insteon/aldb_data.json"))
+    return load_json_object_fixture("insteon/aldb_data.json")
 
 
-async def _setup(hass, hass_ws_client, aldb_data):
+async def _setup(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator, aldb_data: dict[str, Any]
+) -> tuple[MockHAClientWebSocket, MockDevices]:
     """Set up tests."""
+    config_entry = MockConfigEntry(
+        domain=DOMAIN,
+        entry_id="abcde12345",
+        data=MOCK_USER_INPUT_PLM,
+        options={},
+    )
+    config_entry.add_to_hass(hass)
     ws_client = await hass_ws_client(hass)
     devices = MockDevices()
     await devices.async_load()
@@ -67,7 +80,9 @@ def _aldb_dict(mem_addr):
     }
 
 
-async def test_get_aldb(hass, hass_ws_client, aldb_data):
+async def test_get_aldb(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator, aldb_data
+) -> None:
     """Test getting an Insteon device's All-Link Database."""
     ws_client, devices = await _setup(hass, hass_ws_client, aldb_data)
 
@@ -81,7 +96,9 @@ async def test_get_aldb(hass, hass_ws_client, aldb_data):
         assert len(result) == 5
 
 
-async def test_change_aldb_record(hass, hass_ws_client, aldb_data):
+async def test_change_aldb_record(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator, aldb_data
+) -> None:
     """Test changing an Insteon device's All-Link Database record."""
     ws_client, devices = await _setup(hass, hass_ws_client, aldb_data)
     change_rec = _aldb_dict(4079)
@@ -102,7 +119,9 @@ async def test_change_aldb_record(hass, hass_ws_client, aldb_data):
         _compare_records(rec, change_rec)
 
 
-async def test_create_aldb_record(hass, hass_ws_client, aldb_data):
+async def test_create_aldb_record(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator, aldb_data
+) -> None:
     """Test creating a new Insteon All-Link Database record."""
     ws_client, devices = await _setup(hass, hass_ws_client, aldb_data)
     new_rec = _aldb_dict(4079)
@@ -123,7 +142,9 @@ async def test_create_aldb_record(hass, hass_ws_client, aldb_data):
         _compare_records(rec, new_rec)
 
 
-async def test_write_aldb(hass, hass_ws_client, aldb_data):
+async def test_write_aldb(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator, aldb_data
+) -> None:
     """Test writing an Insteon device's All-Link Database."""
     ws_client, devices = await _setup(hass, hass_ws_client, aldb_data)
 
@@ -142,7 +163,9 @@ async def test_write_aldb(hass, hass_ws_client, aldb_data):
         assert devices.async_save.call_count == 1
 
 
-async def test_load_aldb(hass, hass_ws_client, aldb_data):
+async def test_load_aldb(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator, aldb_data
+) -> None:
     """Test loading an Insteon device's All-Link Database."""
     ws_client, devices = await _setup(hass, hass_ws_client, aldb_data)
 
@@ -160,7 +183,9 @@ async def test_load_aldb(hass, hass_ws_client, aldb_data):
         assert devices.async_save.call_count == 1
 
 
-async def test_reset_aldb(hass, hass_ws_client, aldb_data):
+async def test_reset_aldb(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator, aldb_data
+) -> None:
     """Test resetting an Insteon device's All-Link Database."""
     ws_client, devices = await _setup(hass, hass_ws_client, aldb_data)
     record = _aldb_dict(4079)
@@ -189,7 +214,9 @@ async def test_reset_aldb(hass, hass_ws_client, aldb_data):
         assert not devices["33.33.33"].aldb.pending_changes
 
 
-async def test_default_links(hass, hass_ws_client, aldb_data):
+async def test_default_links(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator, aldb_data
+) -> None:
     """Test getting an Insteon device's All-Link Database."""
     ws_client, devices = await _setup(hass, hass_ws_client, aldb_data)
 
@@ -208,7 +235,11 @@ async def test_default_links(hass, hass_ws_client, aldb_data):
         assert devices.async_save.call_count == 1
 
 
-async def test_notify_on_aldb_status(hass, hass_ws_client, aldb_data):
+# This tests needs to be adjusted to remove lingering tasks
+@pytest.mark.parametrize("expected_lingering_tasks", [True])
+async def test_notify_on_aldb_status(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator, aldb_data
+) -> None:
     """Test getting an Insteon device's All-Link Database."""
     ws_client, devices = await _setup(hass, hass_ws_client, aldb_data)
 
@@ -223,13 +254,17 @@ async def test_notify_on_aldb_status(hass, hass_ws_client, aldb_data):
         msg = await ws_client.receive_json()
         assert msg["success"]
 
-        pub.sendMessage(f"333333.{ALDB_STATUS_CHANGED}")
+        pub.sendMessage(f"333333.{ALDB_STATUS_CHANGED}", status=ALDBStatus.LOADED)
         msg = await ws_client.receive_json()
         assert msg["event"]["type"] == "status_changed"
         assert not msg["event"]["is_loading"]
 
 
-async def test_notify_on_aldb_record_added(hass, hass_ws_client, aldb_data):
+# This tests needs to be adjusted to remove lingering tasks
+@pytest.mark.parametrize("expected_lingering_tasks", [True])
+async def test_notify_on_aldb_record_added(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator, aldb_data
+) -> None:
     """Test getting an Insteon device's All-Link Database."""
     ws_client, devices = await _setup(hass, hass_ws_client, aldb_data)
 
@@ -245,22 +280,24 @@ async def test_notify_on_aldb_record_added(hass, hass_ws_client, aldb_data):
         assert msg["success"]
 
         pub.sendMessage(
-            f"{DEVICE_LINK_CONTROLLER_CREATED}.333333",
-            controller=Address("11.11.11"),
-            responder=Address("33.33.33"),
-            group=100,
+            f"333333.{ALDB_LINK_CHANGED}",
+            record="some record",
+            sender=Address("11.11.11"),
+            deleted=False,
         )
         msg = await ws_client.receive_json()
         assert msg["event"]["type"] == "record_loaded"
 
 
-async def test_bad_address(hass, hass_ws_client, aldb_data):
+async def test_bad_address(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator, aldb_data
+) -> None:
     """Test for a bad Insteon address."""
     ws_client, _ = await _setup(hass, hass_ws_client, aldb_data)
     record = _aldb_dict(0)
 
     ws_id = 0
-    for call in ["get", "write", "load", "reset", "add_default_links", "notify"]:
+    for call in ("get", "write", "load", "reset", "add_default_links", "notify"):
         ws_id += 1
         await ws_client.send_json(
             {
@@ -273,7 +310,7 @@ async def test_bad_address(hass, hass_ws_client, aldb_data):
         assert not msg["success"]
         assert msg["error"]["message"] == INSTEON_DEVICE_NOT_FOUND
 
-    for call in ["change", "create"]:
+    for call in ("change", "create"):
         ws_id += 1
         await ws_client.send_json(
             {
@@ -286,3 +323,34 @@ async def test_bad_address(hass, hass_ws_client, aldb_data):
         msg = await ws_client.receive_json()
         assert not msg["success"]
         assert msg["error"]["message"] == INSTEON_DEVICE_NOT_FOUND
+
+
+# pyinsteon's status request handler sleeps in a task of its own
+@pytest.mark.parametrize("expected_lingering_tasks", [True])
+async def test_notify_on_aldb_loading(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator, aldb_data
+) -> None:
+    """Test tracking changes to ALDB status across all devices."""
+    ws_client, devices = await _setup(hass, hass_ws_client, aldb_data)
+
+    with patch.object(insteon.api.aldb, "devices", devices):
+        await ws_client.send_json_auto_id({TYPE: "insteon/aldb/notify_all"})
+        msg = await ws_client.receive_json()
+        assert msg["success"]
+
+        msg = await ws_client.receive_json()
+        assert msg["event"]["type"] == "status"
+        assert not msg["event"]["is_loading"]
+
+        device = devices["333333"]
+        device.aldb._update_status(ALDBStatus.LOADING)
+        msg = await ws_client.receive_json()
+        assert msg["event"]["type"] == "status"
+        assert msg["event"]["is_loading"]
+
+        device.aldb._update_status(ALDBStatus.LOADED)
+        msg = await ws_client.receive_json()
+        assert msg["event"]["type"] == "status"
+        assert not msg["event"]["is_loading"]
+
+        await ws_client.client.session.close()

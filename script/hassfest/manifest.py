@@ -1,7 +1,9 @@
 """Manifest validation."""
-from __future__ import annotations
 
+from enum import StrEnum, auto
+import json
 from pathlib import Path
+import subprocess
 from typing import Any
 from urllib.parse import urlparse
 
@@ -10,20 +12,39 @@ from awesomeversion import (
     AwesomeVersionException,
     AwesomeVersionStrategy,
 )
-import voluptuous as vol
-from voluptuous.humanize import humanize_error
+from hassfest.manifest_util import sort_manifest as util_sort_manifest
+from hassfest.model import Config, Integration, IntegrationType, ScaledQualityScaleTiers
+import probatio
+from probatio.humanize import humanize_error
 
 from homeassistant.const import Platform
 from homeassistant.helpers import config_validation as cv
+from homeassistant.loader import LORAWAN_SCHEMA
 
-from .model import Config, Integration
+from .icons import integration_category_keys
 
 DOCUMENTATION_URL_SCHEMA = "https"
 DOCUMENTATION_URL_HOST = "www.home-assistant.io"
 DOCUMENTATION_URL_PATH_PREFIX = "/integrations/"
 DOCUMENTATION_URL_EXCEPTIONS = {"https://www.home-assistant.io/hassio"}
 
-SUPPORTED_QUALITY_SCALES = ["gold", "internal", "platinum", "silver"]
+_CORE_DOCUMENTATION_BASE = "https://www.home-assistant.io/integrations"
+
+
+class NonScaledQualityScaleTiers(StrEnum):
+    """Supported manifest quality scales."""
+
+    CUSTOM = auto()
+    NO_SCORE = auto()
+    INTERNAL = auto()
+    LEGACY = auto()
+
+
+SUPPORTED_QUALITY_SCALES = [
+    value.name.lower()
+    for enum in [ScaledQualityScaleTiers, NonScaledQualityScaleTiers]
+    for value in enum
+]
 SUPPORTED_IOT_CLASSES = [
     "assumed_state",
     "calculated",
@@ -40,7 +61,9 @@ NO_IOT_CLASS = [
     "application_credentials",
     "auth",
     "automation",
+    "battery",
     "blueprint",
+    "brands",
     "color_extractor",
     "config",
     "configurator",
@@ -49,19 +72,27 @@ NO_IOT_CLASS = [
     "device_automation",
     "device_tracker",
     "diagnostics",
-    "discovery",
+    "door",
+    "doorbell",
     "downloader",
     "ffmpeg",
     "file_upload",
     "frontend",
+    "garage_door",
+    "gate",
     "hardkernel",
     "hardware",
     "history",
     "homeassistant",
     "homeassistant_alerts",
+    "homeassistant_connect_zbt2",
+    "homeassistant_green",
+    "homeassistant_hardware",
     "homeassistant_sky_connect",
     "homeassistant_yellow",
-    "image",
+    "humidity",
+    "illuminance",
+    "image_upload",
     "input_boolean",
     "input_button",
     "input_datetime",
@@ -73,68 +104,99 @@ NO_IOT_CLASS = [
     "logbook",
     "logger",
     "lovelace",
-    "map",
+    "map_tiles",
     "media_source",
+    "moisture",
+    "motion",
     "my",
+    "occupancy",
     "onboarding",
     "panel_custom",
-    "panel_iframe",
     "plant",
+    "power",
     "profiler",
     "proxy",
     "python_script",
     "raspberry_pi",
+    "recovery_mode",
     "repairs",
-    "safe_mode",
     "schedule",
     "script",
     "search",
     "system_health",
     "system_log",
     "tag",
+    "temperature",
     "timer",
     "trace",
+    "vibration",
+    "web_rtc",
     "webhook",
     "websocket_api",
+    "window",
     "zone",
 ]
 
 
-def documentation_url(value: str) -> str:
+# Built-in plumbing and entity platforms, not something people browse for
+NO_CATEGORIES_INTEGRATION_TYPES = {
+    IntegrationType.ENTITY,
+    IntegrationType.SYSTEM,
+}
+
+CATEGORIES_DOCUMENTATION_URL = (
+    "https://contributors.home-assistant.io/core/integrations/categories/"
+)
+
+# Built-in plumbing and entity platforms don't reach any devices or service
+NO_CONNECTIVITY_INTEGRATION_TYPES = {
+    IntegrationType.ENTITY,
+    IntegrationType.SYSTEM,
+}
+
+
+def core_documentation_url(value: str) -> str:
     """Validate that a documentation url has the correct path and domain."""
     if value in DOCUMENTATION_URL_EXCEPTIONS:
         return value
-
-    parsed_url = urlparse(value)
-    if parsed_url.scheme != DOCUMENTATION_URL_SCHEMA:
-        raise vol.Invalid("Documentation url is not prefixed with https")
-    if parsed_url.netloc == DOCUMENTATION_URL_HOST and not parsed_url.path.startswith(
-        DOCUMENTATION_URL_PATH_PREFIX
-    ):
-        raise vol.Invalid(
-            "Documentation url does not begin with www.home-assistant.io/integrations"
+    if not value.startswith(_CORE_DOCUMENTATION_BASE):
+        raise probatio.Invalid(
+            f"Documentation URL does not begin with {_CORE_DOCUMENTATION_BASE}"
         )
 
     return value
 
 
-def verify_lowercase(value: str):
+def custom_documentation_url(value: str) -> str:
+    """Validate that a custom integration documentation url is correct."""
+    parsed_url = urlparse(value)
+    if parsed_url.scheme != DOCUMENTATION_URL_SCHEMA:
+        raise probatio.Invalid("Documentation url is not prefixed with https")
+    if value.startswith(_CORE_DOCUMENTATION_BASE):
+        raise probatio.Invalid(
+            "Documentation URL should point to the custom integration documentation"
+        )
+
+    return value
+
+
+def verify_lowercase(value: str) -> str:
     """Verify a value is lowercase."""
     if value.lower() != value:
-        raise vol.Invalid("Value needs to be lowercase")
+        raise probatio.Invalid("Value needs to be lowercase")
 
     return value
 
 
-def verify_uppercase(value: str):
+def verify_uppercase(value: str) -> str:
     """Verify a value is uppercase."""
     if value.upper() != value:
-        raise vol.Invalid("Value needs to be uppercase")
+        raise probatio.Invalid("Value needs to be uppercase")
 
     return value
 
 
-def verify_version(value: str):
+def verify_version(value: str) -> str:
     """Verify the version."""
     try:
         AwesomeVersion(
@@ -147,54 +209,51 @@ def verify_version(value: str):
                 AwesomeVersionStrategy.PEP440,
             ],
         )
-    except AwesomeVersionException:
-        raise vol.Invalid(f"'{value}' is not a valid version.")
+    except AwesomeVersionException as err:
+        raise probatio.Invalid(f"'{value}' is not a valid version.") from err
     return value
 
 
-def verify_wildcard(value: str):
+def verify_wildcard(value: str) -> str:
     """Verify the matcher contains a wildcard."""
     if "*" not in value:
-        raise vol.Invalid(f"'{value}' needs to contain a wildcard matcher")
+        raise probatio.Invalid(f"'{value}' needs to contain a wildcard matcher")
     return value
 
 
-INTEGRATION_MANIFEST_SCHEMA = vol.Schema(
+INTEGRATION_MANIFEST_SCHEMA = probatio.Schema(
     {
-        vol.Required("domain"): str,
-        vol.Required("name"): str,
-        vol.Optional("integration_type", default="hub"): vol.In(
-            [
-                "device",
-                "entity",
-                "hardware",
-                "helper",
-                "hub",
-                "service",
-                "system",
-            ]
+        probatio.Required("domain"): str,
+        probatio.Required("name"): str,
+        probatio.Optional("integration_type", default="hub"): probatio.In(
+            [t.value for t in IntegrationType if t != IntegrationType.VIRTUAL]
         ),
-        vol.Optional("config_flow"): bool,
-        vol.Optional("mqtt"): [str],
-        vol.Optional("zeroconf"): [
-            vol.Any(
+        probatio.Optional("config_flow"): bool,
+        probatio.Optional("mqtt"): [str],
+        probatio.Optional("lorawan"): LORAWAN_SCHEMA,
+        probatio.Optional("zeroconf"): [
+            probatio.Any(
                 str,
-                vol.All(
+                probatio.All(
                     cv.deprecated("macaddress"),
                     cv.deprecated("model"),
                     cv.deprecated("manufacturer"),
-                    vol.Schema(
+                    probatio.Schema(
                         {
-                            vol.Required("type"): str,
-                            vol.Optional("macaddress"): vol.All(
+                            probatio.Required("type"): str,
+                            probatio.Optional("macaddress"): probatio.All(
                                 str, verify_uppercase, verify_wildcard
                             ),
-                            vol.Optional("manufacturer"): vol.All(
+                            probatio.Optional("manufacturer"): probatio.All(
                                 str, verify_lowercase
                             ),
-                            vol.Optional("model"): vol.All(str, verify_lowercase),
-                            vol.Optional("name"): vol.All(str, verify_lowercase),
-                            vol.Optional("properties"): vol.Schema(
+                            probatio.Optional("model"): probatio.All(
+                                str, verify_lowercase
+                            ),
+                            probatio.Optional("name"): probatio.All(
+                                str, verify_lowercase
+                            ),
+                            probatio.Optional("properties"): probatio.Schema(
                                 {str: verify_lowercase}
                             ),
                         }
@@ -202,92 +261,144 @@ INTEGRATION_MANIFEST_SCHEMA = vol.Schema(
                 ),
             )
         ],
-        vol.Optional("ssdp"): vol.Schema(
-            vol.All([vol.All(vol.Schema({}, extra=vol.ALLOW_EXTRA), vol.Length(min=1))])
+        probatio.Optional("ssdp"): probatio.Schema(
+            probatio.All(
+                [
+                    probatio.All(
+                        probatio.Schema({}, extra=probatio.ALLOW_EXTRA),
+                        probatio.Length(min=1),
+                    )
+                ]
+            )
         ),
-        vol.Optional("bluetooth"): [
-            vol.Schema(
+        probatio.Optional("bluetooth"): [
+            probatio.Schema(
                 {
-                    vol.Optional("connectable"): bool,
-                    vol.Optional("service_uuid"): vol.All(str, verify_lowercase),
-                    vol.Optional("service_data_uuid"): vol.All(str, verify_lowercase),
-                    vol.Optional("local_name"): vol.All(str),
-                    vol.Optional("manufacturer_id"): int,
-                    vol.Optional("manufacturer_data_start"): [int],
+                    probatio.Optional("connectable"): bool,
+                    probatio.Optional("service_uuid"): probatio.All(
+                        str, verify_lowercase
+                    ),
+                    probatio.Optional("service_data_uuid"): probatio.All(
+                        str, verify_lowercase
+                    ),
+                    probatio.Optional("local_name"): probatio.All(str),
+                    probatio.Optional("manufacturer_id"): int,
+                    probatio.Optional("manufacturer_data_start"): [int],
                 }
             )
         ],
-        vol.Optional("homekit"): vol.Schema({vol.Optional("models"): [str]}),
-        vol.Optional("dhcp"): [
-            vol.Schema(
+        probatio.Optional("homekit"): probatio.Schema(
+            {probatio.Optional("models"): [str]}
+        ),
+        probatio.Optional("dhcp"): [
+            probatio.Schema(
                 {
-                    vol.Optional("macaddress"): vol.All(
+                    probatio.Optional("macaddress"): probatio.All(
                         str, verify_uppercase, verify_wildcard
                     ),
-                    vol.Optional("hostname"): vol.All(str, verify_lowercase),
-                    vol.Optional("registered_devices"): cv.boolean,
+                    probatio.Optional("hostname"): probatio.All(str, verify_lowercase),
+                    probatio.Optional("registered_devices"): cv.boolean,
                 }
             )
         ],
-        vol.Optional("usb"): [
-            vol.Schema(
+        probatio.Optional("usb"): [
+            probatio.Schema(
                 {
-                    vol.Optional("vid"): vol.All(str, verify_uppercase),
-                    vol.Optional("pid"): vol.All(str, verify_uppercase),
-                    vol.Optional("serial_number"): vol.All(str, verify_lowercase),
-                    vol.Optional("manufacturer"): vol.All(str, verify_lowercase),
-                    vol.Optional("description"): vol.All(str, verify_lowercase),
-                    vol.Optional("known_devices"): [str],
+                    probatio.Optional("vid"): probatio.All(str, verify_uppercase),
+                    probatio.Optional("pid"): probatio.All(str, verify_uppercase),
+                    probatio.Optional("serial_number"): probatio.All(
+                        str, verify_lowercase
+                    ),
+                    probatio.Optional("manufacturer"): probatio.All(
+                        str, verify_lowercase
+                    ),
+                    probatio.Optional("description"): probatio.All(
+                        str, verify_lowercase
+                    ),
+                    probatio.Optional("known_devices"): [str],
                 }
             )
         ],
-        vol.Required("documentation"): vol.All(
-            vol.Url(), documentation_url  # pylint: disable=no-value-for-parameter
+        probatio.Required("documentation"): probatio.All(
+            probatio.Url(), core_documentation_url
         ),
-        vol.Optional(
-            "issue_tracker"
-        ): vol.Url(),  # pylint: disable=no-value-for-parameter
-        vol.Optional("quality_scale"): vol.In(SUPPORTED_QUALITY_SCALES),
-        vol.Optional("requirements"): [str],
-        vol.Optional("dependencies"): [str],
-        vol.Optional("after_dependencies"): [str],
-        vol.Required("codeowners"): [str],
-        vol.Optional("loggers"): [str],
-        vol.Optional("disabled"): str,
-        vol.Optional("iot_class"): vol.In(SUPPORTED_IOT_CLASSES),
+        probatio.Optional("quality_scale"): probatio.In(SUPPORTED_QUALITY_SCALES),
+        probatio.Optional("requirements"): [str],
+        probatio.Optional("dependencies"): [str],
+        probatio.Optional("after_dependencies"): [str],
+        probatio.Required("codeowners"): [str],
+        probatio.Optional("loggers"): [str],
+        probatio.Optional("disabled"): str,
+        probatio.Optional("iot_class"): probatio.In(SUPPORTED_IOT_CLASSES),
+        probatio.Optional("categories"): probatio.All(
+            [
+                probatio.Match(
+                    r"^[a-z0-9_]+(\.[a-z0-9_]+)?$",
+                    msg="Expected a category like `energy` or `energy.ev_charging`",
+                )
+            ],
+            probatio.Length(min=1, max=3),
+            probatio.Unique(),
+        ),
+        probatio.Optional("connectivity"): probatio.All(
+            [
+                probatio.Match(
+                    r"^[a-z0-9_]+$",
+                    msg="Expected a connectivity like `zigbee` or `cloud`",
+                )
+            ],
+            probatio.Length(min=1),
+            probatio.Unique(),
+        ),
+        probatio.Optional("single_config_entry"): bool,
+        probatio.Optional("preview_features"): probatio.Schema(
+            {
+                cv.slug: probatio.Schema(
+                    {
+                        probatio.Optional("feedback_url"): probatio.Url(),
+                        probatio.Optional("learn_more_url"): probatio.Url(),
+                        probatio.Optional("report_issue_url"): probatio.Url(),
+                    }
+                )
+            }
+        ),
     }
 )
 
-VIRTUAL_INTEGRATION_MANIFEST_SCHEMA = vol.Schema(
+VIRTUAL_INTEGRATION_MANIFEST_SCHEMA = probatio.Schema(
     {
-        vol.Required("domain"): str,
-        vol.Required("name"): str,
-        vol.Required("integration_type"): "virtual",
-        vol.Exclusive("iot_standards", "virtual_integration"): [
-            vol.Any("homekit", "zigbee", "zwave")
+        probatio.Required("domain"): str,
+        probatio.Required("name"): str,
+        probatio.Required("integration_type"): IntegrationType.VIRTUAL.value,
+        probatio.Exclusive("iot_standards", "virtual_integration"): [
+            probatio.Any("homekit", "zigbee", "zwave")
         ],
-        vol.Exclusive("supported_by", "virtual_integration"): str,
+        probatio.Exclusive("supported_by", "virtual_integration"): str,
     }
 )
 
 
-def manifest_schema(value: dict[str, Any]) -> vol.Schema:
+def manifest_schema(value: dict[str, Any]) -> probatio.Schema:
     """Validate integration manifest."""
-    if value.get("integration_type") == "virtual":
+    if value.get("integration_type") == IntegrationType.VIRTUAL:
         return VIRTUAL_INTEGRATION_MANIFEST_SCHEMA(value)
     return INTEGRATION_MANIFEST_SCHEMA(value)
 
 
 CUSTOM_INTEGRATION_MANIFEST_SCHEMA = INTEGRATION_MANIFEST_SCHEMA.extend(
     {
-        vol.Optional("version"): vol.All(str, verify_version),
+        probatio.Required("documentation"): probatio.All(
+            probatio.Url(), custom_documentation_url
+        ),
+        probatio.Optional("version"): probatio.All(str, verify_version),
+        probatio.Optional("issue_tracker"): probatio.Url(),
+        probatio.Optional("import_executor"): bool,
     }
 )
 
 
-def validate_version(integration: Integration):
-    """
-    Validate the version of the integration.
+def validate_version(integration: Integration) -> None:
+    """Validate the version of the integration.
 
     Will be removed when the version key is no longer optional for custom integrations.
     """
@@ -296,47 +407,149 @@ def validate_version(integration: Integration):
         return
 
 
-def validate_manifest(integration: Integration, core_components_dir: Path) -> None:
-    """Validate manifest."""
-    if not integration.manifest:
+HOMEASSISTANT_STRINGS_PATH = "homeassistant/components/homeassistant/strings.json"
+
+
+def load_known_categories(config: Config) -> set[str] | None:
+    """Return the known categories, like `energy` and `energy.ev_charging`.
+
+    Read from the source strings, so a new category can be used before
+    integration_categories.json is regenerated.
+    """
+    # Invalid strings are reported by the json and translations plugins, and the
+    # strings are missing when validating integrations outside a core checkout
+    try:
+        strings = json.loads((config.root / HOMEASSISTANT_STRINGS_PATH).read_text())
+        return integration_category_keys(strings.get("integration_category", {}))
+    except OSError, ValueError, AttributeError, TypeError:
+        return None
+
+
+def load_known_connectivity(config: Config) -> set[str] | None:
+    """Return the known connectivity values, like `zigbee` and `cloud`.
+
+    Read from the source strings, so a new value can be used before
+    integration_connectivity.json is regenerated.
+    """
+    # Invalid strings are reported by the json and translations plugins, and the
+    # strings are missing when validating integrations outside a core checkout
+    try:
+        strings = json.loads((config.root / HOMEASSISTANT_STRINGS_PATH).read_text())
+        return set(strings.get("integration_connectivity", {}))
+    except OSError, ValueError, AttributeError, TypeError:
+        return None
+
+
+def validate_categories(integration: Integration, known_categories: set[str]) -> None:
+    """Validate the categories of an integration."""
+    if not (categories := integration.manifest.get("categories")):
+        # Every core integration people browse for has a place. Virtual
+        # integrations show the categories of the integration they point to.
+        if integration.core and integration.integration_type not in (
+            NO_CATEGORIES_INTEGRATION_TYPES | {IntegrationType.VIRTUAL}
+        ):
+            integration.add_error(
+                "manifest",
+                f"Integrations of type {integration.integration_type} need categories, "
+                f"see {CATEGORIES_DOCUMENTATION_URL} to pick them",
+            )
         return
 
+    if integration.integration_type in NO_CATEGORIES_INTEGRATION_TYPES:
+        integration.add_error(
+            "manifest",
+            f"Integrations of type {integration.integration_type} can't have categories",
+        )
+
+    # Custom integrations only get a warning, so a category that is renamed
+    # or removed in core never breaks an existing repository
+    report = integration.add_error if integration.core else integration.add_warning
+    for category in categories:
+        if category not in known_categories:
+            report(
+                "manifest",
+                f"Unknown category `{category}`, "
+                f"see {HOMEASSISTANT_STRINGS_PATH} for the known categories",
+            )
+
+    for category in categories:
+        parent, _, subcategory = category.partition(".")
+        if subcategory and parent in categories:
+            integration.add_error(
+                "manifest",
+                f"Category `{parent}` is implied by its subcategory `{category}`, "
+                f"remove `{parent}`",
+            )
+
+
+def validate_connectivity(
+    integration: Integration, known_connectivity: set[str]
+) -> None:
+    """Validate the connectivity of an integration."""
+    if not (connectivity := integration.manifest.get("connectivity")):
+        return
+
+    if integration.integration_type in NO_CONNECTIVITY_INTEGRATION_TYPES:
+        integration.add_error(
+            "manifest",
+            f"Integrations of type {integration.integration_type} "
+            "can't have connectivity",
+        )
+
+    # Custom integrations only get a warning, so a value that is renamed
+    # or removed in core never breaks an existing repository
+    report = integration.add_error if integration.core else integration.add_warning
+    for value in connectivity:
+        if value not in known_connectivity:
+            report(
+                "manifest",
+                f"Unknown connectivity `{value}`, "
+                f"see {HOMEASSISTANT_STRINGS_PATH} for the known values",
+            )
+
+
+def validate_manifest(
+    integration: Integration,
+    core_components_dir: Path,
+    known_categories: set[str] | None,
+    known_connectivity: set[str] | None,
+) -> None:
+    """Validate manifest."""
     try:
         if integration.core:
             manifest_schema(integration.manifest)
         else:
             CUSTOM_INTEGRATION_MANIFEST_SCHEMA(integration.manifest)
-    except vol.Invalid as err:
+    except probatio.Invalid as err:
         integration.add_error(
             "manifest", f"Invalid manifest: {humanize_error(integration.manifest, err)}"
         )
+    else:
+        if known_categories is not None:
+            validate_categories(integration, known_categories)
+        if known_connectivity is not None:
+            validate_connectivity(integration, known_connectivity)
 
-    if integration.manifest["domain"] != integration.path.name:
+    if (domain := integration.manifest["domain"]) != integration.path.name:
         integration.add_error("manifest", "Domain does not match dir name")
 
-    if (
-        not integration.core
-        and (core_components_dir / integration.manifest["domain"]).exists()
-    ):
+    if not integration.core and (core_components_dir / domain).exists():
         integration.add_warning(
             "manifest", "Domain collides with built-in core integration"
         )
 
-    if (
-        integration.manifest["domain"] in NO_IOT_CLASS
-        and "iot_class" in integration.manifest
-    ):
+    if domain in NO_IOT_CLASS and "iot_class" in integration.manifest:
         integration.add_error("manifest", "Domain should not have an IoT Class")
 
     if (
-        integration.manifest["domain"] not in NO_IOT_CLASS
+        domain not in NO_IOT_CLASS
         and "iot_class" not in integration.manifest
-        and integration.manifest.get("integration_type") != "virtual"
+        and integration.integration_type != IntegrationType.VIRTUAL
     ):
         integration.add_error("manifest", "Domain is missing an IoT Class")
 
     if (
-        integration.manifest.get("integration_type") == "virtual"
+        integration.integration_type == IntegrationType.VIRTUAL
         and (supported_by := integration.manifest.get("supported_by"))
         and not (core_components_dir / supported_by).exists()
     ):
@@ -345,12 +558,71 @@ def validate_manifest(integration: Integration, core_components_dir: Path) -> No
             "Virtual integration points to non-existing supported_by integration",
         )
 
+    if (
+        (quality_scale := integration.manifest.get("quality_scale"))
+        and quality_scale.upper() in ScaledQualityScaleTiers
+        and ScaledQualityScaleTiers[quality_scale.upper()]
+        >= ScaledQualityScaleTiers.SILVER
+    ):
+        if not integration.manifest.get("codeowners"):
+            integration.add_error(
+                "manifest",
+                f"{quality_scale} integration does not have a code owner",
+            )
+
     if not integration.core:
         validate_version(integration)
+
+
+def sort_manifest(integration: Integration, config: Config) -> bool:
+    """Sort manifest."""
+    if integration.manifest_path is None:
+        integration.add_error(
+            "manifest",
+            "Manifest path not set, unable to sort manifest keys",
+        )
+        return False
+
+    if util_sort_manifest(integration.manifest):
+        if config.action == "generate":
+            integration.manifest_path.write_text(
+                json.dumps(integration.manifest, indent=2) + "\n"
+            )
+            text = "have been sorted"
+        else:
+            text = "are not sorted correctly"
+        integration.add_error(
+            "manifest",
+            f"Manifest keys {text}: domain, name, then alphabetical order",
+        )
+        return True
+    return False
 
 
 def validate(integrations: dict[str, Integration], config: Config) -> None:
     """Handle all integrations manifests."""
     core_components_dir = config.root / "homeassistant/components"
+    known_categories = load_known_categories(config)
+    known_connectivity = load_known_connectivity(config)
+    manifests_resorted = []
     for integration in integrations.values():
-        validate_manifest(integration, core_components_dir)
+        validate_manifest(
+            integration, core_components_dir, known_categories, known_connectivity
+        )
+        if not integration.errors:
+            if sort_manifest(integration, config):
+                manifests_resorted.append(integration.manifest_path)
+    if config.action == "generate" and manifests_resorted:
+        subprocess.run(
+            [
+                "prek",
+                "run",
+                "--hook-stage",
+                "manual",
+                "prettier",
+                "--files",
+                *manifests_resorted,
+            ],
+            stdout=subprocess.DEVNULL,
+            check=True,
+        )

@@ -1,4 +1,5 @@
 """Constants for the motionEye integration."""
+
 from datetime import timedelta
 from typing import Final
 
@@ -28,11 +29,9 @@ DOMAIN: Final = "motioneye"
 ATTR_EVENT_TYPE: Final = "event_type"
 ATTR_WEBHOOK_ID: Final = "webhook_id"
 
-CONF_ACTION: Final = "action"
-CONF_CLIENT: Final = "client"
-CONF_COORDINATOR: Final = "coordinator"
 CONF_ADMIN_PASSWORD: Final = "admin_password"
 CONF_ADMIN_USERNAME: Final = "admin_username"
+CONF_MORE_OPTIONS: Final = "more_options"
 CONF_STREAM_URL_TEMPLATE: Final = "stream_url_template"
 CONF_SURVEILLANCE_USERNAME: Final = "surveillance_username"
 CONF_SURVEILLANCE_PASSWORD: Final = "surveillance_password"
@@ -89,8 +88,8 @@ SERVICE_SET_TEXT_OVERLAY: Final = "set_text_overlay"
 SERVICE_ACTION: Final = "action"
 SERVICE_SNAPSHOT: Final = "snapshot"
 
-SIGNAL_CAMERA_ADD: Final = f"{DOMAIN}_camera_add_signal." "{}"
-SIGNAL_CAMERA_REMOVE: Final = f"{DOMAIN}_camera_remove_signal." "{}"
+SIGNAL_CAMERA_ADD: Final = f"{DOMAIN}_camera_add_signal.{{}}"
+SIGNAL_CAMERA_REMOVE: Final = f"{DOMAIN}_camera_remove_signal.{{}}"
 
 TYPE_MOTIONEYE_ACTION_SENSOR = f"{DOMAIN}_action_sensor"
 TYPE_MOTIONEYE_MJPEG_CAMERA: Final = "motioneye_mjpeg_camera"

@@ -1,8 +1,11 @@
 {
   "domain": "push",
   "name": "Push",
-  "documentation": "https://www.home-assistant.io/integrations/push",
-  "dependencies": ["webhook"],
+  "categories": ["security_safety.cameras"],
   "codeowners": ["@dgomes"],
-  "iot_class": "local_push"
+  "connectivity": ["network"],
+  "dependencies": ["webhook"],
+  "documentation": "https://www.home-assistant.io/integrations/push",
+  "iot_class": "local_push",
+  "quality_scale": "legacy"
 }

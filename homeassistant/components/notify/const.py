@@ -1,40 +1,73 @@
 """Provide common notify constants."""
+
+from enum import IntFlag, StrEnum
 import logging
+from typing import TYPE_CHECKING, Final
 
-import voluptuous as vol
+import probatio
 
-import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.entity_component import EntityComponent
+from homeassistant.util.hass_dict import HassKey
+
+if TYPE_CHECKING:
+    from .entity import NotifyEntity
+
+DOMAIN: Final = "notify"
+
+DATA_COMPONENT: HassKey[EntityComponent[NotifyEntity]] = HassKey(DOMAIN)
 
 ATTR_DATA = "data"
 
 # Text to notify user of
 ATTR_MESSAGE = "message"
 
-# Target of the notification (user, device, etc)
+# Target of the (legacy) notification (user, device, etc)
 ATTR_TARGET = "target"
+
+# Recipients for a notification
+ATTR_RECIPIENTS = "recipients"
 
 # Title of notification
 ATTR_TITLE = "title"
 
-DOMAIN = "notify"
 
 LOGGER = logging.getLogger(__package__)
 
 SERVICE_NOTIFY = "notify"
+SERVICE_SEND_MESSAGE = "send_message"
 SERVICE_PERSISTENT_NOTIFICATION = "persistent_notification"
 
-NOTIFY_SERVICE_SCHEMA = vol.Schema(
+NOTIFY_SERVICE_SCHEMA = probatio.Schema(
     {
-        vol.Required(ATTR_MESSAGE): cv.template,
-        vol.Optional(ATTR_TITLE): cv.template,
-        vol.Optional(ATTR_TARGET): vol.All(cv.ensure_list, [cv.string]),
-        vol.Optional(ATTR_DATA): dict,
+        probatio.Required(ATTR_MESSAGE): cv.string,
+        probatio.Optional(ATTR_TITLE): cv.string,
+        probatio.Optional(ATTR_TARGET): probatio.All(
+            probatio.EnsureList(), [cv.string]
+        ),
+        probatio.Optional(ATTR_DATA): dict,
     }
 )
 
-PERSISTENT_NOTIFICATION_SERVICE_SCHEMA = vol.Schema(
-    {
-        vol.Required(ATTR_MESSAGE): cv.template,
-        vol.Optional(ATTR_TITLE): cv.template,
-    }
-)
+
+class NotifyEntityFeature(IntFlag):
+    """Supported features of a notify entity."""
+
+    TITLE = 1
+
+
+class NotifyService(StrEnum):
+    """Store keys for notify services."""
+
+    NOTIFY = "notify"
+    PERSISTENT_NOTIFICATION = "persistent_notification"
+    SEND_MESSAGE = "send_message"
+
+
+class NotifyServiceArgument(StrEnum):
+    """Store keys for notify service arguments."""
+
+    DATA = "data"
+    MESSAGE = "message"
+    TARGET = "target"
+    TITLE = "title"

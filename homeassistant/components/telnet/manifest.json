@@ -1,7 +1,10 @@
 {
   "domain": "telnet",
   "name": "Telnet",
-  "documentation": "https://www.home-assistant.io/integrations/telnet",
+  "categories": ["diy_makers.web_data_connectors"],
   "codeowners": [],
-  "iot_class": "local_polling"
+  "connectivity": ["network"],
+  "documentation": "https://www.home-assistant.io/integrations/telnet",
+  "iot_class": "local_polling",
+  "quality_scale": "legacy"
 }

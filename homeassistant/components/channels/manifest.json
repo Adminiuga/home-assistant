@@ -1,9 +1,12 @@
 {
   "domain": "channels",
   "name": "Channels",
-  "documentation": "https://www.home-assistant.io/integrations/channels",
-  "requirements": ["pychannels==1.2.3"],
+  "categories": ["media_entertainment.tv_streaming"],
   "codeowners": [],
+  "connectivity": ["network"],
+  "documentation": "https://www.home-assistant.io/integrations/channels",
   "iot_class": "local_polling",
-  "loggers": ["pychannels"]
+  "loggers": ["pychannels"],
+  "quality_scale": "legacy",
+  "requirements": ["pychannels==1.2.3"]
 }

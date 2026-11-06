@@ -1,22 +1,21 @@
 """Support for De Lijn (Flemish public transport) information."""
-from __future__ import annotations
 
 from datetime import datetime
 import logging
 
+import probatio
 from pydelijn.api import Passages
 from pydelijn.common import HttpException
-import voluptuous as vol
 
 from homeassistant.components.sensor import (
-    PLATFORM_SCHEMA,
+    PLATFORM_SCHEMA as SENSOR_PLATFORM_SCHEMA,
     SensorDeviceClass,
     SensorEntity,
 )
 from homeassistant.const import CONF_API_KEY
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
@@ -30,13 +29,15 @@ CONF_NUMBER_OF_DEPARTURES = "number_of_departures"
 
 DEFAULT_NAME = "De Lijn"
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
+PLATFORM_SCHEMA = SENSOR_PLATFORM_SCHEMA.extend(
     {
-        vol.Required(CONF_API_KEY): cv.string,
-        vol.Required(CONF_NEXT_DEPARTURE): [
+        probatio.Required(probatio.Secret(CONF_API_KEY)): cv.string,
+        probatio.Required(CONF_NEXT_DEPARTURE): [
             {
-                vol.Required(CONF_STOP_ID): cv.string,
-                vol.Optional(CONF_NUMBER_OF_DEPARTURES, default=5): cv.positive_int,
+                probatio.Required(CONF_STOP_ID): cv.string,
+                probatio.Optional(
+                    CONF_NUMBER_OF_DEPARTURES, default=5
+                ): cv.positive_int,
             }
         ],
     }
@@ -63,9 +64,8 @@ async def async_setup_platform(
 
     session = async_get_clientsession(hass)
 
-    sensors = []
-    for nextpassage in config[CONF_NEXT_DEPARTURE]:
-        sensors.append(
+    async_add_entities(
+        (
             DeLijnPublicTransportSensor(
                 Passages(
                     nextpassage[CONF_STOP_ID],
@@ -75,9 +75,10 @@ async def async_setup_platform(
                     True,
                 )
             )
-        )
-
-    async_add_entities(sensors, True)
+            for nextpassage in config[CONF_NEXT_DEPARTURE]
+        ),
+        True,
+    )
 
 
 class DeLijnPublicTransportSensor(SensorEntity):
@@ -121,6 +122,6 @@ class DeLijnPublicTransportSensor(SensorEntity):
             self._attr_extra_state_attributes["next_passages"] = self.line.passages
 
             self._attr_available = True
-        except (KeyError) as error:
+        except KeyError as error:
             _LOGGER.error("Invalid data received from De Lijn: %s", error)
             self._attr_available = False

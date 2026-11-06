@@ -1,12 +1,13 @@
 """Support for MAX! binary sensors via MAX! Cube."""
-from __future__ import annotations
+
+from typing import override
 
 from homeassistant.components.binary_sensor import (
     BinarySensorDeviceClass,
     BinarySensorEntity,
 )
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
@@ -60,7 +61,8 @@ class MaxCubeShutter(MaxCubeBinarySensorBase):
         self._attr_unique_id = self._device.serial
 
     @property
-    def is_on(self):
+    @override
+    def is_on(self) -> bool:
         """Return true if the binary sensor is on/open."""
         return self._device.is_open
 
@@ -78,6 +80,7 @@ class MaxCubeBattery(MaxCubeBinarySensorBase):
         self._attr_unique_id = f"{self._device.serial}_battery"
 
     @property
-    def is_on(self):
+    @override
+    def is_on(self) -> bool:
         """Return true if the binary sensor is on/open."""
         return self._device.battery == 1

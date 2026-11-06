@@ -1,0 +1,102 @@
+"""Test jewish calendar service."""
+
+import datetime as dt
+
+import pytest
+
+from homeassistant.components.jewish_calendar.const import DOMAIN
+from homeassistant.components.jewish_calendar.services import (
+    JewishCalendarServiceArgument,
+)
+from homeassistant.core import HomeAssistant
+
+
+@pytest.mark.parametrize(
+    ("test_time", "service_data", "expected"),
+    [
+        pytest.param(
+            dt.datetime(2025, 3, 20, 21, 0),
+            {
+                JewishCalendarServiceArgument.DATE: dt.date(2025, 3, 20),
+                JewishCalendarServiceArgument.NUSACH: "sfarad",
+                JewishCalendarServiceArgument.LANGUAGE: "he",
+                JewishCalendarServiceArgument.AFTER_SUNSET: False,
+            },
+            "",
+            id="no_blessing",
+        ),
+        pytest.param(
+            dt.datetime(2025, 3, 20, 21, 0),
+            {
+                JewishCalendarServiceArgument.DATE: dt.date(2025, 5, 20),
+                JewishCalendarServiceArgument.NUSACH: "ashkenaz",
+                JewishCalendarServiceArgument.LANGUAGE: "he",
+                JewishCalendarServiceArgument.AFTER_SUNSET: False,
+            },
+            "היום שבעה ושלושים יום שהם חמישה שבועות ושני ימים בעומר",
+            id="ahskenaz-hebrew",
+        ),
+        pytest.param(
+            dt.datetime(2025, 3, 20, 21, 0),
+            {
+                JewishCalendarServiceArgument.DATE: dt.date(2025, 5, 20),
+                JewishCalendarServiceArgument.NUSACH: "sfarad",
+                JewishCalendarServiceArgument.LANGUAGE: "en",
+                JewishCalendarServiceArgument.AFTER_SUNSET: True,
+            },
+            (
+                "Today is the thirty-eighth day, which are"
+                " five weeks and three days of the Omer"
+            ),
+            id="sefarad-english-after-sunset",
+        ),
+        pytest.param(
+            dt.datetime(2025, 3, 20, 21, 0),
+            {
+                JewishCalendarServiceArgument.DATE: dt.date(2025, 5, 20),
+                JewishCalendarServiceArgument.NUSACH: "sfarad",
+                JewishCalendarServiceArgument.LANGUAGE: "en",
+                JewishCalendarServiceArgument.AFTER_SUNSET: False,
+            },
+            (
+                "Today is the thirty-seventh day, which are"
+                " five weeks and two days of the Omer"
+            ),
+            id="sefarad-english-before-sunset",
+        ),
+        pytest.param(
+            dt.datetime(2025, 5, 20, 21, 0),
+            {
+                JewishCalendarServiceArgument.NUSACH: "sfarad",
+                JewishCalendarServiceArgument.LANGUAGE: "en",
+            },
+            (
+                "Today is the thirty-eighth day, which are"
+                " five weeks and three days of the Omer"
+            ),
+            id="sefarad-english-after-sunset-without-date",
+        ),
+        pytest.param(
+            dt.datetime(2025, 5, 20, 6, 0),
+            {JewishCalendarServiceArgument.NUSACH: "sfarad"},
+            "היום שבעה ושלושים יום שהם חמישה שבועות ושני ימים לעומר",
+            id="sefarad-english-before-sunset-without-date",
+        ),
+    ],
+    indirect=["test_time"],
+)
+@pytest.mark.usefixtures("setup_at_time")
+async def test_get_omer_blessing(
+    hass: HomeAssistant, service_data: dict[str, str | dt.date | bool], expected: str
+) -> None:
+    """Test get omer blessing."""
+
+    result = await hass.services.async_call(
+        DOMAIN,
+        "count_omer",
+        service_data,
+        blocking=True,
+        return_response=True,
+    )
+
+    assert result["message"] == expected

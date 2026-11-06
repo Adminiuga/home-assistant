@@ -1,21 +1,23 @@
 """Support for the Philips Hue lights."""
-from __future__ import annotations
 
+import asyncio
 from datetime import timedelta
 from functools import partial
 import logging
 import random
+from typing import Any, override
 
 import aiohue
-import async_timeout
 
 from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
-    ATTR_COLOR_TEMP,
+    ATTR_COLOR_TEMP_KELVIN,
     ATTR_EFFECT,
     ATTR_FLASH,
     ATTR_HS_COLOR,
     ATTR_TRANSITION,
+    DEFAULT_MAX_KELVIN,
+    DEFAULT_MIN_KELVIN,
     EFFECT_COLORLOOP,
     EFFECT_RANDOM,
     FLASH_LONG,
@@ -25,24 +27,26 @@ from homeassistant.components.light import (
     LightEntityFeature,
     filter_supported_color_modes,
 )
-from homeassistant.core import callback
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import PlatformNotReady
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.debounce import Debouncer
-from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.update_coordinator import (
     CoordinatorEntity,
     DataUpdateCoordinator,
     UpdateFailed,
 )
-from homeassistant.util import color
+from homeassistant.util import color as color_util
 
-from ..bridge import HueBridge
+from ..bridge import HueConfigEntry
 from ..const import (
     CONF_ALLOW_HUE_GROUPS,
     CONF_ALLOW_UNREACHABLE,
     DEFAULT_ALLOW_HUE_GROUPS,
     DEFAULT_ALLOW_UNREACHABLE,
-    DOMAIN as HUE_DOMAIN,
+    DOMAIN,
     GROUP_TYPE_ENTERTAINMENT,
     GROUP_TYPE_LIGHT_GROUP,
     GROUP_TYPE_LIGHT_SOURCE,
@@ -94,21 +98,13 @@ GAMUT_TYPE_UNAVAILABLE = "None"
 GROUP_MIN_API_VERSION = (1, 13, 0)
 
 
-async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
-    """Old way of setting up Hue lights.
-
-    Can only be called when a user accidentally mentions hue platform in their
-    config. But even in that case it would have been ignored.
-    """
-
-
 def create_light(item_class, coordinator, bridge, is_group, rooms, api, item_id):
     """Create the light."""
     api_item = api[item_id]
 
     if is_group:
         supported_color_modes = set()
-        supported_features = 0
+        supported_features = LightEntityFeature(0)
         for light_id in api_item.lights:
             if light_id not in bridge.api.lights:
                 continue
@@ -136,11 +132,15 @@ def create_light(item_class, coordinator, bridge, is_group, rooms, api, item_id)
     )
 
 
-async def async_setup_entry(hass, config_entry, async_add_entities):
+async def async_setup_entry(
+    hass: HomeAssistant,
+    config_entry: HueConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
     """Set up the Hue lights from a config entry."""
-    bridge: HueBridge = hass.data[HUE_DOMAIN][config_entry.entry_id]
+    bridge = config_entry.runtime_data
     api_version = tuple(int(v) for v in bridge.api.config.apiversion.split("."))
-    rooms = {}
+    rooms: dict[str, str] = {}
 
     allow_groups = config_entry.options.get(
         CONF_ALLOW_HUE_GROUPS, DEFAULT_ALLOW_HUE_GROUPS
@@ -155,6 +155,7 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
         name="light",
         update_method=partial(async_safe_fetch, bridge, bridge.api.lights.update),
         update_interval=SCAN_INTERVAL,
+        config_entry=config_entry,
         request_refresh_debouncer=Debouncer(
             bridge.hass, LOGGER, cooldown=REQUEST_REFRESH_DELAY, immediate=True
         ),
@@ -189,6 +190,7 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
         name="group",
         update_method=partial(async_safe_fetch, bridge, bridge.api.groups.update),
         update_interval=SCAN_INTERVAL,
+        config_entry=config_entry,
         request_refresh_debouncer=Debouncer(
             bridge.hass, LOGGER, cooldown=REQUEST_REFRESH_DELAY, immediate=True
         ),
@@ -224,7 +226,7 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
         # Once we do a rooms update, we cancel the listener
         # until the next time lights are added
         bridge.reset_jobs.remove(cancel_update_rooms_listener)
-        cancel_update_rooms_listener()  # pylint: disable=not-callable
+        cancel_update_rooms_listener()
         cancel_update_rooms_listener = None
 
     @callback
@@ -262,7 +264,7 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
 async def async_safe_fetch(bridge, fetch_method):
     """Safely fetch data."""
     try:
-        with async_timeout.timeout(4):
+        async with asyncio.timeout(4):
             return await bridge.async_request_call(fetch_method)
     except aiohue.Unauthorized as err:
         await bridge.handle_unauthorized_error()
@@ -304,7 +306,8 @@ def hass_to_hue_brightness(value):
     return max(1, round((value / 255) * 254))
 
 
-class HueLight(CoordinatorEntity, LightEntity):
+# pylint: disable-next=home-assistant-enforce-class-module
+class HueLight(CoordinatorEntity[DataUpdateCoordinator[None]], LightEntity):
     """Representation of a Hue light."""
 
     def __init__(
@@ -360,13 +363,14 @@ class HueLight(CoordinatorEntity, LightEntity):
                     "bulb in the Philips Hue App."
                 )
                 LOGGER.warning(err, self.name)
-            if self.gamut and not color.check_valid_gamut(self.gamut):
+            if self.gamut and not color_util.check_valid_gamut(self.gamut):
                 err = "Color gamut of %s: %s, not valid, setting gamut to None."
                 LOGGER.debug(err, self.name, str(self.gamut))
                 self.gamut_typ = GAMUT_TYPE_UNAVAILABLE
                 self.gamut = None
 
     @property
+    @override
     def unique_id(self):
         """Return the unique ID of this Hue light."""
         unique_id = self.light.uniqueid
@@ -381,11 +385,13 @@ class HueLight(CoordinatorEntity, LightEntity):
         return self.unique_id
 
     @property
+    @override
     def name(self):
         """Return the name of the Hue light."""
         return self.light.name
 
     @property
+    @override
     def brightness(self):
         """Return the brightness of this light between 0..255."""
         if self.is_group:
@@ -399,12 +405,13 @@ class HueLight(CoordinatorEntity, LightEntity):
         return hue_brightness_to_hass(bri)
 
     @property
-    def color_mode(self) -> str:
+    @override
+    def color_mode(self) -> ColorMode:
         """Return the color mode of the light."""
         if self._fixed_color_mode:
             return self._fixed_color_mode
 
-        # The light supports both hs/xy and white with adjustabe color_temperature
+        # The light supports both hs/xy and white with adjustable color_temperature
         mode = self._color_mode
         if mode in ("xy", "hs"):
             return ColorMode.HS
@@ -419,64 +426,71 @@ class HueLight(CoordinatorEntity, LightEntity):
         return self.light.state.get("colormode")
 
     @property
+    @override
     def hs_color(self):
         """Return the hs color value."""
         mode = self._color_mode
         source = self.light.action if self.is_group else self.light.state
 
         if mode in ("xy", "hs") and "xy" in source:
-            return color.color_xy_to_hs(*source["xy"], self.gamut)
+            return color_util.color_xy_to_hs(*source["xy"], self.gamut)
 
         return None
 
     @property
-    def color_temp(self):
-        """Return the CT color value."""
+    @override
+    def color_temp_kelvin(self) -> int | None:
+        """Return the color temperature value in Kelvin."""
         # Don't return color temperature unless in color temperature mode
         if self._color_mode != "ct":
             return None
 
-        if self.is_group:
-            return self.light.action.get("ct")
-        return self.light.state.get("ct")
+        ct = (
+            self.light.action.get("ct") if self.is_group else self.light.state.get("ct")
+        )
+        return color_util.color_temperature_mired_to_kelvin(ct) if ct else None
 
     @property
-    def min_mireds(self):
-        """Return the coldest color_temp that this light supports."""
+    @override
+    def max_color_temp_kelvin(self) -> int:
+        """Return the coldest color_temp_kelvin that this light supports."""
         if self.is_group:
-            return super().min_mireds
+            return DEFAULT_MAX_KELVIN
 
         min_mireds = self.light.controlcapabilities.get("ct", {}).get("min")
 
         # We filter out '0' too, which can be incorrectly reported by 3rd party buls
         if not min_mireds:
-            return super().min_mireds
+            return DEFAULT_MAX_KELVIN
 
-        return min_mireds
+        return color_util.color_temperature_mired_to_kelvin(min_mireds)
 
     @property
-    def max_mireds(self):
-        """Return the warmest color_temp that this light supports."""
+    @override
+    def min_color_temp_kelvin(self) -> int:
+        """Return the warmest color_temp_kelvin that this light supports."""
         if self.is_group:
-            return super().max_mireds
+            return DEFAULT_MIN_KELVIN
         if self.is_livarno:
-            return 500
+            return 2000  # 500 mireds
 
         max_mireds = self.light.controlcapabilities.get("ct", {}).get("max")
 
         if not max_mireds:
-            return super().max_mireds
+            return DEFAULT_MIN_KELVIN
 
-        return max_mireds
+        return color_util.color_temperature_mired_to_kelvin(max_mireds)
 
     @property
-    def is_on(self):
+    @override
+    def is_on(self) -> bool:
         """Return true if device is on."""
         if self.is_group:
             return self.light.state["any_on"]
         return self.light.state["on"]
 
     @property
+    @override
     def available(self):
         """Return if light is available."""
         return self.coordinator.last_update_success and (
@@ -484,11 +498,13 @@ class HueLight(CoordinatorEntity, LightEntity):
         )
 
     @property
+    @override
     def effect(self):
         """Return the current effect."""
         return self.light.state.get("effect", None)
 
     @property
+    @override
     def effect_list(self):
         """Return the list of supported effects."""
         if self.is_osram:
@@ -496,6 +512,7 @@ class HueLight(CoordinatorEntity, LightEntity):
         return [EFFECT_COLORLOOP, EFFECT_RANDOM]
 
     @property
+    @override
     def device_info(self) -> DeviceInfo | None:
         """Return the device info."""
         if self.light.type in (
@@ -513,7 +530,7 @@ class HueLight(CoordinatorEntity, LightEntity):
             suggested_area = self._rooms[self.light.id]
 
         return DeviceInfo(
-            identifiers={(HUE_DOMAIN, self.device_id)},
+            identifiers={(DOMAIN, self.device_id)},
             manufacturer=self.light.manufacturername,
             # productname added in Hue Bridge API 1.24
             # (published 03/05/2018)
@@ -521,9 +538,14 @@ class HueLight(CoordinatorEntity, LightEntity):
             name=self.name,
             sw_version=self.light.swversion,
             suggested_area=suggested_area,
-            via_device=(HUE_DOMAIN, self.bridge.api.config.bridgeid),
+            via_device_id=dr.async_get_device_id_by_identifier(
+                self.bridge.hass,
+                (DOMAIN, self.bridge.api.config.bridgeid),
+                config_entry_id=self.bridge.config_entry.entry_id,
+            ),
         )
 
+    @override
     async def async_turn_on(self, **kwargs):
         """Turn the specified or all lights on."""
         command = {"on": True}
@@ -539,11 +561,14 @@ class HueLight(CoordinatorEntity, LightEntity):
                 # Philips hue bulb models respond differently to hue/sat
                 # requests, so we convert to XY first to ensure a consistent
                 # color.
-                xy_color = color.color_hs_to_xy(*kwargs[ATTR_HS_COLOR], self.gamut)
+                xy_color = color_util.color_hs_to_xy(*kwargs[ATTR_HS_COLOR], self.gamut)
                 command["xy"] = xy_color
-        elif ATTR_COLOR_TEMP in kwargs:
-            temp = kwargs[ATTR_COLOR_TEMP]
-            command["ct"] = max(self.min_mireds, min(temp, self.max_mireds))
+        elif ATTR_COLOR_TEMP_KELVIN in kwargs:
+            temp_k = max(
+                self.min_color_temp_kelvin,
+                min(self.max_color_temp_kelvin, kwargs[ATTR_COLOR_TEMP_KELVIN]),
+            )
+            command["ct"] = color_util.color_temperature_kelvin_to_mired(temp_k)
 
         if ATTR_BRIGHTNESS in kwargs:
             command["bri"] = hass_to_hue_brightness(kwargs[ATTR_BRIGHTNESS])
@@ -581,6 +606,7 @@ class HueLight(CoordinatorEntity, LightEntity):
 
         await self.coordinator.async_request_refresh()
 
+    @override
     async def async_turn_off(self, **kwargs):
         """Turn the specified or all lights off."""
         command = {"on": False}
@@ -607,7 +633,8 @@ class HueLight(CoordinatorEntity, LightEntity):
         await self.coordinator.async_request_refresh()
 
     @property
-    def extra_state_attributes(self):
+    @override
+    def extra_state_attributes(self) -> dict[str, Any]:
         """Return the device state attributes."""
         if not self.is_group:
             return {}

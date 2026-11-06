@@ -1,12 +1,13 @@
 {
   "domain": "smarttub",
   "name": "SmartTub",
-  "config_flow": true,
-  "documentation": "https://www.home-assistant.io/integrations/smarttub",
-  "dependencies": [],
+  "categories": ["water.pools_spas"],
   "codeowners": ["@mdz"],
-  "requirements": ["python-smarttub==0.0.33"],
-  "quality_scale": "platinum",
+  "config_flow": true,
+  "connectivity": ["cloud"],
+  "documentation": "https://www.home-assistant.io/integrations/smarttub",
+  "integration_type": "hub",
   "iot_class": "cloud_polling",
-  "loggers": ["smarttub"]
+  "loggers": ["smarttub"],
+  "requirements": ["python-smarttub==0.0.47"]
 }

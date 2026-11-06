@@ -1,19 +1,37 @@
 """Offer time listening automation rules."""
-from datetime import datetime
-from functools import partial
 
-import voluptuous as vol
+from collections.abc import Callable
+from datetime import datetime, timedelta
+from functools import partial
+from typing import Any, NamedTuple
+
+import probatio
 
 from homeassistant.components import sensor
+from homeassistant.components.input_datetime import DOMAIN as INPUT_DATETIME_DOMAIN
+from homeassistant.components.sensor import DOMAIN as SENSOR_DOMAIN
 from homeassistant.const import (
-    ATTR_DEVICE_CLASS,
     CONF_AT,
+    CONF_ENTITY_ID,
+    CONF_OFFSET,
     CONF_PLATFORM,
+    CONF_WEEKDAY,
     STATE_UNAVAILABLE,
     STATE_UNKNOWN,
+    WEEKDAYS,
+    EntityStateAttribute,
 )
-from homeassistant.core import CALLBACK_TYPE, HassJob, HomeAssistant, callback
-from homeassistant.helpers import config_validation as cv
+from homeassistant.core import (
+    CALLBACK_TYPE,
+    Event,
+    EventStateChangedData,
+    HassJob,
+    HomeAssistant,
+    State,
+    callback,
+)
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import config_validation as cv, template
 from homeassistant.helpers.event import (
     async_track_point_in_time,
     async_track_state_change_event,
@@ -21,23 +39,66 @@ from homeassistant.helpers.event import (
 )
 from homeassistant.helpers.trigger import TriggerActionType, TriggerInfo
 from homeassistant.helpers.typing import ConfigType
-import homeassistant.util.dt as dt_util
+from homeassistant.util import dt as dt_util
 
-_TIME_TRIGGER_SCHEMA = vol.Any(
-    cv.time,
-    vol.All(str, cv.entity_domain(["input_datetime", "sensor"])),
-    msg="Expected HH:MM, HH:MM:SS or Entity ID with domain 'input_datetime' or 'sensor'",
-)
+_TIME_TRIGGER_ENTITY = probatio.All(str, cv.entity_domain(["input_datetime", "sensor"]))
+_TIME_AT_SCHEMA = probatio.Any(cv.time, _TIME_TRIGGER_ENTITY)
 
-TRIGGER_SCHEMA = cv.TRIGGER_BASE_SCHEMA.extend(
+_TIME_TRIGGER_ENTITY_WITH_OFFSET = probatio.Schema(
     {
-        vol.Required(CONF_PLATFORM): "time",
-        vol.Required(CONF_AT): vol.All(cv.ensure_list, [_TIME_TRIGGER_SCHEMA]),
+        probatio.Required(CONF_ENTITY_ID): cv.entity_domain(
+            ["input_datetime", "sensor"]
+        ),
+        probatio.Optional(CONF_OFFSET): cv.time_period,
     }
 )
 
 
-async def async_attach_trigger(
+def valid_at_template(value: Any) -> template.Template:
+    """Validate either a jinja2 template, valid time, or valid trigger entity."""
+    tpl = cv.template(value)
+
+    if tpl.is_static:
+        _TIME_AT_SCHEMA(value)
+
+    return tpl
+
+
+_TIME_TRIGGER_SCHEMA = probatio.Any(
+    cv.time,
+    _TIME_TRIGGER_ENTITY,
+    _TIME_TRIGGER_ENTITY_WITH_OFFSET,
+    valid_at_template,
+    msg=(
+        "Expected HH:MM, HH:MM:SS, an Entity ID with domain 'input_datetime' or "
+        "'sensor', a combination of a timestamp sensor entity"
+        " and an offset, or Limited Template"
+    ),
+)
+
+
+TRIGGER_SCHEMA = cv.TRIGGER_BASE_SCHEMA.extend(
+    {
+        probatio.Required(CONF_PLATFORM): "time",
+        probatio.Required(CONF_AT): probatio.All(
+            probatio.EnsureList(), [_TIME_TRIGGER_SCHEMA]
+        ),
+        probatio.Optional(CONF_WEEKDAY): probatio.Any(
+            probatio.In(WEEKDAYS),
+            probatio.All(probatio.EnsureList(), [probatio.In(WEEKDAYS)]),
+        ),
+    }
+)
+
+
+class TrackEntity(NamedTuple):
+    """Represents a tracking entity for a time trigger."""
+
+    entity_id: str
+    callback: Callable
+
+
+async def async_attach_trigger(  # noqa: C901
     hass: HomeAssistant,
     config: ConfigType,
     action: TriggerActionType,
@@ -45,13 +106,28 @@ async def async_attach_trigger(
 ) -> CALLBACK_TYPE:
     """Listen for state changes based on configuration."""
     trigger_data = trigger_info["trigger_data"]
-    entities: dict[str, CALLBACK_TYPE] = {}
-    removes = []
-    job = HassJob(action)
+    variables = trigger_info["variables"] or {}
+    entities: dict[tuple[str, timedelta], CALLBACK_TYPE] = {}
+    removes: list[CALLBACK_TYPE] = []
+    job = HassJob(action, f"time trigger {trigger_info}")
 
     @callback
-    def time_automation_listener(description, now, *, entity_id=None):
+    def time_automation_listener(
+        description: str, now: datetime, *, entity_id: str | None = None
+    ) -> None:
         """Listen for time changes and calls action."""
+        # Check weekday filter if configured
+        if CONF_WEEKDAY in config:
+            weekday_config = config[CONF_WEEKDAY]
+            current_weekday = WEEKDAYS[now.weekday()]
+
+            # Check if current weekday matches the configuration
+            if isinstance(weekday_config, str):
+                if current_weekday != weekday_config:
+                    return
+            elif current_weekday not in weekday_config:
+                return
+
         hass.async_run_hass_job(
             job,
             {
@@ -66,23 +142,31 @@ async def async_attach_trigger(
         )
 
     @callback
-    def update_entity_trigger_event(event):
+    def update_entity_trigger_event(
+        event: Event[EventStateChangedData], offset: timedelta = timedelta(0)
+    ) -> None:
         """update_entity_trigger from the event."""
-        return update_entity_trigger(event.data["entity_id"], event.data["new_state"])
+        return update_entity_trigger(
+            event.data["entity_id"], event.data["new_state"], offset
+        )
 
     @callback
-    def update_entity_trigger(entity_id, new_state=None):
+    def update_entity_trigger(
+        entity_id: str, new_state: State | None = None, offset: timedelta = timedelta(0)
+    ) -> None:
         """Update the entity trigger for the entity_id."""
         # If a listener was already set up for entity, remove it.
-        if remove := entities.pop(entity_id, None):
+        if remove := entities.pop((entity_id, offset), None):
             remove()
             remove = None
 
         if not new_state:
             return
 
+        trigger_dt: datetime | None
+
         # Check state of entity. If valid, set up a listener.
-        if new_state.domain == "input_datetime":
+        if new_state.domain == INPUT_DATETIME_DOMAIN:
             if has_date := new_state.attributes["has_date"]:
                 year = new_state.attributes["year"]
                 month = new_state.attributes["month"]
@@ -97,14 +181,17 @@ async def async_attach_trigger(
 
             if has_date:
                 # If input_datetime has date, then track point in time.
-                trigger_dt = datetime(
-                    year,
-                    month,
-                    day,
-                    hour,
-                    minute,
-                    second,
-                    tzinfo=dt_util.DEFAULT_TIME_ZONE,
+                trigger_dt = (
+                    datetime(
+                        year,
+                        month,
+                        day,
+                        hour,
+                        minute,
+                        second,
+                        tzinfo=dt_util.get_default_time_zone(),
+                    )
+                    + offset
                 )
                 # Only set up listener if time is now or in the future.
                 if trigger_dt >= dt_util.now():
@@ -119,6 +206,17 @@ async def async_attach_trigger(
                     )
             elif has_time:
                 # Else if it has time, then track time change.
+                if offset != timedelta(0):
+                    # Create a temporary datetime object to get an offset.
+                    temp_dt = dt_util.now().replace(
+                        hour=hour, minute=minute, second=second, microsecond=0
+                    )
+                    temp_dt += offset
+                    # Ignore the date and apply the offset even if it wraps
+                    # around to the next day.
+                    hour = temp_dt.hour
+                    minute = temp_dt.minute
+                    second = temp_dt.second
                 remove = async_track_time_change(
                     hass,
                     partial(
@@ -131,12 +229,15 @@ async def async_attach_trigger(
                     second=second,
                 )
         elif (
-            new_state.domain == "sensor"
-            and new_state.attributes.get(ATTR_DEVICE_CLASS)
-            == sensor.SensorDeviceClass.TIMESTAMP
+            new_state.domain == SENSOR_DOMAIN
+            and new_state.attributes.get(EntityStateAttribute.DEVICE_CLASS)
+            in (sensor.SensorDeviceClass.TIMESTAMP, sensor.SensorDeviceClass.UPTIME)
             and new_state.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN)
         ):
             trigger_dt = dt_util.parse_datetime(new_state.state)
+
+            if trigger_dt is not None:
+                trigger_dt += offset
 
             if trigger_dt is not None and trigger_dt > dt_util.utcnow():
                 remove = async_track_point_in_time(
@@ -151,15 +252,39 @@ async def async_attach_trigger(
 
         # Was a listener set up?
         if remove:
-            entities[entity_id] = remove
+            entities[(entity_id, offset)] = remove
 
-    to_track = []
+    to_track: list[TrackEntity] = []
 
     for at_time in config[CONF_AT]:
+        if isinstance(at_time, template.Template):
+            render = template.render_complex(at_time, variables, limited=True)
+            try:
+                at_time = _TIME_AT_SCHEMA(render)
+            except probatio.Invalid as exc:
+                raise HomeAssistantError(
+                    f"Limited Template for 'at' rendered a"
+                    f" unexpected value '{render}', expected"
+                    " HH:MM, HH:MM:SS or Entity ID with domain"
+                    " 'input_datetime' or 'sensor'"
+                ) from exc
+
         if isinstance(at_time, str):
             # entity
-            to_track.append(at_time)
             update_entity_trigger(at_time, new_state=hass.states.get(at_time))
+            to_track.append(TrackEntity(at_time, update_entity_trigger_event))
+        elif isinstance(at_time, dict):
+            # entity with optional offset
+            entity_id: str = at_time[CONF_ENTITY_ID]
+            offset: timedelta = at_time.get(CONF_OFFSET, timedelta(0))
+            update_entity_trigger(
+                entity_id, new_state=hass.states.get(entity_id), offset=offset
+            )
+            to_track.append(
+                TrackEntity(
+                    entity_id, partial(update_entity_trigger_event, offset=offset)
+                )
+            )
         else:
             # datetime.time
             removes.append(
@@ -172,13 +297,14 @@ async def async_attach_trigger(
                 )
             )
 
-    # Track state changes of any entities.
-    removes.append(
-        async_track_state_change_event(hass, to_track, update_entity_trigger_event)
+    # Besides time, we also track state changes of requested entities.
+    removes.extend(
+        (async_track_state_change_event(hass, entry.entity_id, entry.callback))
+        for entry in to_track
     )
 
     @callback
-    def remove_track_time_changes():
+    def remove_track_time_changes() -> None:
         """Remove tracked time changes."""
         for remove in entities.values():
             remove()

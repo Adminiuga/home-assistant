@@ -1,33 +1,49 @@
 """Support for Nexia / Trane XL Thermostats."""
-from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, override
 
 from nexia.const import UNIT_CELSIUS
+from nexia.sensor import NexiaSensor
 from nexia.thermostat import NexiaThermostat
+from nexia.zone import NexiaThermostatZone
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
     SensorEntity,
+    SensorEntityDescription,
     SensorStateClass,
 )
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import PERCENTAGE, TEMP_CELSIUS, TEMP_FAHRENHEIT
+from homeassistant.const import PERCENTAGE, UnitOfTemperature
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .const import DOMAIN
 from .coordinator import NexiaDataUpdateCoordinator
-from .entity import NexiaThermostatEntity, NexiaThermostatZoneEntity
+from .entity import NexiaRoomIQEntity, NexiaThermostatEntity, NexiaThermostatZoneEntity
+from .types import NexiaConfigEntry
 from .util import percent_conv
+
+
+@dataclass(frozen=True, kw_only=True)
+class NexiaRoomIQSensorEntityDescription(SensorEntityDescription):
+    """Describes the sensor entity for a Nexia RoomIQ sensor."""
+
+    available_fn: Callable[[NexiaSensor], bool]
+    value_fn: Callable[[NexiaSensor], int | float | None]
+    include_fn: Callable[[NexiaSensor], bool] = lambda s: True
+    state_class = SensorStateClass.MEASUREMENT
+    entity_registry_enabled_default = False
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    config_entry: NexiaConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up sensors for a Nexia device."""
 
-    coordinator: NexiaDataUpdateCoordinator = hass.data[DOMAIN][config_entry.entry_id]
+    coordinator = config_entry.runtime_data
     nexia_home = coordinator.nexia_home
     entities: list[NexiaThermostatEntity] = []
 
@@ -40,7 +56,7 @@ async def async_setup_entry(
                 coordinator,
                 thermostat,
                 "get_system_status",
-                "System Status",
+                "system_status",
                 None,
                 None,
                 None,
@@ -52,7 +68,7 @@ async def async_setup_entry(
                 coordinator,
                 thermostat,
                 "get_air_cleaner_mode",
-                "Air Cleaner Mode",
+                "air_cleaner_mode",
                 None,
                 None,
                 None,
@@ -65,7 +81,7 @@ async def async_setup_entry(
                     coordinator,
                     thermostat,
                     "get_current_compressor_speed",
-                    "Current Compressor Speed",
+                    "current_compressor_speed",
                     None,
                     PERCENTAGE,
                     SensorStateClass.MEASUREMENT,
@@ -77,7 +93,7 @@ async def async_setup_entry(
                     coordinator,
                     thermostat,
                     "get_requested_compressor_speed",
-                    "Requested Compressor Speed",
+                    "requested_compressor_speed",
                     None,
                     PERCENTAGE,
                     SensorStateClass.MEASUREMENT,
@@ -86,17 +102,16 @@ async def async_setup_entry(
             )
         # Outdoor Temperature
         if thermostat.has_outdoor_temperature():
-            unit = (
-                TEMP_CELSIUS
-                if thermostat.get_unit() == UNIT_CELSIUS
-                else TEMP_FAHRENHEIT
-            )
+            if thermostat.get_unit() == UNIT_CELSIUS:
+                unit = UnitOfTemperature.CELSIUS
+            else:
+                unit = UnitOfTemperature.FAHRENHEIT
             entities.append(
                 NexiaThermostatSensor(
                     coordinator,
                     thermostat,
                     "get_outdoor_temperature",
-                    "Outdoor Temperature",
+                    "outdoor_temperature",
                     SensorDeviceClass.TEMPERATURE,
                     unit,
                     SensorStateClass.MEASUREMENT,
@@ -109,7 +124,36 @@ async def async_setup_entry(
                     coordinator,
                     thermostat,
                     "get_relative_humidity",
-                    "Relative Humidity",
+                    None,
+                    SensorDeviceClass.HUMIDITY,
+                    PERCENTAGE,
+                    SensorStateClass.MEASUREMENT,
+                    percent_conv,
+                )
+            )
+        # Heating Humidification Setpoint
+        if thermostat.has_humidify_support():
+            entities.append(
+                NexiaThermostatSensor(
+                    coordinator,
+                    thermostat,
+                    "get_humidify_setpoint",
+                    "get_humidify_setpoint",
+                    SensorDeviceClass.HUMIDITY,
+                    PERCENTAGE,
+                    SensorStateClass.MEASUREMENT,
+                    percent_conv,
+                )
+            )
+
+        # Cooling Dehumidification Setpoint
+        if thermostat.has_dehumidify_support():
+            entities.append(
+                NexiaThermostatSensor(
+                    coordinator,
+                    thermostat,
+                    "get_dehumidify_setpoint",
+                    "get_dehumidify_setpoint",
                     SensorDeviceClass.HUMIDITY,
                     PERCENTAGE,
                     SensorStateClass.MEASUREMENT,
@@ -120,18 +164,17 @@ async def async_setup_entry(
         # Zone Sensors
         for zone_id in thermostat.get_zone_ids():
             zone = thermostat.get_zone_by_id(zone_id)
-            unit = (
-                TEMP_CELSIUS
-                if thermostat.get_unit() == UNIT_CELSIUS
-                else TEMP_FAHRENHEIT
-            )
+            if thermostat.get_unit() == UNIT_CELSIUS:
+                unit = UnitOfTemperature.CELSIUS
+            else:
+                unit = UnitOfTemperature.FAHRENHEIT
             # Temperature
             entities.append(
                 NexiaThermostatZoneSensor(
                     coordinator,
                     zone,
                     "get_temperature",
-                    "Temperature",
+                    None,
                     SensorDeviceClass.TEMPERATURE,
                     unit,
                     SensorStateClass.MEASUREMENT,
@@ -141,7 +184,7 @@ async def async_setup_entry(
             # Zone Status
             entities.append(
                 NexiaThermostatZoneSensor(
-                    coordinator, zone, "get_status", "Zone Status", None, None, None
+                    coordinator, zone, "get_status", "zone_status", None, None, None
                 )
             )
             # Setpoint Status
@@ -150,12 +193,44 @@ async def async_setup_entry(
                     coordinator,
                     zone,
                     "get_setpoint_status",
-                    "Zone Setpoint Status",
+                    "zone_setpoint_status",
                     None,
                     None,
                     None,
                 )
             )
+
+            if len(zone_sensors := zone.get_sensors()) > 1:
+                room_iq_descriptions = (
+                    NexiaRoomIQSensorEntityDescription(
+                        key="room_iq_temperature",
+                        available_fn=lambda s: s.temperature_valid,
+                        value_fn=lambda s: s.temperature,
+                        device_class=SensorDeviceClass.TEMPERATURE,
+                        native_unit_of_measurement=unit,
+                    ),
+                    NexiaRoomIQSensorEntityDescription(
+                        key="room_iq_humidity",
+                        available_fn=lambda s: s.humidity_valid,
+                        value_fn=lambda s: s.humidity,
+                        device_class=SensorDeviceClass.HUMIDITY,
+                        native_unit_of_measurement=PERCENTAGE,
+                    ),
+                    NexiaRoomIQSensorEntityDescription(
+                        key="room_iq_battery",
+                        available_fn=lambda s: bool(s.battery_valid),
+                        value_fn=lambda s: s.battery_level,
+                        include_fn=lambda s: s.has_battery,
+                        device_class=SensorDeviceClass.BATTERY,
+                        native_unit_of_measurement=PERCENTAGE,
+                    ),
+                )
+                entities.extend(
+                    NexiaRoomIQSensor(coordinator, zone, room_iq_sensor, description)
+                    for room_iq_sensor in zone_sensors
+                    for description in room_iq_descriptions
+                    if description.include_fn(room_iq_sensor)
+                )
 
     async_add_entities(entities)
 
@@ -168,7 +243,7 @@ class NexiaThermostatSensor(NexiaThermostatEntity, SensorEntity):
         coordinator,
         thermostat,
         sensor_call,
-        sensor_name,
+        translation_key,
         sensor_class,
         sensor_unit,
         state_class,
@@ -178,7 +253,6 @@ class NexiaThermostatSensor(NexiaThermostatEntity, SensorEntity):
         super().__init__(
             coordinator,
             thermostat,
-            name=f"{thermostat.get_name()} {sensor_name}",
             unique_id=f"{thermostat.thermostat_id}_{sensor_call}",
         )
         self._call = sensor_call
@@ -186,8 +260,11 @@ class NexiaThermostatSensor(NexiaThermostatEntity, SensorEntity):
         self._attr_device_class = sensor_class
         self._attr_native_unit_of_measurement = sensor_unit
         self._attr_state_class = state_class
+        if translation_key is not None:
+            self._attr_translation_key = translation_key
 
     @property
+    @override
     def native_value(self):
         """Return the state of the sensor."""
         val = getattr(self._thermostat, self._call)()
@@ -206,7 +283,7 @@ class NexiaThermostatZoneSensor(NexiaThermostatZoneEntity, SensorEntity):
         coordinator,
         zone,
         sensor_call,
-        sensor_name,
+        translation_key,
         sensor_class,
         sensor_unit,
         state_class,
@@ -217,7 +294,6 @@ class NexiaThermostatZoneSensor(NexiaThermostatZoneEntity, SensorEntity):
         super().__init__(
             coordinator,
             zone,
-            name=f"{zone.get_name()} {sensor_name}",
             unique_id=f"{zone.zone_id}_{sensor_call}",
         )
         self._call = sensor_call
@@ -225,8 +301,11 @@ class NexiaThermostatZoneSensor(NexiaThermostatZoneEntity, SensorEntity):
         self._attr_device_class = sensor_class
         self._attr_native_unit_of_measurement = sensor_unit
         self._attr_state_class = state_class
+        if translation_key is not None:
+            self._attr_translation_key = translation_key
 
     @property
+    @override
     def native_value(self):
         """Return the state of the sensor."""
         val = getattr(self._zone, self._call)()
@@ -235,3 +314,59 @@ class NexiaThermostatZoneSensor(NexiaThermostatZoneEntity, SensorEntity):
         if isinstance(val, float):
             val = round(val, 1)
         return val
+
+
+class NexiaRoomIQSensor(NexiaRoomIQEntity, SensorEntity):
+    """Provides Nexia RoomIQ sensor support."""
+
+    entity_description: NexiaRoomIQSensorEntityDescription
+
+    def __init__(
+        self,
+        coordinator: NexiaDataUpdateCoordinator,
+        zone: NexiaThermostatZone,
+        sensor: NexiaSensor,
+        description: NexiaRoomIQSensorEntityDescription,
+    ) -> None:
+        """Initialize the sensor entity for a Nexia RoomIQ sensor."""
+        super().__init__(coordinator, zone, sensor, description.key)
+        self.entity_description = description
+        if TYPE_CHECKING:
+            assert self._attr_unique_id is not None
+        self._room_iq_monitor_id = self._attr_unique_id
+
+    @property
+    @override
+    def available(self) -> bool:
+        """Return if the state is available."""
+        try:
+            room_iq_sensor = self._zone.get_sensor_by_id(self._sensor_id)
+        except KeyError:
+            return False
+        return (
+            super().available
+            and (not room_iq_sensor.has_online or bool(room_iq_sensor.connected))
+            and self.entity_description.available_fn(room_iq_sensor)
+        )
+
+    @property
+    @override
+    def native_value(self) -> int | float | None:
+        """Return the state of the RoomIQ sensor."""
+        try:
+            room_iq_sensor = self._zone.get_sensor_by_id(self._sensor_id)
+        except KeyError:
+            return None
+        return self.entity_description.value_fn(room_iq_sensor)
+
+    @override
+    async def async_added_to_hass(self) -> None:
+        """Register this RoomIQ entity."""
+        self._zone.add_room_iq_monitor(self._room_iq_monitor_id)
+        await super().async_added_to_hass()
+
+    @override
+    async def async_will_remove_from_hass(self) -> None:
+        """Unregister this RoomIQ entity."""
+        await super().async_will_remove_from_hass()
+        self._zone.remove_room_iq_monitor(self._room_iq_monitor_id)

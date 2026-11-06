@@ -1,10 +1,9 @@
 """Sensor support for Melnor Bluetooth water timer."""
-from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, override
 
 from melnor_bluetooth.device import Device, Valve
 
@@ -14,21 +13,19 @@ from homeassistant.components.sensor import (
     SensorEntityDescription,
     SensorStateClass,
 )
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import PERCENTAGE, SIGNAL_STRENGTH_DECIBELS_MILLIWATT
+from homeassistant.const import (
+    PERCENTAGE,
+    SIGNAL_STRENGTH_DECIBELS_MILLIWATT,
+    EntityCategory,
+)
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity import EntityCategory
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.typing import StateType
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
 
-from .const import DOMAIN
-from .models import (
-    MelnorBluetoothEntity,
-    MelnorDataUpdateCoordinator,
-    MelnorZoneEntity,
-    get_entities_for_valves,
-)
+from .coordinator import MelnorConfigEntry, MelnorDataUpdateCoordinator
+from .entity import MelnorBluetoothEntity, MelnorZoneEntity, get_entities_for_valves
 
 
 def watering_seconds_left(valve: Valve) -> datetime | None:
@@ -42,32 +39,27 @@ def watering_seconds_left(valve: Valve) -> datetime | None:
     return dt_util.utc_from_timestamp(valve.watering_end_time)
 
 
-@dataclass
-class MelnorSensorEntityDescriptionMixin:
-    """Mixin for required keys."""
+def next_cycle(valve: Valve) -> datetime | None:
+    """Return the value of the next_cycle date, only if the cycle is enabled."""
 
-    state_fn: Callable[[Device], Any]
+    if valve.schedule_enabled is True:
+        return valve.next_cycle
+
+    return None
 
 
-@dataclass
-class MelnorZoneSensorEntityDescriptionMixin:
-    """Mixin for required keys."""
+@dataclass(frozen=True, kw_only=True)
+class MelnorZoneSensorEntityDescription(SensorEntityDescription):
+    """Describes Melnor sensor entity."""
 
     state_fn: Callable[[Valve], Any]
 
 
-@dataclass
-class MelnorZoneSensorEntityDescription(
-    SensorEntityDescription, MelnorZoneSensorEntityDescriptionMixin
-):
+@dataclass(frozen=True, kw_only=True)
+class MelnorSensorEntityDescription(SensorEntityDescription):
     """Describes Melnor sensor entity."""
 
-
-@dataclass
-class MelnorSensorEntityDescription(
-    SensorEntityDescription, MelnorSensorEntityDescriptionMixin
-):
-    """Describes Melnor sensor entity."""
+    state_fn: Callable[[Device], Any]
 
 
 DEVICE_ENTITY_DESCRIPTIONS: list[MelnorSensorEntityDescription] = [
@@ -75,7 +67,6 @@ DEVICE_ENTITY_DESCRIPTIONS: list[MelnorSensorEntityDescription] = [
         device_class=SensorDeviceClass.BATTERY,
         entity_category=EntityCategory.DIAGNOSTIC,
         key="battery",
-        name="Battery",
         native_unit_of_measurement=PERCENTAGE,
         state_class=SensorStateClass.MEASUREMENT,
         state_fn=lambda device: device.battery_level,
@@ -85,7 +76,7 @@ DEVICE_ENTITY_DESCRIPTIONS: list[MelnorSensorEntityDescription] = [
         entity_category=EntityCategory.DIAGNOSTIC,
         entity_registry_enabled_default=False,
         key="rssi",
-        name="RSSI",
+        translation_key="rssi",
         native_unit_of_measurement=SIGNAL_STRENGTH_DECIBELS_MILLIWATT,
         state_class=SensorStateClass.MEASUREMENT,
         state_fn=lambda device: device.rssi,
@@ -96,32 +87,38 @@ ZONE_ENTITY_DESCRIPTIONS: list[MelnorZoneSensorEntityDescription] = [
     MelnorZoneSensorEntityDescription(
         device_class=SensorDeviceClass.TIMESTAMP,
         key="manual_cycle_end",
-        name="Manual Cycle End",
+        translation_key="manual_cycle_end",
         state_fn=watering_seconds_left,
+    ),
+    MelnorZoneSensorEntityDescription(
+        device_class=SensorDeviceClass.TIMESTAMP,
+        key="next_cycle",
+        translation_key="next_cycle",
+        state_fn=next_cycle,
     ),
 ]
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    config_entry: MelnorConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up the sensor platform."""
 
-    coordinator: MelnorDataUpdateCoordinator = hass.data[DOMAIN][config_entry.entry_id]
+    coordinator = config_entry.runtime_data
 
     # Device-level sensors
-    async_add_entities(
+    entities: list[CoordinatorEntity[MelnorDataUpdateCoordinator]] = [
         MelnorSensorEntity(
             coordinator,
             description,
         )
         for description in DEVICE_ENTITY_DESCRIPTIONS
-    )
+    ]
 
     # Valve/Zone-level sensors
-    async_add_entities(
+    entities.extend(
         get_entities_for_valves(
             coordinator,
             ZONE_ENTITY_DESCRIPTIONS,
@@ -130,6 +127,8 @@ async def async_setup_entry(
             ),
         )
     )
+
+    async_add_entities(entities)
 
 
 class MelnorSensorEntity(MelnorBluetoothEntity, SensorEntity):
@@ -150,6 +149,7 @@ class MelnorSensorEntity(MelnorBluetoothEntity, SensorEntity):
         self.entity_description = entity_description
 
     @property
+    @override
     def native_value(self) -> StateType:
         """Return the sensor value."""
         return self.entity_description.state_fn(self._device)
@@ -160,16 +160,8 @@ class MelnorZoneSensorEntity(MelnorZoneEntity, SensorEntity):
 
     entity_description: MelnorZoneSensorEntityDescription
 
-    def __init__(
-        self,
-        coordinator: MelnorDataUpdateCoordinator,
-        entity_description: MelnorZoneSensorEntityDescription,
-        valve: Valve,
-    ) -> None:
-        """Initialize a sensor for a Melnor device."""
-        super().__init__(coordinator, entity_description, valve)
-
     @property
+    @override
     def native_value(self) -> StateType:
         """Return the sensor value."""
         return self.entity_description.state_fn(self._valve)

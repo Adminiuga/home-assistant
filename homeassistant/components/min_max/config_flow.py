@@ -1,40 +1,47 @@
 """Config flow for Min/Max integration."""
-from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, cast
+from typing import Any, cast, override
 
-import voluptuous as vol
+import probatio
 
+from homeassistant.components.input_number import DOMAIN as INPUT_NUMBER_DOMAIN
+from homeassistant.components.number import DOMAIN as NUMBER_DOMAIN
+from homeassistant.components.sensor import DOMAIN as SENSOR_DOMAIN
 from homeassistant.const import CONF_TYPE
 from homeassistant.helpers import selector
 from homeassistant.helpers.schema_config_entry_flow import (
     SchemaConfigFlowHandler,
     SchemaFlowFormStep,
-    SchemaFlowMenuStep,
 )
 
 from .const import CONF_ENTITY_IDS, CONF_ROUND_DIGITS, DOMAIN
 
 _STATISTIC_MEASURES = [
-    selector.SelectOptionDict(value="min", label="Minimum"),
-    selector.SelectOptionDict(value="max", label="Maximum"),
-    selector.SelectOptionDict(value="mean", label="Arithmetic mean"),
-    selector.SelectOptionDict(value="median", label="Median"),
-    selector.SelectOptionDict(value="last", label="Most recently updated"),
-    selector.SelectOptionDict(value="range", label="Statistical range"),
+    "min",
+    "max",
+    "mean",
+    "median",
+    "last",
+    "range",
+    "sum",
 ]
 
 
-OPTIONS_SCHEMA = vol.Schema(
+OPTIONS_SCHEMA = probatio.Schema(
     {
-        vol.Required(CONF_ENTITY_IDS): selector.EntitySelector(
-            selector.EntitySelectorConfig(domain="sensor", multiple=True),
+        probatio.Required(CONF_ENTITY_IDS): selector.EntitySelector(
+            selector.EntitySelectorConfig(
+                domain=[SENSOR_DOMAIN, NUMBER_DOMAIN, INPUT_NUMBER_DOMAIN],
+                multiple=True,
+            ),
         ),
-        vol.Required(CONF_TYPE): selector.SelectSelector(
-            selector.SelectSelectorConfig(options=_STATISTIC_MEASURES),
+        probatio.Required(CONF_TYPE): selector.SelectSelector(
+            selector.SelectSelectorConfig(
+                options=_STATISTIC_MEASURES, translation_key=CONF_TYPE
+            ),
         ),
-        vol.Required(CONF_ROUND_DIGITS, default=2): selector.NumberSelector(
+        probatio.Required(CONF_ROUND_DIGITS, default=2): selector.NumberSelector(
             selector.NumberSelectorConfig(
                 min=0, max=6, mode=selector.NumberSelectorMode.BOX
             ),
@@ -42,18 +49,18 @@ OPTIONS_SCHEMA = vol.Schema(
     }
 )
 
-CONFIG_SCHEMA = vol.Schema(
+CONFIG_SCHEMA = probatio.Schema(
     {
-        vol.Required("name"): selector.TextSelector(),
+        probatio.Required("name"): selector.TextSelector(),
     }
 ).extend(OPTIONS_SCHEMA.schema)
 
-CONFIG_FLOW: dict[str, SchemaFlowFormStep | SchemaFlowMenuStep] = {
-    "user": SchemaFlowFormStep(CONFIG_SCHEMA)
+CONFIG_FLOW = {
+    "user": SchemaFlowFormStep(CONFIG_SCHEMA),
 }
 
-OPTIONS_FLOW: dict[str, SchemaFlowFormStep | SchemaFlowMenuStep] = {
-    "init": SchemaFlowFormStep(OPTIONS_SCHEMA)
+OPTIONS_FLOW = {
+    "init": SchemaFlowFormStep(OPTIONS_SCHEMA),
 }
 
 
@@ -62,7 +69,9 @@ class ConfigFlowHandler(SchemaConfigFlowHandler, domain=DOMAIN):
 
     config_flow = CONFIG_FLOW
     options_flow = OPTIONS_FLOW
+    options_flow_reloads = True
 
+    @override
     def async_config_entry_title(self, options: Mapping[str, Any]) -> str:
         """Return config entry title."""
         return cast(str, options["name"]) if "name" in options else ""

@@ -1,10 +1,9 @@
 """Component for interfacing RFK101 proximity card readers."""
-from __future__ import annotations
 
 import logging
 
+import probatio
 from rfk101py.rfk101py import rfk101py
-import voluptuous as vol
 
 from homeassistant.const import (
     CONF_HOST,
@@ -13,7 +12,7 @@ from homeassistant.const import (
     EVENT_HOMEASSISTANT_STOP,
 )
 from homeassistant.core import Event, HomeAssistant
-import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.typing import ConfigType
 
 _LOGGER = logging.getLogger(__name__)
@@ -22,22 +21,22 @@ DOMAIN = "idteck_prox"
 
 EVENT_IDTECK_PROX_KEYCARD = "idteck_prox_keycard"
 
-CONFIG_SCHEMA = vol.Schema(
+CONFIG_SCHEMA = probatio.Schema(
     {
-        DOMAIN: vol.All(
-            cv.ensure_list,
+        DOMAIN: probatio.All(
+            probatio.EnsureList(),
             [
-                vol.Schema(
+                probatio.Schema(
                     {
-                        vol.Required(CONF_HOST): cv.string,
-                        vol.Required(CONF_PORT): cv.port,
-                        vol.Required(CONF_NAME): cv.string,
+                        probatio.Required(CONF_HOST): cv.string,
+                        probatio.Required(CONF_PORT): probatio.Port(),
+                        probatio.Required(CONF_NAME): cv.string,
                     }
                 )
             ],
         )
     },
-    extra=vol.ALLOW_EXTRA,
+    extra=probatio.ALLOW_EXTRA,
 )
 
 

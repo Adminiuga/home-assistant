@@ -1,11 +1,10 @@
 """MediaPlayer platform for SlimProto Player integration."""
-from __future__ import annotations
 
 import asyncio
-from typing import Any
+from typing import Any, override
 
 from aioslimproto.client import PlayerState, SlimClient
-from aioslimproto.const import EventType, SlimEvent
+from aioslimproto.models import EventType, SlimEvent
 from aioslimproto.server import SlimServer
 
 from homeassistant.components import media_source
@@ -15,38 +14,41 @@ from homeassistant.components.media_player import (
     MediaPlayerEntity,
     MediaPlayerEntityFeature,
     MediaPlayerState,
+    MediaType,
     async_process_play_media_url,
 )
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.entity import DeviceInfo
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.util.dt import utcnow
 
+from . import SlimProtoConfigEntry
 from .const import DEFAULT_NAME, DOMAIN, PLAYER_EVENT
 
 STATE_MAPPING = {
-    PlayerState.IDLE: MediaPlayerState.IDLE,
+    PlayerState.STOPPED: MediaPlayerState.IDLE,
     PlayerState.PLAYING: MediaPlayerState.PLAYING,
+    PlayerState.BUFFER_READY: MediaPlayerState.PLAYING,
+    PlayerState.BUFFERING: MediaPlayerState.PLAYING,
     PlayerState.PAUSED: MediaPlayerState.PAUSED,
 }
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    config_entry: SlimProtoConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up SlimProto MediaPlayer(s) from Config Entry."""
-    slimserver: SlimServer = hass.data[DOMAIN]
+    slimserver = config_entry.runtime_data
     added_ids = set()
 
     async def async_add_player(player: SlimClient) -> None:
         """Add MediaPlayerEntity from SlimClient."""
         # we delay adding the player a small bit because the player name may be received
-        # just a bit after connect. This way we can create a device reg entry with the correct name
-        # the name will either be available within a few milliseconds after connect or not at all
-        # (its an optional data packet)
+        # just a bit after connect. This way we can create a device reg entry with the
+        # correct name the name will either be available within a few milliseconds after
+        # connect or not at all (its an optional data packet)
         for _ in range(10):
             if player.player_id not in player.name:
                 break
@@ -87,6 +89,7 @@ class SlimProtoPlayer(MediaPlayerEntity):
         | MediaPlayerEntityFeature.BROWSE_MEDIA
     )
     _attr_device_class = MediaPlayerDeviceClass.SPEAKER
+    _attr_name = None
 
     def __init__(self, slimserver: SlimServer, player: SlimClient) -> None:
         """Initialize MediaPlayer entity."""
@@ -102,11 +105,12 @@ class SlimProtoPlayer(MediaPlayerEntity):
         )
         # PiCore + SqueezeESP32 player has web interface
         if "-pCP" in self.player.firmware or self.player.device_model == "SqueezeESP32":
-            self._attr_device_info[
-                "configuration_url"
-            ] = f"http://{self.player.device_address}"
+            self._attr_device_info.configuration_url = (
+                f"http://{self.player.device_address}"
+            )
         self.update_attributes()
 
+    @override
     async def async_added_to_hass(self) -> None:
         """Register callbacks."""
         self.update_attributes()
@@ -125,11 +129,13 @@ class SlimProtoPlayer(MediaPlayerEntity):
         )
 
     @property
+    @override
     def available(self) -> bool:
         """Return availability of entity."""
         return self.player.connected
 
     @property
+    @override
     def state(self) -> MediaPlayerState:
         """Return current state."""
         if not self.player.powered:
@@ -140,42 +146,64 @@ class SlimProtoPlayer(MediaPlayerEntity):
     def update_attributes(self) -> None:
         """Handle player updates."""
         self._attr_volume_level = self.player.volume_level / 100
+        self._attr_is_volume_muted = self.player.muted
         self._attr_media_position = self.player.elapsed_seconds
         self._attr_media_position_updated_at = utcnow()
-        self._attr_media_content_id = self.player.current_url
+        if (current_media := self.player.current_media) and (
+            metadata := current_media.metadata
+        ):
+            self._attr_media_content_id = metadata.get("item_id", current_media.url)
+            self._attr_media_artist = metadata.get("artist")
+            self._attr_media_album_name = metadata.get("album")
+            self._attr_media_title = metadata.get("title")
+            self._attr_media_image_url = metadata.get("image_url")
+        else:
+            self._attr_media_content_id = current_media.url if current_media else None
+            self._attr_media_artist = None
+            self._attr_media_album_name = None
+            self._attr_media_title = None
+            self._attr_media_image_url = None
         self._attr_media_content_type = "music"
 
+    @override
     async def async_media_play(self) -> None:
         """Send play command to device."""
         await self.player.play()
 
+    @override
     async def async_media_pause(self) -> None:
         """Send pause command to device."""
         await self.player.pause()
 
+    @override
     async def async_media_stop(self) -> None:
         """Send stop command to device."""
         await self.player.stop()
 
+    @override
     async def async_set_volume_level(self, volume: float) -> None:
         """Send new volume_level to device."""
         volume = round(volume * 100)
         await self.player.volume_set(volume)
 
+    @override
     async def async_mute_volume(self, mute: bool) -> None:
         """Mute the volume."""
         await self.player.mute(mute)
 
+    @override
     async def async_turn_on(self) -> None:
         """Turn on device."""
         await self.player.power(True)
 
+    @override
     async def async_turn_off(self) -> None:
         """Turn off device."""
         await self.player.power(False)
 
+    @override
     async def async_play_media(
-        self, media_type: str, media_id: str, **kwargs: Any
+        self, media_type: MediaType | str, media_id: str, **kwargs: Any
     ) -> None:
         """Send the play_media command to the media player."""
         to_send_media_type: str | None = media_type
@@ -193,8 +221,11 @@ class SlimProtoPlayer(MediaPlayerEntity):
 
         await self.player.play_url(media_id, mime_type=to_send_media_type)
 
+    @override
     async def async_browse_media(
-        self, media_content_type: str | None = None, media_content_id: str | None = None
+        self,
+        media_content_type: MediaType | str | None = None,
+        media_content_id: str | None = None,
     ) -> BrowseMedia:
         """Implement the websocket media browsing helper."""
         return await media_source.async_browse_media(

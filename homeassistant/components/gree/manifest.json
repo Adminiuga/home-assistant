@@ -1,11 +1,13 @@
 {
   "domain": "gree",
   "name": "Gree Climate",
-  "config_flow": true,
-  "documentation": "https://www.home-assistant.io/integrations/gree",
-  "requirements": ["greeclimate==1.3.0"],
-  "dependencies": ["network"],
+  "categories": ["climate.heat_pumps_air_conditioning"],
   "codeowners": ["@cmroche"],
+  "config_flow": true,
+  "connectivity": ["network"],
+  "dependencies": ["network"],
+  "documentation": "https://www.home-assistant.io/integrations/gree",
   "iot_class": "local_polling",
-  "loggers": ["greeclimate"]
+  "loggers": ["greeclimate"],
+  "requirements": ["greeclimate==3.6.3"]
 }

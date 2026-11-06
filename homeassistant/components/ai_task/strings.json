@@ -1,0 +1,115 @@
+{
+  "exceptions": {
+    "attachments_not_supported": {
+      "message": "AI Task entity {entity_id} does not support attachments."
+    },
+    "entity_not_found": {
+      "message": "AI Task entity {entity_id} not found."
+    },
+    "evaluate_missing_input": {
+      "message": "Evaluation requires state or attachments."
+    },
+    "evaluate_not_supported": {
+      "message": "AI Task entity {entity_id} does not support evaluation."
+    },
+    "generate_data_not_supported": {
+      "message": "AI Task entity {entity_id} does not support generating data."
+    },
+    "generate_image_not_supported": {
+      "message": "AI Task entity {entity_id} does not support generating images."
+    },
+    "local_attachments_only": {
+      "message": "Only local attachments are currently supported."
+    },
+    "no_entity": {
+      "message": "No entity_id provided and no preferred entity set."
+    }
+  },
+  "services": {
+    "clear_images": {
+      "description": "Deletes AI generated images.",
+      "fields": {
+        "days": {
+          "description": "Only deletes images that are older than this many days. Leave empty to delete all images.",
+          "name": "Older than"
+        }
+      },
+      "name": "Clear images"
+    },
+    "evaluate": {
+      "description": "Evaluates questions against supplied state and attachments.",
+      "fields": {
+        "attachments": {
+          "description": "Files to evaluate together with the state. Supported types depend on the selected entity.",
+          "name": "Attachments"
+        },
+        "entity_id": {
+          "description": "Entity to run the task on. If omitted, uses the preferred evaluation entity.",
+          "name": "Entity ID"
+        },
+        "questions": {
+          "description": "Named questions with a type (noul, choice, or score), instructions, and criteria for choice and score questions.",
+          "name": "Questions"
+        },
+        "state": {
+          "description": "Text or JSON data to evaluate. Optional when attachments are supplied.",
+          "name": "State"
+        },
+        "task_name": {
+          "description": "Name of the task.",
+          "name": "Task name"
+        }
+      },
+      "name": "Evaluate"
+    },
+    "generate_data": {
+      "description": "Uses AI to run a task that generates data.",
+      "fields": {
+        "attachments": {
+          "description": "List of files to attach for multi-modal AI analysis.",
+          "name": "Attachments"
+        },
+        "entity_id": {
+          "description": "Entity ID to run the task on. If not provided, the preferred entity will be used.",
+          "name": "Entity ID"
+        },
+        "instructions": {
+          "description": "Instructions on what needs to be done.",
+          "name": "Instructions"
+        },
+        "structure": {
+          "description": "When set, the AI Task will output fields with this in structure. The structure is a dictionary where the keys are the field names and the values contain a 'description', a 'selector', and an optional 'required' field.",
+          "name": "Structured output"
+        },
+        "task_name": {
+          "description": "Name of the task.",
+          "name": "Task name"
+        }
+      },
+      "name": "Generate data"
+    },
+    "generate_image": {
+      "description": "Uses AI to generate image.",
+      "fields": {
+        "attachments": {
+          "description": "List of files to attach for using as references.",
+          "name": "Attachments"
+        },
+        "entity_id": {
+          "description": "Entity ID to run the task on.",
+          "name": "Entity ID"
+        },
+        "instructions": {
+          "description": "Instructions that explains the image to be generated.",
+          "name": "Instructions"
+        },
+        "task_name": {
+          "description": "Name of the task.",
+          "name": "Task name"
+        }
+      },
+      "name": "Generate image"
+    }
+  },
+  "title": "AI task"
+}

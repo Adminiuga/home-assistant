@@ -1,8 +1,12 @@
 """Test the WS66i 6-Zone Amplifier init file."""
+
 from unittest.mock import patch
+
+from pytest_homeassistant.common import MockConfigEntry
 
 from homeassistant.components.ws66i.const import DOMAIN
 from homeassistant.config_entries import ConfigEntryState
+from homeassistant.core import HomeAssistant
 
 from .test_media_player import (
     MOCK_CONFIG,
@@ -11,12 +15,10 @@ from .test_media_player import (
     MockWs66i,
 )
 
-from tests.common import MockConfigEntry
-
 ZONE_1_ID = "media_player.zone_11"
 
 
-async def test_cannot_connect(hass):
+async def test_cannot_connect(hass: HomeAssistant) -> None:
     """Test connection error."""
     config_entry = MockConfigEntry(
         domain=DOMAIN, data=MOCK_CONFIG, options=MOCK_OPTIONS
@@ -34,7 +36,7 @@ async def test_cannot_connect(hass):
         assert hass.states.get(ZONE_1_ID) is None
 
 
-async def test_cannot_connect_2(hass):
+async def test_cannot_connect_2(hass: HomeAssistant) -> None:
     """Test connection error pt 2."""
     # Another way to test same case as test_cannot_connect
     ws66i = MockWs66i()
@@ -55,7 +57,7 @@ async def test_cannot_connect_2(hass):
         assert hass.states.get(ZONE_1_ID) is None
 
 
-async def test_unload_config_entry(hass):
+async def test_unload_config_entry(hass: HomeAssistant) -> None:
     """Test unloading config entry."""
     config_entry = MockConfigEntry(
         domain=DOMAIN, data=MOCK_CONFIG, options=MOCK_OPTIONS
@@ -69,12 +71,12 @@ async def test_unload_config_entry(hass):
         await hass.config_entries.async_setup(config_entry.entry_id)
         await hass.async_block_till_done()
 
-    assert hass.data[DOMAIN][config_entry.entry_id]
+    assert config_entry.state is ConfigEntryState.LOADED
 
     with patch.object(MockWs66i, "close") as method_call:
-        await config_entry.async_unload(hass)
+        await hass.config_entries.async_unload(config_entry.entry_id)
         await hass.async_block_till_done()
 
         assert method_call.called
 
-    assert not hass.data[DOMAIN]
+    assert config_entry.state is ConfigEntryState.NOT_LOADED

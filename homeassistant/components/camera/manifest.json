@@ -1,11 +1,16 @@
 {
   "domain": "camera",
   "name": "Camera",
-  "documentation": "https://www.home-assistant.io/integrations/camera",
-  "dependencies": ["http"],
-  "requirements": ["PyTurboJPEG==1.6.7"],
   "after_dependencies": ["media_player"],
   "codeowners": ["@home-assistant/core"],
+  "dependencies": ["http", "web_rtc"],
+  "documentation": "https://www.home-assistant.io/integrations/camera",
+  "integration_type": "entity",
+  "preview_features": {
+    "two_way_audio": {
+      "feedback_url": "https://forms.gle/YjoL6e6dtU4F9WBZ6"
+    }
+  },
   "quality_scale": "internal",
-  "integration_type": "entity"
+  "requirements": ["PyTurboJPEG==1.8.3"]
 }

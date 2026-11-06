@@ -1,9 +1,9 @@
 """Device automation helpers for toggle entity."""
-from __future__ import annotations
 
-import voluptuous as vol
+import probatio
 
 from homeassistant.components.homeassistant.triggers import state as state_trigger
+from homeassistant.components.homeassistant.triggers.state import StateTriggerArgument
 from homeassistant.const import (
     ATTR_ENTITY_ID,
     CONF_CONDITION,
@@ -24,6 +24,7 @@ from homeassistant.helpers.typing import ConfigType, TemplateVarsType
 
 from . import DEVICE_TRIGGER_BASE_SCHEMA, entity
 from .const import (
+    CONF_CHANGED_STATES,
     CONF_IS_OFF,
     CONF_IS_ON,
     CONF_TOGGLE,
@@ -78,28 +79,35 @@ DEVICE_ACTION_TYPES = [CONF_TOGGLE, CONF_TURN_OFF, CONF_TURN_ON]
 
 ACTION_SCHEMA = cv.DEVICE_ACTION_BASE_SCHEMA.extend(
     {
-        vol.Required(CONF_ENTITY_ID): cv.entity_id,
-        vol.Required(CONF_TYPE): vol.In(DEVICE_ACTION_TYPES),
+        probatio.Required(CONF_ENTITY_ID): cv.entity_id_or_uuid,
+        probatio.Required(CONF_TYPE): probatio.In(DEVICE_ACTION_TYPES),
     }
 )
 
 CONDITION_SCHEMA = cv.DEVICE_CONDITION_BASE_SCHEMA.extend(
     {
-        vol.Required(CONF_ENTITY_ID): cv.entity_id,
-        vol.Required(CONF_TYPE): vol.In([CONF_IS_OFF, CONF_IS_ON]),
-        vol.Optional(CONF_FOR): cv.positive_time_period_dict,
+        probatio.Required(CONF_ENTITY_ID): cv.entity_id_or_uuid,
+        probatio.Required(CONF_TYPE): probatio.In([CONF_IS_OFF, CONF_IS_ON]),
+        probatio.Optional(CONF_FOR): cv.positive_time_period_dict,
     }
 )
 
 _TOGGLE_TRIGGER_SCHEMA = DEVICE_TRIGGER_BASE_SCHEMA.extend(
     {
-        vol.Required(CONF_ENTITY_ID): cv.entity_id,
-        vol.Required(CONF_TYPE): vol.In([CONF_TURNED_OFF, CONF_TURNED_ON]),
-        vol.Optional(CONF_FOR): cv.positive_time_period_dict,
+        probatio.Required(CONF_ENTITY_ID): cv.entity_id_or_uuid,
+        probatio.Required(CONF_TYPE): probatio.In([CONF_TURNED_OFF, CONF_TURNED_ON]),
+        probatio.Optional(CONF_FOR): cv.positive_time_period_dict,
     }
 )
 
-TRIGGER_SCHEMA = vol.Any(entity.TRIGGER_SCHEMA, _TOGGLE_TRIGGER_SCHEMA)
+TRIGGER_SCHEMA = probatio.TaggedUnion(
+    CONF_TYPE,
+    {
+        CONF_CHANGED_STATES: entity.TRIGGER_SCHEMA,
+        CONF_TURNED_OFF: _TOGGLE_TRIGGER_SCHEMA,
+        CONF_TURNED_ON: _TOGGLE_TRIGGER_SCHEMA,
+    },
+)
 
 
 async def async_call_action_from_config(
@@ -161,13 +169,13 @@ async def async_attach_trigger(
         to_state = "on"
     else:
         to_state = "off"
-    state_config = {
-        CONF_PLATFORM: "state",
-        state_trigger.CONF_ENTITY_ID: config[CONF_ENTITY_ID],
-        state_trigger.CONF_TO: to_state,
+    state_config: ConfigType = {
+        StateTriggerArgument.PLATFORM: "state",
+        StateTriggerArgument.ENTITY_ID: config[CONF_ENTITY_ID],
+        StateTriggerArgument.TO: to_state,
     }
     if CONF_FOR in config:
-        state_config[CONF_FOR] = config[CONF_FOR]
+        state_config[StateTriggerArgument.FOR] = config[CONF_FOR]
 
     state_config = await state_trigger.async_validate_trigger_config(hass, state_config)
     return await state_trigger.async_attach_trigger(
@@ -196,7 +204,7 @@ async def _async_get_automations(
             {
                 **template,
                 "device_id": device_id,
-                "entity_id": entry.entity_id,
+                "entity_id": entry.id,
                 "domain": domain,
             }
             for template in automation_templates
@@ -232,24 +240,24 @@ async def async_get_triggers(
 
 async def async_get_condition_capabilities(
     hass: HomeAssistant, config: ConfigType
-) -> dict[str, vol.Schema]:
+) -> dict[str, probatio.Schema]:
     """List condition capabilities."""
     return {
-        "extra_fields": vol.Schema(
-            {vol.Optional(CONF_FOR): cv.positive_time_period_dict}
+        "extra_fields": probatio.Schema(
+            {probatio.Optional(CONF_FOR): cv.positive_time_period_dict}
         )
     }
 
 
 async def async_get_trigger_capabilities(
     hass: HomeAssistant, config: ConfigType
-) -> dict[str, vol.Schema]:
+) -> dict[str, probatio.Schema]:
     """List trigger capabilities."""
     if config[CONF_TYPE] not in [CONF_TURNED_ON, CONF_TURNED_OFF]:
         return await entity.async_get_trigger_capabilities(hass, config)
 
     return {
-        "extra_fields": vol.Schema(
-            {vol.Optional(CONF_FOR): cv.positive_time_period_dict}
+        "extra_fields": probatio.Schema(
+            {probatio.Optional(CONF_FOR): cv.positive_time_period_dict}
         )
     }

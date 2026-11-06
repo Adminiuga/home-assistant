@@ -1,24 +1,25 @@
-"""Support for TMB (Transports Metropolitans de Barcelona) Barcelona public transport."""
-from __future__ import annotations
+"""Support for TMB Barcelona public transport."""
 
 from datetime import timedelta
 import logging
+from typing import Any, override
 
+import probatio
 from requests import HTTPError
 from tmb import IBus
-import voluptuous as vol
 
-from homeassistant.components.sensor import PLATFORM_SCHEMA, SensorEntity
-from homeassistant.const import CONF_NAME, TIME_MINUTES
+from homeassistant.components.sensor import (
+    PLATFORM_SCHEMA as SENSOR_PLATFORM_SCHEMA,
+    SensorEntity,
+)
+from homeassistant.const import CONF_NAME, UnitOfTime
 from homeassistant.core import HomeAssistant
-import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 from homeassistant.util import Throttle
 
 _LOGGER = logging.getLogger(__name__)
-
-ICON = "mdi:bus-clock"
 
 CONF_APP_ID = "app_id"
 CONF_APP_KEY = "app_key"
@@ -30,19 +31,21 @@ ATTR_LINE = "line"
 
 MIN_TIME_BETWEEN_UPDATES = timedelta(seconds=60)
 
-LINE_STOP_SCHEMA = vol.Schema(
+LINE_STOP_SCHEMA = probatio.Schema(
     {
-        vol.Required(CONF_BUS_STOP): cv.string,
-        vol.Required(CONF_LINE): cv.string,
-        vol.Optional(CONF_NAME): cv.string,
+        probatio.Required(CONF_BUS_STOP): cv.string,
+        probatio.Required(CONF_LINE): cv.string,
+        probatio.Optional(CONF_NAME): cv.string,
     }
 )
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
+PLATFORM_SCHEMA = SENSOR_PLATFORM_SCHEMA.extend(
     {
-        vol.Required(CONF_APP_ID): cv.string,
-        vol.Required(CONF_APP_KEY): cv.string,
-        vol.Required(CONF_BUS_STOPS): vol.All(cv.ensure_list, [LINE_STOP_SCHEMA]),
+        probatio.Required(CONF_APP_ID): cv.string,
+        probatio.Required(probatio.Secret(CONF_APP_KEY)): cv.string,
+        probatio.Required(CONF_BUS_STOPS): probatio.All(
+            probatio.EnsureList(), [LINE_STOP_SCHEMA]
+        ),
     }
 )
 
@@ -74,6 +77,7 @@ class TMBSensor(SensorEntity):
     """Implementation of a TMB line/stop Sensor."""
 
     _attr_attribution = "Data provided by Transport Metropolitans de Barcelona"
+    _attr_icon = "mdi:bus-clock"
 
     def __init__(self, ibus_client, stop, line, name):
         """Initialize the sensor."""
@@ -81,36 +85,36 @@ class TMBSensor(SensorEntity):
         self._stop = stop
         self._line = line.upper()
         self._name = name
-        self._unit = TIME_MINUTES
+        self._unit = UnitOfTime.MINUTES
         self._state = None
 
     @property
+    @override
     def name(self):
         """Return the name of the sensor."""
         return self._name
 
     @property
-    def icon(self):
-        """Return the icon for the frontend."""
-        return ICON
-
-    @property
+    @override
     def native_unit_of_measurement(self):
         """Return the unit of measurement."""
         return self._unit
 
     @property
+    @override
     def unique_id(self):
         """Return a unique, HASS-friendly identifier for this entity."""
         return f"{self._stop}_{self._line}"
 
     @property
+    @override
     def native_value(self):
         """Return the next departure time."""
         return self._state
 
     @property
-    def extra_state_attributes(self):
+    @override
+    def extra_state_attributes(self) -> dict[str, Any]:
         """Return the state attributes of the last update."""
         return {
             ATTR_BUS_STOP: self._stop,
@@ -124,5 +128,6 @@ class TMBSensor(SensorEntity):
             self._state = self._ibus_client.get_stop_forecast(self._stop, self._line)
         except HTTPError:
             _LOGGER.error(
-                "Unable to fetch data from TMB API. Please check your API keys are valid"
+                "Unable to fetch data from TMB API. Please check your API keys are"
+                " valid"
             )

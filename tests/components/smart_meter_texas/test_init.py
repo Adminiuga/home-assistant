@@ -1,19 +1,26 @@
 """Test the Smart Meter Texas module."""
+
 from unittest.mock import patch
+
+import pytest
+from pytest_homeassistant.common import MockConfigEntry
+from pytest_homeassistant.test_util.aiohttp import AiohttpClientMocker
+from smart_meter_texas.exceptions import SmartMeterTexasAuthError
 
 from homeassistant.components.homeassistant import (
     DOMAIN as HA_DOMAIN,
     SERVICE_UPDATE_ENTITY,
 )
 from homeassistant.components.smart_meter_texas.const import DOMAIN
-from homeassistant.config_entries import ConfigEntryState
+from homeassistant.config_entries import SOURCE_REAUTH, ConfigEntryState
 from homeassistant.const import ATTR_ENTITY_ID
+from homeassistant.core import HomeAssistant
 from homeassistant.setup import async_setup_component
 
 from .conftest import TEST_ENTITY_ID, setup_integration
 
 
-async def test_setup_with_no_config(hass):
+async def test_setup_with_no_config(hass: HomeAssistant) -> None:
     """Test that no config is successful."""
     assert await async_setup_component(hass, DOMAIN, {}) is True
     await hass.async_block_till_done()
@@ -22,21 +29,32 @@ async def test_setup_with_no_config(hass):
     assert len(hass.config_entries.flow.async_progress()) == 0
 
 
-async def test_auth_failure(hass, config_entry, aioclient_mock):
-    """Test if user's username or password is not accepted."""
+async def test_auth_failure(
+    hass: HomeAssistant, config_entry, aioclient_mock: AiohttpClientMocker
+) -> None:
+    """Test a rejected username or password fails setup and starts reauth."""
     await setup_integration(hass, config_entry, aioclient_mock, auth_fail=True)
 
     assert config_entry.state is ConfigEntryState.SETUP_ERROR
+    assert config_entry.reason == "Username or password was not accepted"
+    flows = hass.config_entries.flow.async_progress()
+    assert len(flows) == 1
+    assert flows[0]["context"]["source"] == SOURCE_REAUTH
+    assert flows[0]["context"]["entry_id"] == config_entry.entry_id
 
 
-async def test_api_timeout(hass, config_entry, aioclient_mock):
+async def test_api_timeout(
+    hass: HomeAssistant, config_entry, aioclient_mock: AiohttpClientMocker
+) -> None:
     """Test that a timeout results in ConfigEntryNotReady."""
     await setup_integration(hass, config_entry, aioclient_mock, auth_timeout=True)
 
     assert config_entry.state is ConfigEntryState.SETUP_RETRY
 
 
-async def test_update_failure(hass, config_entry, aioclient_mock):
+async def test_update_failure(
+    hass: HomeAssistant, config_entry, aioclient_mock: AiohttpClientMocker
+) -> None:
     """Test that the coordinator handles a bad response."""
     await setup_integration(hass, config_entry, aioclient_mock, bad_reading=True)
     await async_setup_component(hass, HA_DOMAIN, {})
@@ -52,7 +70,52 @@ async def test_update_failure(hass, config_entry, aioclient_mock):
         updater.assert_called_once()
 
 
-async def test_unload_config_entry(hass, config_entry, aioclient_mock):
+async def test_update_auth_failure_starts_reauth(
+    hass: HomeAssistant,
+    config_entry: MockConfigEntry,
+    aioclient_mock: AiohttpClientMocker,
+) -> None:
+    """Test an auth error while reading meters starts a reauth flow."""
+    await setup_integration(hass, config_entry, aioclient_mock)
+    await async_setup_component(hass, HA_DOMAIN, {})
+    await hass.async_block_till_done()
+    assert config_entry.state is ConfigEntryState.LOADED
+
+    with patch(
+        "smart_meter_texas.Meter.read_meter", side_effect=SmartMeterTexasAuthError
+    ):
+        await hass.services.async_call(
+            HA_DOMAIN,
+            SERVICE_UPDATE_ENTITY,
+            {ATTR_ENTITY_ID: TEST_ENTITY_ID},
+            blocking=True,
+        )
+        await hass.async_block_till_done()
+
+    flows = hass.config_entries.flow.async_progress()
+    assert len(flows) == 1
+    assert flows[0]["context"]["source"] == SOURCE_REAUTH
+    assert flows[0]["context"]["entry_id"] == config_entry.entry_id
+
+
+async def test_read_timeout(
+    hass: HomeAssistant,
+    config_entry: MockConfigEntry,
+    aioclient_mock: AiohttpClientMocker,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test that a meter read that never completes marks the update as failed."""
+    await setup_integration(hass, config_entry, aioclient_mock, stale_reading=True)
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert config_entry.runtime_data.last_update_success is False
+    assert "Meter reading did not complete" in caplog.text
+    assert "Unexpected error" not in caplog.text
+
+
+async def test_unload_config_entry(
+    hass: HomeAssistant, config_entry, aioclient_mock: AiohttpClientMocker
+) -> None:
     """Test entry unloading."""
     await setup_integration(hass, config_entry, aioclient_mock)
 

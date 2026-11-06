@@ -1,15 +1,18 @@
 """Event parser and human readable log generator."""
-from __future__ import annotations
 
 from homeassistant.components.automation import EVENT_AUTOMATION_TRIGGERED
-from homeassistant.components.counter import DOMAIN as COUNTER_DOMAIN
-from homeassistant.components.proximity import DOMAIN as PROXIMITY_DOMAIN
+from homeassistant.components.event import EventEntityStateAttribute
 from homeassistant.components.script import EVENT_SCRIPT_STARTED
 from homeassistant.components.sensor import DOMAIN as SENSOR_DOMAIN
 from homeassistant.const import EVENT_CALL_SERVICE, EVENT_LOGBOOK_ENTRY
 
+#
 # Domains that are always continuous
-ALWAYS_CONTINUOUS_DOMAINS = {COUNTER_DOMAIN, PROXIMITY_DOMAIN}
+#
+# These are hard coded here to avoid importing
+# the entire counter, image, and proximity integrations
+# to get the name of the domain.
+ALWAYS_CONTINUOUS_DOMAINS = {"counter", "image", "proximity"}
 
 # Domains that are continuous if there is a UOM set on the entity
 CONDITIONALLY_CONTINUOUS_DOMAINS = {SENSOR_DOMAIN}
@@ -33,17 +36,22 @@ LOGBOOK_ENTRY_CONTEXT_ID = "context_id"
 LOGBOOK_ENTRY_DOMAIN = "domain"
 LOGBOOK_ENTRY_ENTITY_ID = "entity_id"
 LOGBOOK_ENTRY_ICON = "icon"
+LOGBOOK_ENTRY_ITEM_ID = "item_id"
+LOGBOOK_ENTRY_RUN_ID = "run_id"
 LOGBOOK_ENTRY_SOURCE = "source"
 LOGBOOK_ENTRY_MESSAGE = "message"
 LOGBOOK_ENTRY_NAME = "name"
+LOGBOOK_ENTRY_SERVICE = "service"
+LOGBOOK_ENTRY_SERVICE_DATA = "service_data"
 LOGBOOK_ENTRY_STATE = "state"
+LOGBOOK_ENTRY_ATTRIBUTES = "attributes"
 LOGBOOK_ENTRY_WHEN = "when"
+
+# State attributes surfaced in logbook entries; extend as needed.
+EXPOSED_STATE_ATTRIBUTES = {EventEntityStateAttribute.EVENT_TYPE}
 
 # Automation events that can affect an entity_id or device_id
 AUTOMATION_EVENTS = {EVENT_AUTOMATION_TRIGGERED, EVENT_SCRIPT_STARTED}
 
 # Events that are built-in to the logbook or core
 BUILT_IN_EVENTS = {EVENT_LOGBOOK_ENTRY, EVENT_CALL_SERVICE}
-
-LOGBOOK_FILTERS = "logbook_filters"
-LOGBOOK_ENTITIES_FILTER = "entities_filter"

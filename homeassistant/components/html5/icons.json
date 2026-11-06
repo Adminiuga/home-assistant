@@ -1,0 +1,17 @@
+{
+  "entity": {
+    "event": {
+      "event": {
+        "default": "mdi:gesture-tap-button"
+      }
+    }
+  },
+  "services": {
+    "dismiss_message": {
+      "service": "mdi:comment-remove"
+    },
+    "send_message": {
+      "service": "mdi:comment-arrow-right"
+    }
+  }
+}

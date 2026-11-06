@@ -1,36 +1,45 @@
 """Twilio Call platform for notify component."""
+
 import logging
+from typing import Any, override
 import urllib
 
+import probatio
 from twilio.base.exceptions import TwilioRestException
-import voluptuous as vol
 
 from homeassistant.components.notify import (
     ATTR_TARGET,
-    PLATFORM_SCHEMA,
+    PLATFORM_SCHEMA as NOTIFY_PLATFORM_SCHEMA,
     BaseNotificationService,
 )
-from homeassistant.components.twilio import DATA_TWILIO
-import homeassistant.helpers.config_validation as cv
+from homeassistant.components.twilio import get_client
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
 _LOGGER = logging.getLogger(__name__)
 
+DOMAIN = "twilio_call"
+
 CONF_FROM_NUMBER = "from_number"
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
+PLATFORM_SCHEMA = NOTIFY_PLATFORM_SCHEMA.extend(
     {
-        vol.Required(CONF_FROM_NUMBER): vol.All(
-            cv.string, vol.Match(r"^\+?[1-9]\d{1,14}$")
+        probatio.Required(CONF_FROM_NUMBER): probatio.All(
+            cv.string, probatio.E164(normalize=False)
         )
     }
 )
 
 
-def get_service(hass, config, discovery_info=None):
+def get_service(
+    hass: HomeAssistant,
+    config: ConfigType,
+    discovery_info: DiscoveryInfoType | None = None,
+) -> TwilioCallNotificationService:
     """Get the Twilio Call notification service."""
-    return TwilioCallNotificationService(
-        hass.data[DATA_TWILIO], config[CONF_FROM_NUMBER]
-    )
+    return TwilioCallNotificationService(get_client(hass), config[CONF_FROM_NUMBER])
 
 
 class TwilioCallNotificationService(BaseNotificationService):
@@ -41,10 +50,11 @@ class TwilioCallNotificationService(BaseNotificationService):
         self.client = twilio_client
         self.from_number = from_number
 
-    def send_message(self, message="", **kwargs):
+    @override
+    def send_message(self, message: str = "", **kwargs: Any) -> None:
         """Call to specified target users."""
         if not (targets := kwargs.get(ATTR_TARGET)):
-            _LOGGER.info("At least 1 target is required")
+            _LOGGER.warning("At least 1 target is required")
             return
 
         if message.startswith(("http://", "https://")):
@@ -53,10 +63,19 @@ class TwilioCallNotificationService(BaseNotificationService):
             twimlet_url = "http://twimlets.com/message?Message="
             twimlet_url += urllib.parse.quote(message, safe="")
 
+        failed_targets: list[str] = []
         for target in targets:
             try:
                 self.client.calls.create(
                     to=target, url=twimlet_url, from_=self.from_number
                 )
-            except TwilioRestException as exc:
-                _LOGGER.error(exc)
+            except TwilioRestException as err:
+                _LOGGER.debug("Failed to call %s: %s", target, err)
+                failed_targets.append(target)
+
+        if failed_targets:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="call_failed",
+                translation_placeholders={"targets": ", ".join(failed_targets)},
+            )

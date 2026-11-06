@@ -1,10 +1,13 @@
 {
   "domain": "github",
   "name": "GitHub",
-  "documentation": "https://www.home-assistant.io/integrations/github",
-  "requirements": ["aiogithubapi==22.10.1"],
+  "categories": ["computers_network.cloud_developer_tools"],
   "codeowners": ["@timmo001", "@ludeeus"],
-  "iot_class": "cloud_polling",
   "config_flow": true,
-  "loggers": ["aiogithubapi"]
+  "connectivity": ["cloud"],
+  "documentation": "https://www.home-assistant.io/integrations/github",
+  "integration_type": "service",
+  "iot_class": "cloud_polling",
+  "loggers": ["aiogithubapi"],
+  "requirements": ["aiogithubapi==26.0.0"]
 }

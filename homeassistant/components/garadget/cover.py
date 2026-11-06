@@ -1,16 +1,16 @@
 """Platform for the Garadget cover component."""
-from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, override
 
+import probatio
 import requests
-import voluptuous as vol
 
 from homeassistant.components.cover import (
-    PLATFORM_SCHEMA,
+    PLATFORM_SCHEMA as COVER_PLATFORM_SCHEMA,
     CoverDeviceClass,
     CoverEntity,
+    CoverState,
 )
 from homeassistant.const import (
     CONF_ACCESS_TOKEN,
@@ -19,11 +19,9 @@ from homeassistant.const import (
     CONF_NAME,
     CONF_PASSWORD,
     CONF_USERNAME,
-    STATE_CLOSED,
-    STATE_OPEN,
 )
 from homeassistant.core import HomeAssistant
-import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import track_utc_time_change
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
@@ -37,31 +35,29 @@ ATTR_TIME_IN_STATE = "time_in_state"
 
 DEFAULT_NAME = "Garadget"
 
-STATE_CLOSING = "closing"
 STATE_OFFLINE = "offline"
-STATE_OPENING = "opening"
 STATE_STOPPED = "stopped"
 
 STATES_MAP = {
-    "open": STATE_OPEN,
-    "opening": STATE_OPENING,
-    "closed": STATE_CLOSED,
-    "closing": STATE_CLOSING,
+    "open": CoverState.OPEN,
+    "opening": CoverState.OPENING,
+    "closed": CoverState.CLOSED,
+    "closing": CoverState.CLOSING,
     "stopped": STATE_STOPPED,
 }
 
-COVER_SCHEMA = vol.Schema(
+COVER_SCHEMA = probatio.Schema(
     {
-        vol.Optional(CONF_ACCESS_TOKEN): cv.string,
-        vol.Optional(CONF_DEVICE): cv.string,
-        vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
-        vol.Optional(CONF_PASSWORD): cv.string,
-        vol.Optional(CONF_USERNAME): cv.string,
+        probatio.Optional(probatio.Secret(CONF_ACCESS_TOKEN)): cv.string,
+        probatio.Optional(CONF_DEVICE): cv.string,
+        probatio.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
+        probatio.Optional(probatio.Secret(CONF_PASSWORD)): cv.string,
+        probatio.Optional(CONF_USERNAME): cv.string,
     }
 )
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
-    {vol.Required(CONF_COVERS): cv.schema_with_slug_keys(COVER_SCHEMA)}
+PLATFORM_SCHEMA = COVER_PLATFORM_SCHEMA.extend(
+    {probatio.Required(CONF_COVERS): cv.schema_with_slug_keys(COVER_SCHEMA)}
 )
 
 
@@ -91,6 +87,8 @@ def setup_platform(
 
 class GaradgetCover(CoverEntity):
     """Representation of a Garadget cover."""
+
+    _attr_device_class = CoverDeviceClass.GARAGE
 
     def __init__(self, hass, args):
         """Initialize the cover."""
@@ -139,16 +137,19 @@ class GaradgetCover(CoverEntity):
             self.remove_token()
 
     @property
+    @override
     def name(self) -> str:
         """Return the name of the cover."""
         return self._name
 
     @property
+    @override
     def available(self) -> bool:
         """Return True if entity is available."""
         return self._available
 
     @property
+    @override
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return the device state attributes."""
         data = {}
@@ -168,16 +169,12 @@ class GaradgetCover(CoverEntity):
         return data
 
     @property
+    @override
     def is_closed(self) -> bool | None:
         """Return if the cover is closed."""
         if self._state is None:
             return None
-        return self._state == STATE_CLOSED
-
-    @property
-    def device_class(self) -> CoverDeviceClass:
-        """Return the class of this device, from component DEVICE_CLASSES."""
-        return CoverDeviceClass.GARAGE
+        return self._state == CoverState.CLOSED
 
     def get_token(self):
         """Get new token for usage during this session."""
@@ -212,26 +209,26 @@ class GaradgetCover(CoverEntity):
         """Check the state of the service during an operation."""
         self.schedule_update_ha_state(True)
 
+    @override
     def close_cover(self, **kwargs: Any) -> None:
         """Close the cover."""
         if self._state not in ["close", "closing"]:
-            ret = self._put_command("setState", "close")
+            self._put_command("setState", "close")
             self._start_watcher("close")
-            return ret.get("return_value") == 1
 
+    @override
     def open_cover(self, **kwargs: Any) -> None:
         """Open the cover."""
         if self._state not in ["open", "opening"]:
-            ret = self._put_command("setState", "open")
+            self._put_command("setState", "open")
             self._start_watcher("open")
-            return ret.get("return_value") == 1
 
+    @override
     def stop_cover(self, **kwargs: Any) -> None:
         """Stop the door where it is."""
-        if self._state not in ["stopped"]:
-            ret = self._put_command("setState", "stop")
+        if self._state != "stopped":
+            self._put_command("setState", "stop")
             self._start_watcher("stop")
-            return ret["return_value"] == 1
 
     def update(self) -> None:
         """Get updated status from API."""
@@ -254,7 +251,7 @@ class GaradgetCover(CoverEntity):
             self._state = STATE_OFFLINE
 
         if (
-            self._state not in [STATE_CLOSING, STATE_OPENING]
+            self._state not in [CoverState.CLOSING, CoverState.OPENING]
             and self._unsub_listener_cover is not None
         ):
             self._unsub_listener_cover()
@@ -262,7 +259,10 @@ class GaradgetCover(CoverEntity):
 
     def _get_variable(self, var):
         """Get latest status."""
-        url = f"{self.particle_url}/v1/devices/{self.device_id}/{var}?access_token={self.access_token}"
+        url = (
+            f"{self.particle_url}/v1/devices/{self.device_id}"
+            f"/{var}?access_token={self.access_token}"
+        )
         ret = requests.get(url, timeout=10)
         result = {}
         for pairs in ret.json()["result"].split("|"):

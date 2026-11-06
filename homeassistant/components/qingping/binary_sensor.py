@@ -1,14 +1,12 @@
 """Support for Qingping binary sensors."""
-from __future__ import annotations
 
-from typing import Optional
+from typing import override
 
 from qingping_ble import (
     BinarySensorDeviceClass as QingpingBinarySensorDeviceClass,
     SensorUpdate,
 )
 
-from homeassistant import config_entries
 from homeassistant.components.binary_sensor import (
     BinarySensorDeviceClass,
     BinarySensorEntity,
@@ -17,14 +15,16 @@ from homeassistant.components.binary_sensor import (
 from homeassistant.components.bluetooth.passive_update_processor import (
     PassiveBluetoothDataProcessor,
     PassiveBluetoothDataUpdate,
-    PassiveBluetoothProcessorCoordinator,
     PassiveBluetoothProcessorEntity,
 )
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.sensor import sensor_device_info_to_hass_device_info
 
-from .const import DOMAIN
-from .device import device_key_to_bluetooth_entity_key, sensor_device_info_to_hass
+from . import QingpingConfigEntry
+from .device import device_key_to_bluetooth_entity_key
+
+PARALLEL_UPDATES = 0
 
 BINARY_SENSOR_DESCRIPTIONS = {
     QingpingBinarySensorDeviceClass.MOTION: BinarySensorEntityDescription(
@@ -52,14 +52,16 @@ def sensor_update_to_bluetooth_data_update(
     """Convert a sensor update to a bluetooth data update."""
     return PassiveBluetoothDataUpdate(
         devices={
-            device_id: sensor_device_info_to_hass(device_info)
+            device_id: sensor_device_info_to_hass_device_info(device_info)
             for device_id, device_info in sensor_update.devices.items()
         },
         entity_descriptions={
             device_key_to_bluetooth_entity_key(device_key): BINARY_SENSOR_DESCRIPTIONS[
                 description.device_class
             ]
-            for device_key, description in sensor_update.binary_entity_descriptions.items()
+            for device_key, description in (
+                sensor_update.binary_entity_descriptions.items()
+            )
             if description.device_class
         },
         entity_data={
@@ -75,29 +77,32 @@ def sensor_update_to_bluetooth_data_update(
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    entry: config_entries.ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    entry: QingpingConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up the Qingping BLE sensors."""
-    coordinator: PassiveBluetoothProcessorCoordinator = hass.data[DOMAIN][
-        entry.entry_id
-    ]
+    coordinator = entry.runtime_data
     processor = PassiveBluetoothDataProcessor(sensor_update_to_bluetooth_data_update)
     entry.async_on_unload(
         processor.async_add_entities_listener(
             QingpingBluetoothSensorEntity, async_add_entities
         )
     )
-    entry.async_on_unload(coordinator.async_register_processor(processor))
+    entry.async_on_unload(
+        coordinator.async_register_processor(processor, BinarySensorEntityDescription)
+    )
 
 
 class QingpingBluetoothSensorEntity(
-    PassiveBluetoothProcessorEntity[PassiveBluetoothDataProcessor[Optional[bool]]],
+    PassiveBluetoothProcessorEntity[
+        PassiveBluetoothDataProcessor[bool | None, SensorUpdate]
+    ],
     BinarySensorEntity,
 ):
     """Representation of a Qingping binary sensor."""
 
     @property
+    @override
     def is_on(self) -> bool | None:
         """Return the native value."""
         return self.processor.entity_data.get(self.entity_key)

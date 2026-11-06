@@ -1,31 +1,33 @@
 """Demo implementation of the media player."""
-from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, override
 
+from homeassistant.components import media_source
 from homeassistant.components.media_player import (
+    BrowseMedia,
+    MediaClass,
     MediaPlayerDeviceClass,
     MediaPlayerEntity,
     MediaPlayerEntityFeature,
     MediaPlayerState,
     MediaType,
     RepeatMode,
+    SearchMedia,
+    SearchMediaQuery,
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
-import homeassistant.util.dt as dt_util
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.util import dt as dt_util
 
 
-async def async_setup_platform(
+async def async_setup_entry(
     hass: HomeAssistant,
-    config: ConfigType,
-    async_add_entities: AddEntitiesCallback,
-    discovery_info: DiscoveryInfoType | None = None,
+    config_entry: ConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    """Set up the media player demo platform."""
+    """Set up the Demo config entry."""
     async_add_entities(
         [
             DemoYoutubePlayer(
@@ -40,17 +42,11 @@ async def async_setup_platform(
             DemoMusicPlayer(),
             DemoMusicPlayer("Kitchen"),
             DemoTVShowPlayer(),
+            DemoBrowsePlayer("Browse"),
+            DemoGroupPlayer("Group"),
+            DemoSearchPlayer("Search"),
         ]
     )
-
-
-async def async_setup_entry(
-    hass: HomeAssistant,
-    config_entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
-) -> None:
-    """Set up the Demo config entry."""
-    await async_setup_platform(hass, {}, async_add_entities)
 
 
 SOUND_MODE_LIST = ["Music", "Movie"]
@@ -101,12 +97,16 @@ NETFLIX_PLAYER_SUPPORT = (
     | MediaPlayerEntityFeature.STOP
 )
 
+BROWSE_PLAYER_SUPPORT = MediaPlayerEntityFeature.BROWSE_MEDIA
+
+SEARCH_PLAYER_SUPPORT = MediaPlayerEntityFeature.SEARCH_MEDIA
+
 
 class AbstractDemoPlayer(MediaPlayerEntity):
     """A demo media players."""
 
-    _attr_sound_mode_list = SOUND_MODE_LIST
     _attr_should_poll = False
+    _attr_sound_mode_list = SOUND_MODE_LIST
 
     # We only implement the methods that we support
 
@@ -122,58 +122,55 @@ class AbstractDemoPlayer(MediaPlayerEntity):
         self._attr_sound_mode = DEFAULT_SOUND_MODE
         self._attr_device_class = device_class
 
+    @override
     def turn_on(self) -> None:
         """Turn the media player on."""
         self._attr_state = MediaPlayerState.PLAYING
         self.schedule_update_ha_state()
 
+    @override
     def turn_off(self) -> None:
         """Turn the media player off."""
         self._attr_state = MediaPlayerState.OFF
         self.schedule_update_ha_state()
 
+    @override
     def mute_volume(self, mute: bool) -> None:
         """Mute the volume."""
         self._attr_is_volume_muted = mute
         self.schedule_update_ha_state()
 
-    def volume_up(self) -> None:
-        """Increase volume."""
-        assert self.volume_level is not None
-        self._attr_volume_level = min(1.0, self.volume_level + 0.1)
-        self.schedule_update_ha_state()
-
-    def volume_down(self) -> None:
-        """Decrease volume."""
-        assert self.volume_level is not None
-        self._attr_volume_level = max(0.0, self.volume_level - 0.1)
-        self.schedule_update_ha_state()
-
+    @override
     def set_volume_level(self, volume: float) -> None:
         """Set the volume level, range 0..1."""
         self._attr_volume_level = volume
         self.schedule_update_ha_state()
 
+    @override
     def media_play(self) -> None:
         """Send play command."""
         self._attr_state = MediaPlayerState.PLAYING
         self.schedule_update_ha_state()
 
+    @override
     def media_pause(self) -> None:
         """Send pause command."""
         self._attr_state = MediaPlayerState.PAUSED
         self.schedule_update_ha_state()
 
+    @override
     def media_stop(self) -> None:
         """Send stop command."""
         self._attr_state = MediaPlayerState.OFF
         self.schedule_update_ha_state()
 
+    @override
     def set_shuffle(self, shuffle: bool) -> None:
         """Enable/disable shuffle mode."""
         self._attr_shuffle = shuffle
         self.schedule_update_ha_state()
 
+    @override
     def select_sound_mode(self, sound_mode: str) -> None:
         """Select sound mode."""
         self._attr_sound_mode = sound_mode
@@ -185,50 +182,29 @@ class DemoYoutubePlayer(AbstractDemoPlayer):
 
     # We only implement the methods that we support
 
+    _attr_app_name = "YouTube"
     _attr_media_content_type = MediaType.MOVIE
+    _attr_supported_features = YOUTUBE_PLAYER_SUPPORT
 
     def __init__(
         self, name: str, youtube_id: str, media_title: str, duration: int
     ) -> None:
         """Initialize the demo device."""
         super().__init__(name)
-        self.youtube_id = youtube_id
-        self._media_title = media_title
-        self._duration = duration
+        self._attr_media_content_id = youtube_id
+        self._attr_media_title = media_title
+        self._attr_media_duration = duration
         self._progress: int | None = int(duration * 0.15)
         self._progress_updated_at = dt_util.utcnow()
 
     @property
-    def media_content_id(self) -> str:
-        """Return the content ID of current playing media."""
-        return self.youtube_id
-
-    @property
-    def media_duration(self) -> int:
-        """Return the duration of current playing media in seconds."""
-        return self._duration
-
-    @property
+    @override
     def media_image_url(self) -> str:
         """Return the image url of current playing media."""
-        return f"https://img.youtube.com/vi/{self.youtube_id}/hqdefault.jpg"
+        return f"https://img.youtube.com/vi/{self.media_content_id}/hqdefault.jpg"
 
     @property
-    def media_title(self) -> str:
-        """Return the title of current playing media."""
-        return self._media_title
-
-    @property
-    def app_name(self) -> str:
-        """Return the current running application."""
-        return "YouTube"
-
-    @property
-    def supported_features(self) -> int:
-        """Flag media player features that are supported."""
-        return YOUTUBE_PLAYER_SUPPORT
-
-    @property
+    @override
     def media_position(self) -> int | None:
         """Position of current playing media in seconds."""
         if self._progress is None:
@@ -244,6 +220,7 @@ class DemoYoutubePlayer(AbstractDemoPlayer):
         return position
 
     @property
+    @override
     def media_position_updated_at(self) -> datetime | None:
         """When was the position of the current playing media valid.
 
@@ -253,11 +230,15 @@ class DemoYoutubePlayer(AbstractDemoPlayer):
             return self._progress_updated_at
         return None
 
-    def play_media(self, media_type: str, media_id: str, **kwargs: Any) -> None:
+    @override
+    def play_media(
+        self, media_type: MediaType | str, media_id: str, **kwargs: Any
+    ) -> None:
         """Play a piece of media."""
-        self.youtube_id = media_id
+        self._attr_media_content_id = media_id
         self.schedule_update_ha_state()
 
+    @override
     def media_pause(self) -> None:
         """Send pause command."""
         self._progress = self.media_position
@@ -270,7 +251,14 @@ class DemoMusicPlayer(AbstractDemoPlayer):
 
     # We only implement the methods that we support
 
+    _attr_media_album_name = "Bounzz"
+    _attr_media_content_id = "bounzz-1"
     _attr_media_content_type = MediaType.MUSIC
+    _attr_media_duration = 213
+    _attr_media_image_url = (
+        "https://graph.facebook.com/v2.5/107771475912710/picture?type=large"
+    )
+    _attr_supported_features = MUSIC_PLAYER_SUPPORT
 
     tracks = [
         ("Technohead", "I Wanna Be A Hippy (Flamman & Abraxas Radio Mix)"),
@@ -299,71 +287,42 @@ class DemoMusicPlayer(AbstractDemoPlayer):
         """Initialize the demo device."""
         super().__init__(name)
         self._cur_track = 0
-        self._group_members: list[str] = []
-        self._repeat = RepeatMode.OFF
+        self._attr_group_members: list[str] = []
+        self._attr_repeat = RepeatMode.OFF
 
     @property
-    def group_members(self) -> list[str]:
-        """List of players which are currently grouped together."""
-        return self._group_members
-
-    @property
-    def media_content_id(self) -> str:
-        """Return the content ID of current playing media."""
-        return "bounzz-1"
-
-    @property
-    def media_duration(self) -> int:
-        """Return the duration of current playing media in seconds."""
-        return 213
-
-    @property
-    def media_image_url(self) -> str:
-        """Return the image url of current playing media."""
-        return "https://graph.facebook.com/v2.5/107771475912710/picture?type=large"
-
-    @property
+    @override
     def media_title(self) -> str:
         """Return the title of current playing media."""
         return self.tracks[self._cur_track][1] if self.tracks else ""
 
     @property
+    @override
     def media_artist(self) -> str:
         """Return the artist of current playing media (Music track only)."""
         return self.tracks[self._cur_track][0] if self.tracks else ""
 
     @property
-    def media_album_name(self) -> str:
-        """Return the album of current playing media (Music track only)."""
-        return "Bounzz"
-
-    @property
+    @override
     def media_track(self) -> int:
         """Return the track number of current media (Music track only)."""
         return self._cur_track + 1
 
-    @property
-    def repeat(self) -> RepeatMode:
-        """Return current repeat mode."""
-        return self._repeat
-
-    @property
-    def supported_features(self) -> int:
-        """Flag media player features that are supported."""
-        return MUSIC_PLAYER_SUPPORT
-
+    @override
     def media_previous_track(self) -> None:
         """Send previous track command."""
         if self._cur_track > 0:
             self._cur_track -= 1
             self.schedule_update_ha_state()
 
+    @override
     def media_next_track(self) -> None:
         """Send next track command."""
         if self._cur_track < len(self.tracks) - 1:
             self._cur_track += 1
             self.schedule_update_ha_state()
 
+    @override
     def clear_playlist(self) -> None:
         """Clear players playlist."""
         self.tracks = []
@@ -371,107 +330,132 @@ class DemoMusicPlayer(AbstractDemoPlayer):
         self._attr_state = MediaPlayerState.OFF
         self.schedule_update_ha_state()
 
+    @override
     def set_repeat(self, repeat: RepeatMode) -> None:
         """Enable/disable repeat mode."""
-        self._repeat = repeat
+        self._attr_repeat = repeat
         self.schedule_update_ha_state()
 
+    @override
     def join_players(self, group_members: list[str]) -> None:
         """Join `group_members` as a player group with the current player."""
-        self._group_members = [
-            self.entity_id,
-        ] + group_members
+        self._attr_group_members = [self.entity_id, *group_members]
         self.schedule_update_ha_state()
 
+    @override
     def unjoin_player(self) -> None:
         """Remove this player from any group."""
-        self._group_members = []
+        self._attr_group_members = []
         self.schedule_update_ha_state()
 
 
 class DemoTVShowPlayer(AbstractDemoPlayer):
-    """A Demo media player that only supports YouTube."""
+    """A Demo media player that only supports Netflix."""
 
     # We only implement the methods that we support
 
+    _attr_app_name = "Netflix"
+    _attr_media_content_id = "house-of-cards-1"
     _attr_media_content_type = MediaType.TVSHOW
+    _attr_media_duration = 3600
+    _attr_media_image_url = (
+        "https://graph.facebook.com/v2.5/HouseofCards/picture?width=400"
+    )
+    _attr_media_season = "1"
+    _attr_media_series_title = "House of Cards"
+    _attr_source_list = ["dvd", "youtube"]
+    _attr_supported_features = NETFLIX_PLAYER_SUPPORT
 
     def __init__(self) -> None:
         """Initialize the demo device."""
         super().__init__("Lounge room", MediaPlayerDeviceClass.TV)
         self._cur_episode = 1
         self._episode_count = 13
-        self._source = "dvd"
-        self._source_list = ["dvd", "youtube"]
+        self._attr_source = "dvd"
 
     @property
-    def media_content_id(self) -> str:
-        """Return the content ID of current playing media."""
-        return "house-of-cards-1"
-
-    @property
-    def media_duration(self) -> int:
-        """Return the duration of current playing media in seconds."""
-        return 3600
-
-    @property
-    def media_image_url(self) -> str:
-        """Return the image url of current playing media."""
-        return "https://graph.facebook.com/v2.5/HouseofCards/picture?width=400"
-
-    @property
+    @override
     def media_title(self) -> str:
         """Return the title of current playing media."""
         return f"Chapter {self._cur_episode}"
 
     @property
-    def media_series_title(self) -> str:
-        """Return the series title of current playing media (TV Show only)."""
-        return "House of Cards"
-
-    @property
-    def media_season(self) -> str:
-        """Return the season of current playing media (TV Show only)."""
-        return "1"
-
-    @property
+    @override
     def media_episode(self) -> str:
         """Return the episode of current playing media (TV Show only)."""
         return str(self._cur_episode)
 
-    @property
-    def app_name(self) -> str:
-        """Return the current running application."""
-        return "Netflix"
-
-    @property
-    def source(self) -> str:
-        """Return the current input source."""
-        return self._source
-
-    @property
-    def source_list(self) -> list[str]:
-        """List of available sources."""
-        return self._source_list
-
-    @property
-    def supported_features(self) -> int:
-        """Flag media player features that are supported."""
-        return NETFLIX_PLAYER_SUPPORT
-
+    @override
     def media_previous_track(self) -> None:
         """Send previous track command."""
         if self._cur_episode > 1:
             self._cur_episode -= 1
             self.schedule_update_ha_state()
 
+    @override
     def media_next_track(self) -> None:
         """Send next track command."""
         if self._cur_episode < self._episode_count:
             self._cur_episode += 1
             self.schedule_update_ha_state()
 
+    @override
     def select_source(self, source: str) -> None:
         """Set the input source."""
-        self._source = source
+        self._attr_source = source
         self.schedule_update_ha_state()
+
+
+class DemoBrowsePlayer(AbstractDemoPlayer):
+    """A Demo media player that supports browse and search."""
+
+    _attr_supported_features = BROWSE_PLAYER_SUPPORT | SEARCH_PLAYER_SUPPORT
+
+    @override
+    async def async_browse_media(
+        self,
+        media_content_type: MediaType | str | None = None,
+        media_content_id: str | None = None,
+    ) -> BrowseMedia:
+        """Implement the websocket media browsing helper."""
+
+        return await media_source.async_browse_media(self.hass, media_content_id)
+
+    @override
+    async def async_search_media(self, query: SearchMediaQuery) -> SearchMedia:
+        """Implement the websocket media search helper by delegating to media source."""
+        return await media_source.async_search_media(
+            self.hass, query.media_content_id, query
+        )
+
+
+class DemoGroupPlayer(AbstractDemoPlayer):
+    """A Demo media player that supports grouping."""
+
+    _attr_supported_features = (
+        YOUTUBE_PLAYER_SUPPORT
+        | MediaPlayerEntityFeature.GROUPING
+        | MediaPlayerEntityFeature.TURN_OFF
+    )
+
+
+class DemoSearchPlayer(AbstractDemoPlayer):
+    """A Demo media player that supports searching."""
+
+    _attr_supported_features = SEARCH_PLAYER_SUPPORT
+
+    @override
+    async def async_search_media(self, query: SearchMediaQuery) -> SearchMedia:
+        """Demo implementation of search media."""
+        return SearchMedia(
+            result=[
+                BrowseMedia(
+                    title="Search result",
+                    media_class=MediaClass.MOVIE,
+                    media_content_type=MediaType.MOVIE,
+                    media_content_id="search_result_id",
+                    can_play=True,
+                    can_expand=False,
+                )
+            ]
+        )

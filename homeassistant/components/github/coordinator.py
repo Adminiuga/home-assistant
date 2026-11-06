@@ -1,10 +1,11 @@
 """Custom data update coordinator for the GitHub integration."""
-from __future__ import annotations
 
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, override
 
 from aiogithubapi import (
     GitHubAPI,
+    GitHubAuthenticatedUserModel,
     GitHubConnectionException,
     GitHubEventModel,
     GitHubException,
@@ -12,6 +13,7 @@ from aiogithubapi import (
     GitHubResponseModel,
 )
 
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
@@ -76,10 +78,21 @@ query ($owner: String!, $repository: String!) {
         number
       }
     }
+    merged_pull_request: pullRequests(
+      first:1
+      states: MERGED
+    ) {
+      total: totalCount
+    }
     release: latestRelease {
       name
       url
       tag: tagName
+      assets: releaseAssets(first: 100) {
+        nodes {
+          download_count: downloadCount
+        }
+      }
     }
     refs(
       first: 1
@@ -97,13 +110,65 @@ query ($owner: String!, $repository: String!) {
 }
 """
 
+type GithubConfigEntry = ConfigEntry[GitHubRuntimeData]
 
-class GitHubDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
-    """Data update coordinator for the GitHub integration."""
+
+@dataclass
+class GitHubRuntimeData:
+    """Runtime data for the GitHub integration."""
+
+    user_coordinator: GitHubUserDataUpdateCoordinator
+    repositories: dict[str, GitHubDataUpdateCoordinator]
+
+
+class GitHubUserDataUpdateCoordinator(
+    DataUpdateCoordinator[GitHubAuthenticatedUserModel]
+):
+    """Data update coordinator for the authenticated GitHub user."""
+
+    config_entry: GithubConfigEntry
 
     def __init__(
         self,
         hass: HomeAssistant,
+        config_entry: GithubConfigEntry,
+        client: GitHubAPI,
+    ) -> None:
+        """Initialize GitHub user data update coordinator."""
+        self._client = client
+
+        super().__init__(
+            hass,
+            LOGGER,
+            config_entry=config_entry,
+            name="user",
+            update_interval=FALLBACK_UPDATE_INTERVAL,
+        )
+
+    @override
+    async def _async_update_data(self) -> GitHubAuthenticatedUserModel:
+        """Update data."""
+        try:
+            response = await self._client.user.get()
+        except (GitHubConnectionException, GitHubRatelimitException) as exception:
+            raise UpdateFailed(exception) from exception
+        except GitHubException as exception:
+            # pylint: disable-next=home-assistant-log-and-raise
+            LOGGER.exception(exception)
+            raise UpdateFailed(exception) from exception
+
+        return response.data
+
+
+class GitHubDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
+    """Data update coordinator for the GitHub integration."""
+
+    config_entry: GithubConfigEntry
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        config_entry: GithubConfigEntry,
         client: GitHubAPI,
         repository: str,
     ) -> None:
@@ -117,10 +182,12 @@ class GitHubDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         super().__init__(
             hass,
             LOGGER,
+            config_entry=config_entry,
             name=repository,
             update_interval=FALLBACK_UPDATE_INTERVAL,
         )
 
+    @override
     async def _async_update_data(self) -> GitHubResponseModel[dict[str, Any]]:
         """Update data."""
         owner, repository = self.repository.split("/")
@@ -134,11 +201,12 @@ class GitHubDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             raise UpdateFailed(exception) from exception
         except GitHubException as exception:
             # These are unexpected and we log the trace to help with troubleshooting
+            # pylint: disable-next=home-assistant-log-and-raise
             LOGGER.exception(exception)
             raise UpdateFailed(exception) from exception
-        else:
-            self._last_response = response
-            return response.data["data"]["repository"]
+
+        self._last_response = response
+        return response.data["data"]["repository"]
 
     async def _handle_event(self, event: GitHubEventModel) -> None:
         """Handle an event."""
@@ -159,6 +227,6 @@ class GitHubDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         self.hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, self.unsubscribe)
 
-    def unsubscribe(self, *args) -> None:
+    def unsubscribe(self, *args: Any) -> None:
         """Unsubscribe to repository events."""
         self._client.repos.events.unsubscribe(subscription_id=self._subscription_id)

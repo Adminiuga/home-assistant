@@ -1,5 +1,11 @@
 {
   "config": {
+    "abort": {
+      "already_configured": "[%key:common::config_flow::abort::already_configured_device%]"
+    },
+    "error": {
+      "invalid_place_or_service_id": "Invalid Place or Service ID"
+    },
     "step": {
       "user": {
         "data": {
@@ -7,21 +13,25 @@
           "service_id": "Service ID"
         }
       }
-    },
-    "error": {
-      "invalid_place_or_service_id": "Invalid Place or Service ID"
-    },
-    "abort": {
-      "already_configured": "[%key:common::config_flow::abort::already_configured_device%]"
+    }
+  },
+  "entity": {
+    "sensor": {
+      "current_pickup": {
+        "name": "Current pickup"
+      },
+      "next_pickup": {
+        "name": "Next pickup"
+      }
     }
   },
   "options": {
     "step": {
       "init": {
-        "title": "Configure Recollect Waste",
         "data": {
           "friendly_name": "Use friendly names for pickup types (when possible)"
-        }
+        },
+        "title": "Configure Recollect Waste"
       }
     }
   }

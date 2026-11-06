@@ -1,31 +1,37 @@
 """Test reproduce state for Timer."""
-from homeassistant.components.timer import (
-    ATTR_DURATION,
-    SERVICE_CANCEL,
-    SERVICE_PAUSE,
-    SERVICE_START,
+
+import pytest
+from pytest_homeassistant.common import async_mock_service
+
+from homeassistant.components.timer import DOMAIN
+from homeassistant.components.timer.const import (
     STATUS_ACTIVE,
     STATUS_IDLE,
     STATUS_PAUSED,
+    TimerEntityStateAttribute,
+    TimerService,
+    TimerServiceArgument,
 )
-from homeassistant.core import State
+from homeassistant.core import HomeAssistant, State
 from homeassistant.helpers.state import async_reproduce_state
 
-from tests.common import async_mock_service
 
-
-async def test_reproducing_states(hass, caplog):
+async def test_reproducing_states(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
     """Test reproducing Timer states."""
     hass.states.async_set("timer.entity_idle", STATUS_IDLE, {})
     hass.states.async_set("timer.entity_paused", STATUS_PAUSED, {})
     hass.states.async_set("timer.entity_active", STATUS_ACTIVE, {})
     hass.states.async_set(
-        "timer.entity_active_attr", STATUS_ACTIVE, {ATTR_DURATION: "00:01:00"}
+        "timer.entity_active_attr",
+        STATUS_ACTIVE,
+        {TimerEntityStateAttribute.DURATION: "00:01:00"},
     )
 
-    start_calls = async_mock_service(hass, "timer", SERVICE_START)
-    pause_calls = async_mock_service(hass, "timer", SERVICE_PAUSE)
-    cancel_calls = async_mock_service(hass, "timer", SERVICE_CANCEL)
+    start_calls = async_mock_service(hass, DOMAIN, TimerService.START)
+    pause_calls = async_mock_service(hass, DOMAIN, TimerService.PAUSE)
+    cancel_calls = async_mock_service(hass, DOMAIN, TimerService.CANCEL)
 
     # These calls should do nothing as entities already in desired state
     await async_reproduce_state(
@@ -35,7 +41,9 @@ async def test_reproducing_states(hass, caplog):
             State("timer.entity_paused", STATUS_PAUSED),
             State("timer.entity_active", STATUS_ACTIVE),
             State(
-                "timer.entity_active_attr", STATUS_ACTIVE, {ATTR_DURATION: "00:01:00"}
+                "timer.entity_active_attr",
+                STATUS_ACTIVE,
+                {TimerEntityStateAttribute.DURATION: "00:01:00"},
             ),
         ],
     )
@@ -56,7 +64,11 @@ async def test_reproducing_states(hass, caplog):
     await async_reproduce_state(
         hass,
         [
-            State("timer.entity_idle", STATUS_ACTIVE, {ATTR_DURATION: "00:01:00"}),
+            State(
+                "timer.entity_idle",
+                STATUS_ACTIVE,
+                {TimerEntityStateAttribute.DURATION: "00:01:00"},
+            ),
             State("timer.entity_paused", STATUS_ACTIVE),
             State("timer.entity_active", STATUS_IDLE),
             State("timer.entity_active_attr", STATUS_PAUSED),
@@ -66,7 +78,7 @@ async def test_reproducing_states(hass, caplog):
     )
 
     valid_start_calls = [
-        {"entity_id": "timer.entity_idle", ATTR_DURATION: "00:01:00"},
+        {"entity_id": "timer.entity_idle", TimerServiceArgument.DURATION: "00:01:00"},
         {"entity_id": "timer.entity_paused"},
     ]
     assert len(start_calls) == 2

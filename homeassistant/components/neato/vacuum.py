@@ -1,43 +1,26 @@
 """Support for Neato Connected Vacuums."""
-from __future__ import annotations
 
 from datetime import timedelta
 import logging
-from typing import Any
+from typing import Any, override
 
 from pybotvac import Robot
 from pybotvac.exceptions import NeatoRobotException
-import voluptuous as vol
 
 from homeassistant.components.vacuum import (
     ATTR_STATUS,
-    STATE_CLEANING,
-    STATE_DOCKED,
-    STATE_ERROR,
-    STATE_RETURNING,
     StateVacuumEntity,
+    VacuumActivity,
     VacuumEntityFeature,
 )
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import ATTR_MODE, STATE_IDLE, STATE_PAUSED
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers import config_validation as cv, entity_platform
-from homeassistant.helpers.entity import DeviceInfo
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .const import (
-    ACTION,
-    ALERTS,
-    ERRORS,
-    MODE,
-    NEATO_DOMAIN,
-    NEATO_LOGIN,
-    NEATO_MAP_DATA,
-    NEATO_PERSISTENT_MAPS,
-    NEATO_ROBOTS,
-    SCAN_INTERVAL_MINUTES,
-)
-from .hub import NeatoHub
+from .const import ACTION, ALERTS, DOMAIN, ERRORS, MODE, SCAN_INTERVAL_MINUTES
+from .entity import NeatoEntity
+from .hub import NeatoConfigEntry, NeatoHub
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -54,21 +37,20 @@ ATTR_CLEAN_PAUSE_TIME = "clean_pause_time"
 ATTR_CLEAN_ERROR_TIME = "clean_error_time"
 ATTR_LAUNCHED_FROM = "launched_from"
 
-ATTR_NAVIGATION = "navigation"
-ATTR_CATEGORY = "category"
-ATTR_ZONE = "zone"
-
 
 async def async_setup_entry(
-    hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
+    hass: HomeAssistant,
+    entry: NeatoConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up Neato vacuum with config entry."""
-    dev = []
-    neato: NeatoHub = hass.data[NEATO_LOGIN]
-    mapdata: dict[str, Any] | None = hass.data.get(NEATO_MAP_DATA)
-    persistent_maps: dict[str, Any] | None = hass.data.get(NEATO_PERSISTENT_MAPS)
-    for robot in hass.data[NEATO_ROBOTS]:
-        dev.append(NeatoConnectedVacuum(neato, robot, mapdata, persistent_maps))
+    hub = entry.runtime_data
+    dev = [
+        NeatoConnectedVacuum(
+            hub, robot, hub.map_data or None, hub.persistent_maps or None
+        )
+        for robot in hub.robots
+    ]
 
     if not dev:
         return
@@ -76,28 +58,12 @@ async def async_setup_entry(
     _LOGGER.debug("Adding vacuums %s", dev)
     async_add_entities(dev, True)
 
-    platform = entity_platform.async_get_current_platform()
-    assert platform is not None
 
-    platform.async_register_entity_service(
-        "custom_cleaning",
-        {
-            vol.Optional(ATTR_MODE, default=2): cv.positive_int,
-            vol.Optional(ATTR_NAVIGATION, default=1): cv.positive_int,
-            vol.Optional(ATTR_CATEGORY, default=4): cv.positive_int,
-            vol.Optional(ATTR_ZONE): cv.string,
-        },
-        "neato_custom_cleaning",
-    )
-
-
-class NeatoConnectedVacuum(StateVacuumEntity):
+class NeatoConnectedVacuum(NeatoEntity, StateVacuumEntity):
     """Representation of a Neato Connected Vacuum."""
 
-    _attr_icon = "mdi:robot-vacuum-variant"
     _attr_supported_features = (
-        VacuumEntityFeature.BATTERY
-        | VacuumEntityFeature.PAUSE
+        VacuumEntityFeature.PAUSE
         | VacuumEntityFeature.RETURN_HOME
         | VacuumEntityFeature.STOP
         | VacuumEntityFeature.START
@@ -106,6 +72,7 @@ class NeatoConnectedVacuum(StateVacuumEntity):
         | VacuumEntityFeature.MAP
         | VacuumEntityFeature.LOCATE
     )
+    _attr_name = None
 
     def __init__(
         self,
@@ -115,16 +82,14 @@ class NeatoConnectedVacuum(StateVacuumEntity):
         persistent_maps: dict[str, Any] | None,
     ) -> None:
         """Initialize the Neato Connected Vacuum."""
-        self.robot = robot
+        super().__init__(robot)
         self._attr_available: bool = neato is not None
         self._mapdata = mapdata
-        self._attr_name: str = self.robot.name
         self._robot_has_map: bool = self.robot.has_persistent_maps
         self._robot_maps = persistent_maps
         self._robot_serial: str = self.robot.serial
         self._attr_unique_id: str = self.robot.serial
         self._status_state: str | None = None
-        self._clean_state: str | None = None
         self._state: dict[str, Any] | None = None
         self._clean_time_start: str | None = None
         self._clean_time_stop: str | None = None
@@ -169,23 +134,23 @@ class NeatoConnectedVacuum(StateVacuumEntity):
             robot_alert = None
         if self._state["state"] == 1:
             if self._state["details"]["isCharging"]:
-                self._clean_state = STATE_DOCKED
+                self._attr_activity = VacuumActivity.DOCKED
                 self._status_state = "Charging"
             elif (
                 self._state["details"]["isDocked"]
                 and not self._state["details"]["isCharging"]
             ):
-                self._clean_state = STATE_DOCKED
+                self._attr_activity = VacuumActivity.DOCKED
                 self._status_state = "Docked"
             else:
-                self._clean_state = STATE_IDLE
+                self._attr_activity = VacuumActivity.IDLE
                 self._status_state = "Stopped"
 
             if robot_alert is not None:
                 self._status_state = robot_alert
         elif self._state["state"] == 2:
             if robot_alert is None:
-                self._clean_state = STATE_CLEANING
+                self._attr_activity = VacuumActivity.CLEANING
                 self._status_state = (
                     f"{MODE.get(self._state['cleaning']['mode'])} "
                     f"{ACTION.get(self._state['action'])}"
@@ -200,13 +165,11 @@ class NeatoConnectedVacuum(StateVacuumEntity):
             else:
                 self._status_state = robot_alert
         elif self._state["state"] == 3:
-            self._clean_state = STATE_PAUSED
+            self._attr_activity = VacuumActivity.PAUSED
             self._status_state = "Paused"
         elif self._state["state"] == 4:
-            self._clean_state = STATE_ERROR
+            self._attr_activity = VacuumActivity.ERROR
             self._status_state = ERRORS.get(self._state["error"])
-
-        self._attr_battery_level = self._state["details"]["charge"]
 
         if self._mapdata is None or not self._mapdata.get(self._robot_serial, {}).get(
             "maps", []
@@ -262,11 +225,7 @@ class NeatoConnectedVacuum(StateVacuumEntity):
                     )
 
     @property
-    def state(self) -> str | None:
-        """Return the status of the vacuum cleaner."""
-        return self._clean_state
-
-    @property
+    @override
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return the state attributes of the vacuum cleaner."""
         data: dict[str, Any] = {}
@@ -297,17 +256,17 @@ class NeatoConnectedVacuum(StateVacuumEntity):
         return data
 
     @property
+    @override
     def device_info(self) -> DeviceInfo:
         """Device info for neato robot."""
-        stats = self._robot_stats
-        return DeviceInfo(
-            identifiers={(NEATO_DOMAIN, self._robot_serial)},
-            manufacturer=stats["battery"]["vendor"] if stats else None,
-            model=stats["model"] if stats else None,
-            name=self._attr_name,
-            sw_version=stats["firmware"] if stats else None,
-        )
+        device_info = self._attr_device_info
+        if self._robot_stats:
+            device_info.manufacturer = self._robot_stats["battery"]["vendor"]
+            device_info.model = self._robot_stats["model"]
+            device_info.sw_version = self._robot_stats["firmware"]
+        return device_info
 
+    @override
     def start(self) -> None:
         """Start cleaning or resume cleaning."""
         if self._state:
@@ -317,57 +276,68 @@ class NeatoConnectedVacuum(StateVacuumEntity):
                 elif self._state["state"] == 3:
                     self.robot.resume_cleaning()
             except NeatoRobotException as ex:
-                _LOGGER.error(
-                    "Neato vacuum connection error for '%s': %s", self.entity_id, ex
-                )
+                raise HomeAssistantError(
+                    translation_domain=DOMAIN,
+                    translation_key="start_failed",
+                ) from ex
 
+    @override
     def pause(self) -> None:
         """Pause the vacuum."""
         try:
             self.robot.pause_cleaning()
         except NeatoRobotException as ex:
-            _LOGGER.error(
-                "Neato vacuum connection error for '%s': %s", self.entity_id, ex
-            )
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="pause_failed",
+            ) from ex
 
+    @override
     def return_to_base(self, **kwargs: Any) -> None:
         """Set the vacuum cleaner to return to the dock."""
         try:
-            if self._clean_state == STATE_CLEANING:
+            if self._attr_activity == VacuumActivity.CLEANING:
                 self.robot.pause_cleaning()
-            self._clean_state = STATE_RETURNING
+            self._attr_activity = VacuumActivity.RETURNING
             self.robot.send_to_base()
         except NeatoRobotException as ex:
-            _LOGGER.error(
-                "Neato vacuum connection error for '%s': %s", self.entity_id, ex
-            )
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="return_to_base_failed",
+            ) from ex
 
+    @override
     def stop(self, **kwargs: Any) -> None:
         """Stop the vacuum cleaner."""
         try:
             self.robot.stop_cleaning()
         except NeatoRobotException as ex:
-            _LOGGER.error(
-                "Neato vacuum connection error for '%s': %s", self.entity_id, ex
-            )
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="stop_failed",
+            ) from ex
 
+    @override
     def locate(self, **kwargs: Any) -> None:
         """Locate the robot by making it emit a sound."""
         try:
             self.robot.locate()
         except NeatoRobotException as ex:
-            _LOGGER.error(
-                "Neato vacuum connection error for '%s': %s", self.entity_id, ex
-            )
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="locate_failed",
+            ) from ex
 
+    @override
     def clean_spot(self, **kwargs: Any) -> None:
         """Run a spot cleaning starting from the base."""
         try:
             self.robot.start_spot_cleaning()
         except NeatoRobotException as ex:
-            _LOGGER.error(
-                "Neato vacuum connection error for '%s': %s", self.entity_id, ex
-            )
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="clean_spot_failed",
+            ) from ex
 
     def neato_custom_cleaning(
         self, mode: str, navigation: str, category: str, zone: str | None = None
@@ -383,9 +353,11 @@ class NeatoConnectedVacuum(StateVacuumEntity):
                     "Zone '%s' was not found for the robot '%s'", zone, self.entity_id
                 )
                 return
-            _LOGGER.info("Start cleaning zone '%s' with robot %s", zone, self.entity_id)
+            _LOGGER.debug(
+                "Start cleaning zone '%s' with robot %s", zone, self.entity_id
+            )
 
-        self._clean_state = STATE_CLEANING
+        self._attr_activity = VacuumActivity.CLEANING
         try:
             self.robot.start_cleaning(mode, navigation, category, boundary_id)
         except NeatoRobotException as ex:

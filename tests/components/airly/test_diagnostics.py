@@ -1,38 +1,29 @@
 """Test Airly diagnostics."""
-import json
 
-from homeassistant.components.diagnostics import REDACTED
+import pytest
+from pytest_homeassistant.common import MockConfigEntry
+from pytest_homeassistant.components.diagnostics import get_diagnostics_for_config_entry
+from pytest_homeassistant.typing import ClientSessionGenerator
+from syrupy.assertion import SnapshotAssertion
+from syrupy.filters import props
+
+from homeassistant.core import HomeAssistant
 
 from . import init_integration
 
-from tests.common import load_fixture
-from tests.components.diagnostics import get_diagnostics_for_config_entry
 
-
-async def test_entry_diagnostics(hass, aioclient_mock, hass_client):
+@pytest.mark.usefixtures("mock_airly_client")
+async def test_entry_diagnostics(
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    snapshot: SnapshotAssertion,
+    mock_config_entry: MockConfigEntry,
+) -> None:
     """Test config entry diagnostics."""
-    entry = await init_integration(hass, aioclient_mock)
+    await init_integration(hass, mock_config_entry)
 
-    coordinator_data = json.loads(load_fixture("diagnostics_data.json", "airly"))
+    result = await get_diagnostics_for_config_entry(
+        hass, hass_client, mock_config_entry
+    )
 
-    result = await get_diagnostics_for_config_entry(hass, hass_client, entry)
-
-    assert result["config_entry"] == {
-        "entry_id": entry.entry_id,
-        "version": 1,
-        "domain": "airly",
-        "title": "Home",
-        "data": {
-            "latitude": REDACTED,
-            "longitude": REDACTED,
-            "name": "Home",
-            "api_key": REDACTED,
-        },
-        "options": {},
-        "pref_disable_new_entities": False,
-        "pref_disable_polling": False,
-        "source": "user",
-        "unique_id": REDACTED,
-        "disabled_by": None,
-    }
-    assert result["coordinator_data"] == coordinator_data
+    assert result == snapshot(exclude=props("created_at", "modified_at"))

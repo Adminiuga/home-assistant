@@ -1,16 +1,17 @@
 """Tests Home Assistant location helpers."""
+
 from homeassistant.const import ATTR_FRIENDLY_NAME, ATTR_LATITUDE, ATTR_LONGITUDE
-from homeassistant.core import State
+from homeassistant.core import HomeAssistant, State
 from homeassistant.helpers import location
 
 
-def test_has_location_with_invalid_states():
+def test_has_location_with_invalid_states() -> None:
     """Set up the tests."""
     for state in (None, 1, "hello", object):
         assert not location.has_location(state)
 
 
-def test_has_location_with_states_with_invalid_locations():
+def test_has_location_with_states_with_invalid_locations() -> None:
     """Set up the tests."""
     state = State(
         "hello.world", "invalid", {ATTR_LATITUDE: "no number", ATTR_LONGITUDE: 123.12}
@@ -18,7 +19,7 @@ def test_has_location_with_states_with_invalid_locations():
     assert not location.has_location(state)
 
 
-def test_has_location_with_states_with_valid_location():
+def test_has_location_with_states_with_valid_location() -> None:
     """Set up the tests."""
     state = State(
         "hello.world", "invalid", {ATTR_LATITUDE: 123.12, ATTR_LONGITUDE: 123.12}
@@ -26,7 +27,29 @@ def test_has_location_with_states_with_valid_location():
     assert location.has_location(state)
 
 
-def test_closest_with_no_states_with_location():
+def test_has_location_with_states_with_int_location() -> None:
+    """Test that integer coordinates are valid."""
+    state = State("hello.world", "valid", {ATTR_LATITUDE: 123, ATTR_LONGITUDE: 45})
+    assert location.has_location(state)
+
+
+def test_get_state_coordinates_with_invalid_state() -> None:
+    """Test that an invalid location returns None."""
+    state = State(
+        "hello.world", "invalid", {ATTR_LATITUDE: "no number", ATTR_LONGITUDE: 123.12}
+    )
+    assert location.get_state_coordinates(state) is None
+
+
+def test_get_state_coordinates_with_valid_location() -> None:
+    """Test that a valid location returns the coordinates."""
+    state = State("hello.world", "valid", {ATTR_LATITUDE: 12.34, ATTR_LONGITUDE: 56.78})
+    assert location.get_state_coordinates(state) == location.Coordinates(
+        latitude=12.34, longitude=56.78
+    )
+
+
+def test_closest_with_no_states_with_location() -> None:
     """Set up the tests."""
     state = State("light.test", "on")
     state2 = State(
@@ -37,7 +60,7 @@ def test_closest_with_no_states_with_location():
     assert location.closest(123.45, 123.45, [state, state2, state3]) is None
 
 
-def test_closest_returns_closest():
+def test_closest_returns_closest() -> None:
     """Test ."""
     state = State("light.test", "on", {ATTR_LATITUDE: 124.45, ATTR_LONGITUDE: 124.45})
     state2 = State("light.test", "on", {ATTR_LATITUDE: 125.45, ATTR_LONGITUDE: 125.45})
@@ -45,7 +68,7 @@ def test_closest_returns_closest():
     assert state == location.closest(123.45, 123.45, [state, state2])
 
 
-async def test_coordinates_function_as_attributes(hass):
+async def test_coordinates_function_as_attributes(hass: HomeAssistant) -> None:
     """Test coordinates function."""
     hass.states.async_set(
         "test.object", "happy", {"latitude": 32.87336, "longitude": -117.22943}
@@ -53,13 +76,13 @@ async def test_coordinates_function_as_attributes(hass):
     assert location.find_coordinates(hass, "test.object") == "32.87336,-117.22943"
 
 
-async def test_coordinates_function_as_state(hass):
+async def test_coordinates_function_as_state(hass: HomeAssistant) -> None:
     """Test coordinates function."""
     hass.states.async_set("test.object", "32.87336,-117.22943")
     assert location.find_coordinates(hass, "test.object") == "32.87336,-117.22943"
 
 
-async def test_coordinates_function_device_tracker_in_zone(hass):
+async def test_coordinates_function_device_tracker_in_zone(hass: HomeAssistant) -> None:
     """Test coordinates function."""
     hass.states.async_set(
         "zone.home",
@@ -73,7 +96,7 @@ async def test_coordinates_function_device_tracker_in_zone(hass):
     )
 
 
-async def test_coordinates_function_zone_friendly_name(hass):
+async def test_coordinates_function_zone_friendly_name(hass: HomeAssistant) -> None:
     """Test coordinates function."""
     hass.states.async_set(
         "zone.home",
@@ -88,7 +111,9 @@ async def test_coordinates_function_zone_friendly_name(hass):
     assert location.find_coordinates(hass, "my_home") == "32.87336,-117.22943"
 
 
-async def test_coordinates_function_device_tracker_from_input_select(hass):
+async def test_coordinates_function_device_tracker_from_input_select(
+    hass: HomeAssistant,
+) -> None:
     """Test coordinates function."""
     hass.states.async_set(
         "input_select.select",
@@ -101,7 +126,7 @@ async def test_coordinates_function_device_tracker_from_input_select(hass):
     )
 
 
-def test_coordinates_function_returns_none_on_recursion(hass):
+def test_coordinates_function_returns_none_on_recursion(hass: HomeAssistant) -> None:
     """Test coordinates function."""
     hass.states.async_set(
         "test.first",
@@ -111,7 +136,9 @@ def test_coordinates_function_returns_none_on_recursion(hass):
     assert location.find_coordinates(hass, "test.first") is None
 
 
-async def test_coordinates_function_returns_state_if_no_coords(hass):
+async def test_coordinates_function_returns_state_if_no_coords(
+    hass: HomeAssistant,
+) -> None:
     """Test test_coordinates function."""
     hass.states.async_set(
         "test.object",
@@ -120,7 +147,7 @@ async def test_coordinates_function_returns_state_if_no_coords(hass):
     assert location.find_coordinates(hass, "test.object") == "abc"
 
 
-def test_coordinates_function_returns_input_if_no_coords(hass):
+def test_coordinates_function_returns_input_if_no_coords(hass: HomeAssistant) -> None:
     """Test test_coordinates function."""
     assert location.find_coordinates(hass, "test.abc") == "test.abc"
     assert location.find_coordinates(hass, "abc") == "abc"

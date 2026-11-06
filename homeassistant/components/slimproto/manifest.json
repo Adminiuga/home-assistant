@@ -1,10 +1,13 @@
 {
   "domain": "slimproto",
   "name": "SlimProto (Squeezebox players)",
-  "config_flow": true,
-  "iot_class": "local_push",
-  "documentation": "https://www.home-assistant.io/integrations/slimproto",
-  "requirements": ["aioslimproto==2.1.1"],
+  "after_dependencies": ["media_source"],
+  "categories": ["media_entertainment.speakers_audio"],
   "codeowners": ["@marcelveldt"],
-  "after_dependencies": ["media_source"]
+  "config_flow": true,
+  "connectivity": ["network"],
+  "documentation": "https://www.home-assistant.io/integrations/slimproto",
+  "integration_type": "device",
+  "iot_class": "local_push",
+  "requirements": ["aioslimproto==3.3.0"]
 }

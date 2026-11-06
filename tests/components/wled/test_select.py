@@ -1,537 +1,270 @@
 """Tests for the WLED select platform."""
-import json
-from unittest.mock import MagicMock
 
+from collections.abc import Generator
+import typing
+from unittest.mock import MagicMock, patch
+
+from freezegun.api import FrozenDateTimeFactory
 import pytest
-from wled import Device as WLEDDevice, WLEDConnectionError, WLEDError
-
-from homeassistant.components.select import (
-    ATTR_OPTION,
-    ATTR_OPTIONS,
-    DOMAIN as SELECT_DOMAIN,
+from pytest_homeassistant.common import (
+    MockConfigEntry,
+    async_fire_time_changed,
+    async_load_json_object_fixture,
+    snapshot_platform,
 )
-from homeassistant.components.wled.const import SCAN_INTERVAL
+from syrupy.assertion import SnapshotAssertion
+from wled import (
+    Device as WLEDDevice,
+    Palette as WLEDPalette,
+    Playlist as WLEDPlaylist,
+    Preset as WLEDPreset,
+    WLEDConnectionError,
+    WLEDError,
+)
+
+from homeassistant.components.select import ATTR_OPTION, DOMAIN as SELECT_DOMAIN
+from homeassistant.components.wled.const import DOMAIN, SCAN_INTERVAL
 from homeassistant.const import (
     ATTR_ENTITY_ID,
-    ATTR_ICON,
     SERVICE_SELECT_OPTION,
     STATE_UNAVAILABLE,
-    STATE_UNKNOWN,
+    Platform,
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers import entity_registry as er
-from homeassistant.helpers.entity import EntityCategory
-import homeassistant.util.dt as dt_util
+from homeassistant.helpers import device_registry as dr, entity_registry as er
 
-from tests.common import MockConfigEntry, async_fire_time_changed, load_fixture
+pytestmark = pytest.mark.usefixtures("init_integration")
 
 
-async def test_color_palette_state(
-    hass: HomeAssistant, init_integration: MockConfigEntry
-) -> None:
-    """Test the creation and values of the WLED selects."""
-    entity_registry = er.async_get(hass)
-
-    # First segment of the strip
-    state = hass.states.get("select.wled_rgb_light_segment_1_color_palette")
-    assert state
-    assert state.attributes.get(ATTR_ICON) == "mdi:palette-outline"
-    assert state.attributes.get(ATTR_OPTIONS) == [
-        "Analogous",
-        "April Night",
-        "Autumn",
-        "Based on Primary",
-        "Based on Set",
-        "Beach",
-        "Beech",
-        "Breeze",
-        "C9",
-        "Cloud",
-        "Cyane",
-        "Default",
-        "Departure",
-        "Drywet",
-        "Fire",
-        "Forest",
-        "Grintage",
-        "Hult",
-        "Hult 64",
-        "Icefire",
-        "Jul",
-        "Landscape",
-        "Lava",
-        "Light Pink",
-        "Magenta",
-        "Magred",
-        "Ocean",
-        "Orange & Teal",
-        "Orangery",
-        "Party",
-        "Pastel",
-        "Primary Color",
-        "Rainbow",
-        "Rainbow Bands",
-        "Random Cycle",
-        "Red & Blue",
-        "Rewhi",
-        "Rivendell",
-        "Sakura",
-        "Set Colors",
-        "Sherbet",
-        "Splash",
-        "Sunset",
-        "Sunset 2",
-        "Tertiary",
-        "Tiamat",
-        "Vintage",
-        "Yelblu",
-        "Yellowout",
-        "Yelmag",
-    ]
-    assert state.state == "Random Cycle"
-
-    entry = entity_registry.async_get("select.wled_rgb_light_segment_1_color_palette")
-    assert entry
-    assert entry.unique_id == "aabbccddeeff_palette_1"
-    assert entry.entity_category is EntityCategory.CONFIG
+@pytest.fixture(autouse=True)
+def override_platforms() -> Generator[None]:
+    """Override PLATFORMS."""
+    with patch("homeassistant.components.wled.PLATFORMS", [Platform.SELECT]):
+        yield
 
 
-async def test_color_palette_segment_change_state(
+async def test_snapshots(
     hass: HomeAssistant,
-    init_integration: MockConfigEntry,
-    mock_wled: MagicMock,
+    entity_registry: er.EntityRegistry,
+    snapshot: SnapshotAssertion,
+    mock_config_entry: MockConfigEntry,
 ) -> None:
-    """Test the option change of state of the WLED segments."""
+    """Test snapshots of the platform."""
+    await snapshot_platform(hass, entity_registry, snapshot, mock_config_entry.entry_id)
+
+
+@pytest.mark.parametrize(
+    ("device_fixture", "entity_id", "option", "method", "called_with"),
+    [
+        (
+            "rgb",
+            "select.wled_rgb_light_segment_1_color_palette",
+            "Icefire",
+            "segment",
+            {"segment_id": 1, "palette": "Icefire"},
+        ),
+        (
+            "rgb",
+            "select.wled_rgb_light_live_override",
+            "2",
+            "live",
+            {"live": 2},
+        ),
+        (
+            "rgbw",
+            "select.wled_rgbw_light_playlist",
+            "Playlist 2",
+            "playlist",
+            {"playlist": "Playlist 2"},
+        ),
+        (
+            "rgbw",
+            "select.wled_rgbw_light_preset",
+            "Preset 2",
+            "preset",
+            {"preset": "Preset 2"},
+        ),
+    ],
+)
+async def test_color_palette_state(
+    hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
+    entity_registry: er.EntityRegistry,
+    snapshot: SnapshotAssertion,
+    mock_wled: MagicMock,
+    entity_id: str,
+    option: str,
+    method: str,
+    called_with: dict[str, int | str],
+) -> None:
+    """Test the behavior of the WLED selects."""
+    method_mock = getattr(mock_wled, method)
+
     await hass.services.async_call(
         SELECT_DOMAIN,
         SERVICE_SELECT_OPTION,
-        {
-            ATTR_ENTITY_ID: "select.wled_rgb_light_segment_1_color_palette",
-            ATTR_OPTION: "Icefire",
-        },
+        {ATTR_ENTITY_ID: entity_id, ATTR_OPTION: option},
         blocking=True,
     )
-    await hass.async_block_till_done()
-    assert mock_wled.segment.call_count == 1
-    mock_wled.segment.assert_called_with(
-        segment_id=1,
-        palette="Icefire",
-    )
+    assert method_mock.call_count == 1
+    method_mock.assert_called_with(**called_with)
+
+    # Test invalid response, not becoming unavailable
+    method_mock.side_effect = WLEDError
+    with pytest.raises(HomeAssistantError, match="Invalid response from WLED API"):
+        await hass.services.async_call(
+            SELECT_DOMAIN,
+            SERVICE_SELECT_OPTION,
+            {ATTR_ENTITY_ID: entity_id, ATTR_OPTION: option},
+            blocking=True,
+        )
+
+    assert (state := hass.states.get(entity_id))
+    assert state.state != STATE_UNAVAILABLE
+    assert method_mock.call_count == 2
+    method_mock.assert_called_with(**called_with)
+
+    # Test connection error, leading to becoming unavailable
+    method_mock.side_effect = WLEDConnectionError
+    with pytest.raises(HomeAssistantError, match="Error communicating with WLED API"):
+        await hass.services.async_call(
+            SELECT_DOMAIN,
+            SERVICE_SELECT_OPTION,
+            {ATTR_ENTITY_ID: state.entity_id, ATTR_OPTION: option},
+            blocking=True,
+        )
+
+    assert (state := hass.states.get(state.entity_id))
+    assert state.state == STATE_UNAVAILABLE
+    assert method_mock.call_count == 3
+    method_mock.assert_called_with(**called_with)
 
 
-@pytest.mark.parametrize("mock_wled", ["wled/rgb_single_segment.json"], indirect=True)
+@pytest.mark.parametrize("device_fixture", ["rgb_single_segment"])
 async def test_color_palette_dynamically_handle_segments(
     hass: HomeAssistant,
-    init_integration: MockConfigEntry,
+    freezer: FrozenDateTimeFactory,
     mock_wled: MagicMock,
 ) -> None:
     """Test if a new/deleted segment is dynamically added/removed."""
-    segment0 = hass.states.get("select.wled_rgb_light_color_palette")
-    segment1 = hass.states.get("select.wled_rgb_light_segment_1_color_palette")
-    assert segment0
+    assert (segment0 := hass.states.get("select.wled_rgb_light_color_palette"))
     assert segment0.state == "Default"
-    assert not segment1
+    assert not hass.states.get("select.wled_rgb_light_segment_1_color_palette")
 
     return_value = mock_wled.update.return_value
-    mock_wled.update.return_value = WLEDDevice(
-        json.loads(load_fixture("wled/rgb.json"))
+    mock_wled.update.return_value = WLEDDevice.from_dict(
+        await async_load_json_object_fixture(hass, "rgb.json", DOMAIN)
     )
 
-    async_fire_time_changed(hass, dt_util.utcnow() + SCAN_INTERVAL)
+    freezer.tick(SCAN_INTERVAL)
+    async_fire_time_changed(hass)
     await hass.async_block_till_done()
 
-    segment0 = hass.states.get("select.wled_rgb_light_color_palette")
-    segment1 = hass.states.get("select.wled_rgb_light_segment_1_color_palette")
-    assert segment0
+    assert (segment0 := hass.states.get("select.wled_rgb_light_color_palette"))
     assert segment0.state == "Default"
-    assert segment1
-    assert segment1.state == "Random Cycle"
+    assert (
+        segment1 := hass.states.get("select.wled_rgb_light_segment_1_color_palette")
+    )
+    assert segment1.state == "* Random Cycle"
 
     # Test adding if segment shows up again, including the master entity
     mock_wled.update.return_value = return_value
-    async_fire_time_changed(hass, dt_util.utcnow() + SCAN_INTERVAL)
+    freezer.tick(SCAN_INTERVAL)
+    async_fire_time_changed(hass)
     await hass.async_block_till_done()
 
-    segment0 = hass.states.get("select.wled_rgb_light_color_palette")
-    segment1 = hass.states.get("select.wled_rgb_light_segment_1_color_palette")
-    assert segment0
+    assert (segment0 := hass.states.get("select.wled_rgb_light_color_palette"))
     assert segment0.state == "Default"
-    assert segment1
+    assert (
+        segment1 := hass.states.get("select.wled_rgb_light_segment_1_color_palette")
+    )
     assert segment1.state == STATE_UNAVAILABLE
 
 
-async def test_color_palette_select_error(
-    hass: HomeAssistant,
-    init_integration: MockConfigEntry,
-    mock_wled: MagicMock,
-) -> None:
-    """Test error handling of the WLED selects."""
-    mock_wled.segment.side_effect = WLEDError
-
-    with pytest.raises(HomeAssistantError, match="Invalid response from WLED API"):
-        await hass.services.async_call(
-            SELECT_DOMAIN,
-            SERVICE_SELECT_OPTION,
-            {
-                ATTR_ENTITY_ID: "select.wled_rgb_light_segment_1_color_palette",
-                ATTR_OPTION: "Icefire",
-            },
-            blocking=True,
-        )
-        await hass.async_block_till_done()
-
-    state = hass.states.get("select.wled_rgb_light_segment_1_color_palette")
-    assert state
-    assert state.state == "Random Cycle"
-    assert mock_wled.segment.call_count == 1
-    mock_wled.segment.assert_called_with(segment_id=1, palette="Icefire")
-
-
-async def test_color_palette_select_connection_error(
-    hass: HomeAssistant,
-    init_integration: MockConfigEntry,
-    mock_wled: MagicMock,
-) -> None:
-    """Test error handling of the WLED selects."""
-    mock_wled.segment.side_effect = WLEDConnectionError
-
-    with pytest.raises(HomeAssistantError, match="Error communicating with WLED API"):
-        await hass.services.async_call(
-            SELECT_DOMAIN,
-            SERVICE_SELECT_OPTION,
-            {
-                ATTR_ENTITY_ID: "select.wled_rgb_light_segment_1_color_palette",
-                ATTR_OPTION: "Icefire",
-            },
-            blocking=True,
-        )
-        await hass.async_block_till_done()
-
-    state = hass.states.get("select.wled_rgb_light_segment_1_color_palette")
-    assert state
-    assert state.state == STATE_UNAVAILABLE
-    assert mock_wled.segment.call_count == 1
-    mock_wled.segment.assert_called_with(segment_id=1, palette="Icefire")
-
-
-async def test_preset_unavailable_without_presets(
-    hass: HomeAssistant,
-    init_integration: MockConfigEntry,
-) -> None:
+async def test_preset_unavailable_without_presets(hass: HomeAssistant) -> None:
     """Test WLED preset entity is unavailable when presets are not available."""
-    state = hass.states.get("select.wled_rgb_light_preset")
-    assert state
+    assert (state := hass.states.get("select.wled_rgb_light_preset"))
     assert state.state == STATE_UNAVAILABLE
 
 
-@pytest.mark.parametrize("mock_wled", ["wled/rgbw.json"], indirect=True)
-async def test_preset_state(
-    hass: HomeAssistant,
-    init_integration: MockConfigEntry,
-    mock_wled: MagicMock,
-) -> None:
-    """Test the creation and values of the WLED selects."""
-    entity_registry = er.async_get(hass)
-
-    state = hass.states.get("select.wled_rgbw_light_preset")
-    assert state
-    assert state.attributes.get(ATTR_ICON) == "mdi:playlist-play"
-    assert state.attributes.get(ATTR_OPTIONS) == ["Preset 1", "Preset 2"]
-    assert state.state == "Preset 1"
-
-    entry = entity_registry.async_get("select.wled_rgbw_light_preset")
-    assert entry
-    assert entry.unique_id == "aabbccddee11_preset"
-
-    await hass.services.async_call(
-        SELECT_DOMAIN,
-        SERVICE_SELECT_OPTION,
-        {
-            ATTR_ENTITY_ID: "select.wled_rgbw_light_preset",
-            ATTR_OPTION: "Preset 2",
-        },
-        blocking=True,
-    )
-    await hass.async_block_till_done()
-    assert mock_wled.preset.call_count == 1
-    mock_wled.preset.assert_called_with(preset="Preset 2")
-
-
-@pytest.mark.parametrize("mock_wled", ["wled/rgbw.json"], indirect=True)
-async def test_old_style_preset_active(
-    hass: HomeAssistant,
-    init_integration: MockConfigEntry,
-    mock_wled: MagicMock,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """Test unknown preset returned (when old style/unknown) preset is active."""
-    # Set device preset state to a random number
-    mock_wled.update.return_value.state.preset = 99
-
-    async_fire_time_changed(hass, dt_util.utcnow() + SCAN_INTERVAL)
-    await hass.async_block_till_done()
-
-    state = hass.states.get("select.wled_rgbw_light_preset")
-    assert state
-    assert state.state == STATE_UNKNOWN
-
-
-@pytest.mark.parametrize("mock_wled", ["wled/rgbw.json"], indirect=True)
-async def test_preset_select_error(
-    hass: HomeAssistant,
-    init_integration: MockConfigEntry,
-    mock_wled: MagicMock,
-) -> None:
-    """Test error handling of the WLED selects."""
-    mock_wled.preset.side_effect = WLEDError
-
-    with pytest.raises(HomeAssistantError, match="Invalid response from WLED API"):
-        await hass.services.async_call(
-            SELECT_DOMAIN,
-            SERVICE_SELECT_OPTION,
-            {
-                ATTR_ENTITY_ID: "select.wled_rgbw_light_preset",
-                ATTR_OPTION: "Preset 2",
-            },
-            blocking=True,
-        )
-        await hass.async_block_till_done()
-
-    state = hass.states.get("select.wled_rgbw_light_preset")
-    assert state
-    assert state.state == "Preset 1"
-    assert mock_wled.preset.call_count == 1
-    mock_wled.preset.assert_called_with(preset="Preset 2")
-
-
-@pytest.mark.parametrize("mock_wled", ["wled/rgbw.json"], indirect=True)
-async def test_preset_select_connection_error(
-    hass: HomeAssistant,
-    init_integration: MockConfigEntry,
-    mock_wled: MagicMock,
-) -> None:
-    """Test error handling of the WLED selects."""
-    mock_wled.preset.side_effect = WLEDConnectionError
-
-    with pytest.raises(HomeAssistantError, match="Error communicating with WLED API"):
-        await hass.services.async_call(
-            SELECT_DOMAIN,
-            SERVICE_SELECT_OPTION,
-            {
-                ATTR_ENTITY_ID: "select.wled_rgbw_light_preset",
-                ATTR_OPTION: "Preset 2",
-            },
-            blocking=True,
-        )
-        await hass.async_block_till_done()
-
-    state = hass.states.get("select.wled_rgbw_light_preset")
-    assert state
-    assert state.state == STATE_UNAVAILABLE
-    assert mock_wled.preset.call_count == 1
-    mock_wled.preset.assert_called_with(preset="Preset 2")
-
-
-async def test_playlist_unavailable_without_playlists(
-    hass: HomeAssistant,
-    init_integration: MockConfigEntry,
-) -> None:
+async def test_playlist_unavailable_without_playlists(hass: HomeAssistant) -> None:
     """Test WLED playlist entity is unavailable when playlists are not available."""
-    state = hass.states.get("select.wled_rgb_light_playlist")
-    assert state
+    assert (state := hass.states.get("select.wled_rgb_light_playlist"))
     assert state.state == STATE_UNAVAILABLE
 
 
-@pytest.mark.parametrize("mock_wled", ["wled/rgbw.json"], indirect=True)
-async def test_playlist_state(
+PLAYLIST = {"ps": [1], "dur": [100], "transition": [7], "repeat": 0, "end": 0, "r": 0}
+
+
+@pytest.mark.parametrize(
+    ("entity_id", "data_attr", "new_data", "new_options"),
+    [
+        (
+            "select.wled_rgb_light_preset",
+            "presets",
+            {
+                1: WLEDPreset.from_dict({"preset_id": 1, "n": "Preset 1"}),
+                2: WLEDPreset.from_dict({"preset_id": 2, "n": "Preset 2"}),
+            },
+            ["Preset 1", "Preset 2"],
+        ),
+        (
+            "select.wled_rgb_light_playlist",
+            "playlists",
+            {
+                1: WLEDPlaylist.from_dict(
+                    {"playlist_id": 1, "n": "Playlist 1", "playlist": PLAYLIST}
+                ),
+                2: WLEDPlaylist.from_dict(
+                    {"playlist_id": 2, "n": "Playlist 2", "playlist": PLAYLIST}
+                ),
+            },
+            ["Playlist 1", "Playlist 2"],
+        ),
+        (
+            "select.wled_rgb_light_color_palette",
+            "palettes",
+            {
+                0: WLEDPalette.from_dict({"palette_id": 0, "name": "Palette 1"}),
+                1: WLEDPalette.from_dict({"palette_id": 1, "name": "Palette 2"}),
+            },
+            ["Palette 1", "Palette 2"],
+        ),
+    ],
+)
+async def test_select_load_new_options_after_update(
     hass: HomeAssistant,
-    init_integration: MockConfigEntry,
+    freezer: FrozenDateTimeFactory,
     mock_wled: MagicMock,
+    entity_id: str,
+    data_attr: str,
+    new_data: typing.Any,
+    new_options: list[str],
 ) -> None:
-    """Test the creation and values of the WLED selects."""
-    entity_registry = er.async_get(hass)
-
-    state = hass.states.get("select.wled_rgbw_light_playlist")
-    assert state
-    assert state.attributes.get(ATTR_ICON) == "mdi:play-speed"
-    assert state.attributes.get(ATTR_OPTIONS) == ["Playlist 1", "Playlist 2"]
-    assert state.state == "Playlist 1"
-
-    entry = entity_registry.async_get("select.wled_rgbw_light_playlist")
-    assert entry
-    assert entry.unique_id == "aabbccddee11_playlist"
-
-    await hass.services.async_call(
-        SELECT_DOMAIN,
-        SERVICE_SELECT_OPTION,
-        {
-            ATTR_ENTITY_ID: "select.wled_rgbw_light_playlist",
-            ATTR_OPTION: "Playlist 2",
-        },
-        blocking=True,
+    """Test WLED select entity is updated when new options are added."""
+    setattr(
+        mock_wled.update.return_value,
+        data_attr,
+        {},
     )
-    await hass.async_block_till_done()
-    assert mock_wled.playlist.call_count == 1
-    mock_wled.playlist.assert_called_with(playlist="Playlist 2")
 
-
-@pytest.mark.parametrize("mock_wled", ["wled/rgbw.json"], indirect=True)
-async def test_old_style_playlist_active(
-    hass: HomeAssistant,
-    init_integration: MockConfigEntry,
-    mock_wled: MagicMock,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """Test when old style playlist cycle is active."""
-    # Set device playlist to 0, which meant "cycle" previously.
-    mock_wled.update.return_value.state.playlist = 0
-
-    async_fire_time_changed(hass, dt_util.utcnow() + SCAN_INTERVAL)
+    freezer.tick(SCAN_INTERVAL)
+    async_fire_time_changed(hass)
     await hass.async_block_till_done()
 
-    state = hass.states.get("select.wled_rgbw_light_playlist")
-    assert state
-    assert state.state == STATE_UNKNOWN
+    assert (state := hass.states.get(entity_id))
+    assert state.attributes["options"] == []
 
-
-@pytest.mark.parametrize("mock_wled", ["wled/rgbw.json"], indirect=True)
-async def test_playlist_select_error(
-    hass: HomeAssistant,
-    init_integration: MockConfigEntry,
-    mock_wled: MagicMock,
-) -> None:
-    """Test error handling of the WLED selects."""
-    mock_wled.playlist.side_effect = WLEDError
-
-    with pytest.raises(HomeAssistantError, match="Invalid response from WLED API"):
-        await hass.services.async_call(
-            SELECT_DOMAIN,
-            SERVICE_SELECT_OPTION,
-            {
-                ATTR_ENTITY_ID: "select.wled_rgbw_light_playlist",
-                ATTR_OPTION: "Playlist 2",
-            },
-            blocking=True,
-        )
-        await hass.async_block_till_done()
-
-    state = hass.states.get("select.wled_rgbw_light_playlist")
-    assert state
-    assert state.state == "Playlist 1"
-    assert mock_wled.playlist.call_count == 1
-    mock_wled.playlist.assert_called_with(playlist="Playlist 2")
-
-
-@pytest.mark.parametrize("mock_wled", ["wled/rgbw.json"], indirect=True)
-async def test_playlist_select_connection_error(
-    hass: HomeAssistant,
-    init_integration: MockConfigEntry,
-    mock_wled: MagicMock,
-) -> None:
-    """Test error handling of the WLED selects."""
-    mock_wled.playlist.side_effect = WLEDConnectionError
-
-    with pytest.raises(HomeAssistantError, match="Error communicating with WLED API"):
-        await hass.services.async_call(
-            SELECT_DOMAIN,
-            SERVICE_SELECT_OPTION,
-            {
-                ATTR_ENTITY_ID: "select.wled_rgbw_light_playlist",
-                ATTR_OPTION: "Playlist 2",
-            },
-            blocking=True,
-        )
-        await hass.async_block_till_done()
-
-    state = hass.states.get("select.wled_rgbw_light_playlist")
-    assert state
-    assert state.state == STATE_UNAVAILABLE
-    assert mock_wled.playlist.call_count == 1
-    mock_wled.playlist.assert_called_with(playlist="Playlist 2")
-
-
-async def test_live_override(
-    hass: HomeAssistant,
-    init_integration: MockConfigEntry,
-    mock_wled: MagicMock,
-) -> None:
-    """Test the creation and values of the WLED selects."""
-    entity_registry = er.async_get(hass)
-
-    state = hass.states.get("select.wled_rgb_light_live_override")
-    assert state
-    assert state.attributes.get(ATTR_ICON) == "mdi:theater"
-    assert state.attributes.get(ATTR_OPTIONS) == ["0", "1", "2"]
-    assert state.state == "0"
-
-    entry = entity_registry.async_get("select.wled_rgb_light_live_override")
-    assert entry
-    assert entry.unique_id == "aabbccddeeff_live_override"
-
-    await hass.services.async_call(
-        SELECT_DOMAIN,
-        SERVICE_SELECT_OPTION,
-        {
-            ATTR_ENTITY_ID: "select.wled_rgb_light_live_override",
-            ATTR_OPTION: "2",
-        },
-        blocking=True,
+    setattr(
+        mock_wled.update.return_value,
+        data_attr,
+        new_data,
     )
+
+    freezer.tick(SCAN_INTERVAL)
+    async_fire_time_changed(hass)
     await hass.async_block_till_done()
-    assert mock_wled.live.call_count == 1
-    mock_wled.live.assert_called_with(live=2)
 
-
-async def test_live_select_error(
-    hass: HomeAssistant,
-    init_integration: MockConfigEntry,
-    mock_wled: MagicMock,
-) -> None:
-    """Test error handling of the WLED selects."""
-    mock_wled.live.side_effect = WLEDError
-
-    with pytest.raises(HomeAssistantError, match="Invalid response from WLED API"):
-        await hass.services.async_call(
-            SELECT_DOMAIN,
-            SERVICE_SELECT_OPTION,
-            {
-                ATTR_ENTITY_ID: "select.wled_rgb_light_live_override",
-                ATTR_OPTION: "1",
-            },
-            blocking=True,
-        )
-        await hass.async_block_till_done()
-
-    state = hass.states.get("select.wled_rgb_light_live_override")
-    assert state
-    assert state.state == "0"
-    assert mock_wled.live.call_count == 1
-    mock_wled.live.assert_called_with(live=1)
-
-
-async def test_live_select_connection_error(
-    hass: HomeAssistant,
-    init_integration: MockConfigEntry,
-    mock_wled: MagicMock,
-) -> None:
-    """Test error handling of the WLED selects."""
-    mock_wled.live.side_effect = WLEDConnectionError
-
-    with pytest.raises(HomeAssistantError, match="Error communicating with WLED API"):
-        await hass.services.async_call(
-            SELECT_DOMAIN,
-            SERVICE_SELECT_OPTION,
-            {
-                ATTR_ENTITY_ID: "select.wled_rgb_light_live_override",
-                ATTR_OPTION: "2",
-            },
-            blocking=True,
-        )
-        await hass.async_block_till_done()
-
-    state = hass.states.get("select.wled_rgb_light_live_override")
-    assert state
-    assert state.state == STATE_UNAVAILABLE
-    assert mock_wled.live.call_count == 1
-    mock_wled.live.assert_called_with(live=2)
+    assert (state := hass.states.get(entity_id))
+    assert state.attributes["options"] == new_options

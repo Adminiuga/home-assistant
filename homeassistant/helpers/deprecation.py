@@ -1,22 +1,35 @@
 """Deprecation helpers for Home Assistant."""
-from __future__ import annotations
 
+from annotationlib import Format, get_annotations
 from collections.abc import Callable
+from contextlib import suppress
+from enum import EnumType, IntEnum, IntFlag, StrEnum, _EnumDict
 import functools
 import inspect
 import logging
-from typing import Any, TypeVar
+import sys
+from types import CodeType
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Final,
+    NamedTuple,
+    Self,
+    cast,
+    get_origin,
+    overload,
+    override,
+)
+from warnings import deprecated as mark_deprecated
 
-from typing_extensions import ParamSpec
+from propcache.api import cached_property
+from typing_extensions import Sentinel as sentinel
 
-from ..helpers.frame import MissingIntegrationFrame, get_integration_frame
-
-_ObjectT = TypeVar("_ObjectT", bound=object)
-_R = TypeVar("_R")
-_P = ParamSpec("_P")
+if TYPE_CHECKING:
+    from .frame import ReportBehavior
 
 
-def deprecated_substitute(
+def deprecated_substitute[_ObjectT: object](
     substitute_name: str,
 ) -> Callable[[Callable[[_ObjectT], Any]], Callable[[_ObjectT], Any]]:
     """Help migrate properties to new names.
@@ -40,15 +53,17 @@ def deprecated_substitute(
                 if not warnings.get(module_name):
                     logger = logging.getLogger(module_name)
                     logger.warning(
-                        "'%s' is deprecated. Please rename '%s' to "
-                        "'%s' in '%s' to ensure future support.",
+                        (
+                            "'%s' is deprecated. Please rename '%s' to "
+                            "'%s' in '%s' to ensure future support."
+                        ),
                         substitute_name,
                         substitute_name,
                         func.__name__,
                         inspect.getfile(self.__class__),
                     )
                     warnings[module_name] = True
-                    setattr(func, "_deprecated_substitute_warnings", warnings)
+                    setattr(func, "_deprecated_substitute_warnings", warnings)  # noqa: B010
 
                 # Return the old property
                 return getattr(self, substitute_name)
@@ -79,8 +94,10 @@ def get_deprecated(
 
         logger = logging.getLogger(module_name)
         logger.warning(
-            "'%s' is deprecated. Please rename '%s' to '%s' in your "
-            "configuration file.",
+            (
+                "'%s' is deprecated. Please rename '%s' to '%s' in your "
+                "configuration file."
+            ),
             old_name,
             old_name,
             new_name,
@@ -89,29 +106,56 @@ def get_deprecated(
     return config.get(new_name, default)
 
 
-def deprecated_class(
-    replacement: str,
-) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]:
-    """Mark class as deprecated and provide a replacement class to be used instead."""
+def deprecated_class[_T](
+    replacement: str, *, breaks_in_ha_version: str | None = None
+) -> Callable[[type[_T]], type[_T]]:
+    """Mark class as deprecated and provide a replacement class to be used instead.
 
-    def deprecated_decorator(cls: Callable[_P, _R]) -> Callable[_P, _R]:
+    If the deprecated function was called from a custom integration, ask the user to
+    report an issue.
+    """
+
+    def deprecated_decorator(cls: type[_T]) -> type[_T]:
         """Decorate class as deprecated."""
+        base_meta = type(cls)
 
-        @functools.wraps(cls)
-        def deprecated_cls(*args: _P.args, **kwargs: _P.kwargs) -> _R:
-            """Wrap for the original class."""
-            _print_deprecation_warning(cls, replacement, "class")
-            return cls(*args, **kwargs)
+        def __call__(self: type[Any], *args: Any, **kwargs: Any) -> Any:
+            _print_deprecation_warning(
+                cls, replacement, "class", "instantiated", breaks_in_ha_version
+            )
+            return base_meta.__call__(self, *args, **kwargs)
 
-        return deprecated_cls
+        deprecated_meta = type(
+            f"Deprecated{base_meta.__name__}",
+            (base_meta,),
+            {"__call__": __call__},
+        )
+
+        deprecated_cls = deprecated_meta(
+            cls.__name__,
+            (cls,),
+            {
+                "__module__": cls.__module__,
+                "__qualname__": cls.__qualname__,
+                "__doc__": cls.__doc__,
+                "__slots__": (),
+                "__wrapped__": cls,
+            },
+        )
+
+        return cast(type[_T], deprecated_cls)
 
     return deprecated_decorator
 
 
-def deprecated_function(
-    replacement: str,
+def deprecated_function[**_P, _R](
+    replacement: str, *, breaks_in_ha_version: str | None = None
 ) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]:
-    """Mark function as deprecated and provide a replacement function to be used instead."""
+    """Mark function as deprecated and provide a replacement to be used instead.
+
+    If the deprecated function was called from a custom integration, ask the user to
+    report an issue.
+    """
 
     def deprecated_decorator(func: Callable[_P, _R]) -> Callable[_P, _R]:
         """Decorate function as deprecated."""
@@ -119,7 +163,9 @@ def deprecated_function(
         @functools.wraps(func)
         def deprecated_func(*args: _P.args, **kwargs: _P.kwargs) -> _R:
             """Wrap for the original function."""
-            _print_deprecation_warning(func, replacement, "function")
+            _print_deprecation_warning(
+                func, replacement, "function", "called", breaks_in_ha_version
+            )
             return func(*args, **kwargs)
 
         return deprecated_func
@@ -127,31 +173,539 @@ def deprecated_function(
     return deprecated_decorator
 
 
-def _print_deprecation_warning(obj: Any, replacement: str, description: str) -> None:
-    logger = logging.getLogger(obj.__module__)
+def deprecated_hass_argument[**_P, _T](
+    breaks_in_ha_version: str | None = None,
+) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
+    """Decorate function to indicate that first argument hass will be ignored."""
+
+    def _decorator(func: Callable[_P, _T]) -> Callable[_P, _T]:
+        @functools.wraps(func)
+        def _inner(*args: _P.args, **kwargs: _P.kwargs) -> _T:
+            from homeassistant.core import HomeAssistant  # noqa: PLC0415
+
+            in_arg = len(args) > 0 and isinstance(args[0], HomeAssistant)
+            in_kwarg = "hass" in kwargs and isinstance(kwargs["hass"], HomeAssistant)
+
+            if in_arg or in_kwarg:
+                _print_deprecation_warning_internal(
+                    "hass",
+                    func.__module__,
+                    f"{func.__name__} without hass argument",
+                    "argument",
+                    f"passed to {func.__name__}",
+                    breaks_in_ha_version,
+                    log_when_no_integration_is_found=True,
+                )
+                if in_arg:
+                    args = args[1:]  # type: ignore[assignment]
+                if in_kwarg:
+                    kwargs.pop("hass")
+
+            return func(*args, **kwargs)
+
+        return _inner
+
+    return _decorator
+
+
+def _print_deprecation_warning(
+    obj: Any,
+    replacement: str,
+    description: str,
+    verb: str,
+    breaks_in_ha_version: str | None,
+) -> None:
+    _print_deprecation_warning_internal(
+        obj.__name__,
+        obj.__module__,
+        replacement,
+        description,
+        verb,
+        breaks_in_ha_version,
+        log_when_no_integration_is_found=True,
+    )
+
+
+def _print_deprecation_warning_internal(
+    obj_name: str,
+    module_name: str,
+    replacement: str | None,
+    description: str,
+    verb: str,
+    breaks_in_ha_version: str | None,
+    *,
+    log_when_no_integration_is_found: bool,
+) -> None:
+    # Suppress ImportError due to use of deprecated enum in core.py
+    # Can be removed in HA Core 2025.1
+    with suppress(ImportError):
+        _print_deprecation_warning_internal_impl(
+            obj_name,
+            module_name,
+            replacement,
+            description,
+            verb,
+            breaks_in_ha_version,
+            log_when_no_integration_is_found=log_when_no_integration_is_found,
+        )
+
+
+def _print_deprecation_warning_internal_impl(
+    obj_name: str,
+    module_name: str,
+    replacement: str | None,
+    description: str,
+    verb: str,
+    breaks_in_ha_version: str | None,
+    *,
+    log_when_no_integration_is_found: bool,
+) -> None:
+    from homeassistant.core import async_get_hass_or_none  # noqa: PLC0415
+    from homeassistant.loader import async_suggest_report_issue  # noqa: PLC0415
+
+    from .frame import MissingIntegrationFrame, get_integration_frame  # noqa: PLC0415
+
+    logger = logging.getLogger(module_name)
+    if breaks_in_ha_version:
+        breaks_in = f" It will be removed in HA Core {breaks_in_ha_version}."
+    else:
+        breaks_in = ""
+    if replacement is None:
+        use_instead = ""
+        please = " Please"
+    else:
+        use_instead = f" Use {replacement} instead"
+        please = ", please"
     try:
-        _, integration, path = get_integration_frame()
-        if path == "custom_components/":
+        integration_frame = get_integration_frame()
+    except MissingIntegrationFrame:
+        if log_when_no_integration_is_found:
             logger.warning(
-                "%s was called from %s, this is a deprecated %s. Use %s instead, please report this to the maintainer of %s",
-                obj.__name__,
-                integration,
+                "The deprecated %s %s was %s.%s%s",
                 description,
-                replacement,
-                integration,
+                obj_name,
+                verb,
+                breaks_in,
+                use_instead,
+            )
+    else:
+        if integration_frame.custom_integration:
+            report_issue = async_suggest_report_issue(
+                async_get_hass_or_none(),
+                integration_domain=integration_frame.integration,
+                module=integration_frame.module,
+            )
+            logger.warning(
+                "The deprecated %s %s was %s from %s.%s%s%s %s",
+                description,
+                obj_name,
+                verb,
+                integration_frame.integration,
+                breaks_in,
+                use_instead,
+                please,
+                report_issue,
             )
         else:
             logger.warning(
-                "%s was called from %s, this is a deprecated %s. Use %s instead",
-                obj.__name__,
-                integration,
+                "The deprecated %s %s was %s from %s.%s%s",
                 description,
-                replacement,
+                obj_name,
+                verb,
+                integration_frame.integration,
+                breaks_in,
+                use_instead,
             )
-    except MissingIntegrationFrame:
-        logger.warning(
-            "%s is a deprecated %s. Use %s instead",
-            obj.__name__,
-            description,
-            replacement,
+
+
+class DeprecatedConstant[T](NamedTuple):
+    """Deprecated constant."""
+
+    value: T
+    replacement: str | None
+    breaks_in_ha_version: str | None
+
+
+class DeprecatedConstantEnum[T: (StrEnum | IntEnum | IntFlag)](NamedTuple):
+    """Deprecated constant."""
+
+    enum: T
+    breaks_in_ha_version: str | None
+
+
+class DeprecatedAlias[T](NamedTuple):
+    """Deprecated alias."""
+
+    value: T
+    replacement: str
+    breaks_in_ha_version: str | None
+
+
+class DeferredDeprecatedAlias[T]:
+    """Deprecated alias with deferred evaluation of the value."""
+
+    def __init__(
+        self,
+        value_fn: Callable[[], T],
+        replacement: str,
+        breaks_in_ha_version: str | None,
+    ) -> None:
+        """Initialize."""
+        self.breaks_in_ha_version = breaks_in_ha_version
+        self.replacement = replacement
+        self._value_fn = value_fn
+
+    @functools.cached_property
+    def value(self) -> T:
+        """Return the value."""
+        return self._value_fn()
+
+
+_PREFIX_DEPRECATED = "_DEPRECATED_"
+
+
+def check_if_deprecated_constant(name: str, module_globals: dict[str, Any]) -> Any:
+    """Check if the not found name is a deprecated constant.
+
+    If it is, print a deprecation warning and return the value of the constant.
+    Otherwise raise AttributeError.
+    """
+    module_name = module_globals.get("__name__")
+    value = replacement = None
+    description = "constant"
+    if (deprecated_const := module_globals.get(_PREFIX_DEPRECATED + name)) is None:
+        raise AttributeError(f"Module {module_name!r} has no attribute {name!r}")
+    if isinstance(deprecated_const, DeprecatedConstant):
+        value = deprecated_const.value
+        replacement = deprecated_const.replacement
+        breaks_in_ha_version = deprecated_const.breaks_in_ha_version
+    elif isinstance(deprecated_const, DeprecatedConstantEnum):
+        value = deprecated_const.enum
+        replacement = (
+            f"{deprecated_const.enum.__class__.__name__}.{deprecated_const.enum.name}"
+        )
+        breaks_in_ha_version = deprecated_const.breaks_in_ha_version
+    elif isinstance(deprecated_const, (DeprecatedAlias, DeferredDeprecatedAlias)):
+        description = "alias"
+        value = deprecated_const.value
+        replacement = deprecated_const.replacement
+        breaks_in_ha_version = deprecated_const.breaks_in_ha_version
+
+    if value is None:
+        msg = (
+            f"Value of {_PREFIX_DEPRECATED}{name} is an instance of "
+            f"{type(deprecated_const)} but an instance of DeprecatedAlias, "
+            "DeferredDeprecatedAlias, DeprecatedConstant or DeprecatedConstantEnum "
+            "is required"
+        )
+
+        logging.getLogger(module_name).debug(msg)
+        # PEP 562 -- Module __getattr__ and __dir__
+        # specifies that __getattr__ should raise AttributeError if the attribute is not
+        # found.
+        # https://peps.python.org/pep-0562/#specification
+        raise AttributeError(msg)
+
+    _print_deprecation_warning_internal(
+        name,
+        module_name or __name__,
+        replacement,
+        description,
+        "used",
+        breaks_in_ha_version,
+        log_when_no_integration_is_found=False,
+    )
+    return value
+
+
+def dir_with_deprecated_constants(module_globals_keys: list[str]) -> list[str]:
+    """Return dir() with deprecated constants."""
+    return module_globals_keys + [
+        name.removeprefix(_PREFIX_DEPRECATED)
+        for name in module_globals_keys
+        if name.startswith(_PREFIX_DEPRECATED)
+    ]
+
+
+def all_with_deprecated_constants(module_globals: dict[str, Any]) -> list[str]:
+    """Generate a list for __all___ with deprecated constants."""
+    # Iterate over a copy in case the globals dict is mutated by another thread
+    # while we loop over it.
+    module_globals_keys = list(module_globals)
+    return [itm for itm in module_globals_keys if not itm.startswith("_")] + [
+        name.removeprefix(_PREFIX_DEPRECATED)
+        for name in module_globals_keys
+        if name.startswith(_PREFIX_DEPRECATED)
+    ]
+
+
+class EnumWithDeprecatedMembers(EnumType):
+    """Enum with deprecated members."""
+
+    def __new__(
+        mcs,
+        cls: str,
+        bases: tuple[type, ...],
+        classdict: _EnumDict,
+        *,
+        deprecated: dict[str, tuple[str, str]],
+        **kwds: Any,
+    ) -> Any:
+        """Create a new class."""
+        classdict["__deprecated__"] = deprecated
+        return super().__new__(mcs, cls, bases, classdict, **kwds)
+
+    @override
+    def __getattribute__(cls, name: str) -> Any:
+        """Warn if accessing a deprecated member."""
+        deprecated = super().__getattribute__("__deprecated__")
+        if name in deprecated:
+            _print_deprecation_warning_internal(
+                f"{cls.__name__}.{name}",
+                cls.__module__,
+                f"{deprecated[name][0]}",
+                "enum member",
+                "used",
+                deprecated[name][1],
+                log_when_no_integration_is_found=False,
+            )
+        return super().__getattribute__(name)
+
+
+class _DeprecatedEntityMember[_T]:
+    """Deprecated name of an entity member, forwarding to its replacement.
+
+    Declare a DeprecatedEntityProperty and a DeprecatedEntityAttr on the entity base
+    class, annotated Final (enforced) so type checkers reject subclasses providing
+    them, and
+    call migrate_deprecated_entity_members from the base class' __init_subclass__
+    to serve subclasses which still provide the deprecated name at runtime.
+
+    core_integration_behavior applies to core integrations providing or using the
+    deprecated name, it defaults to ReportBehavior.LOG.
+    """
+
+    def __init__(
+        self,
+        replacement: str,
+        breaks_in_ha_version: str,
+        *,
+        core_integration_behavior: ReportBehavior | None = None,
+    ) -> None:
+        """Initialize the alias."""
+        from .frame import ReportBehavior  # noqa: PLC0415
+
+        self.replacement = replacement
+        self.breaks_in_ha_version = breaks_in_ha_version
+        self.core_integration_behavior = core_integration_behavior or ReportBehavior.LOG
+        self.name = ""
+        self.domain = ""
+
+    def __set_name__(self, owner: type, name: str) -> None:
+        """Store the deprecated name and the domain of the entity base class."""
+        annotation = get_annotations(owner, format=Format.FORWARDREF).get(name)
+        if isinstance(annotation, str):
+            # Stringized by "from __future__ import annotations", not needed since
+            # Python 3.14
+            raise TypeError(
+                f"{owner.__qualname__}.{name} must be annotated Final, remove "
+                "'from __future__ import annotations' so it can be checked"
+            )
+        if annotation is not Final and get_origin(annotation) is not Final:
+            raise TypeError(
+                f"{owner.__qualname__}.{name} must be annotated Final, so type "
+                "checkers reject subclasses still providing the deprecated name"
+            )
+        self.name = name
+        module = owner.__module__
+        # The base class may live in any module of its integration
+        if module.startswith("homeassistant.components."):
+            self.domain = module.split(".")[2]
+        else:
+            self.domain = module.rpartition(".")[2]
+
+    @overload
+    def __get__(self, instance: None, owner: type | None = None) -> Self: ...
+
+    # For type checkers only, usage is reported at runtime by _report_usage; mypy
+    # needs a literal message
+    @overload
+    @mark_deprecated("Deprecated, use the native_ replacement", category=None)
+    def __get__(self, instance: object, owner: type | None = None) -> _T: ...
+
+    def __get__(self, instance: object | None, owner: type | None = None) -> Any:
+        """Read the replacement."""
+        if instance is None:
+            return self
+        self._report_usage(instance, "reads")
+        cls = type(instance)
+        # Descriptors on the replacement return themselves when read off the class
+        if not isinstance(getattr(cls, self.replacement), _DeprecatedEntityFallback):
+            return getattr(instance, self.replacement)
+        # A subclass providing the deprecated name reached it through super(), serve
+        # the replacement its fallback shadows instead of bouncing back to it
+        for klass in cls.__mro__:
+            target = vars(klass).get(self.replacement, _MISSING)
+            if target is _MISSING or isinstance(target, _DeprecatedEntityFallback):
+                continue
+            if isinstance(target, cached_property):
+                # Don't cache under the name the fallback serves
+                return target.func(instance)
+            if (getter := getattr(type(target), "__get__", None)) is not None:
+                return getter(target, instance, cls)
+            return target
+        raise AttributeError(self.replacement)
+
+    @property
+    def native_names(self) -> frozenset[str]:
+        """Return the names under which a subclass provides the replacement."""
+        return frozenset({self.replacement})
+
+    def migrate_subclass(self, cls: type) -> None:
+        """Serve the replacement from a subclass providing the deprecated name."""
+        raise NotImplementedError
+
+    def _report_usage(self, instance: object, action: str) -> None:
+        cls = type(instance)
+        # Finding the integration walks the stack, which is too slow for every
+        # access: report each member and action once per call site and entity class
+        caller = sys._getframe(2)  # noqa: SLF001
+        key = (cls, self.name, action, caller.f_code, caller.f_lineno)
+        if key in _REPORTED_DEPRECATED_ENTITY_USAGE:
+            return
+        self._report_usage_once(cls, action)
+        # Not marked before reporting, ReportBehavior.ERROR must keep raising
+        _REPORTED_DEPRECATED_ENTITY_USAGE.add(key)
+
+    def _report_usage_once(self, cls: type, action: str) -> None:
+        from . import frame  # noqa: PLC0415
+
+        what = (
+            f"{action} the deprecated {cls.__name__}.{self.name}, "
+            f"use {self.replacement} instead"
+        )
+        try:
+            frame.get_integration_frame(exclude_integrations={self.domain})
+        except frame.MissingIntegrationFrame:
+            pass
+        else:
+            # report_usage raises before the frame helper is set up; checked here
+            # because it also raises RuntimeError for ReportBehavior.ERROR
+            if frame._hass.hass is not None:  # noqa: SLF001
+                frame.report_usage(
+                    what,
+                    breaks_in_ha_version=self.breaks_in_ha_version,
+                    core_integration_behavior=self.core_integration_behavior,
+                    exclude_integrations={self.domain},
+                )
+                return
+        logging.getLogger(cls.__module__).warning(
+            "Detected code that %s. This will stop working in Home Assistant %s",
+            what,
+            self.breaks_in_ha_version,
+        )
+
+
+class DeprecatedEntityProperty[_T](_DeprecatedEntityMember[_T]):
+    """Deprecated entity property, a read-only alias of its replacement."""
+
+    @property
+    @override
+    def native_names(self) -> frozenset[str]:
+        """Return the replacement and the _attr_ shorthand storing it."""
+        return frozenset({self.replacement, f"_attr_{self.replacement}"})
+
+    @mark_deprecated("Deprecated, use the native_ replacement", category=None)
+    def __set__(self, instance: object, value: _T) -> None:
+        """Refuse a write, like a property without setter."""
+        raise AttributeError(
+            f"property {self.name!r} of {type(instance).__name__!r} object "
+            "has no setter"
+        )
+
+    @override
+    def migrate_subclass(self, cls: type) -> None:
+        """Serve the replacement from the deprecated property of cls."""
+        setattr(cls, self.replacement, _DeprecatedEntityFallback(self.name))
+
+
+class DeprecatedEntityAttr[_T](_DeprecatedEntityMember[_T]):
+    """Deprecated _attr_ shorthand, an alias of its replacement shorthand."""
+
+    @mark_deprecated("Deprecated, use the native_ replacement", category=None)
+    def __set__(self, instance: object, value: _T) -> None:
+        """Write the replacement."""
+        self._report_usage(instance, "writes")
+        setattr(instance, self.replacement, value)
+
+    @override
+    def migrate_subclass(self, cls: type) -> None:
+        """Move the deprecated class attribute of cls to the replacement.
+
+        The metaclass wraps the replacement as storage, the alias is restored so
+        later writes reach it.
+        """
+        setattr(cls, self.replacement, inspect.getattr_static(cls, self.name))
+        setattr(cls, self.name, self)
+
+
+_REPORTED_DEPRECATED_ENTITY_USAGE: set[tuple[type, str, str, CodeType, int]] = set()
+_MISSING = sentinel("_MISSING")
+
+
+class _DeprecatedEntityFallback:
+    """Replacement serving a subclass which still provides the deprecated name."""
+
+    def __init__(self, name: str) -> None:
+        """Initialize the fallback."""
+        self.name = name
+
+    def __get__(self, instance: object | None, owner: type | None = None) -> Any:
+        """Read the deprecated name the subclass provides."""
+        if instance is None:
+            return self
+        return getattr(instance, self.name)
+
+
+def migrate_deprecated_entity_members(cls: type, base: type) -> None:
+    """Serve the replacements of base's deprecated members from what cls provides.
+
+    Must be called from base.__init_subclass__, which runs before the
+    CachedProperties metaclass wraps the _attr_ class attributes of cls.
+    """
+    from homeassistant.core import async_get_hass_or_none  # noqa: PLC0415
+    from homeassistant.loader import async_suggest_report_issue  # noqa: PLC0415
+
+    from .frame import ReportBehavior  # noqa: PLC0415
+
+    for name, alias in vars(base).items():
+        if not isinstance(alias, _DeprecatedEntityMember):
+            continue
+        # The most derived class providing the deprecated or the native member
+        # wins, the native one when a class provides both
+        native_names = alias.native_names
+        provider = next(
+            klass
+            for klass in cls.__mro__
+            if name in vars(klass) or not native_names.isdisjoint(vars(klass))
+        )
+        if provider is base or not native_names.isdisjoint(vars(provider)):
+            continue
+        alias.migrate_subclass(cls)
+        behavior = ReportBehavior.LOG
+        if cls.__module__.startswith("homeassistant.components."):
+            behavior = alias.core_integration_behavior
+        if behavior is ReportBehavior.IGNORE:
+            continue
+        message = (
+            f"{cls.__module__}::{cls.__qualname__} provides the deprecated {name}, "
+            f"this will stop working in Home Assistant {alias.breaks_in_ha_version}, "
+            f"use {alias.replacement} instead"
+        )
+        if behavior is ReportBehavior.ERROR:
+            raise RuntimeError(message)
+        logging.getLogger(cls.__module__).warning(
+            "%s, please %s",
+            message,
+            async_suggest_report_issue(async_get_hass_or_none(), module=cls.__module__),
         )

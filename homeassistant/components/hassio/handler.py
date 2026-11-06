@@ -1,276 +1,223 @@
 """Handler for Hass.io."""
-import asyncio
+
+from dataclasses import dataclass
 from http import HTTPStatus
 import logging
 import os
+from pathlib import Path
+from typing import Any
 
+from aiohasupervisor import SupervisorClient
+from aiohasupervisor.models import SupervisorOptions
 import aiohttp
+from yarl import URL
 
-from homeassistant.components.http import (
-    CONF_SERVER_HOST,
-    CONF_SERVER_PORT,
-    CONF_SSL_CERTIFICATE,
+from homeassistant.const import EVENT_HOMEASSISTANT_CLOSE
+from homeassistant.core import Event, HomeAssistant, callback
+from homeassistant.helpers.aiohttp_client import (
+    MAXIMUM_HEADER_SIZE,
+    SERVER_SOFTWARE,
+    HassClientResponse,
+    async_get_clientsession,
 )
-from homeassistant.const import SERVER_PORT
+from homeassistant.helpers.json import json_dumps
+from homeassistant.helpers.singleton import singleton
+from homeassistant.util.hass_dict import HassKey
+
+from .const import (
+    ATTR_MESSAGE,
+    ATTR_RESULT,
+    DOMAIN,
+    ENV_SUPERVISOR,
+    ENV_SUPERVISOR_SOCKET,
+    ENV_SUPERVISOR_TOKEN,
+    X_HASS_SOURCE,
+)
 
 _LOGGER = logging.getLogger(__name__)
+
+KEY_SUPERVISOR_PASSTHROUGH_CLIENT: HassKey[HassIO] = HassKey(DOMAIN)
+KEY_SUPERVISOR_CLIENT: HassKey[SupervisorClient] = HassKey("supervisor_client")
+KEY_SUPERVISOR_CONNECTION: HassKey[SupervisorConnection] = HassKey(
+    "hassio_supervisor_connection"
+)
 
 
 class HassioAPIError(RuntimeError):
     """Return if a API trow a error."""
 
 
-def _api_bool(funct):
-    """Return a boolean."""
+@dataclass(frozen=True, slots=True)
+class SupervisorConnection:
+    """Transport Home Assistant uses to reach Supervisor."""
 
-    async def _wrapper(*argv, **kwargs):
-        """Wrap function."""
-        try:
-            data = await funct(*argv, **kwargs)
-            return data["result"] == "ok"
-        except HassioAPIError:
-            return False
+    session: aiohttp.ClientSession
+    base_url: URL
+    # If set, session must connect to this socket
+    unix_socket: Path | None = None
 
-    return _wrapper
-
-
-def api_data(funct):
-    """Return data of an api."""
-
-    async def _wrapper(*argv, **kwargs):
-        """Wrap function."""
-        data = await funct(*argv, **kwargs)
-        if data["result"] == "ok":
-            return data["data"]
-        raise HassioAPIError(data["message"])
-
-    return _wrapper
+    @property
+    def auth_headers(self) -> dict[str, str]:
+        """Return headers authenticating Home Assistant to Supervisor."""
+        # Supervisor identifies the caller by the socket and ignores tokens there
+        if self.unix_socket is not None:
+            return {}
+        return {
+            aiohttp.hdrs.AUTHORIZATION: (
+                f"Bearer {os.environ.get(ENV_SUPERVISOR_TOKEN, '')}"
+            )
+        }
 
 
 class HassIO:
     """Small API wrapper for Hass.io."""
 
-    def __init__(
-        self,
-        loop: asyncio.AbstractEventLoop,
-        websession: aiohttp.ClientSession,
-        ip: str,
-    ) -> None:
+    def __init__(self, connection: SupervisorConnection) -> None:
         """Initialize Hass.io API."""
-        self.loop = loop
-        self.websession = websession
-        self._ip = ip
-
-    @_api_bool
-    def is_connected(self):
-        """Return true if it connected to Hass.io supervisor.
-
-        This method return a coroutine.
-        """
-        return self.send_command("/supervisor/ping", method="get", timeout=15)
-
-    @api_data
-    def get_info(self):
-        """Return generic Supervisor information.
-
-        This method return a coroutine.
-        """
-        return self.send_command("/info", method="get")
-
-    @api_data
-    def get_host_info(self):
-        """Return data for Host.
-
-        This method return a coroutine.
-        """
-        return self.send_command("/host/info", method="get")
-
-    @api_data
-    def get_os_info(self):
-        """Return data for the OS.
-
-        This method return a coroutine.
-        """
-        return self.send_command("/os/info", method="get")
-
-    @api_data
-    def get_core_info(self):
-        """Return data for Home Asssistant Core.
-
-        This method returns a coroutine.
-        """
-        return self.send_command("/core/info", method="get")
-
-    @api_data
-    def get_supervisor_info(self):
-        """Return data for the Supervisor.
-
-        This method returns a coroutine.
-        """
-        return self.send_command("/supervisor/info", method="get")
-
-    @api_data
-    def get_addon_info(self, addon):
-        """Return data for a Add-on.
-
-        This method return a coroutine.
-        """
-        return self.send_command(f"/addons/{addon}/info", method="get")
-
-    @api_data
-    def get_addon_stats(self, addon):
-        """Return stats for an Add-on.
-
-        This method returns a coroutine.
-        """
-        return self.send_command(f"/addons/{addon}/stats", method="get")
-
-    def get_addon_changelog(self, addon):
-        """Return changelog for an Add-on.
-
-        This method returns a coroutine.
-        """
-        return self.send_command(
-            f"/addons/{addon}/changelog", method="get", return_text=True
-        )
-
-    @api_data
-    def get_store(self):
-        """Return data from the store.
-
-        This method return a coroutine.
-        """
-        return self.send_command("/store", method="get")
-
-    @api_data
-    def get_ingress_panels(self):
-        """Return data for Add-on ingress panels.
-
-        This method return a coroutine.
-        """
-        return self.send_command("/ingress/panels", method="get")
-
-    @_api_bool
-    def restart_homeassistant(self):
-        """Restart Home-Assistant container.
-
-        This method return a coroutine.
-        """
-        return self.send_command("/homeassistant/restart")
-
-    @_api_bool
-    def stop_homeassistant(self):
-        """Stop Home-Assistant container.
-
-        This method return a coroutine.
-        """
-        return self.send_command("/homeassistant/stop")
-
-    @_api_bool
-    def refresh_updates(self):
-        """Refresh available updates.
-
-        This method return a coroutine.
-        """
-        return self.send_command("/refresh_updates", timeout=None)
-
-    @api_data
-    def retrieve_discovery_messages(self):
-        """Return all discovery data from Hass.io API.
-
-        This method return a coroutine.
-        """
-        return self.send_command("/discovery", method="get", timeout=60)
-
-    @api_data
-    def get_discovery_message(self, uuid):
-        """Return a single discovery data message.
-
-        This method return a coroutine.
-        """
-        return self.send_command(f"/discovery/{uuid}", method="get")
-
-    @api_data
-    def get_resolution_info(self):
-        """Return data for Supervisor resolution center.
-
-        This method return a coroutine.
-        """
-        return self.send_command("/resolution/info", method="get")
-
-    @_api_bool
-    async def update_hass_api(self, http_config, refresh_token):
-        """Update Home Assistant API data on Hass.io."""
-        port = http_config.get(CONF_SERVER_PORT) or SERVER_PORT
-        options = {
-            "ssl": CONF_SSL_CERTIFICATE in http_config,
-            "port": port,
-            "watchdog": True,
-            "refresh_token": refresh_token.token,
-        }
-
-        if http_config.get(CONF_SERVER_HOST) is not None:
-            options["watchdog"] = False
-            _LOGGER.warning(
-                "Found incompatible HTTP option 'server_host'. Watchdog feature disabled"
-            )
-
-        return await self.send_command("/homeassistant/options", payload=options)
-
-    @_api_bool
-    def update_hass_timezone(self, timezone):
-        """Update Home-Assistant timezone data on Hass.io.
-
-        This method return a coroutine.
-        """
-        return self.send_command("/supervisor/options", payload={"timezone": timezone})
-
-    @_api_bool
-    def update_diagnostics(self, diagnostics: bool):
-        """Update Supervisor diagnostics setting.
-
-        This method return a coroutine.
-        """
-        return self.send_command(
-            "/supervisor/options", payload={"diagnostics": diagnostics}
-        )
+        self._connection = connection
 
     async def send_command(
         self,
-        command,
-        method="post",
-        payload=None,
-        timeout=10,
-        return_text=False,
-    ):
+        command: str,
+        method: str = "post",
+        payload: Any | None = None,
+        timeout: int | None = 10,
+        return_text: bool = False,
+        *,
+        params: dict[str, Any] | None = None,
+        range_header: str | None = None,
+        source: str = "core.handler",
+    ) -> Any:
         """Send API command to Hass.io.
 
         This method is a coroutine.
         """
+        joined_url = self._connection.base_url.with_path(command)
+        # This check is to make sure the normalized URL string
+        # is the same as the URL string that was passed in. If
+        # they are different, then the passed in command URL
+        # contained characters that were removed by the normalization
+        # such as ../../../../etc/passwd
+        if joined_url.raw_path != command:
+            _LOGGER.error("Invalid request %s", command)
+            raise HassioAPIError
+
+        headers = {**self._connection.auth_headers, X_HASS_SOURCE: source}
+        if range_header is not None:
+            headers[aiohttp.hdrs.RANGE] = range_header
+
         try:
-            request = await self.websession.request(
+            response = await self._connection.session.request(
                 method,
-                f"http://{self._ip}{command}",
+                joined_url,
+                params=params,
                 json=payload,
-                headers={
-                    aiohttp.hdrs.AUTHORIZATION: f"Bearer {os.environ.get('SUPERVISOR_TOKEN', '')}"
-                },
+                headers=headers,
                 timeout=aiohttp.ClientTimeout(total=timeout),
             )
 
-            if request.status not in (HTTPStatus.OK, HTTPStatus.BAD_REQUEST):
-                _LOGGER.error("%s return code %d", command, request.status)
-                raise HassioAPIError()
+            if response.status != HTTPStatus.OK:
+                try:
+                    error = await response.json(encoding="utf-8")
+                except aiohttp.ContentTypeError:
+                    # Errors raised outside Supervisor's API handlers are plain text
+                    raise HassioAPIError(
+                        await response.text(encoding="utf-8")
+                    ) from None
+                if error.get(ATTR_RESULT) == "error":
+                    raise HassioAPIError(error.get(ATTR_MESSAGE))
+
+                _LOGGER.error(
+                    "Request to %s method %s returned with code %d",
+                    command,
+                    method,
+                    response.status,
+                )
+                raise HassioAPIError
 
             if return_text:
-                return await request.text(encoding="utf-8")
+                return await response.text(encoding="utf-8")
 
-            return await request.json()
+            return await response.json(encoding="utf-8")
 
-        except asyncio.TimeoutError:
+        except TimeoutError:
             _LOGGER.error("Timeout on %s request", command)
 
         except aiohttp.ClientError as err:
             _LOGGER.error("Client error on %s request %s", command, err)
 
-        raise HassioAPIError()
+        raise HassioAPIError
+
+
+@callback
+def _async_create_supervisor_socket_session(
+    hass: HomeAssistant, unix_socket: Path
+) -> aiohttp.ClientSession:
+    """Create a session connecting to Supervisor over its Unix socket."""
+    session = aiohttp.ClientSession(
+        connector=aiohttp.UnixConnector(path=str(unix_socket)),
+        json_serialize=json_dumps,
+        response_class=HassClientResponse,
+        headers={aiohttp.hdrs.USER_AGENT: SERVER_SOFTWARE},
+        # Every response comes from host "localhost", so a real cookie jar would
+        # replay cookies set through ingress to all apps, users and Supervisor
+        cookie_jar=aiohttp.DummyCookieJar(),
+        max_line_size=MAXIMUM_HEADER_SIZE,
+        max_field_size=MAXIMUM_HEADER_SIZE,
+    )
+
+    async def _async_close_session(event: Event) -> None:
+        await session.close()
+
+    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_CLOSE, _async_close_session)
+    return session
+
+
+@singleton(KEY_SUPERVISOR_CONNECTION)
+def get_supervisor_connection(hass: HomeAssistant) -> SupervisorConnection:
+    """Return the transport to the Supervisor this Core runs under."""
+    if supervisor_socket := os.environ.get(ENV_SUPERVISOR_SOCKET):
+        unix_socket = Path(supervisor_socket)
+        return SupervisorConnection(
+            _async_create_supervisor_socket_session(hass, unix_socket),
+            URL("http://localhost"),
+            unix_socket,
+        )
+    return SupervisorConnection(
+        async_get_clientsession(hass), URL(f"http://{os.environ[ENV_SUPERVISOR]}")
+    )
+
+
+@singleton(KEY_SUPERVISOR_PASSTHROUGH_CLIENT)
+def get_supervisor_passthrough_client(hass: HomeAssistant) -> HassIO:
+    """Return the handler for the Supervisor API passthrough."""
+    return HassIO(get_supervisor_connection(hass))
+
+
+@singleton(KEY_SUPERVISOR_CLIENT)
+def get_supervisor_client(hass: HomeAssistant) -> SupervisorClient:
+    """Return supervisor client."""
+    connection = get_supervisor_connection(hass)
+    if connection.unix_socket is not None:
+        return SupervisorClient(
+            str(connection.base_url),
+            session=connection.session,
+            source="core/aiohasupervisor",
+            unix_socket=connection.unix_socket,
+        )
+    return SupervisorClient(
+        str(connection.base_url),
+        os.environ.get(ENV_SUPERVISOR_TOKEN, ""),
+        session=connection.session,
+        source="core/aiohasupervisor",
+    )
+
+
+async def async_update_diagnostics(hass: HomeAssistant, diagnostics: bool) -> None:
+    """Update Supervisor diagnostics toggle.
+
+    The caller of the function should handle SupervisorError.
+    """
+    await get_supervisor_client(hass).supervisor.set_options(
+        SupervisorOptions(diagnostics=diagnostics)
+    )

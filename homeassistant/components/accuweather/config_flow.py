@@ -1,40 +1,40 @@
 """Adds config flow for AccuWeather."""
-from __future__ import annotations
 
-import asyncio
-from typing import Any
+from asyncio import timeout
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any, override
 
-from accuweather import AccuWeather, ApiError, InvalidApiKeyError, RequestsExceededError
+from accuweather import AccuWeather
+from accuweather.exceptions import ApiError, InvalidApiKeyError, RequestsExceededError
 from aiohttp import ClientError
 from aiohttp.client_exceptions import ClientConnectorError
-from async_timeout import timeout
-import voluptuous as vol
+import probatio
 
-from homeassistant import config_entries
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_API_KEY, CONF_LATITUDE, CONF_LONGITUDE, CONF_NAME
-from homeassistant.core import callback
-from homeassistant.data_entry_flow import FlowResult
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.const import (
+    CONF_API_KEY,
+    CONF_LATITUDE,
+    CONF_LOCATION,
+    CONF_LONGITUDE,
+)
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers.selector import LocationSelector, LocationSelectorConfig
 
-from .const import CONF_FORECAST, DOMAIN
+from .const import DOMAIN
 
 
-class AccuWeatherFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
+class AccuWeatherFlowHandler(ConfigFlow, domain=DOMAIN):
     """Config flow for AccuWeather."""
 
     VERSION = 1
+    _latitude: float | None = None
+    _longitude: float | None = None
 
+    @override
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle a flow initialized by the user."""
-        # Under the terms of use of the API, one user can use one free API key. Due to
-        # the small number of requests allowed, we only allow one integration instance.
-        if self._async_current_entries():
-            return self.async_abort(reason="single_instance_allowed")
-
         errors = {}
 
         if user_input is not None:
@@ -44,11 +44,11 @@ class AccuWeatherFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
                     accuweather = AccuWeather(
                         user_input[CONF_API_KEY],
                         websession,
-                        latitude=user_input[CONF_LATITUDE],
-                        longitude=user_input[CONF_LONGITUDE],
+                        latitude=user_input[CONF_LOCATION][CONF_LATITUDE],
+                        longitude=user_input[CONF_LOCATION][CONF_LONGITUDE],
                     )
                     await accuweather.async_get_location()
-            except (ApiError, ClientConnectorError, asyncio.TimeoutError, ClientError):
+            except ApiError, ClientConnectorError, TimeoutError, ClientError:
                 errors["base"] = "cannot_connect"
             except InvalidApiKeyError:
                 errors[CONF_API_KEY] = "invalid_api_key"
@@ -58,67 +58,79 @@ class AccuWeatherFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
                 await self.async_set_unique_id(
                     accuweather.location_key, raise_on_progress=False
                 )
+                self._abort_if_unique_id_configured()
 
+                if TYPE_CHECKING:
+                    assert accuweather.location_name is not None
+
+                location: dict[str, Any] = user_input.pop(CONF_LOCATION)
                 return self.async_create_entry(
-                    title=user_input[CONF_NAME], data=user_input
+                    title=accuweather.location_name, data={**user_input, **location}
                 )
 
         return self.async_show_form(
             step_id="user",
-            data_schema=vol.Schema(
-                {
-                    vol.Required(CONF_API_KEY): str,
-                    vol.Optional(
-                        CONF_LATITUDE, default=self.hass.config.latitude
-                    ): cv.latitude,
-                    vol.Optional(
-                        CONF_LONGITUDE, default=self.hass.config.longitude
-                    ): cv.longitude,
-                    vol.Optional(
-                        CONF_NAME, default=self.hass.config.location_name
-                    ): str,
-                }
+            data_schema=self.add_suggested_values_to_schema(
+                probatio.Schema(
+                    {
+                        probatio.Required(probatio.Secret(CONF_API_KEY)): str,
+                        probatio.Required(CONF_LOCATION): LocationSelector(
+                            LocationSelectorConfig(radius=False)
+                        ),
+                    }
+                ),
+                user_input
+                or {
+                    CONF_LOCATION: {
+                        CONF_LATITUDE: self.hass.config.latitude,
+                        CONF_LONGITUDE: self.hass.config.longitude,
+                    }
+                },
             ),
             errors=errors,
         )
 
-    @staticmethod
-    @callback
-    def async_get_options_flow(
-        config_entry: ConfigEntry,
-    ) -> AccuWeatherOptionsFlowHandler:
-        """Options callback for AccuWeather."""
-        return AccuWeatherOptionsFlowHandler(config_entry)
+    async def async_step_reauth(
+        self, entry_data: Mapping[str, Any]
+    ) -> ConfigFlowResult:
+        """Handle configuration by re-auth."""
+        self._latitude = entry_data[CONF_LATITUDE]
+        self._longitude = entry_data[CONF_LONGITUDE]
 
+        return await self.async_step_reauth_confirm()
 
-class AccuWeatherOptionsFlowHandler(config_entries.OptionsFlow):
-    """Config flow options for AccuWeather."""
-
-    def __init__(self, entry: ConfigEntry) -> None:
-        """Initialize AccuWeather options flow."""
-        self.config_entry = entry
-
-    async def async_step_init(
+    async def async_step_reauth_confirm(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
-        """Manage the options."""
-        return await self.async_step_user()
+    ) -> ConfigFlowResult:
+        """Dialog that informs the user that reauth is required."""
+        errors: dict[str, str] = {}
 
-    async def async_step_user(
-        self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
-        """Handle a flow initialized by the user."""
         if user_input is not None:
-            return self.async_create_entry(title="", data=user_input)
+            websession = async_get_clientsession(self.hass)
+            try:
+                async with timeout(10):
+                    accuweather = AccuWeather(
+                        user_input[CONF_API_KEY],
+                        websession,
+                        latitude=self._latitude,
+                        longitude=self._longitude,
+                    )
+                    await accuweather.async_get_location()
+            except ApiError, ClientConnectorError, TimeoutError, ClientError:
+                errors["base"] = "cannot_connect"
+            except InvalidApiKeyError:
+                errors["base"] = "invalid_api_key"
+            except RequestsExceededError:
+                errors["base"] = "requests_exceeded"
+            else:
+                return self.async_update_reload_and_abort(
+                    self._get_reauth_entry(), data_updates=user_input
+                )
 
         return self.async_show_form(
-            step_id="user",
-            data_schema=vol.Schema(
-                {
-                    vol.Optional(
-                        CONF_FORECAST,
-                        default=self.config_entry.options.get(CONF_FORECAST, False),
-                    ): bool
-                }
+            step_id="reauth_confirm",
+            data_schema=probatio.Schema(
+                {probatio.Required(probatio.Secret(CONF_API_KEY)): str}
             ),
+            errors=errors,
         )

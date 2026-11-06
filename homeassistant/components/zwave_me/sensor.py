@@ -1,8 +1,8 @@
 """Representation of a sensorMultilevel."""
-from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import override
 
 from zwave_me_ws import ZWaveMeData
 
@@ -12,26 +12,27 @@ from homeassistant.components.sensor import (
     SensorEntityDescription,
     SensorStateClass,
 )
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
-    ELECTRIC_CURRENT_AMPERE,
-    ELECTRIC_POTENTIAL_VOLT,
-    ENERGY_KILO_WATT_HOUR,
     LIGHT_LUX,
     PERCENTAGE,
-    POWER_WATT,
-    PRESSURE_KPA,
-    TEMP_CELSIUS,
+    UnitOfElectricCurrent,
+    UnitOfElectricPotential,
+    UnitOfEnergy,
+    UnitOfPower,
+    UnitOfPressure,
+    UnitOfRatio,
+    UnitOfTemperature,
 )
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from . import ZWaveMeController, ZWaveMeEntity
-from .const import DOMAIN, ZWaveMePlatform
+from .const import ZWaveMePlatform
+from .controller import ZWaveMeConfigEntry, ZWaveMeController
+from .entity import ZWaveMeEntity
 
 
-@dataclass
+@dataclass(frozen=True)
 class ZWaveMeSensorEntityDescription(SensorEntityDescription):
     """Class describing ZWaveMeSensor sensor entities."""
 
@@ -42,19 +43,19 @@ SENSORS_MAP: dict[str, ZWaveMeSensorEntityDescription] = {
     "barometer": ZWaveMeSensorEntityDescription(
         key="barometer",
         device_class=SensorDeviceClass.PRESSURE,
-        native_unit_of_measurement=PRESSURE_KPA,
+        native_unit_of_measurement=UnitOfPressure.KPA,
         state_class=SensorStateClass.MEASUREMENT,
     ),
     "co": ZWaveMeSensorEntityDescription(
         key="co",
         device_class=SensorDeviceClass.CO,
-        native_unit_of_measurement="ppm",
+        native_unit_of_measurement=UnitOfRatio.PARTS_PER_MILLION,
         state_class=SensorStateClass.MEASUREMENT,
     ),
     "co2": ZWaveMeSensorEntityDescription(
         key="co2",
         device_class=SensorDeviceClass.CO2,
-        native_unit_of_measurement="ppm",
+        native_unit_of_measurement=UnitOfRatio.PARTS_PER_MILLION,
         state_class=SensorStateClass.MEASUREMENT,
     ),
     "humidity": ZWaveMeSensorEntityDescription(
@@ -72,13 +73,13 @@ SENSORS_MAP: dict[str, ZWaveMeSensorEntityDescription] = {
     "meterElectric_ampere": ZWaveMeSensorEntityDescription(
         key="meterElectric_ampere",
         device_class=SensorDeviceClass.CURRENT,
-        native_unit_of_measurement=ELECTRIC_CURRENT_AMPERE,
+        native_unit_of_measurement=UnitOfElectricCurrent.AMPERE,
         state_class=SensorStateClass.MEASUREMENT,
     ),
     "meterElectric_kilowatt_hour": ZWaveMeSensorEntityDescription(
         key="meterElectric_kilowatt_hour",
         device_class=SensorDeviceClass.ENERGY,
-        native_unit_of_measurement=ENERGY_KILO_WATT_HOUR,
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
         state_class=SensorStateClass.TOTAL_INCREASING,
     ),
     "meterElectric_power_factor": ZWaveMeSensorEntityDescription(
@@ -91,19 +92,19 @@ SENSORS_MAP: dict[str, ZWaveMeSensorEntityDescription] = {
     "meterElectric_voltage": ZWaveMeSensorEntityDescription(
         key="meterElectric_voltage",
         device_class=SensorDeviceClass.VOLTAGE,
-        native_unit_of_measurement=ELECTRIC_POTENTIAL_VOLT,
+        native_unit_of_measurement=UnitOfElectricPotential.VOLT,
         state_class=SensorStateClass.MEASUREMENT,
     ),
     "meterElectric_watt": ZWaveMeSensorEntityDescription(
         key="meterElectric_watt",
         device_class=SensorDeviceClass.POWER,
-        native_unit_of_measurement=POWER_WATT,
+        native_unit_of_measurement=UnitOfPower.WATT,
         state_class=SensorStateClass.MEASUREMENT,
     ),
     "temperature": ZWaveMeSensorEntityDescription(
         key="temperature",
         device_class=SensorDeviceClass.TEMPERATURE,
-        native_unit_of_measurement=TEMP_CELSIUS,
+        native_unit_of_measurement=UnitOfTemperature.CELSIUS,
         state_class=SensorStateClass.MEASUREMENT,
     ),
     "generic": ZWaveMeSensorEntityDescription(
@@ -115,20 +116,20 @@ DEVICE_NAME = ZWaveMePlatform.SENSOR
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    config_entry: ZWaveMeConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up the sensor platform."""
 
     @callback
     def add_new_device(new_device: ZWaveMeData) -> None:
-        controller: ZWaveMeController = hass.data[DOMAIN][config_entry.entry_id]
-        description = SENSORS_MAP.get(new_device.probeType, SENSORS_MAP["generic"])
-        sensor = ZWaveMeSensor(controller, new_device, description)
-
         async_add_entities(
             [
-                sensor,
+                ZWaveMeSensor(
+                    config_entry.runtime_data,
+                    new_device,
+                    SENSORS_MAP.get(new_device.probeType, SENSORS_MAP["generic"]),
+                )
             ]
         )
 
@@ -155,6 +156,7 @@ class ZWaveMeSensor(ZWaveMeEntity, SensorEntity):
         self.entity_description = description
 
     @property
+    @override
     def native_value(self) -> str:
         """Return the state of the sensor."""
         return self.entity_description.value(self.device.level)

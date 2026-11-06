@@ -1,5 +1,4 @@
 """Support for local control of entities by emulating a Philips Hue bridge."""
-from __future__ import annotations
 
 from functools import cache
 import logging
@@ -15,7 +14,14 @@ from homeassistant.components import (
     script,
 )
 from homeassistant.const import CONF_ENTITIES, CONF_TYPE
-from homeassistant.core import Event, HomeAssistant, State, callback, split_entity_id
+from homeassistant.core import (
+    Event,
+    EventStateChangedData,
+    HomeAssistant,
+    State,
+    callback,
+    split_entity_id,
+)
 from homeassistant.helpers import storage
 from homeassistant.helpers.event import (
     async_track_state_added_domain,
@@ -203,28 +209,28 @@ class Config:
         ):
             return self.entities[state.entity_id][CONF_ENTITY_NAME]
 
-        return state.attributes.get(ATTR_EMULATED_HUE_NAME, state.name)
+        return state.attributes.get(ATTR_EMULATED_HUE_NAME, state.name)  # type: ignore[no-any-return]
 
     @cache  # pylint: disable=method-cache-max-size-none
-    def get_exposed_states(self) -> list[State]:
+    def get_exposed_entity_ids(self) -> list[str]:
         """Return a list of exposed states."""
         state_machine = self.hass.states
         if self.expose_by_default:
             return [
-                state
+                state.entity_id
                 for state in state_machine.async_all()
                 if self.is_state_exposed(state)
             ]
-        states: list[State] = []
-        for entity_id in self.entities:
-            if (state := state_machine.get(entity_id)) and self.is_state_exposed(state):
-                states.append(state)
-        return states
+        return [
+            entity_id
+            for entity_id in self.entities
+            if (state := state_machine.get(entity_id)) and self.is_state_exposed(state)
+        ]
 
     @callback
-    def _clear_exposed_cache(self, event: Event) -> None:
-        """Clear the cache of exposed states."""
-        self.get_exposed_states.cache_clear()  # pylint: disable=no-member
+    def _clear_exposed_cache(self, event: Event[EventStateChangedData]) -> None:
+        """Clear the cache of exposed entity ids."""
+        self.get_exposed_entity_ids.cache_clear()
 
     def is_state_exposed(self, state: State) -> bool:
         """Cache determine if an entity should be exposed on the emulated bridge."""
@@ -247,7 +253,9 @@ class Config:
             return not self._entities_with_hidden_attr_in_config[state.entity_id]
 
         if not self.expose_by_default:
-            return False
+            # Listing an entity is the documented way to expose just a few
+            # devices when expose_by_default is off
+            return state.entity_id in self.entities
         # Expose an entity if the entity's domain is exposed by default and
         # the configuration doesn't explicitly exclude it from being
         # exposed, or if the entity is explicitly exposed

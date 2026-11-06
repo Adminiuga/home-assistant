@@ -1,0 +1,447 @@
+"""Teslemetry parent entity class."""
+
+from abc import abstractmethod
+from typing import Any, override
+
+from tesla_fleet_api.const import Scope
+from tesla_fleet_api.router import VehicleRouter
+from tesla_fleet_api.tesla import EnergySiteRouter
+from tesla_fleet_api.teslemetry import EnergySite, Vehicle
+
+from homeassistant.core import callback
+from homeassistant.exceptions import ServiceValidationError
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.entity import Entity, EntityDescription
+from homeassistant.helpers.typing import StateType
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
+
+from .const import CHARGE_LIMIT_SOC_KEY, DOMAIN
+from .coordinator import (
+    TeslemetryEnergyHistoryCoordinator,
+    TeslemetryEnergySiteInfoCoordinator,
+    TeslemetryEnergySiteLiveCoordinator,
+    TeslemetryLocalComponentsCoordinator,
+    TeslemetryLocalStatusCoordinator,
+    TeslemetryVehicleDataCoordinator,
+    TeslemetryWallConnectorTotalsCoordinator,
+)
+from .models import (
+    TeslemetryChargeOnSolarStore,
+    TeslemetryEnergyData,
+    TeslemetryVehicleData,
+)
+
+
+class TeslemetryRootEntity(Entity):
+    """Parent class for all Teslemetry entities."""
+
+    _attr_has_entity_name = True
+    scoped: bool
+
+    def raise_for_scope(self, scope: Scope) -> None:
+        """Raise an error if a scope is not available."""
+        if not self.scoped:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="missing_scope",
+                translation_placeholders={"scope": scope},
+            )
+
+
+class TeslemetryPollingEntity(
+    TeslemetryRootEntity,
+    CoordinatorEntity[
+        TeslemetryVehicleDataCoordinator
+        | TeslemetryEnergyHistoryCoordinator
+        | TeslemetryEnergySiteLiveCoordinator
+        | TeslemetryEnergySiteInfoCoordinator
+        | TeslemetryWallConnectorTotalsCoordinator
+    ],
+):
+    """Parent class for all Teslemetry Coordinator entities."""
+
+    def __init__(
+        self,
+        coordinator: TeslemetryVehicleDataCoordinator
+        | TeslemetryEnergyHistoryCoordinator
+        | TeslemetryEnergySiteLiveCoordinator
+        | TeslemetryEnergySiteInfoCoordinator
+        | TeslemetryWallConnectorTotalsCoordinator,
+        key: str,
+    ) -> None:
+        """Initialize common aspects of a Teslemetry entity."""
+        super().__init__(coordinator)
+        self.key = key
+        self._attr_translation_key = self.key
+        self._async_update_attrs()
+
+    @property
+    @override
+    def available(self) -> bool:
+        """Return if sensor is available."""
+        return self.coordinator.last_update_success and self._attr_available
+
+    @property
+    def _value(self) -> Any | None:
+        """Return a specific value from coordinator data."""
+        return self.coordinator.data.get(self.key)
+
+    def get(self, key: str, default: Any | None = None) -> Any | None:
+        """Return a specific value from coordinator data."""
+        return self.coordinator.data.get(key, default)
+
+    def get_number(self, key: str, default: float) -> float:
+        """Return a specific number from coordinator data."""
+        if isinstance(value := self.coordinator.data.get(key), (int, float)):
+            return value
+        return default
+
+    @property
+    def is_none(self) -> bool:
+        """Return if the value is a literal None."""
+        return self.get(self.key, False) is None
+
+    @callback
+    @override
+    def _handle_coordinator_update(self) -> None:
+        """Handle updated data from the coordinator."""
+        self._async_update_attrs()
+        self.async_write_ha_state()
+
+    @abstractmethod
+    def _async_update_attrs(self) -> None:
+        """Update the attributes of the entity."""
+
+
+class TeslemetryVehiclePollingEntity(TeslemetryPollingEntity):
+    """Parent class for Teslemetry Vehicle entities."""
+
+    _last_update: int = 0
+    api: Vehicle | VehicleRouter
+    vehicle: TeslemetryVehicleData
+
+    def __init__(
+        self,
+        data: TeslemetryVehicleData,
+        key: str,
+    ) -> None:
+        """Initialize common aspects of a Teslemetry entity."""
+
+        self.api = data.api
+        self.vehicle = data
+        self._attr_unique_id = f"{data.vin}-{key}"
+        self._attr_device_info = data.device
+
+        if not data.poll:
+            # This entities data is not available for free
+            # so disable it by default
+            self._attr_entity_registry_enabled_default = False
+
+        super().__init__(data.coordinator, key)
+        # Lets diagnostics name the entities keeping the vehicle polling.
+        self.coordinator_context = self
+
+    @property
+    @override
+    def _value(self) -> Any | None:
+        """Return a specific value from coordinator data."""
+        return self.coordinator.data.get(self.key)
+
+
+class TeslemetryEnergyLiveEntity(TeslemetryPollingEntity):
+    """Parent class for Teslemetry Energy Site Live entities."""
+
+    api: EnergySite | EnergySiteRouter
+
+    def __init__(
+        self,
+        data: TeslemetryEnergyData,
+        key: str,
+    ) -> None:
+        """Initialize common aspects of a Teslemetry Energy Site Live entity."""
+
+        assert data.live_coordinator
+
+        self.api = data.api
+        self._attr_unique_id = f"{data.id}-{key}"
+        self._attr_device_info = data.device
+
+        super().__init__(data.live_coordinator, key)
+
+
+class TeslemetryEnergyInfoEntity(TeslemetryPollingEntity):
+    """Parent class for Teslemetry Energy Site Info Entities."""
+
+    api: EnergySite | EnergySiteRouter
+    coordinator: TeslemetryEnergySiteInfoCoordinator
+
+    def __init__(
+        self,
+        data: TeslemetryEnergyData,
+        key: str,
+    ) -> None:
+        """Initialize common aspects of a Teslemetry Energy Site Info entity."""
+
+        self.api = data.api
+        self._attr_unique_id = f"{data.id}-{key}"
+        self._attr_device_info = data.device
+
+        super().__init__(data.info_coordinator, key)
+
+
+class TeslemetryEnergyHistoryEntity(TeslemetryPollingEntity):
+    """Parent class for Teslemetry Energy History Entities."""
+
+    def __init__(
+        self,
+        data: TeslemetryEnergyData,
+        key: str,
+    ) -> None:
+        """Initialize common aspects of a Teslemetry Energy Site Info entity."""
+
+        assert data.history_coordinator
+
+        self.api = data.api
+        self._attr_unique_id = f"{data.id}-{key}"
+        self._attr_device_info = data.device
+
+        super().__init__(data.history_coordinator, key)
+
+    @override
+    async def async_update(self) -> None:
+        """Keep the streamed totals; the stream is their only source."""
+
+
+def _wall_connector_device_info(
+    data: TeslemetryEnergyData,
+    din: str,
+    coordinator: TeslemetryEnergySiteLiveCoordinator
+    | TeslemetryWallConnectorTotalsCoordinator,
+) -> DeviceInfo:
+    """Return the device info of a Wall Connector."""
+    # Find the model from the info coordinator
+    model: str | None = None
+    for wc in data.info_coordinator.data.get("components_wall_connectors", []):
+        if wc["din"] == din:
+            model = wc.get("part_name")
+            break
+
+    return DeviceInfo(
+        identifiers={(DOMAIN, din)},
+        manufacturer="Tesla",
+        configuration_url="https://teslemetry.com/console",
+        name="Wall Connector",
+        via_device_id=dr.async_get_device_id_by_identifier(
+            coordinator.hass,
+            (DOMAIN, str(data.id)),
+            config_entry_id=coordinator.config_entry.entry_id,
+        ),
+        serial_number=din.rsplit("-", maxsplit=1)[-1],
+        model=model,
+    )
+
+
+class TeslemetryEnergyLocalStatusEntity(
+    TeslemetryRootEntity, CoordinatorEntity[TeslemetryLocalStatusCoordinator]
+):
+    """Parent class for Teslemetry entities read from the local Powerwall status."""
+
+    def __init__(
+        self,
+        data: TeslemetryEnergyData,
+        key: str,
+    ) -> None:
+        """Initialize common aspects of a Teslemetry local status entity."""
+
+        assert data.local_status_coordinator
+
+        self._attr_translation_key = key
+        self._attr_unique_id = f"{data.id}-{key}"
+        self._attr_device_info = data.device
+
+        super().__init__(data.local_status_coordinator)
+
+
+class TeslemetryEnergyLocalComponentsEntity(
+    TeslemetryRootEntity, CoordinatorEntity[TeslemetryLocalComponentsCoordinator]
+):
+    """Parent class for Teslemetry entities read from the local Powerwall components."""
+
+    def __init__(
+        self,
+        data: TeslemetryEnergyData,
+        key: str,
+    ) -> None:
+        """Initialize common aspects of a Teslemetry local components entity."""
+
+        assert data.local_components_coordinator
+
+        self._attr_translation_key = key
+        self._attr_unique_id = f"{data.id}-{key}"
+        self._attr_device_info = data.device
+
+        super().__init__(data.local_components_coordinator)
+
+
+class TeslemetryWallConnectorEntity(TeslemetryPollingEntity):
+    """Parent class for Teslemetry Wall Connector Entities."""
+
+    _attr_has_entity_name = True
+    api: EnergySite | EnergySiteRouter
+
+    def __init__(
+        self,
+        data: TeslemetryEnergyData,
+        din: str,
+        key: str,
+    ) -> None:
+        """Initialize common aspects of a Teslemetry entity."""
+
+        assert data.live_coordinator
+
+        self.api = data.api
+        self.din = din
+        self._attr_unique_id = f"{data.id}-{din}-{key}"
+        self._attr_device_info = _wall_connector_device_info(
+            data, din, data.live_coordinator
+        )
+
+        super().__init__(data.live_coordinator, key)
+
+    @property
+    @override
+    def _value(self) -> StateType:
+        """Return a specific wall connector value from coordinator data."""
+        value: StateType = (
+            self.coordinator.data.get("wall_connectors", {})
+            .get(self.din, {})
+            .get(self.key)
+        )
+        return value
+
+    @property
+    def exists(self) -> bool:
+        """Return True if it exists in the wall connector coordinator data."""
+        return self.key in self.coordinator.data.get("wall_connectors", {}).get(
+            self.din, {}
+        )
+
+
+class TeslemetryWallConnectorTotalsEntity(TeslemetryPollingEntity):
+    """Parent class for Teslemetry Wall Connector Totals Entities."""
+
+    api: EnergySite | EnergySiteRouter
+    coordinator: TeslemetryWallConnectorTotalsCoordinator
+
+    def __init__(
+        self,
+        data: TeslemetryEnergyData,
+        din: str,
+        key: str,
+    ) -> None:
+        """Initialize common aspects of a Teslemetry Wall Connector Totals entity."""
+
+        assert data.wall_connector_totals_coordinator
+
+        self.api = data.api
+        self.din = din
+        self._attr_unique_id = f"{data.id}-{din}-{key}"
+        self._attr_device_info = _wall_connector_device_info(
+            data, din, data.wall_connector_totals_coordinator
+        )
+
+        super().__init__(data.wall_connector_totals_coordinator, key)
+
+    @override
+    async def async_update(self) -> None:
+        """Keep the streamed totals; the stream is their only source."""
+
+
+class TeslemetryVehicleEntity(TeslemetryRootEntity):
+    """Parent class for Teslemetry Vehicle entities without a coordinator."""
+
+    api: Vehicle | VehicleRouter
+
+    def __init__(self, data: TeslemetryVehicleData, key: str) -> None:
+        """Initialize common aspects of a Teslemetry entity."""
+        self.vehicle = data
+
+        self.api = data.api
+        self.vin = data.vin
+
+        self._attr_translation_key = key
+        self._attr_unique_id = f"{data.vin}-{key}"
+        self._attr_device_info = data.device
+
+
+class TeslemetryVehicleCommandEntity(TeslemetryVehicleEntity):
+    """Parent class for Teslemetry Vehicle entities that only send commands.
+
+    They hold no state of their own, so they subscribe to neither the vehicle
+    coordinator nor a telemetry stream field.
+    """
+
+
+class TeslemetryVehicleStreamEntity(TeslemetryVehicleEntity):
+    """Parent class for Teslemetry Vehicle Stream entities."""
+
+    def __init__(self, data: TeslemetryVehicleData, key: str) -> None:
+        """Initialize common aspects of a Teslemetry entity."""
+        super().__init__(data, key)
+
+        self.stream = data.stream
+        self.add_field = data.stream.get_vehicle(self.vin).add_field
+
+
+class TeslemetryChargeOnSolarEntity(TeslemetryVehicleStreamEntity):
+    """Parent class for the charge-on-solar entities, bounded by the charge limit."""
+
+    _attr_assumed_state = True
+    api: Vehicle
+    # Only created when the vehicle commands scope is granted.
+    scoped = True
+
+    def __init__(
+        self,
+        data: TeslemetryVehicleData,
+        description: EntityDescription,
+        store: TeslemetryChargeOnSolarStore,
+    ) -> None:
+        """Initialize common aspects of a charge-on-solar entity."""
+        self.entity_description = description
+        self._store = store
+        super().__init__(data, description.key)
+
+    @override
+    async def async_added_to_hass(self) -> None:
+        """Handle entity which will be added."""
+        await super().async_added_to_hass()
+        if self.vehicle.polls_charge_limit:
+            self.async_on_remove(
+                self.vehicle.coordinator.async_add_listener(
+                    self._async_handle_coordinator_update
+                )
+            )
+            self._async_handle_coordinator_update()
+            return
+
+        self.async_on_remove(
+            self.vehicle.stream_vehicle.listen_ChargeLimitSoc(
+                self._async_handle_charge_limit_soc
+            )
+        )
+
+    @callback
+    def _async_handle_coordinator_update(self) -> None:
+        """Take the charge limit from the latest poll."""
+        value = self.vehicle.coordinator.data.get(CHARGE_LIMIT_SOC_KEY)
+        self._async_handle_charge_limit_soc(
+            int(value) if isinstance(value, int | float) else None
+        )
+
+    @callback
+    def _async_handle_charge_limit_soc(self, value: int | None) -> None:
+        """Store the latest charge limit."""
+        self.vehicle.charge_limit_soc = None if value is None else int(value)
+        self._store.async_save(self.vehicle)

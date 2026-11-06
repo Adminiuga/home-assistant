@@ -1,29 +1,42 @@
 """The tests for the Event automation."""
-from unittest.mock import AsyncMock, patch
 
-import homeassistant.components.automation as automation
-from homeassistant.core import CoreState
+from unittest.mock import patch
+
+import pytest
+from pytest_homeassistant.common import async_mock_service
+
+from homeassistant.components import automation
+from homeassistant.core import CoreState, HomeAssistant
+from homeassistant.helpers.typing import ConfigType
 from homeassistant.setup import async_setup_component
 
-from tests.common import async_mock_service
 
-
-async def test_if_fires_on_hass_start(hass):
+@pytest.mark.parametrize(
+    "hass_config",
+    [
+        {
+            automation.DOMAIN: {
+                "alias": "hello",
+                "trigger": {"platform": "homeassistant", "event": "start"},
+                "action": {
+                    "service": "test.automation",
+                    "data_template": {"id": "{{ trigger.id}}"},
+                },
+            }
+        }
+    ],
+)
+@pytest.mark.usefixtures("mock_hass_config")
+async def test_if_fires_on_hass_start(
+    hass: HomeAssistant,
+    hass_config: ConfigType,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """Test the firing when Home Assistant starts."""
     calls = async_mock_service(hass, "test", "automation")
-    hass.state = CoreState.not_running
-    config = {
-        automation.DOMAIN: {
-            "alias": "hello",
-            "trigger": {"platform": "homeassistant", "event": "start"},
-            "action": {
-                "service": "test.automation",
-                "data_template": {"id": "{{ trigger.id}}"},
-            },
-        }
-    }
+    hass.set_state(CoreState.not_running)
 
-    assert await async_setup_component(hass, automation.DOMAIN, config)
+    assert await async_setup_component(hass, automation.DOMAIN, hass_config)
     assert automation.is_on(hass, "automation.hello")
     assert len(calls) == 0
 
@@ -32,23 +45,46 @@ async def test_if_fires_on_hass_start(hass):
     assert automation.is_on(hass, "automation.hello")
     assert len(calls) == 1
 
-    with patch(
-        "homeassistant.config.async_hass_config_yaml",
-        AsyncMock(return_value=config),
-    ):
-        await hass.services.async_call(
-            automation.DOMAIN, automation.SERVICE_RELOAD, blocking=True
-        )
+    await hass.services.async_call(
+        automation.DOMAIN, automation.SERVICE_RELOAD, blocking=True
+    )
 
     assert automation.is_on(hass, "automation.hello")
     assert len(calls) == 1
     assert calls[0].data["id"] == 0
 
+    # Detaching the trigger after it fired must not re-invoke the stale once
+    # listener's remove callback.
+    assert "Unable to remove unknown job listener" not in caplog.text
 
-async def test_if_fires_on_hass_shutdown(hass):
+
+async def test_if_not_fires_when_set_up_after_start(hass: HomeAssistant) -> None:
+    """Test the start trigger stays silent when armed after Home Assistant started."""
+    calls = async_mock_service(hass, "test", "automation")
+    assert hass.state is CoreState.running
+
+    assert await async_setup_component(
+        hass,
+        automation.DOMAIN,
+        {
+            automation.DOMAIN: {
+                "alias": "hello",
+                "trigger": {"platform": "homeassistant", "event": "start"},
+                "action": {"service": "test.automation"},
+            }
+        },
+    )
+    assert automation.is_on(hass, "automation.hello")
+    await hass.async_block_till_done()
+
+    # EVENT_HOMEASSISTANT_STARTED has already fired, so the trigger must not fire.
+    assert len(calls) == 0
+
+
+async def test_if_fires_on_hass_shutdown(hass: HomeAssistant) -> None:
     """Test the firing when Home Assistant shuts down."""
     calls = async_mock_service(hass, "test", "automation")
-    hass.state = CoreState.not_running
+    hass.set_state(CoreState.not_running)
 
     assert await async_setup_component(
         hass,

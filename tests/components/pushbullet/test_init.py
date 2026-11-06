@@ -1,16 +1,16 @@
 """Test pushbullet integration."""
+
 from unittest.mock import patch
 
 from pushbullet import InvalidKeyError, PushbulletError
+from pytest_homeassistant.common import MockConfigEntry
 
 from homeassistant.components.pushbullet.const import DOMAIN
-from homeassistant.config_entries import ConfigEntryState
+from homeassistant.config_entries import SOURCE_REAUTH, ConfigEntryState
 from homeassistant.const import EVENT_HOMEASSISTANT_START
 from homeassistant.core import HomeAssistant
 
 from . import MOCK_CONFIG
-
-from tests.common import MockConfigEntry
 
 
 async def test_async_setup_entry_success(
@@ -25,7 +25,7 @@ async def test_async_setup_entry_success(
 
     await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
-    assert entry.state == ConfigEntryState.LOADED
+    assert entry.state is ConfigEntryState.LOADED
 
     with patch(
         "homeassistant.components.pushbullet.api.PushBulletNotificationProvider.start"
@@ -36,7 +36,7 @@ async def test_async_setup_entry_success(
 
 
 async def test_setup_entry_failed_invalid_key(hass: HomeAssistant) -> None:
-    """Test pushbullet failed setup due to invalid key."""
+    """Test pushbullet failed setup due to invalid key starts reauth."""
     entry = MockConfigEntry(
         domain=DOMAIN,
         data=MOCK_CONFIG,
@@ -48,7 +48,12 @@ async def test_setup_entry_failed_invalid_key(hass: HomeAssistant) -> None:
     ):
         await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
-    assert entry.state == ConfigEntryState.SETUP_ERROR
+    assert entry.state is ConfigEntryState.SETUP_ERROR
+    assert entry.reason == "Invalid API key for Pushbullet"
+    flows = hass.config_entries.flow.async_progress()
+    assert len(flows) == 1
+    assert flows[0]["context"]["source"] == SOURCE_REAUTH
+    assert flows[0]["context"]["entry_id"] == entry.entry_id
 
 
 async def test_setup_entry_failed_conn_error(hass: HomeAssistant) -> None:
@@ -64,7 +69,7 @@ async def test_setup_entry_failed_conn_error(hass: HomeAssistant) -> None:
     ):
         await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
-    assert entry.state == ConfigEntryState.SETUP_RETRY
+    assert entry.state is ConfigEntryState.SETUP_RETRY
 
 
 async def test_async_unload_entry(hass: HomeAssistant, requests_mock_fixture) -> None:
@@ -77,8 +82,8 @@ async def test_async_unload_entry(hass: HomeAssistant, requests_mock_fixture) ->
 
     await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
-    assert entry.state == ConfigEntryState.LOADED
+    assert entry.state is ConfigEntryState.LOADED
 
     await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()
-    assert entry.state == ConfigEntryState.NOT_LOADED
+    assert entry.state is ConfigEntryState.NOT_LOADED

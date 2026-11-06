@@ -1,10 +1,13 @@
 {
   "domain": "amberelectric",
   "name": "Amber Electric",
-  "documentation": "https://www.home-assistant.io/integrations/amberelectric",
-  "config_flow": true,
+  "categories": ["energy.energy_prices"],
   "codeowners": ["@madpilot"],
-  "requirements": ["amberelectric==1.0.4"],
+  "config_flow": true,
+  "connectivity": ["cloud"],
+  "documentation": "https://www.home-assistant.io/integrations/amberelectric",
+  "integration_type": "service",
   "iot_class": "cloud_polling",
-  "loggers": ["amberelectric"]
+  "loggers": ["amberelectric"],
+  "requirements": ["amberelectric==2.0.12"]
 }

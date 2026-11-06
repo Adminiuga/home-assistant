@@ -1,79 +1,157 @@
-"""Support for OPNSense Routers."""
-import logging
+"""Support for OPNsense Routers."""
 
-from pyopnsense import diagnostics
-from pyopnsense.exceptions import APIException
-import voluptuous as vol
-
-from homeassistant.const import CONF_API_KEY, CONF_URL, CONF_VERIFY_SSL, Platform
-from homeassistant.core import HomeAssistant
-import homeassistant.helpers.config_validation as cv
-from homeassistant.helpers.discovery import load_platform
-from homeassistant.helpers.typing import ConfigType
-
-_LOGGER = logging.getLogger(__name__)
-
-CONF_API_SECRET = "api_secret"
-CONF_TRACKER_INTERFACE = "tracker_interfaces"
-
-DOMAIN = "opnsense"
-
-OPNSENSE_DATA = DOMAIN
-
-CONFIG_SCHEMA = vol.Schema(
-    {
-        DOMAIN: vol.Schema(
-            {
-                vol.Required(CONF_URL): cv.url,
-                vol.Required(CONF_API_KEY): cv.string,
-                vol.Required(CONF_API_SECRET): cv.string,
-                vol.Optional(CONF_VERIFY_SSL, default=False): cv.boolean,
-                vol.Optional(CONF_TRACKER_INTERFACE, default=[]): vol.All(
-                    cv.ensure_list, [cv.string]
-                ),
-            }
-        )
-    },
-    extra=vol.ALLOW_EXTRA,
+from aiopnsense import (
+    OPNsenseBelowMinFirmware,
+    OPNsenseClient,
+    OPNsenseConnectionError,
+    OPNsenseInvalidAuth,
+    OPNsenseInvalidURL,
+    OPNsensePrivilegeMissing,
+    OPNsenseSSLError,
+    OPNsenseTimeoutError,
+    OPNsenseUnknownFirmware,
 )
 
+from homeassistant.config_entries import ConfigEntryState
+from homeassistant.const import CONF_API_KEY, CONF_URL, CONF_VERIFY_SSL, Platform
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryError, ConfigEntryNotReady
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+import homeassistant.helpers.config_validation as cv
 
-def setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    """Set up the opnsense component."""
+from .const import CONF_API_SECRET, CONF_TRACKER_INTERFACES, DOMAIN
+from .types import OPNsenseConfigEntry, OPNsenseRuntimeData
 
-    conf = config[DOMAIN]
-    url = conf[CONF_URL]
-    api_key = conf[CONF_API_KEY]
-    api_secret = conf[CONF_API_SECRET]
-    verify_ssl = conf[CONF_VERIFY_SSL]
-    tracker_interfaces = conf[CONF_TRACKER_INTERFACE]
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
-    interfaces_client = diagnostics.InterfaceClient(
-        api_key, api_secret, url, verify_ssl
+PLATFORMS = [Platform.DEVICE_TRACKER]
+
+
+async def async_setup_entry(
+    hass: HomeAssistant, config_entry: OPNsenseConfigEntry
+) -> None:
+    """Set up the OPNsense component from a config entry."""
+    url = config_entry.data[CONF_URL]
+    session = async_get_clientsession(
+        hass, verify_ssl=config_entry.data[CONF_VERIFY_SSL]
     )
+    client = OPNsenseClient(
+        url,
+        config_entry.data[CONF_API_KEY],
+        config_entry.data[CONF_API_SECRET],
+        session,
+        opts={"verify_ssl": config_entry.data[CONF_VERIFY_SSL]},
+    )
+    tracker_interfaces = config_entry.data.get(CONF_TRACKER_INTERFACES, [])
     try:
-        interfaces_client.get_arp()
-    except APIException:
-        _LOGGER.exception("Failure while connecting to OPNsense API endpoint")
-        return False
+        await client.validate()
+        if tracker_interfaces:
+            interfaces_resp = await client.get_interfaces()
+    except OPNsenseUnknownFirmware as err:
+        raise ConfigEntryError(
+            translation_domain=DOMAIN,
+            translation_key="unknown_firmware",
+            translation_placeholders={"url": url},
+        ) from err
+    except OPNsenseBelowMinFirmware as err:
+        raise ConfigEntryError(
+            translation_domain=DOMAIN,
+            translation_key="firmware_too_old",
+            translation_placeholders={"url": url},
+        ) from err
+    except OPNsenseInvalidURL as err:
+        raise ConfigEntryError(
+            translation_domain=DOMAIN,
+            translation_key="invalid_url",
+            translation_placeholders={"url": url},
+        ) from err
+    except OPNsenseTimeoutError as err:
+        raise ConfigEntryNotReady(
+            translation_domain=DOMAIN,
+            translation_key="timeout_connecting",
+            translation_placeholders={"url": url},
+        ) from err
+    except OPNsenseSSLError as err:
+        raise ConfigEntryError(
+            translation_domain=DOMAIN,
+            translation_key="ssl_error",
+            translation_placeholders={"url": url},
+        ) from err
+    except OPNsenseInvalidAuth as err:
+        raise ConfigEntryError(
+            translation_domain=DOMAIN,
+            translation_key="invalid_auth",
+            translation_placeholders={"url": url},
+        ) from err
+    except OPNsensePrivilegeMissing as err:
+        raise ConfigEntryError(
+            translation_domain=DOMAIN,
+            translation_key="privilege_missing",
+            translation_placeholders={"url": url},
+        ) from err
+    except OPNsenseConnectionError as err:
+        raise ConfigEntryNotReady(
+            translation_domain=DOMAIN,
+            translation_key="cannot_connect",
+            translation_placeholders={"url": url},
+        ) from err
 
     if tracker_interfaces:
         # Verify that specified tracker interfaces are valid
-        netinsight_client = diagnostics.NetworkInsightClient(
-            api_key, api_secret, url, verify_ssl
-        )
-        interfaces = list(netinsight_client.get_interfaces().values())
-        for interface in tracker_interfaces:
-            if interface not in interfaces:
-                _LOGGER.error(
-                    "Specified OPNsense tracker interface %s is not found", interface
+        known_interfaces = [
+            name for ifinfo in interfaces_resp.values() if (name := ifinfo.get("name"))
+        ]
+        for intf_description in tracker_interfaces:
+            if intf_description not in known_interfaces:
+                raise ConfigEntryError(
+                    translation_domain=DOMAIN,
+                    translation_key="tracker_interface_not_found",
+                    translation_placeholders={
+                        "interface": intf_description,
+                        "known": ", ".join(known_interfaces),
+                    },
                 )
-                return False
 
-    hass.data[OPNSENSE_DATA] = {
-        "interfaces": interfaces_client,
-        CONF_TRACKER_INTERFACE: tracker_interfaces,
+    config_entry.runtime_data = OPNsenseRuntimeData(
+        client=client,
+        tracker_interfaces=tracker_interfaces,
+    )
+
+    await hass.config_entries.async_forward_entry_setups(config_entry, PLATFORMS)
+
+
+async def async_unload_entry(
+    hass: HomeAssistant, config_entry: OPNsenseConfigEntry
+) -> None:
+    """Unload a config entry."""
+    await hass.config_entries.async_unload_platforms_or_raise(config_entry, PLATFORMS)
+
+
+async def async_remove_config_entry_device(
+    hass: HomeAssistant,
+    config_entry: OPNsenseConfigEntry,
+    device_entry: dr.AnyDeviceEntry,
+) -> bool:
+    """Allow removing a client device while the client is not connected."""
+    if not isinstance(device_entry, dr.DeviceEntry):
+        # This integration does not create child devices.
+        return False
+    if config_entry.state is not ConfigEntryState.LOADED:
+        return True
+    runtime_data = config_entry.runtime_data
+    connected = (
+        coordinator.data
+        if (coordinator := runtime_data.tracker_coordinator) and coordinator.data
+        else {}
+    )
+    device_macs = {
+        mac
+        for connection_type, mac in device_entry.connections
+        if connection_type == dr.CONNECTION_NETWORK_MAC
     }
-
-    load_platform(hass, Platform.DEVICE_TRACKER, DOMAIN, tracker_interfaces, config)
+    if not device_macs.isdisjoint(connected):
+        return False
+    # Forget the client, so it is added again when it reconnects
+    runtime_data.tracked_devices -= device_macs
     return True

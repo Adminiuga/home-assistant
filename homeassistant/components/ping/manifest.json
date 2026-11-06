@@ -1,10 +1,16 @@
 {
   "domain": "ping",
   "name": "Ping (ICMP)",
+  "categories": [
+    "presence_location.network_presence",
+    "computers_network.monitoring"
+  ],
+  "codeowners": ["@jpbede"],
+  "config_flow": true,
   "documentation": "https://www.home-assistant.io/integrations/ping",
-  "codeowners": [],
-  "requirements": ["icmplib==3.0"],
-  "quality_scale": "internal",
+  "integration_type": "service",
   "iot_class": "local_polling",
-  "loggers": ["icmplib"]
+  "loggers": ["icmplib"],
+  "quality_scale": "internal",
+  "requirements": ["icmplib==3.0.4"]
 }

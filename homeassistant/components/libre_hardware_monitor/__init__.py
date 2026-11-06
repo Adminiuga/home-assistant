@@ -1,0 +1,140 @@
+"""The LibreHardwareMonitor integration."""
+
+import logging
+
+from homeassistant.const import Platform, UnitOfDataRate
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr, entity_registry as er
+
+from .const import (
+    DOMAIN,
+    LEGACY_DATA_SIZE_UNIT_EQUIVALENTS,
+    THROUGHPUT_UNIQUE_ID_FRAGMENT,
+)
+from .coordinator import (
+    LibreHardwareMonitorConfigEntry,
+    LibreHardwareMonitorCoordinator,
+)
+
+PLATFORMS = [Platform.SENSOR]
+
+_LOGGER = logging.getLogger(__name__)
+
+
+async def async_migrate_entry(
+    hass: HomeAssistant, config_entry: LibreHardwareMonitorConfigEntry
+) -> None:
+    """Migrate to current config flow version."""
+    _LOGGER.debug(
+        "Migrating from version %s.%s", config_entry.version, config_entry.minor_version
+    )
+
+    if config_entry.version == 1:
+        # Migrate entity identifiers
+        entity_registry = er.async_get(hass)
+        registry_entries = er.async_entries_for_config_entry(
+            entity_registry, config_entry.entry_id
+        )
+        for reg_entry in registry_entries:
+            new_unique_id = f"{config_entry.entry_id}_{reg_entry.unique_id[4:]}"
+            _LOGGER.debug(
+                "Migrating entity %s unique id from %s to %s",
+                reg_entry.entity_id,
+                reg_entry.unique_id,
+                new_unique_id,
+            )
+            entity_registry.async_update_entity(
+                reg_entry.entity_id, new_unique_id=new_unique_id
+            )
+
+        # Migrate device identifiers
+        device_registry = dr.async_get(hass)
+        device_entries = dr.async_entries_for_config_entry(
+            registry=device_registry, config_entry_id=config_entry.entry_id
+        )
+        for device in device_entries:
+            old_device_id = next(iter(device.identifiers))[1]
+            new_device_id = f"{config_entry.entry_id}_{old_device_id}"
+            _LOGGER.debug(
+                "Migrating device %s unique id from %s to %s",
+                device.name,
+                old_device_id,
+                new_device_id,
+            )
+            device_registry.async_update_device(
+                device_id=device.id,
+                new_identifiers={(DOMAIN, new_device_id)},
+            )
+
+        hass.config_entries.async_update_entry(
+            config_entry, data=config_entry.data, version=2, minor_version=1
+        )
+
+        _LOGGER.debug("Migration to version 2.1 successful")
+
+    if config_entry.version == 2 and config_entry.minor_version == 1:
+        # Migrate Throughput unit from KB/s to KiB/s
+        entity_registry = er.async_get(hass)
+        registry_entries = er.async_entries_for_config_entry(
+            entity_registry, config_entry.entry_id
+        )
+
+        throughput_entities = [
+            entry
+            for entry in registry_entries
+            if THROUGHPUT_UNIQUE_ID_FRAGMENT in entry.unique_id
+        ]
+        for reg_entry in throughput_entities:
+            _LOGGER.debug(
+                "Migrating entity %s unit from %s to %s",
+                reg_entry.entity_id,
+                reg_entry.unit_of_measurement,
+                UnitOfDataRate.KIBIBYTES_PER_SECOND,
+            )
+            entity_registry.async_update_entity(
+                reg_entry.entity_id,
+                unit_of_measurement=UnitOfDataRate.KIBIBYTES_PER_SECOND,
+            )
+
+        # Migrate binary Data units LHM labels MB and GB to MiB and GiB
+        for reg_entry in registry_entries:
+            if not (
+                data_size_unit := LEGACY_DATA_SIZE_UNIT_EQUIVALENTS.get(
+                    reg_entry.unit_of_measurement
+                )
+            ):
+                continue
+            _LOGGER.debug(
+                "Migrating entity %s unit from %s to %s",
+                reg_entry.entity_id,
+                reg_entry.unit_of_measurement,
+                data_size_unit,
+            )
+            entity_registry.async_update_entity(
+                reg_entry.entity_id, unit_of_measurement=data_size_unit
+            )
+
+        hass.config_entries.async_update_entry(
+            config_entry, data=config_entry.data, version=2, minor_version=2
+        )
+
+        _LOGGER.debug("Migration to version 2.2 successful")
+
+
+async def async_setup_entry(
+    hass: HomeAssistant, config_entry: LibreHardwareMonitorConfigEntry
+) -> None:
+    """Set up LibreHardwareMonitor from a config entry."""
+
+    lhm_coordinator = LibreHardwareMonitorCoordinator(hass, config_entry)
+    await lhm_coordinator.async_config_entry_first_refresh()
+
+    config_entry.runtime_data = lhm_coordinator
+    await hass.config_entries.async_forward_entry_setups(config_entry, PLATFORMS)
+
+
+async def async_unload_entry(
+    hass: HomeAssistant, config_entry: LibreHardwareMonitorConfigEntry
+) -> None:
+    """Unload a config entry."""
+    await hass.config_entries.async_unload_platforms_or_raise(config_entry, PLATFORMS)

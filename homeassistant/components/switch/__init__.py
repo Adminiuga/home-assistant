@@ -1,60 +1,64 @@
 """Component to interface with switches that can be controlled remotely."""
-from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import timedelta
 import logging
 
-import voluptuous as vol
-
-from homeassistant.backports.enum import StrEnum
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     SERVICE_TOGGLE,
     SERVICE_TURN_OFF,
     SERVICE_TURN_ON,
+    STATE_OFF,
     STATE_ON,
 )
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers.config_validation import (  # noqa: F401
-    PLATFORM_SCHEMA,
-    PLATFORM_SCHEMA_BASE,
-)
-from homeassistant.helpers.entity import ToggleEntity, ToggleEntityDescription
+from homeassistant.core import DOMAIN as HOMEASSISTANT_DOMAIN, HomeAssistant
+from homeassistant.exceptions import ConfigEntryError
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.entity_component import EntityComponent
 from homeassistant.helpers.typing import ConfigType
-from homeassistant.loader import bind_hass
 
-from .const import DOMAIN
-
-SCAN_INTERVAL = timedelta(seconds=30)
-
-ENTITY_ID_FORMAT = DOMAIN + ".{}"
-
-MIN_TIME_BETWEEN_SCANS = timedelta(seconds=10)
+from .const import (
+    DATA_COMPONENT,
+    DEVICE_CLASSES_SCHEMA,
+    DOMAIN,
+    SwitchDeviceClass,
+    SwitchService,
+)
+from .entity import SwitchEntity, SwitchEntityDescription
+from .services import async_setup_services
 
 _LOGGER = logging.getLogger(__name__)
 
+ENTITY_ID_FORMAT = DOMAIN + ".{}"
+PLATFORM_SCHEMA = cv.PLATFORM_SCHEMA
+PLATFORM_SCHEMA_BASE = cv.PLATFORM_SCHEMA_BASE
+SCAN_INTERVAL = timedelta(seconds=30)
 
-class SwitchDeviceClass(StrEnum):
-    """Device class for switches."""
-
-    OUTLET = "outlet"
-    SWITCH = "switch"
+MIN_TIME_BETWEEN_SCANS = timedelta(seconds=10)
 
 
-DEVICE_CLASSES_SCHEMA = vol.All(vol.Lower, vol.Coerce(SwitchDeviceClass))
-
-# DEVICE_CLASS* below are deprecated as of 2021.12
-# use the SwitchDeviceClass enum instead.
 DEVICE_CLASSES = [cls.value for cls in SwitchDeviceClass]
-DEVICE_CLASS_OUTLET = SwitchDeviceClass.OUTLET.value
-DEVICE_CLASS_SWITCH = SwitchDeviceClass.SWITCH.value
+
+__all__ = [
+    "DEVICE_CLASSES_SCHEMA",
+    "DOMAIN",
+    "ENTITY_ID_FORMAT",
+    "PLATFORM_SCHEMA",
+    "PLATFORM_SCHEMA_BASE",
+    "SERVICE_TOGGLE",
+    "SERVICE_TURN_OFF",
+    "SERVICE_TURN_ON",
+    "STATE_OFF",
+    "STATE_ON",
+    "SwitchDeviceClass",
+    "SwitchEntity",
+    "SwitchEntityDescription",
+    "SwitchService",
+]
 
 # mypy: disallow-any-generics
 
 
-@bind_hass
 def is_on(hass: HomeAssistant, entity_id: str) -> bool:
     """Return if the switch is on based on the statemachine.
 
@@ -65,48 +69,26 @@ def is_on(hass: HomeAssistant, entity_id: str) -> bool:
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Track states and offer events for switches."""
-    component = hass.data[DOMAIN] = EntityComponent[SwitchEntity](
+    component = hass.data[DATA_COMPONENT] = EntityComponent[SwitchEntity](
         _LOGGER, DOMAIN, hass, SCAN_INTERVAL
     )
     await component.async_setup(config)
 
-    component.async_register_entity_service(SERVICE_TURN_OFF, {}, "async_turn_off")
-    component.async_register_entity_service(SERVICE_TURN_ON, {}, "async_turn_on")
-    component.async_register_entity_service(SERVICE_TOGGLE, {}, "async_toggle")
+    async_setup_services(hass)
 
     return True
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Set up a config entry."""
-    component: EntityComponent[SwitchEntity] = hass.data[DOMAIN]
-    return await component.async_setup_entry(entry)
+    if not await hass.data[DATA_COMPONENT].async_setup_entry(entry):
+        raise ConfigEntryError(
+            translation_domain=HOMEASSISTANT_DOMAIN,
+            translation_key="platform_setup_failed",
+            translation_placeholders={"platform": entry.domain, "domain": DOMAIN},
+        )
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Unload a config entry."""
-    component: EntityComponent[SwitchEntity] = hass.data[DOMAIN]
-    return await component.async_unload_entry(entry)
-
-
-@dataclass
-class SwitchEntityDescription(ToggleEntityDescription):
-    """A class that describes switch entities."""
-
-    device_class: SwitchDeviceClass | str | None = None
-
-
-class SwitchEntity(ToggleEntity):
-    """Base class for switch entities."""
-
-    entity_description: SwitchEntityDescription
-    _attr_device_class: SwitchDeviceClass | str | None
-
-    @property
-    def device_class(self) -> SwitchDeviceClass | str | None:
-        """Return the class of this entity."""
-        if hasattr(self, "_attr_device_class"):
-            return self._attr_device_class
-        if hasattr(self, "entity_description"):
-            return self.entity_description.device_class
-        return None
+    await hass.data[DATA_COMPONENT].async_unload_entry(entry)

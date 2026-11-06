@@ -1,11 +1,21 @@
 {
   "domain": "twinkly",
   "name": "Twinkly",
-  "documentation": "https://www.home-assistant.io/integrations/twinkly",
-  "requirements": ["ttls==1.4.3"],
-  "codeowners": ["@dr1rrb", "@Robbie1221"],
+  "categories": ["lighting.led_strips_controllers"],
+  "codeowners": ["@dr1rrb", "@Robbie1221", "@Olen"],
   "config_flow": true,
-  "dhcp": [{ "hostname": "twinkly_*" }],
+  "connectivity": ["network"],
+  "dhcp": [
+    {
+      "hostname": "twinkly_*"
+    },
+    {
+      "hostname": "twinkly-*"
+    }
+  ],
+  "documentation": "https://www.home-assistant.io/integrations/twinkly",
+  "integration_type": "device",
   "iot_class": "local_polling",
-  "loggers": ["ttls"]
+  "loggers": ["ttls"],
+  "requirements": ["ttls==1.11.1"]
 }

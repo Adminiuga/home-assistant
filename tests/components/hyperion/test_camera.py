@@ -1,5 +1,4 @@
 """Tests for the Hyperion integration."""
-from __future__ import annotations
 
 import asyncio
 import base64
@@ -177,7 +176,11 @@ async def test_camera_stream_failed_start_stream_call(hass: HomeAssistant) -> No
     assert not client.async_send_image_stream_stop.called
 
 
-async def test_device_info(hass: HomeAssistant) -> None:
+async def test_device_info(
+    hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
+    entity_registry: er.EntityRegistry,
+) -> None:
     """Verify device information includes expected details."""
     client = create_mock_client()
 
@@ -190,17 +193,17 @@ async def test_device_info(hass: HomeAssistant) -> None:
     await setup_test_config_entry(hass, hyperion_client=client)
 
     device_id = get_hyperion_device_id(TEST_SYSINFO_ID, TEST_INSTANCE)
-    device_registry = dr.async_get(hass)
 
-    device = device_registry.async_get_device({(DOMAIN, device_id)})
+    device = device_registry.async_get_device_by_identifier(
+        (DOMAIN, device_id), TEST_CONFIG_ENTRY_ID
+    )
     assert device
-    assert device.config_entries == {TEST_CONFIG_ENTRY_ID}
+    assert device.config_entry_id == TEST_CONFIG_ENTRY_ID
     assert device.identifiers == {(DOMAIN, device_id)}
     assert device.manufacturer == HYPERION_MANUFACTURER_NAME
     assert device.model == HYPERION_MODEL_NAME
     assert device.name == TEST_INSTANCE_1["friendly_name"]
 
-    entity_registry = er.async_get(hass)
     entities_from_device = [
         entry.entity_id
         for entry in er.async_entries_for_device(entity_registry, device.id)

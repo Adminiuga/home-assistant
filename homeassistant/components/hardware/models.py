@@ -1,13 +1,33 @@
 """Models for Hardware."""
-from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Protocol
 
-from homeassistant.core import HomeAssistant, callback
+import psutil_home_assistant as ha_psutil
+
+from homeassistant.components import websocket_api
+from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
+from homeassistant.helpers.integration_platform import LazyIntegrationPlatforms
 
 
 @dataclass
+class HardwareData:
+    """Hardware data."""
+
+    hardware_platforms: LazyIntegrationPlatforms[HardwareProtocol]
+    system_status: SystemStatus
+
+
+@dataclass(slots=True)
+class SystemStatus:
+    """System status."""
+
+    ha_psutil: ha_psutil
+    remove_periodic_timer: CALLBACK_TYPE | None
+    subscribers: set[tuple[websocket_api.ActiveConnection, int]]
+
+
+@dataclass(slots=True)
 class BoardInfo:
     """Board info type."""
 
@@ -17,7 +37,7 @@ class BoardInfo:
     revision: str | None
 
 
-@dataclass(frozen=True)
+@dataclass(slots=True, frozen=True)
 class USBInfo:
     """USB info type."""
 
@@ -28,12 +48,13 @@ class USBInfo:
     description: str | None
 
 
-@dataclass(frozen=True)
+@dataclass(slots=True, frozen=True)
 class HardwareInfo:
     """Hardware info type."""
 
     name: str | None
     board: BoardInfo | None
+    config_entries: list[str] | None
     dongle: USBInfo | None
     url: str | None
 

@@ -1,9 +1,13 @@
 {
   "domain": "feedreader",
   "name": "Feedreader",
+  "categories": ["news_social_media"],
+  "codeowners": ["@mib1185"],
+  "config_flow": true,
+  "connectivity": ["cloud", "network"],
   "documentation": "https://www.home-assistant.io/integrations/feedreader",
-  "requirements": ["feedparser==6.0.10"],
-  "codeowners": [],
+  "integration_type": "service",
   "iot_class": "cloud_polling",
-  "loggers": ["feedparser", "sgmllib3k"]
+  "loggers": ["feedparser", "sgmllib3k"],
+  "requirements": ["feedparser==6.0.12"]
 }

@@ -1,17 +1,24 @@
 """Test the Home Assistant Yellow hardware platform."""
+
 from unittest.mock import patch
 
 import pytest
+from pytest_homeassistant.common import MockConfigEntry, MockModule, mock_integration
+from pytest_homeassistant.typing import WebSocketGenerator
 
+from homeassistant.components.hassio import DOMAIN as HASSIO_DOMAIN, HassioNotReadyError
 from homeassistant.components.homeassistant_yellow.const import DOMAIN
 from homeassistant.core import HomeAssistant
+from homeassistant.setup import async_setup_component
 
-from tests.common import MockConfigEntry, MockModule, mock_integration
 
-
-async def test_hardware_info(hass: HomeAssistant, hass_ws_client) -> None:
+@pytest.mark.usefixtures("supervisor_client")
+async def test_hardware_info(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator, addon_store_info
+) -> None:
     """Test we can get the board info."""
     mock_integration(hass, MockModule("hassio"))
+    await async_setup_component(hass, HASSIO_DOMAIN, {})
 
     # Setup the config entry
     config_entry = MockConfigEntry(
@@ -48,18 +55,23 @@ async def test_hardware_info(hass: HomeAssistant, hass_ws_client) -> None:
                     "model": "yellow",
                     "revision": None,
                 },
+                "config_entries": [config_entry.entry_id],
                 "dongle": None,
                 "name": "Home Assistant Yellow",
-                "url": None,
+                "url": "https://support.nabucasa.com/hc/en-us/categories/24734575925149-Home-Assistant-Yellow",
             }
         ]
     }
 
 
-@pytest.mark.parametrize("os_info", [None, {"board": None}, {"board": "other"}])
-async def test_hardware_info_fail(hass: HomeAssistant, hass_ws_client, os_info) -> None:
+@pytest.mark.parametrize("os_info", [{"board": None}, {"board": "other"}])
+@pytest.mark.usefixtures("supervisor_client")
+async def test_hardware_info_fail(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator, os_info, addon_store_info
+) -> None:
     """Test async_info raises if os_info is not as expected."""
     mock_integration(hass, MockModule("hassio"))
+    await async_setup_component(hass, HASSIO_DOMAIN, {})
 
     # Setup the config entry
     config_entry = MockConfigEntry(
@@ -81,6 +93,43 @@ async def test_hardware_info_fail(hass: HomeAssistant, hass_ws_client, os_info) 
     with patch(
         "homeassistant.components.homeassistant_yellow.hardware.get_os_info",
         return_value=os_info,
+    ):
+        await client.send_json({"id": 1, "type": "hardware/info"})
+        msg = await client.receive_json()
+
+    assert msg["id"] == 1
+    assert msg["success"]
+    assert msg["result"] == {"hardware": []}
+
+
+@pytest.mark.usefixtures("supervisor_client")
+async def test_hardware_info_not_ready(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator, addon_store_info
+) -> None:
+    """Test async_info raises HassioNotReadyError when hassio is not ready."""
+    mock_integration(hass, MockModule("hassio"))
+    await async_setup_component(hass, HASSIO_DOMAIN, {})
+
+    # Setup the config entry
+    config_entry = MockConfigEntry(
+        data={},
+        domain=DOMAIN,
+        options={},
+        title="Home Assistant Yellow",
+    )
+    config_entry.add_to_hass(hass)
+    with patch(
+        "homeassistant.components.homeassistant_yellow.get_os_info",
+        return_value={"board": "yellow"},
+    ):
+        assert await hass.config_entries.async_setup(config_entry.entry_id)
+        await hass.async_block_till_done()
+
+    client = await hass_ws_client(hass)
+
+    with patch(
+        "homeassistant.components.homeassistant_yellow.hardware.get_os_info",
+        side_effect=HassioNotReadyError,
     ):
         await client.send_json({"id": 1, "type": "hardware/info"})
         msg = await client.receive_json()

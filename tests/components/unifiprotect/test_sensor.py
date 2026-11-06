@@ -1,35 +1,47 @@
 """Test the UniFi Protect sensor platform."""
-# pylint: disable=protected-access
-from __future__ import annotations
 
+from collections.abc import Callable, Coroutine
 from datetime import datetime, timedelta
-from unittest.mock import AsyncMock, Mock
+from typing import Any
+from unittest.mock import Mock
 
-from pyunifiprotect.data import (
+import pytest
+from uiprotect.data import (
     NVR,
     Camera,
+    DeviceState,
+    DoorbellMessageType,
     Event,
     EventType,
+    Light,
+    LightModeEnableType,
+    LightModeType,
+    ModelType,
+    Permission,
+    PublicLcdMessage,
     Sensor,
-    SmartDetectObjectType,
+    WSAction,
 )
-from pyunifiprotect.data.nvr import EventMetadata
+from uiprotect.data.devices import Hotplug
+from uiprotect.data.nvr import EventMetadata
+from uiprotect.data.public_devices import SensorFeatureCapability
+from uiprotect.utils import convert_to_datetime, to_js_time
+from uiprotect.websocket import WebsocketState
 
-from homeassistant.components.unifiprotect.const import (
-    ATTR_EVENT_SCORE,
-    DEFAULT_ATTRIBUTION,
-)
+from homeassistant.components.unifiprotect.const import DEFAULT_ATTRIBUTION, DOMAIN
 from homeassistant.components.unifiprotect.sensor import (
     ALL_DEVICES_SENSORS,
     CAMERA_DISABLED_SENSORS,
     CAMERA_SENSORS,
-    MOTION_SENSORS,
+    DOORBELL_TRIP_SENSORS,
+    LIGHT_SENSORS,
     MOTION_TRIP_SENSORS,
     NVR_DISABLED_SENSORS,
     NVR_SENSORS,
-    OBJECT_TYPE_NONE,
     SENSE_SENSORS,
+    ProtectSensorEntityDescription,
 )
+from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import (
     ATTR_ATTRIBUTION,
     STATE_UNAVAILABLE,
@@ -38,6 +50,7 @@ from homeassistant.const import (
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
+from homeassistant.util.dt import utcnow
 
 from .utils import (
     MockUFPFixture,
@@ -46,52 +59,127 @@ from .utils import (
     enable_entity,
     ids_from_device_description,
     init_entry,
+    make_public_camera,
+    make_public_light,
+    make_public_sensor,
+    public_device_ws_message,
+    registered_keys,
     remove_entities,
     reset_objects,
+    setup_public_camera,
+    setup_public_light,
+    setup_public_sensor,
     time_changed,
 )
 
-CAMERA_SENSORS_WRITE = CAMERA_SENSORS[:5]
+pytestmark = pytest.mark.usefixtures("mock_private_only_entities_registered")
+
+
+def get_sensor_by_key(sensors: tuple, key: str) -> ProtectSensorEntityDescription:
+    """Get sensor description by key."""
+    for sensor in sensors:
+        if sensor.key == key:
+            return sensor
+    raise ValueError(f"Sensor with key '{key}' not found")
+
+
+# Constants for test slicing (subsets of sensor tuples)
+CAMERA_SENSORS_WRITE = CAMERA_SENSORS[:4]
 SENSE_SENSORS_WRITE = SENSE_SENSORS[:8]
 
 
 async def test_sensor_camera_remove(
     hass: HomeAssistant, ufp: MockUFPFixture, doorbell: Camera, unadopted_camera: Camera
-):
+) -> None:
     """Test removing and re-adding a camera device."""
 
     ufp.api.bootstrap.nvr.system_info.ustorage = None
     await init_entry(hass, ufp, [doorbell, unadopted_camera])
-    assert_entity_counts(hass, Platform.SENSOR, 25, 13)
+    assert_entity_counts(hass, Platform.SENSOR, 24, 12)
     await remove_entities(hass, ufp, [doorbell, unadopted_camera])
     assert_entity_counts(hass, Platform.SENSOR, 12, 9)
     await adopt_devices(hass, ufp, [doorbell, unadopted_camera])
-    assert_entity_counts(hass, Platform.SENSOR, 25, 13)
+    assert_entity_counts(hass, Platform.SENSOR, 24, 12)
 
 
 async def test_sensor_sensor_remove(
     hass: HomeAssistant, ufp: MockUFPFixture, sensor_all: Sensor
-):
+) -> None:
     """Test removing and re-adding a light device."""
 
     ufp.api.bootstrap.nvr.system_info.ustorage = None
     await init_entry(hass, ufp, [sensor_all])
-    assert_entity_counts(hass, Platform.SENSOR, 22, 14)
+    assert_entity_counts(hass, Platform.SENSOR, 23, 14)
     await remove_entities(hass, ufp, [sensor_all])
     assert_entity_counts(hass, Platform.SENSOR, 12, 9)
     await adopt_devices(hass, ufp, [sensor_all])
-    assert_entity_counts(hass, Platform.SENSOR, 22, 14)
+    assert_entity_counts(hass, Platform.SENSOR, 23, 14)
+
+
+async def test_sensor_sense_capability_creation_filter(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    ufp: MockUFPFixture,
+    sensor_all: Sensor,
+) -> None:
+    """A capability map limits sensor entity creation to the advertised capabilities."""
+    setup_public_sensor(
+        ufp,
+        capabilities={SensorFeatureCapability.OPEN, SensorFeatureCapability.TAMPER},
+    )
+    await init_entry(hass, ufp, [sensor_all])
+
+    for key, created in (
+        ("battery_level", True),
+        ("door_last_trip_time", True),
+        ("tampering_last_trip_time", True),
+        ("temperature_level", False),
+        ("humidity_level", False),
+        ("light_level", False),
+        ("alarm_sound", False),
+        ("motion_last_trip_time", False),
+    ):
+        description = next(d for d in SENSE_SENSORS if d.key == key)
+        _, entity_id = await ids_from_device_description(
+            hass, Platform.SENSOR, sensor_all, description
+        )
+        assert (entity_registry.async_get(entity_id) is not None) is created, key
+
+
+async def test_sensor_sense_metrics_read_their_own_public_path(
+    hass: HomeAssistant,
+    ufp: MockUFPFixture,
+    sensor_all: Sensor,
+) -> None:
+    """Each environmental sensor reads its own metric from the public object.
+
+    The fixture reports the same number for light, humidity and temperature, so
+    a swapped ``ufp_public_value`` path would go unnoticed without diverging
+    values here.
+    """
+    setup_public_sensor(
+        ufp, light_value=11.0, humidity_value=22.0, temperature_value=33.0
+    )
+    await init_entry(hass, ufp, [sensor_all])
+
+    name = sensor_all.name.lower().replace(" ", "_")
+    assert hass.states.get(f"sensor.{name}_illuminance").state == "11.0"
+    assert hass.states.get(f"sensor.{name}_humidity").state == "22.0"
+    assert hass.states.get(f"sensor.{name}_temperature").state == "33.0"
 
 
 async def test_sensor_setup_sensor(
-    hass: HomeAssistant, ufp: MockUFPFixture, sensor_all: Sensor
-):
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    ufp: MockUFPFixture,
+    sensor_all: Sensor,
+) -> None:
     """Test sensor entity setup for sensor devices."""
 
+    # The private fixture reports -50; the sensor must read the public value.
+    setup_public_sensor(ufp, signal_strength=-71, signal_quality=87)
     await init_entry(hass, ufp, [sensor_all])
-    assert_entity_counts(hass, Platform.SENSOR, 22, 14)
-
-    entity_registry = er.async_get(hass)
+    assert_entity_counts(hass, Platform.SENSOR, 23, 14)
 
     expected_values = (
         "10",
@@ -103,8 +191,8 @@ async def test_sensor_setup_sensor(
     for index, description in enumerate(SENSE_SENSORS_WRITE):
         if not description.entity_registry_enabled_default:
             continue
-        unique_id, entity_id = ids_from_device_description(
-            Platform.SENSOR, sensor_all, description
+        unique_id, entity_id = await ids_from_device_description(
+            hass, Platform.SENSOR, sensor_all, description
         )
 
         entity = entity_registry.async_get(entity_id)
@@ -116,9 +204,12 @@ async def test_sensor_setup_sensor(
         assert state.state == expected_values[index]
         assert state.attributes[ATTR_ATTRIBUTION] == DEFAULT_ATTRIBUTION
 
-    # BLE signal
-    unique_id, entity_id = ids_from_device_description(
-        Platform.SENSOR, sensor_all, ALL_DEVICES_SENSORS[1]
+    # Signal strength
+    unique_id, entity_id = await ids_from_device_description(
+        hass,
+        Platform.SENSOR,
+        sensor_all,
+        get_sensor_by_key(SENSE_SENSORS, "signal_strength"),
     )
 
     entity = entity_registry.async_get(entity_id)
@@ -126,23 +217,46 @@ async def test_sensor_setup_sensor(
     assert entity.disabled is True
     assert entity.unique_id == unique_id
 
+    assert (
+        entity_id
+        == f"sensor.{sensor_all.name.lower().replace(' ', '_')}_signal_strength"
+    )
+
     await enable_entity(hass, ufp.entry.entry_id, entity_id)
 
     state = hass.states.get(entity_id)
     assert state
-    assert state.state == "-50"
+    assert state.state == "-71"
     assert state.attributes[ATTR_ATTRIBUTION] == DEFAULT_ATTRIBUTION
+
+    # Signal quality
+    _, entity_id = await ids_from_device_description(
+        hass,
+        Platform.SENSOR,
+        sensor_all,
+        get_sensor_by_key(SENSE_SENSORS, "signal_quality"),
+    )
+    await enable_entity(hass, ufp.entry.entry_id, entity_id)
+    assert hass.states.get(entity_id).state == "87"
 
 
 async def test_sensor_setup_sensor_none(
-    hass: HomeAssistant, ufp: MockUFPFixture, sensor: Sensor
-):
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    ufp: MockUFPFixture,
+    sensor: Sensor,
+) -> None:
     """Test sensor entity setup for sensor devices with no sensors enabled."""
 
+    setup_public_sensor(
+        ufp,
+        motion_enabled=False,
+        temperature_enabled=False,
+        humidity_enabled=False,
+        light_enabled=False,
+    )
     await init_entry(hass, ufp, [sensor])
-    assert_entity_counts(hass, Platform.SENSOR, 22, 14)
-
-    entity_registry = er.async_get(hass)
+    assert_entity_counts(hass, Platform.SENSOR, 23, 14)
 
     expected_values = (
         "10",
@@ -154,8 +268,8 @@ async def test_sensor_setup_sensor_none(
     for index, description in enumerate(SENSE_SENSORS_WRITE):
         if not description.entity_registry_enabled_default:
             continue
-        unique_id, entity_id = ids_from_device_description(
-            Platform.SENSOR, sensor, description
+        unique_id, entity_id = await ids_from_device_description(
+            hass, Platform.SENSOR, sensor, description
         )
 
         entity = entity_registry.async_get(entity_id)
@@ -168,9 +282,117 @@ async def test_sensor_setup_sensor_none(
         assert state.attributes[ATTR_ATTRIBUTION] == DEFAULT_ATTRIBUTION
 
 
+async def test_sensor_battery_public_ws_update(
+    hass: HomeAssistant,
+    ufp: MockUFPFixture,
+    sensor_all: Sensor,
+) -> None:
+    """Battery level refreshes from a public devices WS update."""
+    setup_public_sensor(ufp)
+    await init_entry(hass, ufp, [sensor_all])
+
+    _, entity_id = await ids_from_device_description(
+        hass, Platform.SENSOR, sensor_all, SENSE_SENSORS_WRITE[0]
+    )
+    assert hass.states.get(entity_id).state == "10"
+
+    public = make_public_sensor(sensor_all, percentage=42)
+    ufp.devices_ws_subscription(public_device_ws_message(public))
+    await hass.async_block_till_done()
+
+    assert hass.states.get(entity_id).state == "42"
+
+
+async def test_sensor_battery_unavailable_on_public_disconnect(
+    hass: HomeAssistant,
+    ufp: MockUFPFixture,
+    sensor_all: Sensor,
+) -> None:
+    """Battery availability follows the public object's connection state."""
+    setup_public_sensor(ufp)
+    await init_entry(hass, ufp, [sensor_all])
+
+    _, entity_id = await ids_from_device_description(
+        hass, Platform.SENSOR, sensor_all, SENSE_SENSORS_WRITE[0]
+    )
+    assert hass.states.get(entity_id).state == "10"
+
+    public = make_public_sensor(sensor_all, state=DeviceState.DISCONNECTED)
+    ufp.devices_ws_subscription(public_device_ws_message(public))
+    await hass.async_block_till_done()
+
+    assert hass.states.get(entity_id).state == STATE_UNAVAILABLE
+
+
+async def test_sensor_battery_unavailable_without_public_api(
+    hass: HomeAssistant,
+    ufp: MockUFPFixture,
+    sensor_all: Sensor,
+) -> None:
+    """A migrated battery entity is unavailable without a public object."""
+    await init_entry(hass, ufp, [sensor_all])
+
+    _, entity_id = await ids_from_device_description(
+        hass, Platform.SENSOR, sensor_all, SENSE_SENSORS_WRITE[0]
+    )
+    assert hass.states.get(entity_id).state == STATE_UNAVAILABLE
+
+
+async def test_sensor_battery_unavailable_on_public_ws_disconnect(
+    hass: HomeAssistant,
+    ufp: MockUFPFixture,
+    sensor_all: Sensor,
+) -> None:
+    """Battery follows the public websocket health, not the private one."""
+    setup_public_sensor(ufp)
+    await init_entry(hass, ufp, [sensor_all])
+
+    _, entity_id = await ids_from_device_description(
+        hass, Platform.SENSOR, sensor_all, SENSE_SENSORS_WRITE[0]
+    )
+    assert hass.states.get(entity_id).state == "10"
+
+    assert ufp.devices_ws_state_subscription is not None
+    ufp.devices_ws_state_subscription(WebsocketState.DISCONNECTED)
+    await hass.async_block_till_done()
+
+    assert hass.states.get(entity_id).state == STATE_UNAVAILABLE
+
+
+async def test_sensor_battery_refreshes_on_public_ws_reconnect(
+    hass: HomeAssistant,
+    ufp: MockUFPFixture,
+    sensor_all: Sensor,
+) -> None:
+    """Battery re-reads the bootstrap on public websocket reconnect."""
+    setup_public_sensor(ufp)
+    await init_entry(hass, ufp, [sensor_all])
+
+    _, entity_id = await ids_from_device_description(
+        hass, Platform.SENSOR, sensor_all, SENSE_SENSORS_WRITE[0]
+    )
+    assert hass.states.get(entity_id).state == "10"
+
+    assert ufp.devices_ws_state_subscription is not None
+    ufp.devices_ws_state_subscription(WebsocketState.DISCONNECTED)
+    await hass.async_block_till_done()
+    assert hass.states.get(entity_id).state == STATE_UNAVAILABLE
+
+    # Value changes while the socket is down; the fake rebuilds on lookup, so
+    # re-seed it with the new value.
+    setup_public_sensor(ufp, percentage=55)
+    ufp.devices_ws_state_subscription(WebsocketState.CONNECTED)
+    await hass.async_block_till_done()
+
+    assert hass.states.get(entity_id).state == "55"
+
+
 async def test_sensor_setup_nvr(
-    hass: HomeAssistant, ufp: MockUFPFixture, fixed_now: datetime
-):
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    ufp: MockUFPFixture,
+    fixed_now: datetime,
+) -> None:
     """Test sensor entity setup for NVR device."""
 
     reset_objects(ufp.api.bootstrap)
@@ -194,8 +416,6 @@ async def test_sensor_setup_nvr(
 
     assert_entity_counts(hass, Platform.SENSOR, 12, 9)
 
-    entity_registry = er.async_get(hass)
-
     expected_values = (
         fixed_now.replace(second=0, microsecond=0).isoformat(),
         "50.0",
@@ -208,8 +428,8 @@ async def test_sensor_setup_nvr(
         "50",
     )
     for index, description in enumerate(NVR_SENSORS):
-        unique_id, entity_id = ids_from_device_description(
-            Platform.SENSOR, nvr, description
+        unique_id, entity_id = await ids_from_device_description(
+            hass, Platform.SENSOR, nvr, description
         )
 
         entity = entity_registry.async_get(entity_id)
@@ -227,8 +447,8 @@ async def test_sensor_setup_nvr(
 
     expected_values = ("50.0", "50.0", "50.0")
     for index, description in enumerate(NVR_DISABLED_SENSORS):
-        unique_id, entity_id = ids_from_device_description(
-            Platform.SENSOR, nvr, description
+        unique_id, entity_id = await ids_from_device_description(
+            hass, Platform.SENSOR, nvr, description
         )
 
         entity = entity_registry.async_get(entity_id)
@@ -244,7 +464,9 @@ async def test_sensor_setup_nvr(
         assert state.attributes[ATTR_ATTRIBUTION] == DEFAULT_ATTRIBUTION
 
 
-async def test_sensor_nvr_missing_values(hass: HomeAssistant, ufp: MockUFPFixture):
+async def test_sensor_nvr_missing_values(
+    hass: HomeAssistant, entity_registry: er.EntityRegistry, ufp: MockUFPFixture
+) -> None:
     """Test NVR sensor sensors if no data available."""
 
     reset_objects(ufp.api.bootstrap)
@@ -259,12 +481,10 @@ async def test_sensor_nvr_missing_values(hass: HomeAssistant, ufp: MockUFPFixtur
 
     assert_entity_counts(hass, Platform.SENSOR, 12, 9)
 
-    entity_registry = er.async_get(hass)
-
     # Uptime
-    description = NVR_SENSORS[0]
-    unique_id, entity_id = ids_from_device_description(
-        Platform.SENSOR, nvr, description
+    description = get_sensor_by_key(NVR_SENSORS, "uptime")
+    unique_id, entity_id = await ids_from_device_description(
+        hass, Platform.SENSOR, nvr, description
     )
 
     entity = entity_registry.async_get(entity_id)
@@ -278,10 +498,10 @@ async def test_sensor_nvr_missing_values(hass: HomeAssistant, ufp: MockUFPFixtur
     assert state.state == STATE_UNKNOWN
     assert state.attributes[ATTR_ATTRIBUTION] == DEFAULT_ATTRIBUTION
 
-    # Memory
-    description = NVR_SENSORS[8]
-    unique_id, entity_id = ids_from_device_description(
-        Platform.SENSOR, nvr, description
+    # Recording capacity
+    description = get_sensor_by_key(NVR_SENSORS, "record_capacity")
+    unique_id, entity_id = await ids_from_device_description(
+        hass, Platform.SENSOR, nvr, description
     )
 
     entity = entity_registry.async_get(entity_id)
@@ -293,10 +513,10 @@ async def test_sensor_nvr_missing_values(hass: HomeAssistant, ufp: MockUFPFixtur
     assert state.state == "0"
     assert state.attributes[ATTR_ATTRIBUTION] == DEFAULT_ATTRIBUTION
 
-    # Memory
-    description = NVR_DISABLED_SENSORS[2]
-    unique_id, entity_id = ids_from_device_description(
-        Platform.SENSOR, nvr, description
+    # Memory utilization
+    description = get_sensor_by_key(NVR_DISABLED_SENSORS, "memory_utilization")
+    unique_id, entity_id = await ids_from_device_description(
+        hass, Platform.SENSOR, nvr, description
     )
 
     entity = entity_registry.async_get(entity_id)
@@ -313,26 +533,28 @@ async def test_sensor_nvr_missing_values(hass: HomeAssistant, ufp: MockUFPFixtur
 
 
 async def test_sensor_setup_camera(
-    hass: HomeAssistant, ufp: MockUFPFixture, doorbell: Camera, fixed_now: datetime
-):
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    ufp: MockUFPFixture,
+    doorbell: Camera,
+    fixed_now: datetime,
+) -> None:
     """Test sensor entity setup for camera devices."""
 
     await init_entry(hass, ufp, [doorbell])
-    assert_entity_counts(hass, Platform.SENSOR, 25, 13)
-
-    entity_registry = er.async_get(hass)
+    assert_entity_counts(hass, Platform.SENSOR, 24, 12)
 
     expected_values = (
         fixed_now.replace(microsecond=0).isoformat(),
-        "100",
-        "100.0",
+        "0.0001",
+        "0.0001",
         "20.0",
     )
     for index, description in enumerate(CAMERA_SENSORS_WRITE):
         if not description.entity_registry_enabled_default:
             continue
-        unique_id, entity_id = ids_from_device_description(
-            Platform.SENSOR, doorbell, description
+        unique_id, entity_id = await ids_from_device_description(
+            hass, Platform.SENSOR, doorbell, description
         )
 
         entity = entity_registry.async_get(entity_id)
@@ -345,10 +567,10 @@ async def test_sensor_setup_camera(
         assert state.state == expected_values[index]
         assert state.attributes[ATTR_ATTRIBUTION] == DEFAULT_ATTRIBUTION
 
-    expected_values = ("100", "100")
+    expected_values = ("0.0001", "0.0001")
     for index, description in enumerate(CAMERA_DISABLED_SENSORS):
-        unique_id, entity_id = ids_from_device_description(
-            Platform.SENSOR, doorbell, description
+        unique_id, entity_id = await ids_from_device_description(
+            hass, Platform.SENSOR, doorbell, description
         )
 
         entity = entity_registry.async_get(entity_id)
@@ -363,9 +585,12 @@ async def test_sensor_setup_camera(
         assert state.state == expected_values[index]
         assert state.attributes[ATTR_ATTRIBUTION] == DEFAULT_ATTRIBUTION
 
-    # Wired signal
-    unique_id, entity_id = ids_from_device_description(
-        Platform.SENSOR, doorbell, ALL_DEVICES_SENSORS[2]
+    # Wired signal (phy_rate / link speed)
+    unique_id, entity_id = await ids_from_device_description(
+        hass,
+        Platform.SENSOR,
+        doorbell,
+        get_sensor_by_key(ALL_DEVICES_SENSORS, "phy_rate"),
     )
 
     entity = entity_registry.async_get(entity_id)
@@ -380,9 +605,12 @@ async def test_sensor_setup_camera(
     assert state.state == "1000"
     assert state.attributes[ATTR_ATTRIBUTION] == DEFAULT_ATTRIBUTION
 
-    # WiFi signal
-    unique_id, entity_id = ids_from_device_description(
-        Platform.SENSOR, doorbell, ALL_DEVICES_SENSORS[3]
+    # Wi-Fi signal
+    unique_id, entity_id = await ids_from_device_description(
+        hass,
+        Platform.SENSOR,
+        doorbell,
+        get_sensor_by_key(ALL_DEVICES_SENSORS, "wifi_signal"),
     )
 
     entity = entity_registry.async_get(entity_id)
@@ -397,39 +625,31 @@ async def test_sensor_setup_camera(
     assert state.state == "-50"
     assert state.attributes[ATTR_ATTRIBUTION] == DEFAULT_ATTRIBUTION
 
-    # Detected Object
-    unique_id, entity_id = ids_from_device_description(
-        Platform.SENSOR, doorbell, MOTION_SENSORS[0]
-    )
 
-    entity = entity_registry.async_get(entity_id)
-    assert entity
-    assert entity.unique_id == unique_id
-
-    state = hass.states.get(entity_id)
-    assert state
-    assert state.state == OBJECT_TYPE_NONE
-    assert state.attributes[ATTR_ATTRIBUTION] == DEFAULT_ATTRIBUTION
-    assert state.attributes[ATTR_EVENT_SCORE] == 0
-
-
+@pytest.mark.usefixtures("entity_registry_enabled_by_default")
+@pytest.mark.parametrize(
+    "description",
+    [
+        pytest.param(MOTION_TRIP_SENSORS[0], id="last_motion"),
+        pytest.param(DOORBELL_TRIP_SENSORS[0], id="last_ring"),
+    ],
+)
 async def test_sensor_setup_camera_with_last_trip_time(
     hass: HomeAssistant,
-    entity_registry_enabled_by_default: AsyncMock,
+    entity_registry: er.EntityRegistry,
     ufp: MockUFPFixture,
     doorbell: Camera,
     fixed_now: datetime,
-):
+    description: ProtectSensorEntityDescription,
+) -> None:
     """Test sensor entity setup for camera devices with last trip time."""
 
     await init_entry(hass, ufp, [doorbell])
-    assert_entity_counts(hass, Platform.SENSOR, 25, 25)
-
-    entity_registry = er.async_get(hass)
+    assert_entity_counts(hass, Platform.SENSOR, 24, 24)
 
     # Last Trip Time
-    unique_id, entity_id = ids_from_device_description(
-        Platform.SENSOR, doorbell, MOTION_TRIP_SENSORS[0]
+    unique_id, entity_id = await ids_from_device_description(
+        hass, Platform.SENSOR, doorbell, description
     )
 
     entity = entity_registry.async_get(entity_id)
@@ -445,64 +665,44 @@ async def test_sensor_setup_camera_with_last_trip_time(
     assert state.attributes[ATTR_ATTRIBUTION] == DEFAULT_ATTRIBUTION
 
 
-async def test_sensor_update_motion(
-    hass: HomeAssistant, ufp: MockUFPFixture, doorbell: Camera, fixed_now: datetime
-):
-    """Test sensor motion entity."""
+async def test_sensor_camera_without_doorbell_has_no_last_ring(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    ufp: MockUFPFixture,
+    camera: Camera,
+) -> None:
+    """Only doorbells get the last ring sensor."""
+    await init_entry(hass, ufp, [camera])
 
-    await init_entry(hass, ufp, [doorbell])
-    assert_entity_counts(hass, Platform.SENSOR, 25, 13)
-
-    _, entity_id = ids_from_device_description(
-        Platform.SENSOR, doorbell, MOTION_SENSORS[0]
+    assert entity_registry.async_get_entity_id(
+        Platform.SENSOR, DOMAIN, f"{camera.mac}_motion_last_trip_time"
     )
-
-    event = Event(
-        id="test_event_id",
-        type=EventType.SMART_DETECT,
-        start=fixed_now - timedelta(seconds=1),
-        end=None,
-        score=100,
-        smart_detect_types=[SmartDetectObjectType.PERSON],
-        smart_detect_event_ids=[],
-        camera_id=doorbell.id,
-        api=ufp.api,
+    assert (
+        entity_registry.async_get_entity_id(
+            Platform.SENSOR, DOMAIN, f"{camera.mac}_doorbell_last_trip_time"
+        )
+        is None
     )
-
-    new_camera = doorbell.copy()
-    new_camera.is_smart_detected = True
-    new_camera.last_smart_detect_event_id = event.id
-
-    mock_msg = Mock()
-    mock_msg.changed_data = {}
-    mock_msg.new_obj = event
-
-    ufp.api.bootstrap.cameras = {new_camera.id: new_camera}
-    ufp.api.bootstrap.events = {event.id: event}
-    ufp.ws_msg(mock_msg)
-    await hass.async_block_till_done()
-
-    state = hass.states.get(entity_id)
-    assert state
-    assert state.state == SmartDetectObjectType.PERSON.value
-    assert state.attributes[ATTR_ATTRIBUTION] == DEFAULT_ATTRIBUTION
-    assert state.attributes[ATTR_EVENT_SCORE] == 100
 
 
 async def test_sensor_update_alarm(
     hass: HomeAssistant, ufp: MockUFPFixture, sensor_all: Sensor, fixed_now: datetime
-):
+) -> None:
     """Test sensor motion entity."""
 
     await init_entry(hass, ufp, [sensor_all])
-    assert_entity_counts(hass, Platform.SENSOR, 22, 14)
+    assert_entity_counts(hass, Platform.SENSOR, 23, 14)
 
-    _, entity_id = ids_from_device_description(
-        Platform.SENSOR, sensor_all, SENSE_SENSORS_WRITE[4]
+    _, entity_id = await ids_from_device_description(
+        hass,
+        Platform.SENSOR,
+        sensor_all,
+        get_sensor_by_key(SENSE_SENSORS, "alarm_sound"),
     )
 
     event_metadata = EventMetadata(sensor_id=sensor_all.id, alarm_type="smoke")
     event = Event(
+        model=ModelType.EVENT,
         id="test_event_id",
         type=EventType.SENSOR_ALARM,
         start=fixed_now - timedelta(seconds=1),
@@ -514,7 +714,7 @@ async def test_sensor_update_alarm(
         api=ufp.api,
     )
 
-    new_sensor = sensor_all.copy()
+    new_sensor = sensor_all.model_copy()
     new_sensor.set_alarm_timeout()
     new_sensor.last_alarm_event_id = event.id
 
@@ -533,23 +733,33 @@ async def test_sensor_update_alarm(
     await time_changed(hass, 10)
 
 
+@pytest.mark.usefixtures("entity_registry_enabled_by_default")
 async def test_sensor_update_alarm_with_last_trip_time(
     hass: HomeAssistant,
-    entity_registry_enabled_by_default: AsyncMock,
+    entity_registry: er.EntityRegistry,
     ufp: MockUFPFixture,
     sensor_all: Sensor,
     fixed_now: datetime,
-):
+) -> None:
     """Test sensor motion entity with last trip time."""
 
+    # Distinct offsets: equal values would hide a swapped path.
+    setup_public_sensor(
+        ufp,
+        motion_detected_at=fixed_now - timedelta(hours=1),
+        open_status_changed_at=fixed_now - timedelta(hours=2),
+        tampering_detected_at=fixed_now - timedelta(hours=3),
+    )
     await init_entry(hass, ufp, [sensor_all])
-    assert_entity_counts(hass, Platform.SENSOR, 22, 22)
+    assert_entity_counts(hass, Platform.SENSOR, 23, 23)
 
     # Last Trip Time
-    unique_id, entity_id = ids_from_device_description(
-        Platform.SENSOR, sensor_all, SENSE_SENSORS_WRITE[-3]
+    unique_id, entity_id = await ids_from_device_description(
+        hass,
+        Platform.SENSOR,
+        sensor_all,
+        get_sensor_by_key(SENSE_SENSORS, "door_last_trip_time"),
     )
-    entity_registry = er.async_get(hass)
 
     entity = entity_registry.async_get(entity_id)
     assert entity
@@ -559,6 +769,307 @@ async def test_sensor_update_alarm_with_last_trip_time(
     assert state
     assert (
         state.state
-        == (fixed_now - timedelta(hours=1)).replace(microsecond=0).isoformat()
+        == (fixed_now - timedelta(hours=2)).replace(microsecond=0).isoformat()
     )
     assert state.attributes[ATTR_ATTRIBUTION] == DEFAULT_ATTRIBUTION
+
+    # Door and motion map to different public fields; asserting both with
+    # different offsets is what catches a swapped path.
+    _, motion_entity_id = await ids_from_device_description(
+        hass,
+        Platform.SENSOR,
+        sensor_all,
+        get_sensor_by_key(SENSE_SENSORS, "motion_last_trip_time"),
+    )
+    motion_state = hass.states.get(motion_entity_id)
+    assert motion_state
+    assert (
+        motion_state.state
+        == (fixed_now - timedelta(hours=1)).replace(microsecond=0).isoformat()
+    )
+
+    _, tamper_entity_id = await ids_from_device_description(
+        hass,
+        Platform.SENSOR,
+        sensor_all,
+        get_sensor_by_key(SENSE_SENSORS, "tampering_last_trip_time"),
+    )
+    tamper_state = hass.states.get(tamper_entity_id)
+    assert tamper_state
+    assert (
+        tamper_state.state
+        == (fixed_now - timedelta(hours=3)).replace(microsecond=0).isoformat()
+    )
+
+
+async def test_sensor_precision(
+    hass: HomeAssistant, ufp: MockUFPFixture, sensor_all: Sensor, fixed_now: datetime
+) -> None:
+    """Test sensor precision value is respected."""
+
+    await init_entry(hass, ufp, [sensor_all])
+    assert_entity_counts(hass, Platform.SENSOR, 23, 14)
+    nvr: NVR = ufp.api.bootstrap.nvr
+
+    _, entity_id = await ids_from_device_description(
+        hass, Platform.SENSOR, nvr, get_sensor_by_key(NVR_SENSORS, "resolution_4K")
+    )
+
+    assert hass.states.get(entity_id).state == "17.49"
+
+
+async def test_sensor_light_last_motion_public(
+    hass: HomeAssistant, ufp: MockUFPFixture, light: Light
+) -> None:
+    """The light's last-motion timestamp reads from the public API."""
+
+    setup_public_light(ufp)
+    await init_entry(hass, ufp, [light])
+
+    _, entity_id = await ids_from_device_description(
+        hass, Platform.SENSOR, light, LIGHT_SENSORS[0]
+    )
+    await enable_entity(hass, ufp.entry.entry_id, entity_id)
+
+    # A value the private fixture would not produce proves the public source.
+    last_motion_ms = 1700000000000
+    public = make_public_light(light, last_motion_ms=last_motion_ms)
+    ufp.devices_ws_subscription(public_device_ws_message(public))
+    await hass.async_block_till_done()
+
+    assert (
+        hass.states.get(entity_id).state
+        == convert_to_datetime(last_motion_ms).isoformat()
+    )
+
+
+async def test_sensor_light_last_motion_unavailable_without_public(
+    hass: HomeAssistant, ufp: MockUFPFixture, light: Light
+) -> None:
+    """The migrated last-motion sensor is unavailable without a public object."""
+
+    await init_entry(hass, ufp, [light])
+
+    _, entity_id = await ids_from_device_description(
+        hass, Platform.SENSOR, light, LIGHT_SENSORS[0]
+    )
+    await enable_entity(hass, ufp.entry.entry_id, entity_id)
+
+    assert hass.states.get(entity_id).state == STATE_UNAVAILABLE
+
+
+@pytest.mark.parametrize(
+    ("mode", "enable_at", "expected"),
+    [
+        (LightModeType.MOTION, LightModeEnableType.ALWAYS, "motion"),
+        (LightModeType.MOTION, LightModeEnableType.DARK, "motion_dark"),
+        (LightModeType.WHEN_DARK, LightModeEnableType.DARK, "always"),
+        (LightModeType.MANUAL, LightModeEnableType.DARK, "off"),
+    ],
+)
+async def test_sensor_light_mode_mirror_public(
+    hass: HomeAssistant,
+    ufp: MockUFPFixture,
+    light: Light,
+    mode: LightModeType,
+    enable_at: LightModeEnableType,
+    expected: str,
+) -> None:
+    """The deprecated light mode mirror shows the public preset value."""
+    ufp.api.bootstrap.auth_user.all_permissions = [
+        Permission.unifi_dict_to_dict({"rawPermission": "light:read:*"})
+    ]
+    setup_public_light(ufp, light_mode=mode, light_mode_enable_at=enable_at)
+    await init_entry(hass, ufp, [light])
+
+    _, entity_id = await ids_from_device_description(
+        hass, Platform.SENSOR, light, get_sensor_by_key(LIGHT_SENSORS, "light_motion")
+    )
+    assert hass.states.get(entity_id).state == expected
+
+
+async def test_public_only_sensor_sense_end_to_end(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    sensor_all: Sensor,
+    ufp_public_only: MockUFPFixture,
+    setup_public_only: Callable[[], Coroutine[Any, Any, None]],
+) -> None:
+    """A public-only entry builds the migrated sense sensors from the public object.
+
+    The readings and trip timestamps follow the capability map; the private-only
+    sensors (alarm sound, sensitivity, mount type, paired camera) are absent.
+    """
+    public = make_public_sensor(
+        sensor_all,
+        percentage=42,
+        temperature_value=21.5,
+        capabilities={
+            SensorFeatureCapability.TEMPERATURE,
+            SensorFeatureCapability.MOTION,
+        },
+    )
+    ufp_public_only.api.public_bootstrap.sensors[sensor_all.id] = public
+
+    await setup_public_only()
+
+    assert ufp_public_only.entry.state is ConfigEntryState.LOADED
+    keys = registered_keys(entity_registry, Platform.SENSOR, sensor_all.mac)
+    assert {
+        "battery_level",
+        "temperature_level",
+        "motion_last_trip_time",
+        "signal_strength",
+        "signal_quality",
+    } <= keys
+    assert not keys & {"alarm_sound", "sensitivity", "mount_type", "paired_camera"}
+    assert "humidity_level" not in keys
+
+    entity_id = entity_registry.async_get_entity_id(
+        Platform.SENSOR, DOMAIN, f"{sensor_all.mac}_battery_level"
+    )
+    assert entity_id
+    assert hass.states.get(entity_id).state == "42"
+
+
+async def test_public_only_sensor_light_end_to_end(
+    entity_registry: er.EntityRegistry,
+    light: Light,
+    ufp_public_only: MockUFPFixture,
+    setup_public_only: Callable[[], Coroutine[Any, Any, None]],
+) -> None:
+    """A public-only entry builds the floodlight trip time but no read-only mirrors."""
+    public = make_public_light(light, last_motion_ms=to_js_time(utcnow()))
+    ufp_public_only.api.public_bootstrap.lights[light.id] = public
+
+    await setup_public_only()
+
+    keys = registered_keys(entity_registry, Platform.SENSOR, light.mac)
+    assert "motion_last_trip_time" in keys
+    assert not keys & {"paired_camera", "sensitivity", "light_motion"}
+
+    entity_id = entity_registry.async_get_entity_id(
+        Platform.SENSOR, DOMAIN, f"{light.mac}_motion_last_trip_time"
+    )
+    assert entity_id
+    assert (
+        entity_registry.async_get(entity_id).disabled_by
+        is er.RegistryEntryDisabler.INTEGRATION
+    )
+
+
+async def test_public_only_sensor_camera_has_none(
+    entity_registry: er.EntityRegistry,
+    camera: Camera,
+    ufp_public_only: MockUFPFixture,
+    setup_public_only: Callable[[], Coroutine[Any, Any, None]],
+) -> None:
+    """The camera sensors all read the private bootstrap, so none are built."""
+    public = make_public_camera(camera)
+    public.rtsps_streams = None
+    ufp_public_only.api.public_bootstrap.cameras[camera.id] = public
+
+    await setup_public_only()
+
+    assert registered_keys(entity_registry, Platform.SENSOR, camera.mac) == set()
+
+
+async def test_public_only_sensor_added_after_setup(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    light: Light,
+    ufp_public_only: MockUFPFixture,
+    setup_public_only: Callable[[], Coroutine[Any, Any, None]],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A light added later gets its sensors from its public add frame.
+
+    The public devices websocket ``add`` frame is the only discovery signal
+    without a local user; a re-delivered frame must not add a second time.
+    """
+    await setup_public_only()
+    assert_entity_counts(hass, Platform.SENSOR, 0, 0)
+
+    public = make_public_light(light)
+    ufp_public_only.api.public_bootstrap.lights[light.id] = public
+    msg = public_device_ws_message(public)
+    msg.action = WSAction.ADD
+    ufp_public_only.devices_ws_subscription(msg)
+    await hass.async_block_till_done()
+
+    assert "motion_last_trip_time" in registered_keys(
+        entity_registry, Platform.SENSOR, light.mac
+    )
+    count = len(hass.states.async_entity_ids(Platform.SENSOR.value))
+
+    ufp_public_only.devices_ws_subscription(msg)
+    await hass.async_block_till_done()
+
+    assert len(hass.states.async_entity_ids(Platform.SENSOR.value)) == count
+    assert "already exists" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("key", "public", "expected"),
+    [
+        pytest.param("mic_level", {"mic_volume": 17}, "17", id="mic_level"),
+        pytest.param(
+            "doorbell_text",
+            {
+                "lcd_message": PublicLcdMessage(
+                    type=DoorbellMessageType.CUSTOM_MESSAGE, text="Hi"
+                )
+            },
+            "Hi",
+            id="doorbell_text",
+        ),
+    ],
+)
+async def test_sensor_camera_mirror_reads_public(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    ufp: MockUFPFixture,
+    doorbell: Camera,
+    key: str,
+    public: dict[str, Any],
+    expected: str,
+) -> None:
+    """A read-only user's camera setting mirror shows the public value."""
+    ufp.api.bootstrap.auth_user.all_permissions = [
+        Permission.unifi_dict_to_dict({"rawPermission": "camera:read:*"})
+    ]
+    setup_public_camera(ufp, **public)
+
+    await init_entry(hass, ufp, [doorbell])
+
+    entity_id = entity_registry.async_get_entity_id(
+        Platform.SENSOR, DOMAIN, f"{doorbell.mac}_{key}"
+    )
+    assert entity_id is not None
+    assert hass.states.get(entity_id).state == expected
+
+
+async def test_sensor_camera_mic_mirror_unavailable_with_module_only(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    ufp: MockUFPFixture,
+    doorbell: Camera,
+) -> None:
+    """A hot-plugged module alone leaves the microphone mirror unavailable.
+
+    The number it is deprecated for is gated on the built-in microphone.
+    """
+    doorbell.feature_flags.has_mic = False
+    doorbell.feature_flags.hotplug = Hotplug(audio=True)
+    ufp.api.bootstrap.auth_user.all_permissions = [
+        Permission.unifi_dict_to_dict({"rawPermission": "camera:read:*"})
+    ]
+    setup_public_camera(ufp)
+
+    await init_entry(hass, ufp, [doorbell])
+
+    entity_id = entity_registry.async_get_entity_id(
+        Platform.SENSOR, DOMAIN, f"{doorbell.mac}_mic_level"
+    )
+    assert entity_id is not None
+    assert hass.states.get(entity_id).state == STATE_UNAVAILABLE

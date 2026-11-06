@@ -1,30 +1,30 @@
 """Test the Min/Max config flow."""
+
 from unittest.mock import patch
 
 import pytest
+from pytest_homeassistant.common import MockConfigEntry, get_schema_suggested_value
 
 from homeassistant import config_entries
 from homeassistant.components.min_max.const import DOMAIN
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
 
-from tests.common import MockConfigEntry
 
-
-@pytest.mark.parametrize("platform", ("sensor",))
-async def test_config_flow(hass: HomeAssistant, platform) -> None:
+@pytest.mark.parametrize("platform", ["sensor"])
+async def test_config_flow(hass: HomeAssistant, platform: str) -> None:
     """Test the config flow."""
     input_sensors = ["sensor.input_one", "sensor.input_two"]
 
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": config_entries.SOURCE_USER}
     )
-    assert result["type"] == FlowResultType.FORM
+    assert result["type"] is FlowResultType.FORM
     assert result["errors"] is None
 
     with patch(
         "homeassistant.components.min_max.async_setup_entry",
-        return_value=True,
+        return_value=None,
     ) as mock_setup_entry:
         result = await hass.config_entries.flow.async_configure(
             result["flow_id"],
@@ -32,7 +32,7 @@ async def test_config_flow(hass: HomeAssistant, platform) -> None:
         )
         await hass.async_block_till_done()
 
-    assert result["type"] == FlowResultType.CREATE_ENTRY
+    assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["title"] == "My min_max"
     assert result["data"] == {}
     assert result["options"] == {
@@ -54,19 +54,8 @@ async def test_config_flow(hass: HomeAssistant, platform) -> None:
     assert config_entry.title == "My min_max"
 
 
-def get_suggested(schema, key):
-    """Get suggested value for key in voluptuous schema."""
-    for k in schema.keys():
-        if k == key:
-            if k.description is None or "suggested_value" not in k.description:
-                return None
-            return k.description["suggested_value"]
-    # Wanted key absent from schema
-    raise Exception
-
-
-@pytest.mark.parametrize("platform", ("sensor",))
-async def test_options(hass: HomeAssistant, platform) -> None:
+@pytest.mark.parametrize("platform", ["sensor"])
+async def test_options(hass: HomeAssistant, platform: str) -> None:
     """Test reconfiguring."""
     hass.states.async_set("sensor.input_one", "10")
     hass.states.async_set("sensor.input_two", "20")
@@ -92,12 +81,12 @@ async def test_options(hass: HomeAssistant, platform) -> None:
     await hass.async_block_till_done()
 
     result = await hass.config_entries.options.async_init(config_entry.entry_id)
-    assert result["type"] == FlowResultType.FORM
+    assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "init"
     schema = result["data_schema"].schema
-    assert get_suggested(schema, "entity_ids") == input_sensors1
-    assert get_suggested(schema, "round_digits") == 0
-    assert get_suggested(schema, "type") == "min"
+    assert get_schema_suggested_value(schema, "entity_ids") == input_sensors1
+    assert get_schema_suggested_value(schema, "round_digits") == 0
+    assert get_schema_suggested_value(schema, "type") == "min"
 
     result = await hass.config_entries.options.async_configure(
         result["flow_id"],
@@ -107,7 +96,7 @@ async def test_options(hass: HomeAssistant, platform) -> None:
             "type": "mean",
         },
     )
-    assert result["type"] == FlowResultType.CREATE_ENTRY
+    assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["data"] == {
         "entity_ids": input_sensors2,
         "name": "My min_max",

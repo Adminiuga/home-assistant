@@ -1,59 +1,68 @@
 """Support for the DIRECTV remote."""
-from __future__ import annotations
 
 from collections.abc import Iterable
 from datetime import timedelta
-import logging
-from typing import Any
+from typing import Any, override
 
 from directv import DIRECTV, DIRECTVError
 
 from homeassistant.components.remote import ATTR_NUM_REPEATS, RemoteEntity
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
+from . import DirecTVConfigEntry
 from .const import DOMAIN
 from .entity import DIRECTVEntity
-
-_LOGGER = logging.getLogger(__name__)
 
 SCAN_INTERVAL = timedelta(minutes=2)
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    entry: DirecTVConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Load DirecTV remote based on a config entry."""
-    dtv = hass.data[DOMAIN][entry.entry_id]
-    entities = []
+    dtv = entry.runtime_data
 
-    for location in dtv.device.locations:
-        entities.append(
+    async_add_entities(
+        (
             DIRECTVRemote(
+                hass=hass,
                 dtv=dtv,
+                entry=entry,
                 name=str.title(location.name),
                 address=location.address,
             )
-        )
-
-    async_add_entities(entities, True)
+            for location in dtv.device.locations
+        ),
+        True,
+    )
 
 
 class DIRECTVRemote(DIRECTVEntity, RemoteEntity):
     """Device that sends commands to a DirecTV receiver."""
 
-    def __init__(self, *, dtv: DIRECTV, name: str, address: str = "0") -> None:
+    def __init__(
+        self,
+        *,
+        hass: HomeAssistant,
+        dtv: DIRECTV,
+        entry: DirecTVConfigEntry,
+        name: str,
+        address: str = "0",
+    ) -> None:
         """Initialize DirecTV remote."""
         super().__init__(
+            hass=hass,
             dtv=dtv,
+            entry=entry,
+            name=name,
             address=address,
         )
 
         self._attr_unique_id = self._device_id
-        self._attr_name = name
         self._attr_available = False
         self._attr_is_on = True
 
@@ -68,14 +77,17 @@ class DIRECTVRemote(DIRECTVEntity, RemoteEntity):
             self._attr_available = False
             self._attr_is_on = False
 
+    @override
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn the device on."""
         await self.dtv.remote("poweron", self._address)
 
+    @override
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn the device off."""
         await self.dtv.remote("poweroff", self._address)
 
+    @override
     async def async_send_command(self, command: Iterable[str], **kwargs: Any) -> None:
         """Send a command to a device.
 
@@ -92,9 +104,12 @@ class DIRECTVRemote(DIRECTVEntity, RemoteEntity):
             for single_command in command:
                 try:
                     await self.dtv.remote(single_command, self._address)
-                except DIRECTVError:
-                    _LOGGER.exception(
-                        "Sending command %s to device %s failed",
-                        single_command,
-                        self._device_id,
-                    )
+                except DIRECTVError as err:
+                    raise HomeAssistantError(
+                        translation_domain=DOMAIN,
+                        translation_key="send_command_failed",
+                        translation_placeholders={
+                            "command": single_command,
+                            "device": self._device_id,
+                        },
+                    ) from err

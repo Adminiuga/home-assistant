@@ -1,0 +1,373 @@
+"""Provide common test tools."""
+
+from functools import cache
+import json
+from typing import Any
+from unittest.mock import MagicMock
+
+from matter_server.client.models.node import MatterNode
+from matter_server.common.helpers.util import dataclass_from_dict
+from matter_server.common.models import EventType, MatterNodeData
+from pytest_homeassistant.common import MockConfigEntry, load_fixture
+from syrupy.assertion import SnapshotAssertion
+
+from homeassistant.components.matter import DOMAIN
+from homeassistant.components.matter.const import ID_TYPE_DEVICE_ID
+from homeassistant.const import Platform
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr, entity_registry as er
+
+FIXTURES = [
+    "air_quality_sensor",
+    "aqara_camera_hub_g350",
+    "aqara_door_window_p2",
+    "aqara_led_strip_t2",
+    "aqara_light_switch_h2_us_4099",
+    "aqara_light_switch_h2_us_4100",
+    "aqara_light_switch_h2_us_4101",
+    "aqara_motion_p2",
+    "aqara_multi_state_p100",
+    "aqara_presence_fp300",
+    "aqara_sensor_w100",
+    "aqara_shutter_switch_h2",
+    "aqara_thermostat_w500",
+    "aqara_thermostat_w500_presets",
+    "aqara_u200",
+    "atios_knx_bridge",
+    "color_temperature_light",
+    "cync_keypad_dimmer",
+    "dewenwils_3_zone_transformer",
+    "ductech_smartwings_levitate",
+    "eberle_ute3000",
+    "ecovacs_deebot",
+    "eufy_vacuum_omni_e28",
+    "eve_contact_sensor",
+    "eve_energy_20ecn4101",
+    "eve_energy_plug",
+    "eve_energy_plug_patched",
+    "eve_shutter",
+    "eve_thermo_v4",
+    "eve_thermo_v5",
+    "eve_weather_sensor",
+    "extended_color_light",
+    "haojai_switch",
+    "heiman_co_sensor",
+    "heiman_motion_sensor_m1",
+    "heiman_smoke_detector",
+    "ikea_air_quality_monitor",
+    "ikea_bilresa_dual_button",
+    "ikea_scroll_wheel",
+    "inovelli_vtm30",
+    "inovelli_vtm31",
+    "lifx_switch_115",
+    "lifx_switch_89",
+    "longan_link_thermostat",
+    "mock_air_purifier",
+    "mock_battery_solar_bridge",
+    "mock_battery_storage",
+    "mock_camera",
+    "mock_chime",
+    "mock_closure_covering_lift",
+    "mock_closure_roof_window",
+    "mock_cooktop",
+    "mock_dimmable_light",
+    "mock_dimmable_plugin_unit",
+    "mock_door_lock",
+    "mock_door_lock_with_unbolt",
+    "mock_doorbell",
+    "mock_extractor_hood",
+    "mock_fan",
+    "mock_flow_sensor",
+    "mock_generic_switch",
+    "mock_generic_switch_multi",
+    "mock_humidity_sensor",
+    "mock_laundry_dryer",
+    "mock_leak_sensor",
+    "mock_light_sensor",
+    "mock_lock",
+    "mock_microwave_oven",
+    "mock_mounted_dimmable_load_control_fixture",
+    "mock_occupancy_sensor",
+    "mock_occupancy_sensor_pir",
+    "mock_on_off_plugin_unit",
+    "mock_onoff_light",
+    "mock_onoff_light_alt_name",
+    "mock_onoff_light_no_name",
+    "mock_oven",
+    "mock_pressure_sensor",
+    "mock_pump",
+    "mock_room_airconditioner",
+    "mock_soil_sensor",
+    "mock_solar_battery_storage",
+    "mock_solar_inverter",
+    "mock_speaker",
+    "mock_switch_unit",
+    "mock_temperature_sensor",
+    "mock_thermostat",
+    "mock_vacuum_cleaner",
+    "mock_valve",
+    "mock_window_covering_full",
+    "mock_window_covering_lift",
+    "mock_window_covering_pa_lift",
+    "mock_window_covering_pa_lift_null_tilt",
+    "mock_window_covering_pa_tilt",
+    "mock_window_covering_tilt",
+    "nanoleaf_nl77k1",
+    "onoff_light_with_levelcontrol_present",
+    "resideo_x2s_thermostat",
+    "roborock_saros_10",
+    "secuyou_smart_lock",
+    "silabs_dishwasher",
+    "silabs_evse_charging",
+    "silabs_fan",
+    "silabs_laundrywasher",
+    "silabs_light_switch",
+    "silabs_range_hood",
+    "silabs_refrigerator",
+    "silabs_water_heater",
+    "switchbot_k11_plus",
+    "tado_smart_radiator_thermostat_x",
+    "tapo_smart_outdoor_plug_in_dimmer",
+    "tapo_smart_wi_fi_outlet",
+    "tapo_smart_wi_fi_plug_265",
+    "tapo_smart_wi_fi_power_strip",
+    "tp_link_smart_outdoor_plug",
+    "uascent_smart_switch",
+    "wago_home_blind_control",
+    "wago_home_relay_16a",
+    "yandex_smart_socket",
+    "zemismart_mt25b",
+]
+
+
+@cache
+def load_node_fixture(fixture: str) -> str:
+    """Load a fixture."""
+    return load_fixture(f"matter/nodes/{fixture}.json")
+
+
+def load_and_parse_node_fixture(fixture: str) -> dict[str, Any]:
+    """Load and parse a node fixture."""
+    return json.loads(load_node_fixture(fixture))
+
+
+async def _setup_integration_with_nodes(
+    hass: HomeAssistant,
+    client: MagicMock,
+    nodes: list[MatterNode],
+) -> None:
+    """Set up Matter integration with nodes."""
+    client.get_nodes.return_value = nodes
+
+    def _get_node(node_id: int) -> MatterNode:
+        try:
+            return next(node for node in nodes if node.node_id == node_id)
+        except StopIteration as err:
+            raise KeyError(f"Node with id {node_id} not found") from err
+
+    client.get_node.side_effect = _get_node
+    config_entry = MockConfigEntry(
+        domain=DOMAIN, data={"url": "http://mock-matter-server-url"}
+    )
+    config_entry.add_to_hass(hass)
+
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+
+async def setup_integration_with_node_fixture(
+    hass: HomeAssistant,
+    node_fixture: str,
+    client: MagicMock,
+    override_attributes: dict[str, Any] | None = None,
+) -> MatterNode:
+    """Set up Matter integration with single fixture as node."""
+    node = create_node_from_fixture(node_fixture, override_attributes)
+
+    await _setup_integration_with_nodes(hass, client, [node])
+
+    return node
+
+
+async def setup_integration_with_node_fixtures(
+    hass: HomeAssistant,
+    client: MagicMock,
+) -> None:
+    """Set up Matter integration with all fixtures as nodes."""
+    nodes = [
+        create_node_from_fixture(node_fixture, override_serial=True)
+        for node_fixture in FIXTURES
+    ]
+
+    await _setup_integration_with_nodes(hass, client, nodes)
+
+
+def create_node_from_fixture(
+    node_fixture: str,
+    override_attributes: dict[str, Any] | None = None,
+    *,
+    override_serial: bool = False,
+) -> MatterNode:
+    """Create a node from a fixture."""
+    node_data = load_and_parse_node_fixture(node_fixture)
+    # Override serial number to ensure uniqueness across fixtures
+    if override_serial and "0/40/15" in node_data["attributes"]:
+        node_data["attributes"]["0/40/15"] = f"serial_{node_data['node_id']}"
+    if override_attributes:
+        node_data["attributes"].update(override_attributes)
+    return MatterNode(
+        dataclass_from_dict(
+            MatterNodeData,
+            node_data,
+        )
+    )
+
+
+def set_node_attribute(
+    node: MatterNode,
+    endpoint: int,
+    cluster_id: int,
+    attribute_id: int,
+    value: Any,
+) -> None:
+    """Set a node attribute."""
+    attribute_path = f"{endpoint}/{cluster_id}/{attribute_id}"
+    node.endpoints[endpoint].set_attribute_value(attribute_path, value)
+
+
+async def trigger_subscription_callback(
+    hass: HomeAssistant,
+    client: MagicMock,
+    event: EventType = EventType.ATTRIBUTE_UPDATED,
+    data: Any = None,
+    node_id: int | None = None,
+    attribute_path: str | None = None,
+) -> None:
+    """Trigger matching subscription callbacks or broadcast when filters are omitted."""
+    for sub in client.subscribe_events.call_args_list:
+        kwargs = sub.kwargs
+        if kwargs.get("event_filter") not in (None, event):
+            continue
+        if node_id is not None and kwargs.get("node_filter") not in (None, node_id):
+            continue
+        if attribute_path is not None and kwargs.get("attr_path_filter") not in (
+            None,
+            attribute_path,
+        ):
+            continue
+        kwargs["callback"](event, data)
+    await hass.async_block_till_done()
+
+
+async def set_node_attribute_and_notify(
+    hass: HomeAssistant,
+    client: MagicMock,
+    node: MatterNode,
+    *,
+    endpoint: int,
+    cluster_id: int,
+    attribute_id: int,
+    value: Any,
+) -> None:
+    """Set a node attribute and fire the matching ATTRIBUTE_UPDATED subscription."""
+    set_node_attribute(node, endpoint, cluster_id, attribute_id, value)
+    await trigger_subscription_callback(
+        hass,
+        client,
+        data=value,
+        node_id=node.node_id,
+        attribute_path=f"{endpoint}/{cluster_id}/{attribute_id}",
+    )
+
+
+@cache
+def _get_fixture_names() -> dict[int, str]:
+    """Get the fixture name for each node ID."""
+    return {
+        load_and_parse_node_fixture(fixture_name)["node_id"]: fixture_name
+        for fixture_name in FIXTURES
+    }
+
+
+def snapshot_matter_entities(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    snapshot: SnapshotAssertion,
+    platform: Platform,
+) -> None:
+    """Snapshot Matter entities."""
+    entities = hass.states.async_all(platform)
+    for entity_state in entities:
+        entity_entry = entity_registry.async_get(entity_state.entity_id)
+        node_id = int(entity_entry.unique_id.split("-")[1], 16)
+        fixture_name = _get_fixture_names()[node_id]
+        assert entity_entry == snapshot(
+            name=f"{fixture_name}][{entity_entry.entity_id}-entry"
+        )
+        assert entity_state == snapshot(
+            name=f"{fixture_name}][{entity_entry.entity_id}-state"
+        )
+
+
+def _matter_device_id(device: dr.AnyDeviceEntry) -> str:
+    """Return the stable Matter device-id portion of a device's identifiers."""
+    prefix = f"{ID_TYPE_DEVICE_ID}_"
+    return next(
+        identifier[1].removeprefix(prefix)
+        for identifier in device.identifiers
+        if identifier[0] == DOMAIN and identifier[1].startswith(prefix)
+    )
+
+
+def _device_entity_names(
+    entity_registry: er.EntityRegistry, device_id: str
+) -> dict[str, str | None]:
+    """Return a device's entities as a sorted entity_id -> name mapping."""
+    return {
+        entry.entity_id: entry.original_name
+        for entry in sorted(
+            er.async_entries_for_device(
+                entity_registry, device_id, include_disabled_entities=True
+            ),
+            key=lambda entry: entry.entity_id,
+        )
+    }
+
+
+def snapshot_matter_devices(
+    hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
+    entity_registry: er.EntityRegistry,
+    snapshot: SnapshotAssertion,
+) -> None:
+    """Snapshot the Matter device topology and entity names.
+
+    Produces a stable tree keyed by the Matter device id, showing each node
+    device, its child devices, its bridge (``via_device``) link and the entity
+    names on each device, so the effect of multi-endpoint changes (child devices,
+    entity naming) are asserted.
+    """
+    entry_id = hass.config_entries.async_entries(DOMAIN)[0].entry_id
+    devices = dr.async_entries_for_config_entry(device_registry, entry_id)
+    matter_id_by_device_id = {
+        device.id: _matter_device_id(device) for device in devices
+    }
+
+    tree = {
+        _matter_device_id(device): {
+            "name": device.name,
+            "via_device": matter_id_by_device_id.get(device.via_device_id),
+            "entities": _device_entity_names(entity_registry, device.id),
+            "children": {
+                _matter_device_id(child): {
+                    "name": child.name,
+                    "entities": _device_entity_names(entity_registry, child.id),
+                }
+                for child in dr.async_entries_for_parent_device(
+                    device_registry, device.id
+                )
+            },
+        }
+        for device in devices
+    }
+    assert tree == snapshot

@@ -1,52 +1,47 @@
 """Get WHOIS information for a given host."""
-from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import cast
+from datetime import UTC, datetime
+from typing import override
 
-from whois import Domain
+from whoisdomain import Domain
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
     SensorEntity,
     SensorEntityDescription,
 )
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_DOMAIN, TIME_DAYS
+from homeassistant.const import CONF_DOMAIN, EntityCategory, UnitOfTime
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.device_registry import DeviceEntryType
-from homeassistant.helpers.entity import DeviceInfo, EntityCategory
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.update_coordinator import (
-    CoordinatorEntity,
-    DataUpdateCoordinator,
+from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.util import dt as dt_util
+
+from .const import (
+    ATTR_EXPIRES,
+    ATTR_NAME_SERVERS,
+    ATTR_REGISTRAR,
+    ATTR_UPDATED,
+    DOMAIN,
+    STATUS_TYPES,
 )
+from .coordinator import WhoisConfigEntry, WhoisCoordinator
 
-from .const import ATTR_EXPIRES, ATTR_NAME_SERVERS, ATTR_REGISTRAR, ATTR_UPDATED, DOMAIN
 
-
-@dataclass
-class WhoisSensorEntityDescriptionMixin:
-    """Mixin for required keys."""
+@dataclass(frozen=True, kw_only=True)
+class WhoisSensorEntityDescription(SensorEntityDescription):
+    """Describes a Whois sensor entity."""
 
     value_fn: Callable[[Domain], datetime | int | str | None]
-
-
-@dataclass
-class WhoisSensorEntityDescription(
-    SensorEntityDescription, WhoisSensorEntityDescriptionMixin
-):
-    """Describes a Whois sensor entity."""
 
 
 def _days_until_expiration(domain: Domain) -> int | None:
     """Calculate days left until domain expires."""
     if domain.expiration_date is None:
         return None
-    # We need to cast here, as (unlike Pyright) mypy isn't able to determine the type.
-    return cast(int, (domain.expiration_date - domain.expiration_date.utcnow()).days)
+    return (domain.expiration_date - dt_util.utcnow().replace(tzinfo=None)).days
 
 
 def _ensure_timezone(timestamp: datetime | None) -> datetime | None:
@@ -56,90 +51,113 @@ def _ensure_timezone(timestamp: datetime | None) -> datetime | None:
 
     # If timezone info isn't provided by the Whois, assume UTC.
     if timestamp.tzinfo is None:
-        return timestamp.replace(tzinfo=timezone.utc)
+        return timestamp.replace(tzinfo=UTC)
 
     return timestamp
+
+
+def _get_status_type(status: str | None) -> str | None:
+    """Get the status type from the status string.
+
+    Return the status type in snake_case for translations.
+
+    E.g: "clientDeleteProhibited https://icann.org/epp#clientDeleteProhibited"
+    -> "client_delete_prohibited".
+    """
+    if status is None:
+        return None
+
+    # If the status is not in the STATUS_TYPES, return the status as is.
+    for icann_status, hass_status in STATUS_TYPES.items():
+        if icann_status in status:
+            return hass_status
+
+    # If the status is not in the STATUS_TYPES, return None.
+    return None
 
 
 SENSORS: tuple[WhoisSensorEntityDescription, ...] = (
     WhoisSensorEntityDescription(
         key="admin",
-        name="Admin",
-        icon="mdi:account-star",
+        translation_key="admin",
         entity_category=EntityCategory.DIAGNOSTIC,
         entity_registry_enabled_default=False,
         value_fn=lambda domain: getattr(domain, "admin", None),
     ),
     WhoisSensorEntityDescription(
         key="creation_date",
-        name="Created",
+        translation_key="creation_date",
         device_class=SensorDeviceClass.TIMESTAMP,
         entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda domain: _ensure_timezone(domain.creation_date),
     ),
     WhoisSensorEntityDescription(
         key="days_until_expiration",
-        name="Days until expiration",
-        icon="mdi:calendar-clock",
-        native_unit_of_measurement=TIME_DAYS,
+        translation_key="days_until_expiration",
+        native_unit_of_measurement=UnitOfTime.DAYS,
         value_fn=_days_until_expiration,
     ),
     WhoisSensorEntityDescription(
         key="expiration_date",
-        name="Expires",
+        translation_key="expiration_date",
         device_class=SensorDeviceClass.TIMESTAMP,
         entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda domain: _ensure_timezone(domain.expiration_date),
     ),
     WhoisSensorEntityDescription(
         key="last_updated",
-        name="Last updated",
+        translation_key="last_updated",
         device_class=SensorDeviceClass.TIMESTAMP,
         entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=lambda domain: _ensure_timezone(domain.last_updated),
+        value_fn=lambda domain: _ensure_timezone(domain.updated_date),
     ),
     WhoisSensorEntityDescription(
         key="owner",
-        name="Owner",
-        icon="mdi:account",
+        translation_key="owner",
         entity_category=EntityCategory.DIAGNOSTIC,
         entity_registry_enabled_default=False,
         value_fn=lambda domain: getattr(domain, "owner", None),
     ),
     WhoisSensorEntityDescription(
         key="registrant",
-        name="Registrant",
-        icon="mdi:account-edit",
+        translation_key="registrant",
         entity_category=EntityCategory.DIAGNOSTIC,
         entity_registry_enabled_default=False,
         value_fn=lambda domain: getattr(domain, "registrant", None),
     ),
     WhoisSensorEntityDescription(
         key="registrar",
-        name="Registrar",
-        icon="mdi:store",
+        translation_key="registrar",
         entity_category=EntityCategory.DIAGNOSTIC,
         entity_registry_enabled_default=False,
-        value_fn=lambda domain: domain.registrar if domain.registrar else None,
+        value_fn=lambda domain: domain.registrar or None,
     ),
     WhoisSensorEntityDescription(
         key="reseller",
-        name="Reseller",
-        icon="mdi:store",
+        translation_key="reseller",
         entity_category=EntityCategory.DIAGNOSTIC,
         entity_registry_enabled_default=False,
         value_fn=lambda domain: getattr(domain, "reseller", None),
+    ),
+    WhoisSensorEntityDescription(
+        key="status",
+        translation_key="status",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        device_class=SensorDeviceClass.ENUM,
+        options=list(STATUS_TYPES.values()),
+        entity_registry_enabled_default=False,
+        value_fn=lambda domain: _get_status_type(domain.status),
     ),
 )
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    entry: WhoisConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up the platform from config_entry."""
-    coordinator = hass.data[DOMAIN][entry.entry_id]
+    coordinator = entry.runtime_data
     async_add_entities(
         [
             WhoisSensorEntity(
@@ -152,7 +170,7 @@ async def async_setup_entry(
     )
 
 
-class WhoisSensorEntity(CoordinatorEntity, SensorEntity):
+class WhoisSensorEntity(CoordinatorEntity[WhoisCoordinator], SensorEntity):
     """Implementation of a WHOIS sensor."""
 
     entity_description: WhoisSensorEntityDescription
@@ -160,7 +178,7 @@ class WhoisSensorEntity(CoordinatorEntity, SensorEntity):
 
     def __init__(
         self,
-        coordinator: DataUpdateCoordinator,
+        coordinator: WhoisCoordinator,
         description: WhoisSensorEntityDescription,
         domain: str,
     ) -> None:
@@ -176,6 +194,7 @@ class WhoisSensorEntity(CoordinatorEntity, SensorEntity):
         self._domain = domain
 
     @property
+    @override
     def native_value(self) -> datetime | int | str | None:
         """Return the state of the sensor."""
         if self.coordinator.data is None:
@@ -183,7 +202,8 @@ class WhoisSensorEntity(CoordinatorEntity, SensorEntity):
         return self.entity_description.value_fn(self.coordinator.data)
 
     @property
-    def extra_state_attributes(self) -> dict[str, int | float | None] | None:
+    @override
+    def extra_state_attributes(self) -> dict[str, str] | None:
         """Return the state attributes of the monitored installation."""
 
         # Only add attributes to the original sensor
@@ -200,8 +220,8 @@ class WhoisSensorEntity(CoordinatorEntity, SensorEntity):
         if name_servers := self.coordinator.data.name_servers:
             attrs[ATTR_NAME_SERVERS] = " ".join(name_servers)
 
-        if last_updated := self.coordinator.data.last_updated:
-            attrs[ATTR_UPDATED] = last_updated.isoformat()
+        if updated_date := self.coordinator.data.updated_date:
+            attrs[ATTR_UPDATED] = updated_date.isoformat()
 
         if registrar := self.coordinator.data.registrar:
             attrs[ATTR_REGISTRAR] = registrar

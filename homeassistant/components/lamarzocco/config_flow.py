@@ -1,0 +1,488 @@
+"""Config flow for La Marzocco integration."""
+
+from collections.abc import Mapping
+import logging
+from typing import Any, override
+import uuid
+
+from aiohttp import ClientSession
+import probatio
+from pylamarzocco import LaMarzoccoCloudClient
+from pylamarzocco.const import DeviceType
+from pylamarzocco.exceptions import (
+    AuthFail,
+    PolicyAcceptanceRequired,
+    RequestNotSuccessful,
+)
+from pylamarzocco.models import Thing
+from pylamarzocco.util import InstallationKey, generate_installation_key
+
+from homeassistant.components.bluetooth import (
+    BluetoothServiceInfo,
+    async_discovered_service_info,
+)
+from homeassistant.config_entries import (
+    SOURCE_REAUTH,
+    SOURCE_RECONFIGURE,
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlowWithReload,
+)
+from homeassistant.const import (
+    CONF_ADDRESS,
+    CONF_MAC,
+    CONF_NAME,
+    CONF_PASSWORD,
+    CONF_TOKEN,
+    CONF_USERNAME,
+)
+from homeassistant.core import callback
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.selector import (
+    SelectOptionDict,
+    SelectSelector,
+    SelectSelectorConfig,
+    SelectSelectorMode,
+    TextSelector,
+    TextSelectorConfig,
+    TextSelectorType,
+)
+from homeassistant.helpers.service_info.dhcp import DhcpServiceInfo
+
+from . import create_client_session
+from .const import (
+    BT_MODEL_PREFIXES,
+    CONF_INSTALLATION_KEY,
+    CONF_OFFLINE_MODE,
+    CONF_USE_BLUETOOTH,
+    DOMAIN,
+)
+from .coordinator import LaMarzoccoConfigEntry
+
+CONF_MACHINE = "machine"
+CONF_PROFILE_POLICY = "profile_policy"
+CONF_COMMERCIAL_POLICY = "commercial_policy"
+
+_LOGGER = logging.getLogger(__name__)
+
+
+class LmConfigFlow(ConfigFlow, domain=DOMAIN):
+    """Handle a config flow for La Marzocco."""
+
+    VERSION = 4
+
+    _client: ClientSession
+    _cloud_client: LaMarzoccoCloudClient
+    _installation_key: InstallationKey
+
+    def __init__(self) -> None:
+        """Initialize the config flow."""
+        self._config: dict[str, Any] = {}
+        self._things: dict[str, Thing] = {}
+        self._discovered: dict[str, str] = {}
+
+    @override
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle the initial step."""
+
+        errors = {}
+
+        if user_input:
+            data: dict[str, Any] = {}
+            if self.source == SOURCE_REAUTH:
+                data = dict(self._get_reauth_entry().data)
+            data = {
+                **data,
+                **user_input,
+            }
+
+            self._client = create_client_session(self.hass)
+            self._installation_key = generate_installation_key(
+                str(uuid.uuid4()).lower()
+            )
+            self._cloud_client = LaMarzoccoCloudClient(
+                username=data[CONF_USERNAME],
+                password=data[CONF_PASSWORD],
+                client=self._client,
+                installation_key=self._installation_key,
+            )
+            try:
+                await self._cloud_client.async_register_client()
+                things = await self._cloud_client.list_things()
+            except PolicyAcceptanceRequired:
+                self._config = data
+                return await self.async_step_accept_policy()
+            except AuthFail:
+                _LOGGER.debug("Server rejected login credentials")
+                errors["base"] = "invalid_auth"
+            except RequestNotSuccessful, TimeoutError:
+                errors["base"] = "cannot_connect"
+            else:
+                if (error := self._store_machines(things)) is None:
+                    self._config = data
+                    return await self._async_continue_after_login()
+                errors["base"] = error
+
+        return self._async_show_credentials_form(errors)
+
+    @callback
+    def _async_show_credentials_form(
+        self, errors: dict[str, str] | None = None
+    ) -> ConfigFlowResult:
+        """Show the credentials form of the current flow source."""
+        if self.source == SOURCE_REAUTH:
+            return self.async_show_form(
+                step_id="reauth_confirm",
+                data_schema=probatio.Schema(
+                    {
+                        probatio.Required(probatio.Secret(CONF_PASSWORD)): str,
+                    }
+                ),
+                errors=errors,
+            )
+
+        if self.source == SOURCE_RECONFIGURE:
+            reconfigure_entry = self._get_reconfigure_entry()
+            return self.async_show_form(
+                step_id="reconfigure",
+                data_schema=probatio.Schema(
+                    {
+                        probatio.Required(
+                            CONF_USERNAME, default=reconfigure_entry.data[CONF_USERNAME]
+                        ): TextSelector(
+                            TextSelectorConfig(
+                                type=TextSelectorType.EMAIL, autocomplete="username"
+                            ),
+                        ),
+                        probatio.Required(
+                            probatio.Secret(CONF_PASSWORD),
+                            default=reconfigure_entry.data[CONF_PASSWORD],
+                        ): TextSelector(
+                            TextSelectorConfig(
+                                type=TextSelectorType.PASSWORD,
+                                autocomplete="current-password",
+                            ),
+                        ),
+                    }
+                ),
+                errors=errors,
+            )
+
+        placeholders: dict[str, str] | None = None
+        if self._discovered:
+            self.context["title_placeholders"] = placeholders = {
+                "name": self._discovered[CONF_MACHINE]
+            }
+
+        return self.async_show_form(
+            step_id="user",
+            data_schema=probatio.Schema(
+                {
+                    probatio.Required(CONF_USERNAME): TextSelector(
+                        TextSelectorConfig(
+                            type=TextSelectorType.EMAIL, autocomplete="username"
+                        )
+                    ),
+                    probatio.Required(probatio.Secret(CONF_PASSWORD)): TextSelector(
+                        TextSelectorConfig(
+                            type=TextSelectorType.PASSWORD,
+                            autocomplete="current-password",
+                        )
+                    ),
+                }
+            ),
+            errors=errors,
+            description_placeholders=placeholders,
+        )
+
+    async def async_step_accept_policy(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Let the user accept the latest La Marzocco privacy policy."""
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            try:
+                await self._cloud_client.accept_privacy_policy(
+                    profile_policy=user_input[CONF_PROFILE_POLICY],
+                    commercial_policy=user_input[CONF_COMMERCIAL_POLICY],
+                )
+                things = await self._cloud_client.list_things()
+            except AuthFail:
+                _LOGGER.debug("Server rejected login credentials")
+                return self._async_show_credentials_form({"base": "invalid_auth"})
+            except PolicyAcceptanceRequired:
+                _LOGGER.debug("Server still requires accepting the privacy policy")
+                errors["base"] = "policy_not_accepted"
+            except RequestNotSuccessful, TimeoutError:
+                errors["base"] = "cannot_connect"
+            else:
+                if (error := self._store_machines(things)) is not None:
+                    return self.async_abort(reason=error)
+                return await self._async_continue_after_login()
+
+        return self.async_show_form(
+            step_id="accept_policy",
+            data_schema=probatio.Schema(
+                {
+                    probatio.Required(CONF_PROFILE_POLICY, default=False): bool,
+                    probatio.Required(CONF_COMMERCIAL_POLICY, default=False): bool,
+                }
+            ),
+            errors=errors,
+        )
+
+    def _store_machines(self, things: list[Thing]) -> str | None:
+        """Store the machines of the account and return an error, if any."""
+        self._things = {
+            thing.serial_number: thing
+            for thing in things
+            if thing.type is DeviceType.MACHINE
+        }
+        if not self._things:
+            return "no_machines"
+        if self._discovered and self._discovered[CONF_MACHINE] not in self._things:
+            return "machine_not_found"
+        return None
+
+    async def _async_continue_after_login(self) -> ConfigFlowResult:
+        """Continue the flow once logged in and the machines are known."""
+        if self.source == SOURCE_REAUTH:
+            return self.async_update_reload_and_abort(
+                self._get_reauth_entry(), data_updates=self._config
+            )
+        if self._discovered:
+            # store discovered connection address
+            if CONF_MAC in self._discovered:
+                self._config[CONF_MAC] = self._discovered[CONF_MAC]
+            if CONF_ADDRESS in self._discovered:
+                self._config[CONF_ADDRESS] = self._discovered[CONF_ADDRESS]
+
+            return await self.async_step_machine_selection(
+                user_input={CONF_MACHINE: self._discovered[CONF_MACHINE]}
+            )
+        return await self.async_step_machine_selection()
+
+    async def async_step_machine_selection(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Let user select machine to connect to."""
+        errors: dict[str, str] = {}
+        if user_input:
+            if not self._discovered:
+                serial_number = user_input[CONF_MACHINE]
+                if self.source != SOURCE_RECONFIGURE:
+                    await self.async_set_unique_id(serial_number)
+                    self._abort_if_unique_id_configured()
+            else:
+                serial_number = self._discovered[CONF_MACHINE]
+
+            selected_device = self._things[serial_number]
+
+            if not errors:
+                if self.source == SOURCE_RECONFIGURE:
+                    for service_info in async_discovered_service_info(self.hass):
+                        if service_info.name.startswith(BT_MODEL_PREFIXES):
+                            self._discovered[service_info.name] = service_info.address
+
+                    if self._discovered:
+                        return await self.async_step_bluetooth_selection()
+                    return self.async_update_reload_and_abort(
+                        self._get_reconfigure_entry(),
+                        data_updates=self._config,
+                    )
+
+                return self.async_create_entry(
+                    title=selected_device.name,
+                    data={
+                        **self._config,
+                        CONF_INSTALLATION_KEY: self._installation_key.to_json(),
+                        CONF_TOKEN: self._things[serial_number].ble_auth_token,
+                    },
+                )
+
+        machine_options = [
+            SelectOptionDict(
+                value=thing.serial_number,
+                label=f"{thing.name} ({thing.serial_number})",
+            )
+            for thing in self._things.values()
+        ]
+
+        machine_selection_schema = probatio.Schema(
+            {
+                probatio.Required(
+                    CONF_MACHINE, default=machine_options[0]["value"]
+                ): SelectSelector(
+                    SelectSelectorConfig(
+                        options=machine_options,
+                        mode=SelectSelectorMode.DROPDOWN,
+                    )
+                ),
+            }
+        )
+
+        return self.async_show_form(
+            step_id="machine_selection",
+            data_schema=machine_selection_schema,
+            errors=errors,
+        )
+
+    async def async_step_bluetooth_selection(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle Bluetooth device selection."""
+
+        if user_input is not None:
+            return self.async_update_reload_and_abort(
+                self._get_reconfigure_entry(),
+                data_updates={
+                    CONF_MAC: user_input[CONF_MAC],
+                },
+            )
+
+        bt_options = [
+            SelectOptionDict(
+                value=device_mac,
+                label=f"{device_name} ({device_mac})",
+            )
+            for device_name, device_mac in self._discovered.items()
+        ]
+
+        return self.async_show_form(
+            step_id="bluetooth_selection",
+            data_schema=probatio.Schema(
+                {
+                    probatio.Required(CONF_MAC): SelectSelector(
+                        SelectSelectorConfig(
+                            options=bt_options,
+                            mode=SelectSelectorMode.DROPDOWN,
+                        )
+                    ),
+                },
+            ),
+        )
+
+    @override
+    async def async_step_bluetooth(
+        self, discovery_info: BluetoothServiceInfo
+    ) -> ConfigFlowResult:
+        """Handle a flow initialized by discovery over Bluetooth."""
+        address = discovery_info.address
+        name = discovery_info.name
+
+        _LOGGER.debug(
+            "Discovered La Marzocco machine %s through Bluetooth at address %s",
+            name,
+            address,
+        )
+
+        self._discovered[CONF_NAME] = name
+        self._discovered[CONF_MAC] = address
+
+        serial = name.split("_")[1]
+        self._discovered[CONF_MACHINE] = serial
+
+        await self.async_set_unique_id(serial)
+        self._abort_if_unique_id_configured()
+
+        return await self.async_step_user()
+
+    @override
+    async def async_step_dhcp(
+        self, discovery_info: DhcpServiceInfo
+    ) -> ConfigFlowResult:
+        """Handle discovery via dhcp."""
+
+        serial = discovery_info.hostname.upper()
+
+        await self.async_set_unique_id(serial)
+        self._abort_if_unique_id_configured(
+            updates={
+                CONF_ADDRESS: discovery_info.macaddress,
+            }
+        )
+        self._async_abort_entries_match({CONF_ADDRESS: discovery_info.macaddress})
+
+        _LOGGER.debug(
+            "Discovered La Marzocco machine %s through DHCP at address %s",
+            discovery_info.hostname,
+            discovery_info.ip,
+        )
+
+        self._discovered[CONF_NAME] = discovery_info.hostname
+        self._discovered[CONF_MACHINE] = serial
+        self._discovered[CONF_ADDRESS] = discovery_info.macaddress
+
+        return await self.async_step_user()
+
+    async def async_step_reauth(
+        self, entry_data: Mapping[str, Any]
+    ) -> ConfigFlowResult:
+        """Perform reauth upon an API authentication error."""
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Dialog that informs the user that reauth is required."""
+        if not user_input:
+            return self._async_show_credentials_form()
+
+        return await self.async_step_user(user_input)
+
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Perform reconfiguration of the config entry."""
+        if not user_input:
+            return self._async_show_credentials_form()
+
+        return await self.async_step_user(user_input)
+
+    @staticmethod
+    @callback
+    @override
+    def async_get_options_flow(
+        config_entry: LaMarzoccoConfigEntry,
+    ) -> LmOptionsFlowHandler:
+        """Create the options flow."""
+        return LmOptionsFlowHandler()
+
+
+class LmOptionsFlowHandler(OptionsFlowWithReload):
+    """Handles options flow for the component."""
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Manage the options for the custom component."""
+        errors: dict[str, str] = {}
+
+        if user_input:
+            if user_input.get(CONF_OFFLINE_MODE) and not user_input.get(
+                CONF_USE_BLUETOOTH
+            ):
+                errors[CONF_USE_BLUETOOTH] = "bluetooth_required_offline"
+            else:
+                return self.async_create_entry(title="", data=user_input)
+        options_schema = probatio.Schema(
+            {
+                probatio.Optional(
+                    CONF_USE_BLUETOOTH,
+                    default=self.config_entry.options.get(CONF_USE_BLUETOOTH, True),
+                ): cv.boolean,
+                probatio.Optional(
+                    CONF_OFFLINE_MODE,
+                    default=self.config_entry.options.get(CONF_OFFLINE_MODE, False),
+                ): cv.boolean,
+            }
+        )
+
+        return self.async_show_form(
+            step_id="init",
+            data_schema=options_schema,
+            errors=errors,
+        )

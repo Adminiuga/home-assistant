@@ -1,8 +1,9 @@
 """Support to control ecoal/esterownik.pl coal/wood boiler controller."""
+
 import logging
 
 from ecoaliface.simple import ECoalController
-import voluptuous as vol
+import probatio
 
 from homeassistant.const import (
     CONF_HOST,
@@ -14,7 +15,7 @@ from homeassistant.const import (
     Platform,
 )
 from homeassistant.core import HomeAssistant
-import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.discovery import load_platform
 from homeassistant.helpers.typing import ConfigType
 
@@ -50,35 +51,37 @@ AVAILABLE_SENSORS = {
     "exhaust_temp": "Exhaust temperature",
 }
 
-SWITCH_SCHEMA = vol.Schema(
+SWITCH_SCHEMA = probatio.Schema(
     {
-        vol.Optional(CONF_MONITORED_CONDITIONS, default=list(AVAILABLE_PUMPS)): vol.All(
-            cv.ensure_list, [vol.In(AVAILABLE_PUMPS)]
-        )
+        probatio.Optional(
+            CONF_MONITORED_CONDITIONS, default=list(AVAILABLE_PUMPS)
+        ): probatio.All(probatio.EnsureList(), [probatio.In(AVAILABLE_PUMPS)])
     }
 )
 
-SENSOR_SCHEMA = vol.Schema(
+SENSOR_SCHEMA = probatio.Schema(
     {
-        vol.Optional(
+        probatio.Optional(
             CONF_MONITORED_CONDITIONS, default=list(AVAILABLE_SENSORS)
-        ): vol.All(cv.ensure_list, [vol.In(AVAILABLE_SENSORS)])
+        ): probatio.All(probatio.EnsureList(), [probatio.In(AVAILABLE_SENSORS)])
     }
 )
 
-CONFIG_SCHEMA = vol.Schema(
+CONFIG_SCHEMA = probatio.Schema(
     {
-        DOMAIN: vol.Schema(
+        DOMAIN: probatio.Schema(
             {
-                vol.Required(CONF_HOST): cv.string,
-                vol.Optional(CONF_PASSWORD, default=DEFAULT_PASSWORD): cv.string,
-                vol.Optional(CONF_SENSORS, default={}): SENSOR_SCHEMA,
-                vol.Optional(CONF_SWITCHES, default={}): SWITCH_SCHEMA,
-                vol.Optional(CONF_USERNAME, default=DEFAULT_USERNAME): cv.string,
+                probatio.Required(CONF_HOST): cv.string,
+                probatio.Optional(
+                    probatio.Secret(CONF_PASSWORD), default=DEFAULT_PASSWORD
+                ): cv.string,
+                probatio.Optional(CONF_SENSORS, default={}): SENSOR_SCHEMA,
+                probatio.Optional(CONF_SWITCHES, default={}): SWITCH_SCHEMA,
+                probatio.Optional(CONF_USERNAME, default=DEFAULT_USERNAME): cv.string,
             }
         )
     },
-    extra=vol.ALLOW_EXTRA,
+    extra=probatio.ALLOW_EXTRA,
 )
 
 

@@ -1,9 +1,12 @@
 {
   "domain": "nibe_heatpump",
   "name": "Nibe Heat Pump",
-  "config_flow": true,
-  "documentation": "https://www.home-assistant.io/integrations/nibe_heatpump",
-  "requirements": ["nibe==1.2.1"],
+  "categories": ["climate.heat_pumps_air_conditioning"],
   "codeowners": ["@elupus"],
-  "iot_class": "local_polling"
+  "config_flow": true,
+  "connectivity": ["modbus", "network"],
+  "documentation": "https://www.home-assistant.io/integrations/nibe_heatpump",
+  "integration_type": "device",
+  "iot_class": "local_polling",
+  "requirements": ["nibe==2.25.0"]
 }

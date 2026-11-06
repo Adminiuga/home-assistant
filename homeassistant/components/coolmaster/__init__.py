@@ -1,70 +1,100 @@
 """The Coolmaster integration."""
-import logging
 
 from pycoolmasternet_async import CoolMasterNet
 
-from homeassistant.components.climate import SCAN_INTERVAL
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST, CONF_PORT, Platform
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryNotReady
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.helpers import device_registry as dr, entity_registry as er
 
-from .const import DATA_COORDINATOR, DATA_INFO, DOMAIN
+from .const import CONF_SEND_WAKEUP_PROMPT, CONF_SWING_SUPPORT, DOMAIN
+from .coordinator import CoolmasterConfigEntry, CoolmasterDataUpdateCoordinator
 
-_LOGGER = logging.getLogger(__name__)
-
-PLATFORMS = [Platform.CLIMATE]
+PLATFORMS = [Platform.BINARY_SENSOR, Platform.BUTTON, Platform.CLIMATE, Platform.SENSOR]
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_setup_entry(hass: HomeAssistant, entry: CoolmasterConfigEntry) -> None:
     """Set up Coolmaster from a config entry."""
     host = entry.data[CONF_HOST]
     port = entry.data[CONF_PORT]
-    coolmaster = CoolMasterNet(host, port)
+    send_wakeup_prompt = entry.data.get(CONF_SEND_WAKEUP_PROMPT, False)
+    if not entry.data.get(CONF_SWING_SUPPORT):
+        coolmaster = CoolMasterNet(
+            host,
+            port,
+            send_initial_line_feed=send_wakeup_prompt,
+        )
+    else:
+        # Swing support adds an additional request per unit. The requests are
+        # done in parallel, which can cause delays on the server. Therefore,
+        # we increase the request timeout to 5 seconds instead of 1.
+        coolmaster = CoolMasterNet(
+            host,
+            port,
+            send_initial_line_feed=send_wakeup_prompt,
+            read_timeout=5,
+            swing_support=True,
+        )
     try:
         info = await coolmaster.info()
         if not info:
             raise ConfigEntryNotReady
     except OSError as error:
-        raise ConfigEntryNotReady() from error
-    coordinator = CoolmasterDataUpdateCoordinator(hass, coolmaster)
-    hass.data.setdefault(DOMAIN, {})
+        raise ConfigEntryNotReady from error
+    coordinator = CoolmasterDataUpdateCoordinator(hass, entry, coolmaster, info)
     await coordinator.async_config_entry_first_refresh()
-    hass.data[DOMAIN][entry.entry_id] = {
-        DATA_INFO: info,
-        DATA_COORDINATOR: coordinator,
-    }
+    entry.runtime_data = coordinator
+    await _async_migrate_unique_ids(hass, entry)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    return True
+
+async def _async_migrate_unique_ids(
+    hass: HomeAssistant, entry: CoolmasterConfigEntry
+) -> None:
+    """Migrate entities and devices to config-entry-scoped unique IDs.
+
+    Unique IDs used to be the raw unit ID (e.g. L5.002). Unit IDs are only
+    unique within a single CoolMasterNet device, so two devices reporting
+    the same unit IDs collided and the second device's entities were
+    silently dropped.
+    """
+    prefix = f"{entry.entry_id}-"
+
+    @callback
+    def _migrate(entity_entry: er.RegistryEntry) -> dict[str, str] | None:
+        if entity_entry.unique_id.startswith(prefix):
+            return None
+        return {"new_unique_id": f"{prefix}{entity_entry.unique_id}"}
+
+    await er.async_migrate_entries(hass, entry.entry_id, _migrate)
+
+    dev_reg = dr.async_get(hass)
+    for device in dr.async_entries_for_config_entry(dev_reg, entry.entry_id):
+        # Prefix every identifier owned by this entry, including units that
+        # are currently not reported (e.g. offline), so a returning unit
+        # reuses its migrated device instead of creating a duplicate.
+        new_identifiers = {
+            (domain, ident)
+            if domain != DOMAIN or ident.startswith(prefix)
+            else (domain, f"{prefix}{ident}")
+            for domain, ident in device.identifiers
+        }
+        if new_identifiers != device.identifiers:
+            dev_reg.async_update_device(device.id, new_identifiers=new_identifiers)
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_unload_entry(hass: HomeAssistant, entry: CoolmasterConfigEntry) -> None:
     """Unload a Coolmaster config entry."""
-    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-    if unload_ok:
-        hass.data[DOMAIN].pop(entry.entry_id)
-    return unload_ok
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)
 
 
-class CoolmasterDataUpdateCoordinator(DataUpdateCoordinator):
-    """Class to manage fetching Coolmaster data."""
-
-    def __init__(self, hass, coolmaster):
-        """Initialize global Coolmaster data updater."""
-        self._coolmaster = coolmaster
-
-        super().__init__(
-            hass,
-            _LOGGER,
-            name=DOMAIN,
-            update_interval=SCAN_INTERVAL,
-        )
-
-    async def _async_update_data(self):
-        """Fetch data from Coolmaster."""
-        try:
-            return await self._coolmaster.status()
-        except OSError as error:
-            raise UpdateFailed from error
+async def async_remove_config_entry_device(
+    hass: HomeAssistant,
+    config_entry: CoolmasterConfigEntry,
+    device_entry: dr.AnyDeviceEntry,
+) -> bool:
+    """Remove a config entry from a device."""
+    return not device_entry.identifiers.intersection(
+        (DOMAIN, f"{config_entry.entry_id}-{unit_id}")
+        for unit_id in config_entry.runtime_data.data
+    )

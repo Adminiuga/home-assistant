@@ -1,17 +1,22 @@
 {
   "domain": "screenlogic",
   "name": "Pentair ScreenLogic",
-  "config_flow": true,
-  "documentation": "https://www.home-assistant.io/integrations/screenlogic",
-  "requirements": ["screenlogicpy==0.5.4"],
+  "categories": ["water.pools_spas"],
   "codeowners": ["@dieselrabbit", "@bdraco"],
+  "config_flow": true,
+  "connectivity": ["network"],
   "dhcp": [
-    { "registered_devices": true },
+    {
+      "registered_devices": true
+    },
     {
       "hostname": "pentair*",
       "macaddress": "00C033*"
     }
   ],
-  "iot_class": "local_polling",
-  "loggers": ["screenlogicpy"]
+  "documentation": "https://www.home-assistant.io/integrations/screenlogic",
+  "integration_type": "hub",
+  "iot_class": "local_push",
+  "loggers": ["screenlogicpy"],
+  "requirements": ["screenlogicpy==0.10.2"]
 }

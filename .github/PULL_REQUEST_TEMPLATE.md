@@ -46,6 +46,8 @@
 - This PR fixes or closes issue: fixes #
 - This PR is related to issue: 
 - Link to documentation pull request: 
+- Link to contributors documentation pull request: 
+- Link to frontend pull request: 
 
 ## Checklist
 <!--
@@ -53,14 +55,21 @@
   creating the PR. If you're unsure about any of them, don't hesitate to ask.
   We're here to help! This is simply a reminder of what we are going to look
   for before merging your code.
+
+  AI tools are welcome, but contributors are responsible for *fully*
+  understanding the code before submitting a PR. Please follow our AI policy:
+  https://contributors.home-assistant.io/start/ai-policy/
 -->
 
+- [ ] I understand the code I am submitting and can explain how it works.
 - [ ] The code change is tested and works locally.
 - [ ] Local tests pass. **Your PR cannot be merged unless tests pass**
 - [ ] There is no commented out code in this PR.
 - [ ] I have followed the [development checklist][dev-checklist]
-- [ ] The code has been formatted using Black (`black --fast homeassistant tests`)
+- [ ] I have followed the [perfect PR recommendations][perfect-pr]
+- [ ] The code has been formatted using Ruff (`ruff format homeassistant tests`)
 - [ ] Tests have been added to verify that the new code works.
+- [ ] Any generated code has been carefully reviewed for correctness and compliance with project standards.
 
 If user exposed functionality or configuration variables are added/changed:
 
@@ -72,8 +81,7 @@ If the code communicates with devices, web services, or third-party tools:
       Updated and included derived files by running: `python3 -m script.hassfest`.
 - [ ] New or updated dependencies have been added to `requirements_all.txt`.  
       Updated by running `python3 -m script.gen_requirements_all`.
-- [ ] For the updated dependencies - a link to the changelog, or at minimum a diff between library versions is added to the PR description.
-- [ ] Untested files have been added to `.coveragerc`.
+- [ ] For the updated dependencies a diff between library versions and ideally a link to the changelog/release notes is added to the PR description.
 
 <!--
   This project is very active and we have a high turnover of pull requests.
@@ -103,7 +111,8 @@ To help with the load of incoming pull requests:
 
   Below, some useful links you could explore:
 -->
-[dev-checklist]: https://developers.home-assistant.io/docs/en/development_checklist.html
-[manifest-docs]: https://developers.home-assistant.io/docs/en/creating_integration_manifest.html
-[quality-scale]: https://developers.home-assistant.io/docs/en/next/integration_quality_scale_index.html
+[dev-checklist]: https://contributors.home-assistant.io/core/development/checklist/
+[manifest-docs]: https://contributors.home-assistant.io/core/integrations/manifest/
+[quality-scale]: https://contributors.home-assistant.io/core/quality-scale/
 [docs-repository]: https://github.com/home-assistant/home-assistant.io
+[perfect-pr]: https://contributors.home-assistant.io/start/pull-requests/#before-you-open-it

@@ -1,32 +1,35 @@
 """The tests for hls streams."""
+
 from datetime import timedelta
 from http import HTTPStatus
-import logging
 from unittest.mock import patch
 from urllib.parse import urlparse
 
 import av
 import pytest
+from pytest_homeassistant.common import async_fire_time_changed
+from pytest_homeassistant.typing import ClientSessionGenerator
 
-from homeassistant.components.stream import create_stream
+from homeassistant.components.stream import Stream, create_stream
 from homeassistant.components.stream.const import (
+    DOMAIN,
     EXT_X_START_LL_HLS,
     EXT_X_START_NON_LL_HLS,
     HLS_PROVIDER,
     MAX_SEGMENTS,
     NUM_PLAYLIST_SEGMENTS,
 )
-from homeassistant.components.stream.core import Part
+from homeassistant.components.stream.core import Orientation, Part
+from homeassistant.core import HomeAssistant
 from homeassistant.setup import async_setup_component
-import homeassistant.util.dt as dt_util
+from homeassistant.util import dt as dt_util
 
 from .common import (
     FAKE_TIME,
     DefaultSegment as Segment,
     assert_mp4_has_transform_matrix,
+    dynamic_stream_settings,
 )
-
-from tests.common import async_fire_time_changed
 
 STREAM_SOURCE = "some-stream-source"
 INIT_BYTES = b"\x00\x00\x00\x08moov"
@@ -43,15 +46,15 @@ HLS_CONFIG = {
 
 
 @pytest.fixture
-async def setup_component(hass) -> None:
+async def setup_component(hass: HomeAssistant) -> None:
     """Test fixture to setup the stream component."""
-    await async_setup_component(hass, "stream", HLS_CONFIG)
+    await async_setup_component(hass, DOMAIN, HLS_CONFIG)
 
 
 class HlsClient:
     """Test fixture for fetching the hls stream."""
 
-    def __init__(self, http_client, parsed_url):
+    def __init__(self, http_client, parsed_url) -> None:
         """Initialize HlsClient."""
         self.http_client = http_client
         self.parsed_url = parsed_url
@@ -66,7 +69,7 @@ class HlsClient:
 
 
 @pytest.fixture
-def hls_stream(hass, hass_client):
+def hls_stream(hass: HomeAssistant, hass_client: ClientSessionGenerator):
     """Create test fixture for creating an HLS client for a stream."""
 
     async def create_client_for_stream(stream):
@@ -116,13 +119,16 @@ def make_playlist(
         response.extend(
             [
                 f"#EXT-X-PART-INF:PART-TARGET={part_target_duration:.3f}",
-                f"#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK={2*part_target_duration:.3f}",
-                f"#EXT-X-START:TIME-OFFSET=-{EXT_X_START_LL_HLS*part_target_duration:.3f},PRECISE=YES",
+                "#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK="
+                f"{2 * part_target_duration:.3f}",
+                "#EXT-X-START:TIME-OFFSET=-"
+                f"{EXT_X_START_LL_HLS * part_target_duration:.3f},PRECISE=YES",
             ]
         )
     else:
         response.append(
-            f"#EXT-X-START:TIME-OFFSET=-{EXT_X_START_NON_LL_HLS*segment_duration:.3f},PRECISE=YES",
+            "#EXT-X-START:TIME-OFFSET=-"
+            f"{EXT_X_START_NON_LL_HLS * segment_duration:.3f},PRECISE=YES",
         )
     if segments:
         response.extend(segments)
@@ -133,10 +139,9 @@ def make_playlist(
 
 
 async def test_hls_stream(
-    hass, setup_component, hls_stream, stream_worker_sync, h264_video
-):
-    """
-    Test hls stream.
+    hass: HomeAssistant, setup_component, hls_stream, stream_worker_sync, h264_video
+) -> None:
+    """Test hls stream.
 
     Purposefully not mocking anything here to test full
     integration with the stream component.
@@ -145,7 +150,7 @@ async def test_hls_stream(
     stream_worker_sync.pause()
 
     # Setup demo HLS track
-    stream = create_stream(hass, h264_video, {})
+    stream = create_stream(hass, h264_video, {}, dynamic_stream_settings())
 
     # Request stream
     stream.add_provider(HLS_PROVIDER)
@@ -185,7 +190,7 @@ async def test_hls_stream(
     assert stream.get_diagnostics() == {
         "container_format": "mov,mp4,m4a,3gp,3g2,mj2",
         "keepalive": False,
-        "orientation": 1,
+        "orientation": Orientation.NO_TRANSFORM,
         "start_worker": 1,
         "video_codec": "h264",
         "worker_error": 1,
@@ -193,13 +198,17 @@ async def test_hls_stream(
 
 
 async def test_stream_timeout(
-    hass, hass_client, setup_component, stream_worker_sync, h264_video
-):
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    setup_component,
+    stream_worker_sync,
+    h264_video,
+) -> None:
     """Test hls stream timeout."""
     stream_worker_sync.pause()
 
     # Setup demo HLS track
-    stream = create_stream(hass, h264_video, {})
+    stream = create_stream(hass, h264_video, {}, dynamic_stream_settings())
 
     available_states = []
 
@@ -221,8 +230,8 @@ async def test_stream_timeout(
     playlist_response = await http_client.get(parsed_url.path)
     assert playlist_response.status == HTTPStatus.OK
 
-    # Wait a minute
-    future = dt_util.utcnow() + timedelta(minutes=1)
+    # Wait 40 seconds
+    future = dt_util.utcnow() + timedelta(seconds=40)
     async_fire_time_changed(hass, future)
     await hass.async_block_till_done()
 
@@ -232,8 +241,8 @@ async def test_stream_timeout(
 
     stream_worker_sync.resume()
 
-    # Wait 5 minutes
-    future = dt_util.utcnow() + timedelta(minutes=5)
+    # Wait 2 minutes
+    future = dt_util.utcnow() + timedelta(minutes=2)
     async_fire_time_changed(hass, future)
     await hass.async_block_till_done()
 
@@ -246,13 +255,17 @@ async def test_stream_timeout(
 
 
 async def test_stream_timeout_after_stop(
-    hass, hass_client, setup_component, stream_worker_sync, h264_video
-):
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    setup_component,
+    stream_worker_sync,
+    h264_video,
+) -> None:
     """Test hls stream timeout after the stream has been stopped already."""
     stream_worker_sync.pause()
 
     # Setup demo HLS track
-    stream = create_stream(hass, h264_video, {})
+    stream = create_stream(hass, h264_video, {}, dynamic_stream_settings())
 
     # Request stream
     stream.add_provider(HLS_PROVIDER)
@@ -268,11 +281,24 @@ async def test_stream_timeout_after_stop(
     await hass.async_block_till_done()
 
 
-async def test_stream_retries(hass, setup_component, should_retry):
+@pytest.mark.parametrize(
+    ("exception"),
+    [
+        # pylint: disable-next=c-extension-no-member
+        (av.error.InvalidDataError(-2, "error")),
+        (av.HTTPBadRequestError(500, "error")),
+    ],
+)
+async def test_stream_retries(
+    hass: HomeAssistant,
+    setup_component,
+    should_retry,
+    exception,
+) -> None:
     """Test hls stream is retried on failure."""
     # Setup demo HLS track
     source = "test_stream_keepalive_source"
-    stream = create_stream(hass, source, {})
+    stream = create_stream(hass, source, {}, dynamic_stream_settings())
     track = stream.add_provider(HLS_PROVIDER)
     track.num_segments = 2
 
@@ -284,29 +310,36 @@ async def test_stream_retries(hass, setup_component, should_retry):
 
     stream.set_update_callback(update_callback)
 
-    cur_time = 0
+    open_future1 = hass.loop.create_future()
+    open_future2 = hass.loop.create_future()
+    futures = [open_future2, open_future1]
 
-    def time_side_effect():
-        logging.info("time side effect")
-        nonlocal cur_time
-        if cur_time >= 80:
-            logging.info("changing return value")
+    original_set_state = Stream._set_state
+
+    def set_state_wrapper(self, state: bool) -> None:
+        if state is False:
             should_retry.return_value = False  # Thread should exit and be joinable.
-        cur_time += 40
-        return cur_time
+        original_set_state(self, state)
 
-    with patch("av.open") as av_open, patch(
-        "homeassistant.components.stream.time"
-    ) as mock_time, patch(
-        "homeassistant.components.stream.STREAM_RESTART_INCREMENT", 0
+    def av_open_side_effect(*args, **kwargs):
+        hass.loop.call_soon_threadsafe(futures.pop().set_result, None)
+        raise exception
+
+    with (
+        patch("av.open") as av_open,
+        patch("homeassistant.components.stream.Stream._set_state", set_state_wrapper),
+        patch("homeassistant.components.stream.STREAM_RESTART_INCREMENT", 0),
     ):
-        av_open.side_effect = av.error.InvalidDataError(-2, "error")
-        mock_time.time.side_effect = time_side_effect
+        av_open.side_effect = av_open_side_effect
         # Request stream. Enable retries which are disabled by default in tests.
         should_retry.return_value = True
         await stream.start()
-        stream._thread.join()
-        stream._thread = None
+        # Capture the thread reference before yielding to the event loop, since
+        # worker_finished() may clear stream._thread once the worker exits.
+        worker_thread = stream._thread
+        await open_future1
+        await open_future2
+        await hass.async_add_executor_job(worker_thread.join)
         assert av_open.call_count == 2
         await hass.async_block_till_done()
 
@@ -318,9 +351,11 @@ async def test_stream_retries(hass, setup_component, should_retry):
     assert available_states == [True, False, True]
 
 
-async def test_hls_playlist_view_no_output(hass, setup_component, hls_stream):
+async def test_hls_playlist_view_no_output(
+    hass: HomeAssistant, setup_component, hls_stream
+) -> None:
     """Test rendering the hls playlist with no output segments."""
-    stream = create_stream(hass, STREAM_SOURCE, {})
+    stream = create_stream(hass, STREAM_SOURCE, {}, dynamic_stream_settings())
     stream.add_provider(HLS_PROVIDER)
 
     hls_client = await hls_stream(stream)
@@ -330,9 +365,11 @@ async def test_hls_playlist_view_no_output(hass, setup_component, hls_stream):
     assert resp.status == HTTPStatus.NOT_FOUND
 
 
-async def test_hls_playlist_view(hass, setup_component, hls_stream, stream_worker_sync):
+async def test_hls_playlist_view(
+    hass: HomeAssistant, setup_component, hls_stream, stream_worker_sync
+) -> None:
     """Test rendering the hls playlist with 1 and 2 output segments."""
-    stream = create_stream(hass, STREAM_SOURCE, {})
+    stream = create_stream(hass, STREAM_SOURCE, {}, dynamic_stream_settings())
     stream_worker_sync.pause()
     hls = stream.add_provider(HLS_PROVIDER)
     for i in range(2):
@@ -361,9 +398,11 @@ async def test_hls_playlist_view(hass, setup_component, hls_stream, stream_worke
     await stream.stop()
 
 
-async def test_hls_max_segments(hass, setup_component, hls_stream, stream_worker_sync):
-    """Test rendering the hls playlist with more segments than the segment deque can hold."""
-    stream = create_stream(hass, STREAM_SOURCE, {})
+async def test_hls_max_segments(
+    hass: HomeAssistant, setup_component, hls_stream, stream_worker_sync
+) -> None:
+    """Test hls playlist with more segments than the deque can hold."""
+    stream = create_stream(hass, STREAM_SOURCE, {}, dynamic_stream_settings())
     stream_worker_sync.pause()
     hls = stream.add_provider(HLS_PROVIDER)
 
@@ -380,9 +419,7 @@ async def test_hls_max_segments(hass, setup_component, hls_stream, stream_worker
 
     # Only NUM_PLAYLIST_SEGMENTS are returned in the playlist.
     start = MAX_SEGMENTS + 1 - NUM_PLAYLIST_SEGMENTS
-    segments = []
-    for sequence in range(start, MAX_SEGMENTS + 1):
-        segments.append(make_segment(sequence))
+    segments = [make_segment(sequence) for sequence in range(start, MAX_SEGMENTS + 1)]
     assert await resp.text() == make_playlist(sequence=start, segments=segments)
 
     # Fetch the actual segments with a fake byte payload
@@ -401,7 +438,8 @@ async def test_hls_max_segments(hass, setup_component, hls_stream, stream_worker
         segment_response = await hls_client.get("/segment/0.m4s")
     assert segment_response.status == HTTPStatus.NOT_FOUND
 
-    # However all segments in the buffer are accessible, even those that were not in the playlist.
+    # However all segments in the buffer are accessible,
+    # even those that were not in the playlist.
     for sequence in range(1, MAX_SEGMENTS + 1):
         segment_response = await hls_client.get(f"/segment/{sequence}.m4s")
         assert segment_response.status == HTTPStatus.OK
@@ -411,11 +449,11 @@ async def test_hls_max_segments(hass, setup_component, hls_stream, stream_worker
 
 
 async def test_hls_playlist_view_discontinuity(
-    hass, setup_component, hls_stream, stream_worker_sync
-):
+    hass: HomeAssistant, setup_component, hls_stream, stream_worker_sync
+) -> None:
     """Test a discontinuity across segments in the stream with 3 segments."""
 
-    stream = create_stream(hass, STREAM_SOURCE, {})
+    stream = create_stream(hass, STREAM_SOURCE, {}, dynamic_stream_settings())
     stream_worker_sync.pause()
     hls = stream.add_provider(HLS_PROVIDER)
 
@@ -449,10 +487,10 @@ async def test_hls_playlist_view_discontinuity(
 
 
 async def test_hls_max_segments_discontinuity(
-    hass, setup_component, hls_stream, stream_worker_sync
-):
+    hass: HomeAssistant, setup_component, hls_stream, stream_worker_sync
+) -> None:
     """Test a discontinuity with more segments than the segment deque can hold."""
-    stream = create_stream(hass, STREAM_SOURCE, {})
+    stream = create_stream(hass, STREAM_SOURCE, {}, dynamic_stream_settings())
     stream_worker_sync.pause()
     hls = stream.add_provider(HLS_PROVIDER)
 
@@ -478,9 +516,7 @@ async def test_hls_max_segments_discontinuity(
     # EXT-X-DISCONTINUITY tag to be omitted and EXT-X-DISCONTINUITY-SEQUENCE
     # returned instead.
     start = MAX_SEGMENTS + 1 - NUM_PLAYLIST_SEGMENTS
-    segments = []
-    for sequence in range(start, MAX_SEGMENTS + 1):
-        segments.append(make_segment(sequence))
+    segments = [make_segment(sequence) for sequence in range(start, MAX_SEGMENTS + 1)]
     assert await resp.text() == make_playlist(
         sequence=start,
         discontinuity_sequence=1,
@@ -492,10 +528,10 @@ async def test_hls_max_segments_discontinuity(
 
 
 async def test_remove_incomplete_segment_on_exit(
-    hass, setup_component, stream_worker_sync
-):
+    hass: HomeAssistant, setup_component, stream_worker_sync
+) -> None:
     """Test that the incomplete segment gets removed when the worker thread quits."""
-    stream = create_stream(hass, STREAM_SOURCE, {})
+    stream = create_stream(hass, STREAM_SOURCE, {}, dynamic_stream_settings())
     stream_worker_sync.pause()
     await stream.start()
     hls = stream.add_provider(HLS_PROVIDER)
@@ -524,10 +560,9 @@ async def test_remove_incomplete_segment_on_exit(
 
 
 async def test_hls_stream_rotate(
-    hass, setup_component, hls_stream, stream_worker_sync, h264_video
-):
-    """
-    Test hls stream with rotation applied.
+    hass: HomeAssistant, setup_component, hls_stream, stream_worker_sync, h264_video
+) -> None:
+    """Test hls stream with rotation applied.
 
     Purposefully not mocking anything here to test full
     integration with the stream component.
@@ -536,7 +571,7 @@ async def test_hls_stream_rotate(
     stream_worker_sync.pause()
 
     # Setup demo HLS track
-    stream = create_stream(hass, h264_video, {})
+    stream = create_stream(hass, h264_video, {}, dynamic_stream_settings())
 
     # Request stream
     stream.add_provider(HLS_PROVIDER)
@@ -549,14 +584,14 @@ async def test_hls_stream_rotate(
     assert master_playlist_response.status == HTTPStatus.OK
 
     # Fetch rotated init
-    stream.orientation = 6
+    stream.dynamic_stream_settings.orientation = Orientation.ROTATE_LEFT
     init_response = await hls_client.get("/init.mp4")
     assert init_response.status == HTTPStatus.OK
     init = await init_response.read()
 
     stream_worker_sync.resume()
 
-    assert_mp4_has_transform_matrix(init, stream.orientation)
+    assert_mp4_has_transform_matrix(init, stream.dynamic_stream_settings.orientation)
 
     # Stop stream, if it hasn't quit already
     await stream.stop()

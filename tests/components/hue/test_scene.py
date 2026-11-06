@@ -1,22 +1,35 @@
 """Philips Hue scene platform tests for V2 bridge/api."""
 
+from copy import deepcopy
+import logging
+from unittest.mock import Mock
 
-from homeassistant.const import STATE_UNKNOWN
+import pytest
+
+from homeassistant.components.hue import DOMAIN
+from homeassistant.const import STATE_UNKNOWN, Platform
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
+from homeassistant.util.json import JsonArrayType
 
 from .conftest import setup_platform
 from .const import FAKE_SCENE
 
 
-async def test_scene(hass, mock_bridge_v2, v2_resources_test_data):
+async def test_scene(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    mock_bridge_v2: Mock,
+    v2_resources_test_data: JsonArrayType,
+) -> None:
     """Test if (config) scenes get created."""
     await mock_bridge_v2.api.load_test_data(v2_resources_test_data)
 
-    await setup_platform(hass, mock_bridge_v2, "scene")
+    await setup_platform(hass, mock_bridge_v2, Platform.SCENE)
     # there shouldn't have been any requests at this point
     assert len(mock_bridge_v2.mock_requests) == 0
-    # 2 entities should be created from test data
-    assert len(hass.states.async_all()) == 2
+    # 3 entities should be created from test data
+    assert len(hass.states.async_all()) == 3
 
     # test (dynamic) scene for a hue zone
     test_entity = hass.states.get("scene.test_zone_dynamic_test_scene")
@@ -27,11 +40,11 @@ async def test_scene(hass, mock_bridge_v2, v2_resources_test_data):
     assert test_entity.attributes["group_type"] == "zone"
     assert test_entity.attributes["name"] == "Dynamic Test Scene"
     assert test_entity.attributes["speed"] == 0.6269841194152832
-    assert test_entity.attributes["brightness"] == 46.85
+    assert test_entity.attributes["brightness"] == 119
     assert test_entity.attributes["is_dynamic"] is True
 
     # test (regular) scene for a hue room
-    test_entity = hass.states.get("scene.test_room_regular_test_scene")
+    test_entity = hass.states.get("scene.test_room_test_room_regular_test_scene")
     assert test_entity is not None
     assert test_entity.name == "Test Room Regular Test Scene"
     assert test_entity.state == STATE_UNKNOWN
@@ -39,27 +52,42 @@ async def test_scene(hass, mock_bridge_v2, v2_resources_test_data):
     assert test_entity.attributes["group_type"] == "room"
     assert test_entity.attributes["name"] == "Regular Test Scene"
     assert test_entity.attributes["speed"] == 0.5
-    assert test_entity.attributes["brightness"] == 100.0
+    assert test_entity.attributes["brightness"] == 255
     assert test_entity.attributes["is_dynamic"] is False
 
+    # test smart scene
+    test_entity = hass.states.get("scene.test_room_test_room_smart_test_scene")
+    assert test_entity is not None
+    assert test_entity.name == "Test Room Smart Test Scene"
+    assert test_entity.state == STATE_UNKNOWN
+    assert test_entity.attributes["group_name"] == "Test Room"
+    assert test_entity.attributes["group_type"] == "room"
+    assert test_entity.attributes["name"] == "Smart Test Scene"
+    assert test_entity.attributes["active_timeslot_id"] == 1
+    assert test_entity.attributes["active_timeslot_name"] == "wednesday"
+    assert test_entity.attributes["active_scene"] == "Regular Test Scene"
+    assert test_entity.attributes["is_active"] is True
+
     # scene entities should have be assigned to the room/zone device/service
-    ent_reg = er.async_get(hass)
     for entity_id in (
         "scene.test_zone_dynamic_test_scene",
-        "scene.test_room_regular_test_scene",
+        "scene.test_room_test_room_regular_test_scene",
+        "scene.test_room_test_room_smart_test_scene",
     ):
-        entity_entry = ent_reg.async_get(entity_id)
+        entity_entry = entity_registry.async_get(entity_id)
         assert entity_entry
         assert entity_entry.device_id is not None
 
 
-async def test_scene_turn_on_service(hass, mock_bridge_v2, v2_resources_test_data):
+async def test_scene_turn_on_service(
+    hass: HomeAssistant, mock_bridge_v2: Mock, v2_resources_test_data: JsonArrayType
+) -> None:
     """Test calling the turn on service on a scene."""
     await mock_bridge_v2.api.load_test_data(v2_resources_test_data)
 
-    await setup_platform(hass, mock_bridge_v2, "scene")
+    await setup_platform(hass, mock_bridge_v2, Platform.SCENE)
 
-    test_entity_id = "scene.test_room_regular_test_scene"
+    test_entity_id = "scene.test_room_test_room_regular_test_scene"
 
     # call the HA turn_on service
     await hass.services.async_call(
@@ -89,18 +117,18 @@ async def test_scene_turn_on_service(hass, mock_bridge_v2, v2_resources_test_dat
 
 
 async def test_scene_advanced_turn_on_service(
-    hass, mock_bridge_v2, v2_resources_test_data
-):
+    hass: HomeAssistant, mock_bridge_v2: Mock, v2_resources_test_data: JsonArrayType
+) -> None:
     """Test calling the advanced turn on service on a scene."""
     await mock_bridge_v2.api.load_test_data(v2_resources_test_data)
 
-    await setup_platform(hass, mock_bridge_v2, "scene")
+    await setup_platform(hass, mock_bridge_v2, Platform.SCENE)
 
-    test_entity_id = "scene.test_room_regular_test_scene"
+    test_entity_id = "scene.test_room_test_room_regular_test_scene"
 
     # call the hue.activate_scene service
     await hass.services.async_call(
-        "hue",
+        DOMAIN,
         "activate_scene",
         {"entity_id": test_entity_id},
         blocking=True,
@@ -113,7 +141,7 @@ async def test_scene_advanced_turn_on_service(
 
     # test again with sending speed and dynamic
     await hass.services.async_call(
-        "hue",
+        DOMAIN,
         "activate_scene",
         {"entity_id": test_entity_id, "speed": 80, "dynamic": True},
         blocking=True,
@@ -125,13 +153,15 @@ async def test_scene_advanced_turn_on_service(
     }
 
 
-async def test_scene_updates(hass, mock_bridge_v2, v2_resources_test_data):
+async def test_scene_updates(
+    hass: HomeAssistant, mock_bridge_v2: Mock, v2_resources_test_data: JsonArrayType
+) -> None:
     """Test scene events from bridge."""
     await mock_bridge_v2.api.load_test_data(v2_resources_test_data)
 
-    await setup_platform(hass, mock_bridge_v2, "scene")
+    await setup_platform(hass, mock_bridge_v2, Platform.SCENE)
 
-    test_entity_id = "scene.test_room_mocked_scene"
+    test_entity_id = "scene.test_room_test_room_mocked_scene"
 
     # verify entity does not exist before we start
     assert hass.states.get(test_entity_id) is None
@@ -145,7 +175,7 @@ async def test_scene_updates(hass, mock_bridge_v2, v2_resources_test_data):
     assert test_entity is not None
     assert test_entity.state == STATE_UNKNOWN
     assert test_entity.name == "Test Room Mocked Scene"
-    assert test_entity.attributes["brightness"] == 65.0
+    assert test_entity.attributes["brightness"] == 166
 
     # test update
     updated_resource = {**FAKE_SCENE}
@@ -154,7 +184,7 @@ async def test_scene_updates(hass, mock_bridge_v2, v2_resources_test_data):
     await hass.async_block_till_done()
     test_entity = hass.states.get(test_entity_id)
     assert test_entity is not None
-    assert test_entity.attributes["brightness"] == 35.0
+    assert test_entity.attributes["brightness"] == 89
 
     # # test entity name changes on group name change
     mock_bridge_v2.api.emit_event(
@@ -167,7 +197,7 @@ async def test_scene_updates(hass, mock_bridge_v2, v2_resources_test_data):
     )
     await hass.async_block_till_done()
     test_entity = hass.states.get(test_entity_id)
-    assert test_entity.name == "Test Room 2 Mocked Scene"
+    assert test_entity.attributes["group_name"] == "Test Room 2"
 
     # # test delete
     mock_bridge_v2.api.emit_event("delete", updated_resource)
@@ -175,3 +205,121 @@ async def test_scene_updates(hass, mock_bridge_v2, v2_resources_test_data):
     await hass.async_block_till_done()
     test_entity = hass.states.get(test_entity_id)
     assert test_entity is None
+
+
+@pytest.mark.parametrize(
+    "resource_type",
+    [pytest.param("scene", id="regular"), pytest.param("smart_scene", id="smart")],
+)
+async def test_scene_with_orphaned_group(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    mock_bridge_v2: Mock,
+    v2_resources_test_data: JsonArrayType,
+    caplog: pytest.LogCaptureFixture,
+    resource_type: str,
+) -> None:
+    """Test that a scene referencing a non-existent group is skipped and logged."""
+    caplog.set_level(logging.WARNING)
+    orphaned_scene = deepcopy(
+        next(
+            resource
+            for resource in v2_resources_test_data
+            if resource["type"] == resource_type
+        )
+    )
+    orphaned_scene["id"] = "orphaned_scene_id"
+    orphaned_scene["group"] = {"rid": "non-existent-group-id", "rtype": "room"}
+    await mock_bridge_v2.api.load_test_data([*v2_resources_test_data, orphaned_scene])
+
+    await setup_platform(hass, mock_bridge_v2, Platform.SCENE)
+
+    assert (
+        entity_registry.async_get_entity_id(
+            Platform.SCENE, DOMAIN, orphaned_scene["id"]
+        )
+        is None
+    )
+    assert len(hass.states.async_all()) == 3
+    record = next(
+        record
+        for record in caplog.records
+        if record.name == "homeassistant.components.hue.scene"
+    )
+    assert record.levelno == logging.WARNING
+    assert record.getMessage() == (
+        "Skipping Hue scene orphaned_scene_id: group non-existent-group-id "
+        "could not be resolved"
+    )
+    assert record.exc_info is None
+
+
+@pytest.mark.parametrize(
+    "resource_type",
+    [pytest.param("scene", id="regular"), pytest.param("smart_scene", id="smart")],
+)
+async def test_scene_added_after_group_deleted(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    mock_bridge_v2: Mock,
+    v2_resources_test_data: JsonArrayType,
+    caplog: pytest.LogCaptureFixture,
+    resource_type: str,
+) -> None:
+    """Test a late scene for a deleted group is skipped without blocking valid scenes."""
+    caplog.set_level(logging.WARNING)
+    room = next(
+        resource for resource in v2_resources_test_data if resource["type"] == "room"
+    )
+    zone = next(
+        resource for resource in v2_resources_test_data if resource["type"] == "zone"
+    )
+    late_scene = deepcopy(
+        next(
+            resource
+            for resource in v2_resources_test_data
+            if resource["type"] == resource_type
+            and resource["group"]["rid"] == room["id"]
+        )
+    )
+    late_scene["id"] = "late_scene_id"
+    late_scene["metadata"]["name"] = "Late scene"
+
+    await mock_bridge_v2.api.load_test_data(v2_resources_test_data)
+    await setup_platform(hass, mock_bridge_v2, Platform.SCENE)
+
+    mock_bridge_v2.api.emit_event("delete", {"type": "room", "id": room["id"]})
+    await hass.async_block_till_done()
+    await hass.async_block_till_done()
+    assert room["id"] not in mock_bridge_v2.api.groups
+
+    caplog.clear()
+    mock_bridge_v2.api.emit_event("add", late_scene)
+    await hass.async_block_till_done()
+
+    assert (
+        entity_registry.async_get_entity_id(Platform.SCENE, DOMAIN, late_scene["id"])
+        is None
+    )
+    record = next(
+        record
+        for record in caplog.records
+        if record.name == "homeassistant.components.hue.scene"
+    )
+    assert record.levelno == logging.WARNING
+    assert record.getMessage() == (
+        f"Skipping Hue scene late_scene_id: group {room['id']} could not be resolved"
+    )
+    assert record.exc_info is None
+
+    valid_scene = deepcopy(late_scene)
+    valid_scene["id"] = "valid_scene_id"
+    valid_scene["group"] = {"rid": zone["id"], "rtype": "zone"}
+    mock_bridge_v2.api.emit_event("add", valid_scene)
+    await hass.async_block_till_done()
+
+    entity_id = entity_registry.async_get_entity_id(
+        Platform.SCENE, DOMAIN, valid_scene["id"]
+    )
+    assert entity_id is not None
+    assert hass.states.get(entity_id) is not None

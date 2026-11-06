@@ -1,50 +1,43 @@
 """Code to handle a Livisi switches."""
-from __future__ import annotations
 
-from typing import Any
+from typing import Any, override
+
+from livisi import LivisiDevice
 
 from homeassistant.components.switch import SwitchEntity
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
-from homeassistant.helpers.entity import DeviceInfo
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .const import (
-    DOMAIN,
-    LIVISI_REACHABILITY_CHANGE,
-    LIVISI_STATE_CHANGE,
-    LOGGER,
-    PSS_DEVICE_TYPE,
-)
-from .coordinator import LivisiDataUpdateCoordinator
+from .const import LIVISI_STATE_CHANGE, LOGGER, ON_STATE, SWITCH_DEVICE_TYPES
+from .coordinator import LivisiConfigEntry, LivisiDataUpdateCoordinator
+from .entity import LivisiEntity
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    config_entry: LivisiConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up switch device."""
-    coordinator: LivisiDataUpdateCoordinator = hass.data[DOMAIN][config_entry.entry_id]
+    coordinator = config_entry.runtime_data
 
     @callback
     def handle_coordinator_update() -> None:
         """Add switch."""
-        shc_devices: list[dict[str, Any]] = coordinator.data
+        shc_devices: list[LivisiDevice] = coordinator.data
         entities: list[SwitchEntity] = []
         for device in shc_devices:
             if (
-                device["type"] == PSS_DEVICE_TYPE
-                and device["id"] not in coordinator.devices
+                device.type in SWITCH_DEVICE_TYPES
+                and device.id not in coordinator.devices
             ):
-                livisi_switch: SwitchEntity = create_entity(
-                    config_entry, device, coordinator
+                livisi_switch: SwitchEntity = LivisiSwitch(
+                    config_entry, coordinator, device
                 )
-                LOGGER.debug("Include device type: %s", device["type"])
-                coordinator.devices.add(device["id"])
+                LOGGER.debug("Include device type: %s", device.type)
+                coordinator.devices.add(device.id)
                 entities.append(livisi_switch)
         async_add_entities(entities)
 
@@ -53,109 +46,73 @@ async def async_setup_entry(
     )
 
 
-def create_entity(
-    config_entry: ConfigEntry,
-    device: dict[str, Any],
-    coordinator: LivisiDataUpdateCoordinator,
-) -> SwitchEntity:
-    """Create Switch Entity."""
-    config_details: dict[str, Any] = device["config"]
-    capabilities: list = device["capabilities"]
-    room_id: str = device["location"]
-    room_name: str = coordinator.rooms[room_id]
-    livisi_switch = LivisiSwitch(
-        config_entry,
-        coordinator,
-        unique_id=device["id"],
-        manufacturer=device["manufacturer"],
-        device_type=device["type"],
-        name=config_details["name"],
-        capability_id=capabilities[0],
-        room=room_name,
-    )
-    return livisi_switch
-
-
-class LivisiSwitch(CoordinatorEntity[LivisiDataUpdateCoordinator], SwitchEntity):
+class LivisiSwitch(LivisiEntity, SwitchEntity):
     """Represents the Livisi Switch."""
 
     def __init__(
         self,
-        config_entry: ConfigEntry,
+        config_entry: LivisiConfigEntry,
         coordinator: LivisiDataUpdateCoordinator,
-        unique_id: str,
-        manufacturer: str,
-        device_type: str,
-        name: str,
-        capability_id: str,
-        room: str,
+        device: LivisiDevice,
     ) -> None:
-        """Initialize the Livisi Switch."""
-        self.config_entry = config_entry
-        self._attr_unique_id = unique_id
-        self._attr_name = name
-        self._capability_id = capability_id
-        self.aio_livisi = coordinator.aiolivisi
-        self._attr_available = False
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, unique_id)},
-            manufacturer=manufacturer,
-            model=device_type,
-            name=name,
-            suggested_area=room,
-            via_device=(DOMAIN, config_entry.entry_id),
-        )
-        super().__init__(coordinator)
+        """Initialize the Livisi switch."""
+        super().__init__(config_entry, coordinator, device)
+        self._capability_id = self.capabilities["SwitchActuator"]
 
+    @override
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn the entity on."""
-        response = await self.aio_livisi.async_pss_set_state(
-            self._capability_id, is_on=True
+        success = await self.aio_livisi.async_set_state(
+            self._capability_id, key=ON_STATE, value=True
         )
-        if response is None:
+        if not success:
             self._attr_available = False
-            raise HomeAssistantError(f"Failed to turn on {self._attr_name}")
+            self.coordinator.mark_device_unreachable(self._device_id)
+            raise HomeAssistantError(f"Failed to turn on {self.entity_id}")
+        self._attr_available = True
 
+    @override
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn the entity off."""
-        response = await self.aio_livisi.async_pss_set_state(
-            self._capability_id, is_on=False
+        success = await self.aio_livisi.async_set_state(
+            self._capability_id, key=ON_STATE, value=False
         )
-        if response is None:
+        if not success:
             self._attr_available = False
-            raise HomeAssistantError(f"Failed to turn off {self._attr_name}")
+            self.coordinator.mark_device_unreachable(self._device_id)
+            raise HomeAssistantError(f"Failed to turn off {self.entity_id}")
+        self._attr_available = True
 
+    @override
     async def async_added_to_hass(self) -> None:
         """Register callbacks."""
-        response = await self.coordinator.async_get_pss_state(self._capability_id)
-        if response is None:
-            self._attr_is_on = False
-            self._attr_available = False
-        else:
-            self._attr_is_on = response
+        await super().async_added_to_hass()
+
+        await self._async_update_initial_value()
         self.async_on_remove(
             async_dispatcher_connect(
                 self.hass,
-                f"{LIVISI_STATE_CHANGE}_{self._capability_id}",
+                f"{LIVISI_STATE_CHANGE}_{self._capability_id}_{ON_STATE}",
                 self.update_states,
             )
         )
-        self.async_on_remove(
-            async_dispatcher_connect(
-                self.hass,
-                f"{LIVISI_REACHABILITY_CHANGE}_{self.unique_id}",
-                self.update_reachability,
-            )
+
+    @override
+    async def async_update_value(self) -> bool:
+        """Get the current switch state."""
+        response = await self.coordinator.async_get_device_state(
+            self._capability_id, ON_STATE
         )
+        if response is None:
+            self._attr_is_on = False
+            self._attr_available = False
+            return False
+        self._attr_is_on = response
+        return True
 
     @callback
     def update_states(self, state: bool) -> None:
-        """Update the states of the switch device."""
+        """Update the state of the switch device."""
+        self._attr_available = True
         self._attr_is_on = state
-        self.async_write_ha_state()
-
-    @callback
-    def update_reachability(self, is_reachable: bool) -> None:
-        """Update the reachability of the switch device."""
-        self._attr_available = is_reachable
         self.async_write_ha_state()

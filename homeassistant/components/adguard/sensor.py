@@ -1,97 +1,100 @@
 """Support for AdGuard Home sensors."""
-from __future__ import annotations
 
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Any
+from typing import override
 
-from adguardhome import AdGuardHome, AdGuardHomeConnectionError
-
-from homeassistant.components.sensor import SensorEntity, SensorEntityDescription
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import PERCENTAGE, TIME_MILLISECONDS
+from homeassistant.components.sensor import (
+    SensorDeviceClass,
+    SensorEntity,
+    SensorEntityDescription,
+    SensorStateClass,
+)
+from homeassistant.const import PERCENTAGE, UnitOfTime
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import PlatformNotReady
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .const import DATA_ADGUARD_CLIENT, DATA_ADGUARD_VERSION, DOMAIN
+from .coordinator import (
+    AdGuardConfigEntry,
+    AdGuardHomeStatistics,
+    AdGuardHomeStatisticsCoordinator,
+)
 from .entity import AdGuardHomeEntity
 
-SCAN_INTERVAL = timedelta(seconds=300)
-PARALLEL_UPDATES = 4
+PARALLEL_UPDATES = 0
 
 
-@dataclass
-class AdGuardHomeEntityDescriptionMixin:
-    """Mixin for required keys."""
-
-    value_fn: Callable[[AdGuardHome], Coroutine[Any, Any, int | float]]
-
-
-@dataclass
-class AdGuardHomeEntityDescription(
-    SensorEntityDescription, AdGuardHomeEntityDescriptionMixin
-):
+@dataclass(frozen=True, kw_only=True)
+class AdGuardHomeEntityDescription(SensorEntityDescription):
     """Describes AdGuard Home sensor entity."""
+
+    value_fn: Callable[[AdGuardHomeStatistics], int | float]
 
 
 SENSORS: tuple[AdGuardHomeEntityDescription, ...] = (
     AdGuardHomeEntityDescription(
         key="dns_queries",
-        name="DNS queries",
-        icon="mdi:magnify",
+        translation_key="dns_queries",
+        state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement="queries",
-        value_fn=lambda adguard: adguard.stats.dns_queries(),
+        value_fn=lambda data: data.stats.dns_queries,
     ),
     AdGuardHomeEntityDescription(
         key="blocked_filtering",
-        name="DNS queries blocked",
-        icon="mdi:magnify-close",
+        translation_key="dns_queries_blocked",
+        state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement="queries",
-        value_fn=lambda adguard: adguard.stats.blocked_filtering(),
+        value_fn=lambda data: data.stats.blocked_filtering,
     ),
     AdGuardHomeEntityDescription(
         key="blocked_percentage",
-        name="DNS queries blocked ratio",
-        icon="mdi:magnify-close",
+        translation_key="dns_queries_blocked_ratio",
+        state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement=PERCENTAGE,
-        value_fn=lambda adguard: adguard.stats.blocked_percentage(),
+        suggested_display_precision=2,
+        value_fn=lambda data: data.stats.blocked_percentage,
     ),
     AdGuardHomeEntityDescription(
         key="blocked_parental",
-        name="Parental control blocked",
-        icon="mdi:human-male-girl",
+        translation_key="parental_control_blocked",
+        state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement="requests",
-        value_fn=lambda adguard: adguard.stats.replaced_parental(),
+        value_fn=lambda data: data.stats.blocked_parental,
     ),
     AdGuardHomeEntityDescription(
         key="blocked_safebrowsing",
-        name="Safe browsing blocked",
-        icon="mdi:shield-half-full",
+        translation_key="safe_browsing_blocked",
+        state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement="requests",
-        value_fn=lambda adguard: adguard.stats.replaced_safebrowsing(),
+        value_fn=lambda data: data.stats.blocked_safebrowsing,
     ),
     AdGuardHomeEntityDescription(
         key="enforced_safesearch",
-        name="Safe searches enforced",
-        icon="mdi:shield-search",
+        translation_key="safe_searches_enforced",
+        state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement="requests",
-        value_fn=lambda adguard: adguard.stats.replaced_safesearch(),
+        value_fn=lambda data: data.stats.enforced_safesearch,
     ),
     AdGuardHomeEntityDescription(
         key="average_speed",
-        name="Average processing speed",
-        icon="mdi:speedometer",
-        native_unit_of_measurement=TIME_MILLISECONDS,
-        value_fn=lambda adguard: adguard.stats.avg_processing_time(),
+        translation_key="average_processing_speed",
+        state_class=SensorStateClass.MEASUREMENT,
+        device_class=SensorDeviceClass.DURATION,
+        native_unit_of_measurement=UnitOfTime.MILLISECONDS,
+        suggested_display_precision=2,
+        value_fn=lambda data: (
+            data.stats.avg_processing_time / timedelta(milliseconds=1)
+        ),
     ),
     AdGuardHomeEntityDescription(
         key="rules_count",
-        name="Rules count",
-        icon="mdi:counter",
+        translation_key="rules_count",
+        state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement="rules",
-        value_fn=lambda adguard: adguard.filtering.rules_count(allowlist=False),
+        value_fn=lambda data: sum(
+            blocklist.rules_count for blocklist in data.blocklists
+        ),
         entity_registry_enabled_default=False,
     ),
 )
@@ -99,52 +102,37 @@ SENSORS: tuple[AdGuardHomeEntityDescription, ...] = (
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    entry: AdGuardConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up AdGuard Home sensor based on a config entry."""
-    adguard = hass.data[DOMAIN][entry.entry_id][DATA_ADGUARD_CLIENT]
-
-    try:
-        version = await adguard.version()
-    except AdGuardHomeConnectionError as exception:
-        raise PlatformNotReady from exception
-
-    hass.data[DOMAIN][entry.entry_id][DATA_ADGUARD_VERSION] = version
+    coordinator = entry.runtime_data.statistics
 
     async_add_entities(
-        [AdGuardHomeSensor(adguard, entry, description) for description in SENSORS],
-        True,
+        AdGuardHomeSensor(coordinator, description) for description in SENSORS
     )
 
 
-class AdGuardHomeSensor(AdGuardHomeEntity, SensorEntity):
+class AdGuardHomeSensor(
+    AdGuardHomeEntity[AdGuardHomeStatisticsCoordinator], SensorEntity
+):
     """Defines a AdGuard Home sensor."""
 
     entity_description: AdGuardHomeEntityDescription
 
     def __init__(
         self,
-        adguard: AdGuardHome,
-        entry: ConfigEntry,
+        coordinator: AdGuardHomeStatisticsCoordinator,
         description: AdGuardHomeEntityDescription,
     ) -> None:
         """Initialize AdGuard Home sensor."""
-        super().__init__(adguard, entry)
+        super().__init__(coordinator)
+        entry = coordinator.config_entry
         self.entity_description = description
-        self._attr_unique_id = "_".join(
-            [
-                DOMAIN,
-                adguard.host,
-                str(adguard.port),
-                "sensor",
-                description.key,
-            ]
-        )
+        self._attr_unique_id = f"{entry.entry_id}_{description.key}"
 
-    async def _adguard_update(self) -> None:
-        """Update AdGuard Home entity."""
-        value = await self.entity_description.value_fn(self.adguard)
-        self._attr_native_value = value
-        if isinstance(value, float):
-            self._attr_native_value = f"{value:.2f}"
+    @property
+    @override
+    def native_value(self) -> int | float:
+        """Return the state of the sensor."""
+        return self.entity_description.value_fn(self.coordinator.data)

@@ -1,77 +1,57 @@
-"""Component for the Somfy MyLink device supporting the Synergy API."""
-import asyncio
-import logging
+"""The Somfy MyLink integration."""
 
-from somfy_mylink_synergy import SomfyMyLinkSynergy
+from dataclasses import dataclass
+
+from pysomfymylink import (
+    Shade,
+    SomfyMyLink,
+    SomfyMyLinkApiError,
+    SomfyMyLinkConnectionError,
+)
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST, CONF_PORT
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
-from homeassistant.helpers import config_validation as cv
 
-from .const import CONF_SYSTEM_ID, DATA_SOMFY_MYLINK, DOMAIN, MYLINK_STATUS, PLATFORMS
+from .const import CONF_SYSTEM_ID, PLATFORMS
 
-UNDO_UPDATE_LISTENER = "undo_update_listener"
-
-_LOGGER = logging.getLogger(__name__)
-
-CONFIG_SCHEMA = cv.removed(DOMAIN, raise_if_present=False)
+type SomfyMyLinkConfigEntry = ConfigEntry[SomfyMyLinkRuntimeData]
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+@dataclass
+class SomfyMyLinkRuntimeData:
+    """Runtime data for Somfy MyLink."""
+
+    somfy_mylink: SomfyMyLink
+    shades: list[Shade]
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: SomfyMyLinkConfigEntry) -> None:
     """Set up Somfy MyLink from a config entry."""
-    hass.data.setdefault(DOMAIN, {})
-
-    config = entry.data
-    somfy_mylink = SomfyMyLinkSynergy(
-        config[CONF_SYSTEM_ID], config[CONF_HOST], config[CONF_PORT]
+    somfy_mylink = SomfyMyLink(
+        entry.data[CONF_HOST],
+        entry.data[CONF_SYSTEM_ID],
+        port=entry.data[CONF_PORT],
     )
 
     try:
-        mylink_status = await somfy_mylink.status_info()
-    except asyncio.TimeoutError as ex:
+        shades = await somfy_mylink.status_info()
+    except (SomfyMyLinkConnectionError, SomfyMyLinkApiError) as ex:
         raise ConfigEntryNotReady(
-            "Unable to connect to the Somfy MyLink device, please check your settings"
+            "Unable to reach the Somfy MyLink device, please check your settings"
         ) from ex
 
-    if not mylink_status or "error" in mylink_status:
-        _LOGGER.error(
-            "Somfy Mylink failed to setup because of an error: %s",
-            mylink_status.get("error", {}).get(
-                "message", "Empty response from mylink device"
-            ),
-        )
-        return False
-
-    if "result" not in mylink_status:
-        raise ConfigEntryNotReady("The Somfy MyLink device returned an empty result")
-
-    undo_listener = entry.add_update_listener(_async_update_listener)
-
-    hass.data[DOMAIN][entry.entry_id] = {
-        DATA_SOMFY_MYLINK: somfy_mylink,
-        MYLINK_STATUS: mylink_status,
-        UNDO_UPDATE_LISTENER: undo_listener,
-    }
+    entry.runtime_data = SomfyMyLinkRuntimeData(
+        somfy_mylink=somfy_mylink,
+        shades=shades,
+    )
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    return True
 
-
-async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Handle options update."""
-    await hass.config_entries.async_reload(entry.entry_id)
-
-
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_unload_entry(
+    hass: HomeAssistant, entry: SomfyMyLinkConfigEntry
+) -> None:
     """Unload a config entry."""
-    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-
-    hass.data[DOMAIN][entry.entry_id][UNDO_UPDATE_LISTENER]()
-
-    if unload_ok:
-        hass.data[DOMAIN].pop(entry.entry_id)
-
-    return unload_ok
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)

@@ -1,20 +1,16 @@
 """Decorator for view methods to help with data validation."""
-from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Coroutine
 from functools import wraps
 from http import HTTPStatus
 import logging
-from typing import Any, TypeVar
+from typing import Any, Concatenate
 
 from aiohttp import web
-from typing_extensions import Concatenate, ParamSpec
-import voluptuous as vol
+import probatio
 
-from .view import HomeAssistantView
-
-_HassViewT = TypeVar("_HassViewT", bound=HomeAssistantView)
-_P = ParamSpec("_P")
+from homeassistant.helpers.http import HomeAssistantView
+from homeassistant.helpers.typing import VolDictType
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -22,21 +18,23 @@ _LOGGER = logging.getLogger(__name__)
 class RequestDataValidator:
     """Decorator that will validate the incoming data.
 
-    Takes in a voluptuous schema and adds 'data' as
+    Takes in a probatio schema and adds 'data' as
     keyword argument to the function call.
 
     Will return a 400 if no JSON provided or doesn't match schema.
     """
 
-    def __init__(self, schema: vol.Schema, allow_empty: bool = False) -> None:
+    def __init__(
+        self, schema: VolDictType | probatio.Schema, allow_empty: bool = False
+    ) -> None:
         """Initialize the decorator."""
         if isinstance(schema, dict):
-            schema = vol.Schema(schema)
+            schema = probatio.Schema(schema)
 
         self._schema = schema
         self._allow_empty = allow_empty
 
-    def __call__(
+    def __call__[_HassViewT: HomeAssistantView, **_P](
         self,
         method: Callable[
             Concatenate[_HassViewT, web.Request, dict[str, Any], _P],
@@ -64,13 +62,12 @@ class RequestDataValidator:
 
             try:
                 data: dict[str, Any] = self._schema(raw_data)
-            except vol.Invalid as err:
+            except probatio.Invalid as err:
                 _LOGGER.error("Data does not match schema: %s", err)
                 return view.json_message(
                     f"Message format incorrect: {err}", HTTPStatus.BAD_REQUEST
                 )
 
-            result = await method(view, request, data, *args, **kwargs)
-            return result
+            return await method(view, request, data, *args, **kwargs)
 
         return wrapper

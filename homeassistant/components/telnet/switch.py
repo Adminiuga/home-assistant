@@ -1,16 +1,15 @@
 """Support for switch controlled using a telnet connection."""
-from __future__ import annotations
 
 from datetime import timedelta
 import logging
-import telnetlib
-from typing import Any
+from typing import Any, override
 
-import voluptuous as vol
+import probatio
+import telnetlib  # pylint: disable=deprecated-module
 
 from homeassistant.components.switch import (
     ENTITY_ID_FORMAT,
-    PLATFORM_SCHEMA,
+    PLATFORM_SCHEMA as SWITCH_PLATFORM_SCHEMA,
     SwitchEntity,
 )
 from homeassistant.const import (
@@ -25,7 +24,7 @@ from homeassistant.const import (
     CONF_VALUE_TEMPLATE,
 )
 from homeassistant.core import HomeAssistant
-import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.template import Template
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
@@ -35,21 +34,23 @@ _LOGGER = logging.getLogger(__name__)
 DEFAULT_PORT = 23
 DEFAULT_TIMEOUT = 0.2
 
-SWITCH_SCHEMA = vol.Schema(
+SWITCH_SCHEMA = probatio.Schema(
     {
-        vol.Required(CONF_COMMAND_OFF): cv.string,
-        vol.Required(CONF_COMMAND_ON): cv.string,
-        vol.Required(CONF_RESOURCE): cv.string,
-        vol.Optional(CONF_VALUE_TEMPLATE): cv.template,
-        vol.Optional(CONF_COMMAND_STATE): cv.string,
-        vol.Optional(CONF_NAME): cv.string,
-        vol.Optional(CONF_PORT, default=DEFAULT_PORT): cv.port,
-        vol.Optional(CONF_TIMEOUT, default=DEFAULT_TIMEOUT): vol.Coerce(float),
+        probatio.Required(CONF_COMMAND_OFF): cv.string,
+        probatio.Required(CONF_COMMAND_ON): cv.string,
+        probatio.Required(CONF_RESOURCE): cv.string,
+        probatio.Optional(CONF_VALUE_TEMPLATE): cv.template,
+        probatio.Optional(CONF_COMMAND_STATE): cv.string,
+        probatio.Optional(CONF_NAME): cv.string,
+        probatio.Optional(CONF_PORT, default=DEFAULT_PORT): probatio.Port(),
+        probatio.Optional(CONF_TIMEOUT, default=DEFAULT_TIMEOUT): probatio.Coerce(
+            float
+        ),
     }
 )
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
-    {vol.Required(CONF_SWITCHES): cv.schema_with_slug_keys(SWITCH_SCHEMA)}
+PLATFORM_SCHEMA = SWITCH_PLATFORM_SCHEMA.extend(
+    {probatio.Required(CONF_SWITCHES): cv.schema_with_slug_keys(SWITCH_SCHEMA)}
 )
 
 SCAN_INTERVAL = timedelta(seconds=10)
@@ -66,11 +67,6 @@ def setup_platform(
     switches = []
 
     for object_id, device_config in devices.items():
-        value_template: Template | None = device_config.get(CONF_VALUE_TEMPLATE)
-
-        if value_template is not None:
-            value_template.hass = hass
-
         switches.append(
             TelnetSwitch(
                 object_id,
@@ -80,7 +76,7 @@ def setup_platform(
                 device_config[CONF_COMMAND_ON],
                 device_config[CONF_COMMAND_OFF],
                 device_config.get(CONF_COMMAND_STATE),
-                value_template,
+                device_config.get(CONF_VALUE_TEMPLATE),
                 device_config[CONF_TIMEOUT],
             )
         )
@@ -143,9 +139,10 @@ class TelnetSwitch(SwitchEntity):
             rendered = self._value_template.render_with_possible_json_value(response)
         else:
             _LOGGER.warning("Empty response for command: %s", self._command_state)
-            return None
+            return
         self._attr_is_on = rendered == "True"
 
+    @override
     def turn_on(self, **kwargs: Any) -> None:
         """Turn the device on."""
         self._telnet_command(self._command_on)
@@ -153,6 +150,7 @@ class TelnetSwitch(SwitchEntity):
             self._attr_is_on = True
             self.schedule_update_ha_state()
 
+    @override
     def turn_off(self, **kwargs: Any) -> None:
         """Turn the device off."""
         self._telnet_command(self._command_off)

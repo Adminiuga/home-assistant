@@ -1,7 +1,8 @@
 """Account linking via the cloud."""
-import asyncio
+
+from datetime import datetime
 import logging
-from typing import Any
+from typing import Any, override
 
 import aiohttp
 from awesomeversion import AwesomeVersion
@@ -11,7 +12,7 @@ from homeassistant.const import __version__ as HA_VERSION
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import config_entry_oauth2_flow, event
 
-from .const import DOMAIN
+from .const import DATA_CLOUD, DOMAIN
 
 DATA_SERVICES = "cloud_account_link_services"
 CACHE_TIMEOUT = 3600
@@ -24,21 +25,23 @@ CURRENT_PLAIN_VERSION = AwesomeVersion(
 
 
 @callback
-def async_setup(hass: HomeAssistant):
+def async_setup(hass: HomeAssistant) -> None:
     """Set up cloud account link."""
     config_entry_oauth2_flow.async_add_implementation_provider(
         hass, DOMAIN, async_provide_implementation
     )
 
 
-async def async_provide_implementation(hass: HomeAssistant, domain: str):
+async def async_provide_implementation(
+    hass: HomeAssistant, domain: str
+) -> list[config_entry_oauth2_flow.AbstractOAuth2Implementation]:
     """Provide an implementation for a domain."""
     services = await _get_services(hass)
 
     for service in services:
         if (
             service["service"] == domain
-            and CURRENT_PLAIN_VERSION >= service["min_version"]
+            and service["min_version"] <= CURRENT_PLAIN_VERSION
             and (
                 service.get("accepts_new_authorizations", True)
                 or (
@@ -55,20 +58,27 @@ async def async_provide_implementation(hass: HomeAssistant, domain: str):
     return []
 
 
-async def _get_services(hass):
+async def _get_services(hass: HomeAssistant) -> list[dict[str, Any]]:
     """Get the available services."""
-    if (services := hass.data.get(DATA_SERVICES)) is not None:
+    services: list[dict[str, Any]]
+    if DATA_SERVICES in hass.data:
+        services = hass.data[DATA_SERVICES]
         return services
 
     try:
-        services = await account_link.async_fetch_available_services(hass.data[DOMAIN])
-    except (aiohttp.ClientError, asyncio.TimeoutError):
-        return []
+        services = await account_link.async_fetch_available_services(
+            hass.data[DATA_CLOUD]
+        )
+    except (aiohttp.ClientError, TimeoutError) as err:
+        raise config_entry_oauth2_flow.ImplementationUnavailableError(
+            "Cannot provide OAuth2 implementation for cloud services. "
+            "Failed to fetch from account link server."
+        ) from err
 
     hass.data[DATA_SERVICES] = services
 
     @callback
-    def clear_services(_now):
+    def clear_services(_now: datetime) -> None:
         """Clear services cache."""
         hass.data.pop(DATA_SERVICES, None)
 
@@ -86,28 +96,37 @@ class CloudOAuth2Implementation(config_entry_oauth2_flow.AbstractOAuth2Implement
         self.service = service
 
     @property
+    @override
     def name(self) -> str:
         """Name of the implementation."""
-        return "Home Assistant Cloud"
+        return "Home Assistant Link"
 
     @property
+    @override
     def domain(self) -> str:
         """Domain that is providing the implementation."""
         return DOMAIN
 
+    @property
+    @override
+    def service_domain(self) -> str:
+        """Domain of the service the tokens are for."""
+        return self.service
+
+    @override
     async def async_generate_authorize_url(self, flow_id: str) -> str:
         """Generate a url for the user to authorize."""
         helper = account_link.AuthorizeAccountHelper(
-            self.hass.data[DOMAIN], self.service
+            self.hass.data[DATA_CLOUD], self.service
         )
         authorize_url = await helper.async_get_authorize_url()
 
-        async def await_tokens():
+        async def await_tokens() -> None:
             """Wait for tokens and pass them on when received."""
             try:
                 tokens = await helper.async_get_tokens()
 
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 _LOGGER.info("Timeout fetching tokens for flow %s", flow_id)
             except account_link.AccountLinkException as err:
                 _LOGGER.info(
@@ -118,18 +137,27 @@ class CloudOAuth2Implementation(config_entry_oauth2_flow.AbstractOAuth2Implement
                     flow_id=flow_id, user_input=tokens
                 )
 
-        self.hass.async_create_task(await_tokens())
+        # It's a background task because it should be cancelled
+        # on shutdown and there's nothing else we can do in
+        # such case. There's also no need to wait for this
+        # during setup.
+        self.hass.async_create_background_task(
+            await_tokens(), name="Awaiting OAuth tokens"
+        )
 
         return authorize_url
 
+    @override
     async def async_resolve_external_data(self, external_data: Any) -> dict:
         """Resolve external data to tokens."""
         # We already passed in tokens
-        return external_data
+        dict_data: dict = external_data
+        return dict_data
 
+    @override
     async def _async_refresh_token(self, token: dict) -> dict:
         """Refresh a token."""
         new_token = await account_link.async_fetch_access_token(
-            self.hass.data[DOMAIN], self.service, token["refresh_token"]
+            self.hass.data[DATA_CLOUD], self.service, token["refresh_token"]
         )
         return {**token, **new_token}

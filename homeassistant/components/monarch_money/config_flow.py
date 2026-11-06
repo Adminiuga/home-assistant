@@ -1,0 +1,205 @@
+"""Config flow for Monarch Money integration."""
+
+from collections.abc import Mapping
+import logging
+from typing import Any, override
+
+from aiohttp import ClientError, ClientResponseError
+from gql.transport.exceptions import TransportError, TransportServerError
+from monarchmoney import LoginFailedException, RequireMFAException
+from monarchmoney.monarchmoney import SESSION_FILE
+import probatio
+from typedmonarchmoney import TypedMonarchMoney
+from typedmonarchmoney.models import MonarchSubscription
+
+from homeassistant.config_entries import SOURCE_REAUTH, ConfigFlow, ConfigFlowResult
+from homeassistant.const import CONF_EMAIL, CONF_ID, CONF_PASSWORD, CONF_TOKEN
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.selector import (
+    TextSelector,
+    TextSelectorConfig,
+    TextSelectorType,
+)
+
+from .const import CONF_MFA_CODE, DOMAIN, LOGGER
+
+_LOGGER = logging.getLogger(__name__)
+
+
+STEP_USER_DATA_SCHEMA = probatio.Schema(
+    {
+        probatio.Required(CONF_EMAIL): TextSelector(
+            TextSelectorConfig(
+                type=TextSelectorType.EMAIL,
+                autocomplete="username",
+            ),
+        ),
+        probatio.Required(probatio.Secret(CONF_PASSWORD)): TextSelector(
+            TextSelectorConfig(
+                type=TextSelectorType.PASSWORD,
+                autocomplete="current-password",
+            ),
+        ),
+    }
+)
+
+STEP_MFA_DATA_SCHEMA = probatio.Schema(
+    {
+        probatio.Required(CONF_MFA_CODE): TextSelector(
+            TextSelectorConfig(
+                type=TextSelectorType.TEXT,
+                autocomplete="one-time-code",
+            ),
+        ),
+    }
+)
+
+
+async def validate_login(
+    hass: HomeAssistant,
+    data: dict[str, Any],
+    email: str | None = None,
+    password: str | None = None,
+) -> dict[str, Any]:
+    """Validate the user input allows us to connect.
+
+    Data has the keys from STEP_USER_DATA_SCHEMA with values provided by the user.
+    Upon success a session will be saved
+    """
+
+    if not email:
+        email = data[CONF_EMAIL]
+    if not password:
+        password = data[CONF_PASSWORD]
+    monarch_client = TypedMonarchMoney()
+    if CONF_MFA_CODE in data:
+        mfa_code = data[CONF_MFA_CODE]
+        LOGGER.debug("Attempting to authenticate with MFA code")
+        try:
+            await monarch_client.multi_factor_authenticate(email, password, mfa_code)
+        except (KeyError, RequireMFAException, LoginFailedException) as err:
+            # Backing library MFA failures can surface as a KeyError or auth error.
+            LOGGER.debug("Bad MFA Code")
+            raise BadMFA from err
+    else:
+        LOGGER.debug("Attempting to authenticate")
+        try:
+            await monarch_client.login(
+                email=email,
+                password=password,
+                save_session=False,
+                use_saved_session=False,
+            )
+        except RequireMFAException:
+            raise
+        except LoginFailedException as err:
+            raise InvalidAuth from err
+
+    LOGGER.debug("Connection successful - saving session to file %s", SESSION_FILE)
+    LOGGER.debug("Obtaining subscription id")
+    subs: MonarchSubscription = await monarch_client.get_subscription_details()
+    assert subs is not None
+    subscription_id = subs.id
+    return {
+        CONF_TOKEN: monarch_client.token,
+        CONF_ID: subscription_id,
+    }
+
+
+class MonarchMoneyConfigFlow(ConfigFlow, domain=DOMAIN):
+    """Handle a config flow for Monarch Money."""
+
+    VERSION = 1
+
+    def __init__(self) -> None:
+        """Initialize config flow."""
+        self.email: str | None = None
+        self.password: str | None = None
+
+    @override
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle the initial step."""
+        return await self._async_step_login("user", user_input)
+
+    async def async_step_reauth(
+        self, entry_data: Mapping[str, Any]
+    ) -> ConfigFlowResult:
+        """Start reauthentication after credentials expire."""
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Ask for credentials to renew the existing subscription token."""
+        return await self._async_step_login("reauth_confirm", user_input)
+
+    async def _async_step_login(
+        self, step_id: str, user_input: dict[str, Any] | None
+    ) -> ConfigFlowResult:
+        """Authenticate a new or existing entry, including MFA."""
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            try:
+                info = await validate_login(
+                    self.hass, user_input, email=self.email, password=self.password
+                )
+            except RequireMFAException:
+                self.email = user_input[CONF_EMAIL]
+                self.password = user_input[CONF_PASSWORD]
+
+                return self.async_show_form(
+                    step_id=step_id,
+                    data_schema=STEP_MFA_DATA_SCHEMA,
+                    errors={"base": "mfa_required"},
+                )
+            except BadMFA:
+                return self.async_show_form(
+                    step_id=step_id,
+                    data_schema=STEP_MFA_DATA_SCHEMA,
+                    errors={"base": "bad_mfa"},
+                )
+            except InvalidAuth, LoginFailedException:
+                self.email = self.password = None
+                errors["base"] = "invalid_auth"
+            except (ClientResponseError, TransportServerError) as err:
+                status = (
+                    err.status if isinstance(err, ClientResponseError) else err.code
+                )
+                if status in (401, 403):
+                    self.email = self.password = None
+                    errors["base"] = "invalid_auth"
+                else:
+                    errors["base"] = "cannot_connect"
+            except ClientError, TransportError, TimeoutError:
+                errors["base"] = "cannot_connect"
+            else:
+                await self.async_set_unique_id(info[CONF_ID])
+                if self.source == SOURCE_REAUTH:
+                    self._abort_if_unique_id_mismatch()
+                    return self.async_update_reload_and_abort(
+                        self._get_reauth_entry(),
+                        data_updates={CONF_TOKEN: info[CONF_TOKEN]},
+                    )
+                self._abort_if_unique_id_configured()
+
+                return self.async_create_entry(
+                    title="Monarch Money",
+                    data={CONF_TOKEN: info[CONF_TOKEN]},
+                )
+        return self.async_show_form(
+            step_id=step_id,
+            data_schema=STEP_MFA_DATA_SCHEMA if self.email else STEP_USER_DATA_SCHEMA,
+            errors=errors,
+        )
+
+
+class InvalidAuth(HomeAssistantError):
+    """Error to indicate there is invalid auth."""
+
+
+class BadMFA(HomeAssistantError):
+    """Error to indicate the MFA code was bad."""

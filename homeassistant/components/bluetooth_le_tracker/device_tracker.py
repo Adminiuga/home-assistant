@@ -1,20 +1,17 @@
 """Tracking for bluetooth low energy devices."""
-from __future__ import annotations
 
-import asyncio
 from datetime import datetime, timedelta
 import logging
 from uuid import UUID
 
 from bleak import BleakClient, BleakError
-import voluptuous as vol
+import probatio
 
 from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth.match import BluetoothCallbackMatcher
 from homeassistant.components.device_tracker import (
     CONF_TRACK_NEW,
-    PLATFORM_SCHEMA as PARENT_PLATFORM_SCHEMA,
-    SCAN_INTERVAL,
+    PLATFORM_SCHEMA as DEVICE_TRACKER_PLATFORM_SCHEMA,
     SourceType,
 )
 from homeassistant.components.device_tracker.legacy import (
@@ -24,10 +21,10 @@ from homeassistant.components.device_tracker.legacy import (
 )
 from homeassistant.const import CONF_SCAN_INTERVAL, EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import Event, HomeAssistant, callback
-import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
-import homeassistant.util.dt as dt_util
+from homeassistant.util import dt as dt_util
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -40,12 +37,13 @@ DEFAULT_TRACK_BATTERY_INTERVAL = timedelta(days=1)
 DATA_BLE = "BLE"
 DATA_BLE_ADAPTER = "ADAPTER"
 BLE_PREFIX = "BLE_"
+SCAN_INTERVAL = timedelta(seconds=12)
 MIN_SEEN_NEW = 5
 
-PLATFORM_SCHEMA = PARENT_PLATFORM_SCHEMA.extend(
+PLATFORM_SCHEMA = DEVICE_TRACKER_PLATFORM_SCHEMA.extend(
     {
-        vol.Optional(CONF_TRACK_BATTERY, default=False): cv.boolean,
-        vol.Optional(
+        probatio.Optional(CONF_TRACK_BATTERY, default=False): cv.boolean,
+        probatio.Optional(
             CONF_TRACK_BATTERY_INTERVAL, default=DEFAULT_TRACK_BATTERY_INTERVAL
         ): cv.time_period,
     }
@@ -70,6 +68,7 @@ async def async_setup_scanner(  # noqa: C901
     yaml_path = hass.config.path(YAML_DEVICES)
     devs_to_track: set[str] = set()
     devs_no_track: set[str] = set()
+    devs_advertise_time: dict[str, float] = {}
     devs_track_battery = {}
     interval: timedelta = config.get(CONF_SCAN_INTERVAL, SCAN_INTERVAL)
     # if track new devices is true discover new devices
@@ -154,7 +153,7 @@ async def async_setup_scanner(  # noqa: C901
             async with BleakClient(device) as client:
                 bat_char = await client.read_gatt_char(BATTERY_CHARACTERISTIC_UUID)
                 battery = ord(bat_char)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             _LOGGER.debug(
                 "Timeout when trying to get battery status for %s", service_info.name
             )
@@ -163,8 +162,10 @@ async def async_setup_scanner(  # noqa: C901
         # until bleak releases v0.15+ which resolves these.
         except (AttributeError, BleakError) as err:
             _LOGGER.debug("Could not read battery status: %s", err)
-            # If the device does not offer battery information, there is no point in asking again later on.
-            # Remove the device from the battery-tracked devices, so that their battery is not wasted
+            # If the device does not offer battery information,
+            # there is no point in asking again later on.
+            # Remove the device from the battery-tracked
+            # devices, so that their battery is not wasted
             # trying to get an unavailable information.
             del devs_track_battery[mac]
         if battery:
@@ -178,6 +179,7 @@ async def async_setup_scanner(  # noqa: C901
         """Update from a ble callback."""
         mac = service_info.address
         if mac in devs_to_track:
+            devs_advertise_time[mac] = service_info.time
             now = dt_util.utcnow()
             hass.async_create_task(async_see_device(mac, service_info.name))
             if (
@@ -185,13 +187,14 @@ async def async_setup_scanner(  # noqa: C901
                 and now > devs_track_battery[mac] + battery_track_interval
             ):
                 devs_track_battery[mac] = now
-                asyncio.create_task(
-                    _async_see_update_ble_battery(mac, now, service_info)
+                hass.async_create_background_task(
+                    _async_see_update_ble_battery(mac, now, service_info),
+                    "bluetooth_le_tracker.device_tracker-see_update_ble_battery",
                 )
 
         if track_new:
             if mac not in devs_to_track and mac not in devs_no_track:
-                _LOGGER.info("Discovered Bluetooth LE device %s", mac)
+                _LOGGER.debug("Discovered Bluetooth LE device %s", mac)
                 hass.async_create_task(
                     async_see_device(mac, service_info.name, new_device=True)
                 )
@@ -204,7 +207,9 @@ async def async_setup_scanner(  # noqa: C901
         # there have been no callbacks because the RSSI or
         # other properties have not changed.
         for service_info in bluetooth.async_discovered_service_info(hass, False):
-            _async_update_ble(service_info, bluetooth.BluetoothChange.ADVERTISEMENT)
+            # Only call _async_update_ble if the advertisement time has changed
+            if service_info.time != devs_advertise_time.get(service_info.address):
+                _async_update_ble(service_info, bluetooth.BluetoothChange.ADVERTISEMENT)
 
     cancels = [
         bluetooth.async_register_callback(

@@ -1,12 +1,12 @@
 """Test the sensor significant change platform."""
+
 import pytest
 
 from homeassistant.components.sensor import SensorDeviceClass, significant_change
 from homeassistant.const import (
     ATTR_DEVICE_CLASS,
     ATTR_UNIT_OF_MEASUREMENT,
-    TEMP_CELSIUS,
-    TEMP_FAHRENHEIT,
+    UnitOfTemperature,
 )
 
 AQI_ATTRS = {
@@ -23,17 +23,27 @@ HUMIDITY_ATTRS = {
 
 TEMP_CELSIUS_ATTRS = {
     ATTR_DEVICE_CLASS: SensorDeviceClass.TEMPERATURE,
-    ATTR_UNIT_OF_MEASUREMENT: TEMP_CELSIUS,
+    ATTR_UNIT_OF_MEASUREMENT: UnitOfTemperature.CELSIUS,
 }
 
 TEMP_FREEDOM_ATTRS = {
     ATTR_DEVICE_CLASS: SensorDeviceClass.TEMPERATURE,
-    ATTR_UNIT_OF_MEASUREMENT: TEMP_FAHRENHEIT,
+    ATTR_UNIT_OF_MEASUREMENT: UnitOfTemperature.FAHRENHEIT,
+}
+
+TEMP_DELTA_CELSIUS_ATTRS = {
+    ATTR_DEVICE_CLASS: SensorDeviceClass.TEMPERATURE_DELTA,
+    ATTR_UNIT_OF_MEASUREMENT: UnitOfTemperature.CELSIUS,
+}
+
+TEMP_DELTA_FAHRENHEIT_ATTRS = {
+    ATTR_DEVICE_CLASS: SensorDeviceClass.TEMPERATURE_DELTA,
+    ATTR_UNIT_OF_MEASUREMENT: UnitOfTemperature.FAHRENHEIT,
 }
 
 
 @pytest.mark.parametrize(
-    "old_state,new_state,attrs,result",
+    ("old_state", "new_state", "attrs", "result"),
     [
         ("0", "1", AQI_ATTRS, True),
         ("1", "0", AQI_ATTRS, True),
@@ -54,9 +64,16 @@ TEMP_FREEDOM_ATTRS = {
         ("70", "70.5", TEMP_FREEDOM_ATTRS, False),
         ("fail", "70", TEMP_FREEDOM_ATTRS, True),
         ("70", "fail", TEMP_FREEDOM_ATTRS, False),
+        ("12", "12", TEMP_DELTA_CELSIUS_ATTRS, False),
+        ("12", "13", TEMP_DELTA_CELSIUS_ATTRS, True),
+        ("12.1", "12.2", TEMP_DELTA_CELSIUS_ATTRS, False),
+        ("7", "8", TEMP_DELTA_FAHRENHEIT_ATTRS, True),
+        ("7", "7.5", TEMP_DELTA_FAHRENHEIT_ATTRS, False),
     ],
 )
-async def test_significant_change_temperature(old_state, new_state, attrs, result):
+async def test_significant_change_temperature(
+    old_state, new_state, attrs, result
+) -> None:
     """Detect temperature significant changes."""
     assert (
         significant_change.async_check_significant_change(

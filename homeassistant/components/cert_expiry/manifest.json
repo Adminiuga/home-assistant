@@ -1,8 +1,11 @@
 {
   "domain": "cert_expiry",
   "name": "Certificate Expiry",
-  "documentation": "https://www.home-assistant.io/integrations/cert_expiry",
+  "categories": ["computers_network.monitoring"],
+  "codeowners": ["@jjlawren"],
   "config_flow": true,
-  "codeowners": ["@Cereal2nd", "@jjlawren"],
+  "connectivity": ["cloud", "network"],
+  "documentation": "https://www.home-assistant.io/integrations/cert_expiry",
+  "integration_type": "service",
   "iot_class": "cloud_polling"
 }

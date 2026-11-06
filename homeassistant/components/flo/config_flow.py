@@ -1,59 +1,73 @@
 """Config flow for flo integration."""
-from aioflo import async_get_api
+
+from typing import Any, override
+
 from aioflo.errors import RequestError
-import voluptuous as vol
+import probatio
 
-from homeassistant import config_entries, core, exceptions
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 
-from .const import DOMAIN, LOGGER
+from . import async_get_flo_api
+from .const import CONF_USE_SSO, DOMAIN, LOGGER
 
-DATA_SCHEMA = vol.Schema({vol.Required("username"): str, vol.Required("password"): str})
+DATA_SCHEMA = probatio.Schema(
+    {
+        probatio.Required(CONF_USERNAME): str,
+        probatio.Required(probatio.Secret(CONF_PASSWORD)): str,
+    }
+)
 
 
-async def validate_input(hass: core.HomeAssistant, data):
+async def validate_input(hass: HomeAssistant, data) -> bool:
     """Validate the user input allows us to connect.
 
     Data has the keys from DATA_SCHEMA with values provided by the user.
+    Returns True if Moen SSO was used.
     """
 
-    session = async_get_clientsession(hass)
     try:
-        api = await async_get_api(
-            data[CONF_USERNAME], data[CONF_PASSWORD], session=session
+        _api, used_sso = await async_get_flo_api(
+            hass, data[CONF_USERNAME], data[CONF_PASSWORD]
         )
     except RequestError as request_error:
         LOGGER.error("Error connecting to the Flo API: %s", request_error)
         raise CannotConnect from request_error
-
-    user_info = await api.user.get_info()
-    a_location_id = user_info["locations"][0]["id"]
-    location_info = await api.location.get_info(a_location_id)
-    return {"title": location_info["nickname"]}
+    return used_sso
 
 
-class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
+class FloConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for flo."""
 
     VERSION = 1
 
-    async def async_step_user(self, user_input=None):
+    @override
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle the initial step."""
         errors = {}
         if user_input is not None:
             await self.async_set_unique_id(user_input[CONF_USERNAME])
             self._abort_if_unique_id_configured()
             try:
-                info = await validate_input(self.hass, user_input)
-                return self.async_create_entry(title=info["title"], data=user_input)
+                used_sso = await validate_input(self.hass, user_input)
             except CannotConnect:
                 errors["base"] = "cannot_connect"
+            else:
+                entry_data = dict(user_input)
+                if used_sso:
+                    entry_data[CONF_USE_SSO] = True
+                return self.async_create_entry(
+                    title=user_input[CONF_USERNAME], data=entry_data
+                )
 
         return self.async_show_form(
             step_id="user", data_schema=DATA_SCHEMA, errors=errors
         )
 
 
-class CannotConnect(exceptions.HomeAssistantError):
+class CannotConnect(HomeAssistantError):
     """Error to indicate we cannot connect."""

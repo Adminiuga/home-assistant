@@ -1,4 +1,7 @@
 """The tests for the EntityFilter component."""
+
+import pytest
+
 from homeassistant.helpers.entityfilter import (
     FILTER_SCHEMA,
     INCLUDE_EXCLUDE_FILTER_SCHEMA,
@@ -7,7 +10,7 @@ from homeassistant.helpers.entityfilter import (
 )
 
 
-def test_no_filters_case_1():
+def test_no_filters_case_1() -> None:
     """If include and exclude not included, pass everything."""
     incl_dom = {}
     incl_ent = {}
@@ -19,7 +22,7 @@ def test_no_filters_case_1():
         assert testfilter(value)
 
 
-def test_includes_only_case_2():
+def test_includes_only_case_2() -> None:
     """If include specified, only pass if specified (Case 2)."""
     incl_dom = {"light", "sensor"}
     incl_ent = {"binary_sensor.working"}
@@ -34,7 +37,7 @@ def test_includes_only_case_2():
     assert testfilter("sun.sun") is False
 
 
-def test_includes_only_with_glob_case_2():
+def test_includes_only_with_glob_case_2() -> None:
     """If include specified, only pass if specified (Case 2)."""
     incl_dom = {"light", "sensor"}
     incl_glob = {"cover.*_window"}
@@ -55,7 +58,7 @@ def test_includes_only_with_glob_case_2():
     assert testfilter("cover.garage_door") is False
 
 
-def test_excludes_only_case_3():
+def test_excludes_only_case_3() -> None:
     """If exclude specified, pass all but specified (Case 3)."""
     incl_dom = {}
     incl_ent = {}
@@ -70,7 +73,7 @@ def test_excludes_only_case_3():
     assert testfilter("sun.sun") is True
 
 
-def test_excludes_only_with_glob_case_3():
+def test_excludes_only_with_glob_case_3() -> None:
     """If exclude specified, pass all but specified (Case 3)."""
     incl_dom = {}
     incl_glob = {}
@@ -91,7 +94,7 @@ def test_excludes_only_with_glob_case_3():
     assert testfilter("cover.garage_door")
 
 
-def test_with_include_domain_case4():
+def test_with_include_domain_case4() -> None:
     """Test case 4 - include and exclude specified, with included domain."""
     incl_dom = {"light", "sensor"}
     incl_ent = {"binary_sensor.working"}
@@ -108,8 +111,8 @@ def test_with_include_domain_case4():
     assert testfilter("sun.sun") is False
 
 
-def test_with_include_domain_exclude_glob_case4():
-    """Test case 4 - include and exclude specified, with included domain but excluded by glob."""
+def test_with_include_domain_exclude_glob_case4() -> None:
+    """Test case 4 - include and exclude, with included domain but excluded glob."""
     incl_dom = {"light", "sensor"}
     incl_ent = {"binary_sensor.working"}
     incl_glob = {}
@@ -130,7 +133,7 @@ def test_with_include_domain_exclude_glob_case4():
     assert testfilter("sun.sun") is False
 
 
-def test_with_include_glob_case4():
+def test_with_include_glob_case4() -> None:
     """Test case 4 - include and exclude specified, with included glob."""
     incl_dom = {}
     incl_glob = {"light.*", "sensor.*"}
@@ -151,7 +154,7 @@ def test_with_include_glob_case4():
     assert testfilter("sun.sun") is False
 
 
-def test_with_include_domain_glob_filtering_case4():
+def test_with_include_domain_glob_filtering_case4() -> None:
     """Test case 4 - include and exclude specified, both have domains and globs."""
     incl_dom = {"light"}
     incl_glob = {"*working"}
@@ -173,8 +176,8 @@ def test_with_include_domain_glob_filtering_case4():
     assert testfilter("sun.sun") is False
 
 
-def test_with_include_domain_glob_filtering_case4a_include_strong():
-    """Test case 4 - include and exclude specified, both have domains and globs, and a specifically included entity."""
+def test_with_include_domain_glob_filtering_case4a_include_strong() -> None:
+    """Test case 4 - include and exclude, domains, globs, and a specific entity."""
     incl_dom = {"light"}
     incl_glob = {"*working"}
     incl_ent = {"binary_sensor.specificly_included"}
@@ -186,18 +189,18 @@ def test_with_include_domain_glob_filtering_case4a_include_strong():
     )
 
     assert testfilter("sensor.working")
-    assert testfilter("sensor.notworking") is True  # iclude is stronger
+    assert testfilter("sensor.notworking") is True  # include is stronger
     assert testfilter("light.test")
-    assert testfilter("light.notworking") is True  # iclude is stronger
+    assert testfilter("light.notworking") is True  # include is stronger
     assert testfilter("light.ignoreme") is False
-    assert testfilter("binary_sensor.not_working") is True  # iclude is stronger
+    assert testfilter("binary_sensor.not_working") is True  # include is stronger
     assert testfilter("binary_sensor.another") is False
     assert testfilter("binary_sensor.specificly_included") is True
     assert testfilter("sun.sun") is False
 
 
-def test_with_include_glob_filtering_case4a_include_strong():
-    """Test case 4 - include and exclude specified, both have globs, and a specifically included entity."""
+def test_with_include_glob_filtering_case4a_include_strong() -> None:
+    """Test case 4 - include and exclude, globs, and a specific entity."""
     incl_dom = {}
     incl_glob = {"*working"}
     incl_ent = {"binary_sensor.specificly_included"}
@@ -220,7 +223,7 @@ def test_with_include_glob_filtering_case4a_include_strong():
     assert testfilter("sun.sun") is False
 
 
-def test_exclude_domain_case5():
+def test_exclude_domain_case5() -> None:
     """Test case 5 - include and exclude specified, with excluded domain."""
     incl_dom = {}
     incl_ent = {"binary_sensor.working"}
@@ -237,7 +240,7 @@ def test_exclude_domain_case5():
     assert testfilter("sun.sun") is True
 
 
-def test_exclude_glob_case5():
+def test_exclude_glob_case5() -> None:
     """Test case 5 - include and exclude specified, with excluded glob."""
     incl_dom = {}
     incl_glob = {}
@@ -258,8 +261,8 @@ def test_exclude_glob_case5():
     assert testfilter("sun.sun") is True
 
 
-def test_exclude_glob_case5_include_strong():
-    """Test case 5 - include and exclude specified, with excluded glob, and a specifically included entity."""
+def test_exclude_glob_case5_include_strong() -> None:
+    """Test case 5 - include and exclude, excluded glob, specific entity."""
     incl_dom = {}
     incl_glob = {}
     incl_ent = {"binary_sensor.working"}
@@ -279,7 +282,34 @@ def test_exclude_glob_case5_include_strong():
     assert testfilter("sun.sun") is True
 
 
-def test_no_domain_case6():
+@pytest.mark.parametrize(
+    ("exclude_domains", "exclude_entity_globs"),
+    [
+        pytest.param(["binary_sensor"], [], id="exclude_domain"),
+        pytest.param([], ["binary_sensor.*"], id="exclude_glob"),
+    ],
+)
+def test_case5_entity_in_include_and_exclude_entities(
+    exclude_domains: list[str], exclude_entity_globs: list[str]
+) -> None:
+    """Test case 5 - an entity in both entity lists is included."""
+    testfilter = generate_filter(
+        [],
+        ["sensor.both", "binary_sensor.both"],
+        exclude_domains,
+        ["sensor.both", "binary_sensor.both", "sensor.excluded"],
+        [],
+        exclude_entity_globs,
+    )
+
+    assert testfilter("sensor.both")
+    assert testfilter("binary_sensor.both")
+    assert testfilter("sensor.excluded") is False
+    assert testfilter("sensor.other")
+    assert testfilter("binary_sensor.other") is False
+
+
+def test_no_domain_case6() -> None:
     """Test case 6 - include and exclude specified, with no domains."""
     incl_dom = {}
     incl_ent = {"binary_sensor.working"}
@@ -296,7 +326,7 @@ def test_no_domain_case6():
     assert testfilter("sun.sun") is False
 
 
-def test_filter_schema_empty():
+def test_filter_schema_empty() -> None:
     """Test filter schema."""
     conf = {}
     filt = FILTER_SCHEMA(conf)
@@ -314,7 +344,7 @@ def test_filter_schema_empty():
     assert filt.empty_filter
 
 
-def test_filter_schema():
+def test_filter_schema() -> None:
     """Test filter schema."""
     conf = {
         "include_domains": ["light"],
@@ -328,7 +358,7 @@ def test_filter_schema():
     assert not filt.empty_filter
 
 
-def test_filter_schema_with_globs():
+def test_filter_schema_with_globs() -> None:
     """Test filter schema with glob options."""
     conf = {
         "include_domains": ["light"],
@@ -343,7 +373,7 @@ def test_filter_schema_with_globs():
     assert not filt.empty_filter
 
 
-def test_filter_schema_include_exclude():
+def test_filter_schema_include_exclude() -> None:
     """Test the include exclude filter schema."""
     conf = {
         "include": {
@@ -369,7 +399,7 @@ def test_filter_schema_include_exclude():
     assert not filt.empty_filter
 
 
-def test_exlictly_included():
+def test_explicitly_included() -> None:
     """Test if an entity is explicitly included."""
     conf = {
         "include": {
@@ -395,7 +425,29 @@ def test_exlictly_included():
     assert filt.explicitly_excluded("light.kitchen")
 
 
-def test_complex_include_exclude_filter():
+def test_get_filter() -> None:
+    """Test we can get the underlying filter."""
+    conf = {
+        "include": {
+            "domains": ["light"],
+            "entity_globs": ["sensor.kitchen_*"],
+            "entities": ["switch.kitchen"],
+        },
+        "exclude": {
+            "domains": ["cover"],
+            "entity_globs": ["sensor.weather_*"],
+            "entities": ["light.kitchen"],
+        },
+    }
+    filt: EntityFilter = INCLUDE_EXCLUDE_FILTER_SCHEMA(conf)
+    underlying_filter = filt.get_filter()
+    assert underlying_filter("light.any")
+    assert not underlying_filter("switch.other")
+    assert underlying_filter("sensor.kitchen_4")
+    assert underlying_filter("switch.kitchen")
+
+
+def test_complex_include_exclude_filter() -> None:
     """Test a complex include exclude filter."""
     conf = {
         "include": {

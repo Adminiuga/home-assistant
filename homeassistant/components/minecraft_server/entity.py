@@ -1,0 +1,39 @@
+"""Base entity for the Minecraft Server integration."""
+
+from homeassistant.const import CONF_TYPE
+from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
+
+from .api import MinecraftServerType
+from .const import DOMAIN
+from .coordinator import MinecraftServerConfigEntry, MinecraftServerCoordinator
+
+MANUFACTURER = "Mojang Studios"
+
+
+class MinecraftServerEntity(CoordinatorEntity[MinecraftServerCoordinator]):
+    """Representation of a Minecraft Server base entity."""
+
+    _attr_has_entity_name = True
+
+    def __init__(
+        self,
+        coordinator: MinecraftServerCoordinator,
+        config_entry: MinecraftServerConfigEntry,
+    ) -> None:
+        """Initialize base entity."""
+        super().__init__(coordinator)
+
+        self._attr_device_info = DeviceInfo(
+            entry_type=DeviceEntryType.SERVICE,
+            identifiers={(DOMAIN, config_entry.entry_id)},
+            manufacturer=MANUFACTURER,
+            model=(
+                "Minecraft Server ("
+                f"{config_entry.data.get(CONF_TYPE, MinecraftServerType.JAVA_EDITION)})"
+            ),
+            name=coordinator.name,
+            sw_version=(
+                f"{coordinator.data.version} ({coordinator.data.protocol_version})"
+            ),
+        )

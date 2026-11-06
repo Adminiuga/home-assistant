@@ -1,99 +1,126 @@
-"""Test the National Weather Service (NWS) config flow."""
+"""Test the MetOffice config flow."""
+
+import datetime as dt
 import json
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+
+import pytest
+from pytest_homeassistant.common import MockConfigEntry, async_load_json_object_fixture
+import requests_mock
 
 from homeassistant import config_entries
 from homeassistant.components.metoffice.const import DOMAIN
+from homeassistant.const import (
+    CONF_API_KEY,
+    CONF_LATITUDE,
+    CONF_LOCATION,
+    CONF_LONGITUDE,
+)
+from homeassistant.core import HomeAssistant
+from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.helpers import device_registry as dr
 
 from .const import (
     METOFFICE_CONFIG_WAVERTREE,
     TEST_API_KEY,
+    TEST_COORDINATES_WAVERTREE,
     TEST_LATITUDE_WAVERTREE,
     TEST_LONGITUDE_WAVERTREE,
     TEST_SITE_NAME_WAVERTREE,
 )
 
-from tests.common import MockConfigEntry, load_fixture
 
-
-async def test_form(hass, requests_mock):
+async def test_form(hass: HomeAssistant, requests_mock: requests_mock.Mocker) -> None:
     """Test we get the form."""
     hass.config.latitude = TEST_LATITUDE_WAVERTREE
     hass.config.longitude = TEST_LONGITUDE_WAVERTREE
 
     # all metoffice test data encapsulated in here
-    mock_json = json.loads(load_fixture("metoffice.json"))
-    all_sites = json.dumps(mock_json["all_sites"])
-    requests_mock.get("/public/data/val/wxfcs/all/json/sitelist/", text=all_sites)
+    mock_json = await async_load_json_object_fixture(hass, "metoffice.json", DOMAIN)
+    wavertree_daily = json.dumps(mock_json["wavertree_daily"])
+    requests_mock.get(
+        "https://data.hub.api.metoffice.gov.uk/sitespecific/v0/point/daily",
+        text=wavertree_daily,
+    )
 
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": config_entries.SOURCE_USER}
     )
-    assert result["type"] == "form"
+    assert result["type"] is FlowResultType.FORM
     assert result["errors"] == {}
 
     with patch(
         "homeassistant.components.metoffice.async_setup_entry",
-        return_value=True,
+        return_value=None,
     ) as mock_setup_entry:
         result2 = await hass.config_entries.flow.async_configure(
-            result["flow_id"], {"api_key": TEST_API_KEY}
+            result["flow_id"],
+            {
+                CONF_API_KEY: TEST_API_KEY,
+                CONF_LOCATION: {
+                    "latitude": TEST_LATITUDE_WAVERTREE,
+                    "longitude": TEST_LONGITUDE_WAVERTREE,
+                },
+            },
         )
         await hass.async_block_till_done()
 
-    assert result2["type"] == "create_entry"
+    assert result2["type"] is FlowResultType.CREATE_ENTRY
     assert result2["title"] == TEST_SITE_NAME_WAVERTREE
-    assert result2["data"] == {
-        "api_key": TEST_API_KEY,
-        "latitude": TEST_LATITUDE_WAVERTREE,
-        "longitude": TEST_LONGITUDE_WAVERTREE,
-        "name": TEST_SITE_NAME_WAVERTREE,
-    }
+    assert result2["data"] == METOFFICE_CONFIG_WAVERTREE
+    assert result2["result"].unique_id == TEST_COORDINATES_WAVERTREE
     assert len(mock_setup_entry.mock_calls) == 1
 
 
-async def test_form_already_configured(hass, requests_mock):
+async def test_form_already_configured(
+    hass: HomeAssistant, requests_mock: requests_mock.Mocker, entry: MockConfigEntry
+) -> None:
     """Test we handle duplicate entries."""
     hass.config.latitude = TEST_LATITUDE_WAVERTREE
     hass.config.longitude = TEST_LONGITUDE_WAVERTREE
 
     # all metoffice test data encapsulated in here
-    mock_json = json.loads(load_fixture("metoffice.json"))
-
-    all_sites = json.dumps(mock_json["all_sites"])
-
-    requests_mock.get("/public/data/val/wxfcs/all/json/sitelist/", text=all_sites)
+    mock_json = await async_load_json_object_fixture(hass, "metoffice.json", DOMAIN)
+    wavertree_daily = json.dumps(mock_json["wavertree_daily"])
     requests_mock.get(
-        "/public/data/val/wxfcs/all/json/354107?res=3hourly",
-        text="",
-    )
-    requests_mock.get(
-        "/public/data/val/wxfcs/all/json/354107?res=daily",
-        text="",
+        "https://data.hub.api.metoffice.gov.uk/sitespecific/v0/point/daily",
+        text=wavertree_daily,
     )
 
-    MockConfigEntry(
-        domain=DOMAIN,
-        unique_id=f"{TEST_LATITUDE_WAVERTREE}_{TEST_LONGITUDE_WAVERTREE}",
-        data=METOFFICE_CONFIG_WAVERTREE,
-    ).add_to_hass(hass)
+    entry.add_to_hass(hass)
 
     result = await hass.config_entries.flow.async_init(
-        DOMAIN,
-        context={"source": config_entries.SOURCE_USER},
-        data=METOFFICE_CONFIG_WAVERTREE,
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
     )
 
-    assert result["type"] == "abort"
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "user"
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={
+            CONF_API_KEY: TEST_API_KEY,
+            CONF_LOCATION: {
+                CONF_LATITUDE: TEST_LATITUDE_WAVERTREE,
+                CONF_LONGITUDE: TEST_LONGITUDE_WAVERTREE,
+            },
+        },
+    )
+
+    assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "already_configured"
 
 
-async def test_form_cannot_connect(hass, requests_mock):
+async def test_form_cannot_connect(
+    hass: HomeAssistant, requests_mock: requests_mock.Mocker
+) -> None:
     """Test we handle cannot connect error."""
     hass.config.latitude = TEST_LATITUDE_WAVERTREE
     hass.config.longitude = TEST_LONGITUDE_WAVERTREE
 
-    requests_mock.get("/public/data/val/wxfcs/all/json/sitelist/", text="")
+    requests_mock.get(
+        "https://data.hub.api.metoffice.gov.uk/sitespecific/v0/point/daily", text=""
+    )
 
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": config_entries.SOURCE_USER}
@@ -101,17 +128,48 @@ async def test_form_cannot_connect(hass, requests_mock):
 
     result2 = await hass.config_entries.flow.async_configure(
         result["flow_id"],
-        {"api_key": TEST_API_KEY},
+        {
+            "api_key": TEST_API_KEY,
+            CONF_LOCATION: {
+                CONF_LATITUDE: TEST_LATITUDE_WAVERTREE,
+                CONF_LONGITUDE: TEST_LONGITUDE_WAVERTREE,
+            },
+        },
     )
 
-    assert result2["type"] == "form"
+    assert result2["type"] is FlowResultType.FORM
     assert result2["errors"] == {"base": "cannot_connect"}
 
+    mock_json = await async_load_json_object_fixture(hass, "metoffice.json", DOMAIN)
+    requests_mock.get(
+        "https://data.hub.api.metoffice.gov.uk/sitespecific/v0/point/daily",
+        text=json.dumps(mock_json["wavertree_daily"]),
+    )
+    with patch(
+        "homeassistant.components.metoffice.async_setup_entry",
+        return_value=None,
+    ):
+        result3 = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {
+                "api_key": TEST_API_KEY,
+                CONF_LOCATION: {
+                    CONF_LATITUDE: TEST_LATITUDE_WAVERTREE,
+                    CONF_LONGITUDE: TEST_LONGITUDE_WAVERTREE,
+                },
+            },
+        )
+        await hass.async_block_till_done()
 
-async def test_form_unknown_error(hass, mock_simple_manager_fail):
+    assert result3["type"] is FlowResultType.CREATE_ENTRY
+
+
+async def test_form_unknown_error(
+    hass: HomeAssistant, mock_simple_manager_fail: MagicMock
+) -> None:
     """Test we handle unknown error."""
     mock_instance = mock_simple_manager_fail.return_value
-    mock_instance.get_nearest_forecast_site.side_effect = ValueError
+    mock_instance.get_forecast.side_effect = ValueError
 
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": config_entries.SOURCE_USER}
@@ -119,8 +177,105 @@ async def test_form_unknown_error(hass, mock_simple_manager_fail):
 
     result2 = await hass.config_entries.flow.async_configure(
         result["flow_id"],
-        {"api_key": TEST_API_KEY},
+        {
+            "api_key": TEST_API_KEY,
+            CONF_LOCATION: {
+                CONF_LATITUDE: TEST_LATITUDE_WAVERTREE,
+                CONF_LONGITUDE: TEST_LONGITUDE_WAVERTREE,
+            },
+        },
     )
 
-    assert result2["type"] == "form"
+    assert result2["type"] is FlowResultType.FORM
     assert result2["errors"] == {"base": "unknown"}
+
+    mock_instance.get_forecast = MagicMock()
+    mock_instance.get_forecast.return_value.name = TEST_SITE_NAME_WAVERTREE
+    with patch(
+        "homeassistant.components.metoffice.async_setup_entry",
+        return_value=None,
+    ):
+        result3 = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {
+                "api_key": TEST_API_KEY,
+                CONF_LOCATION: {
+                    CONF_LATITUDE: TEST_LATITUDE_WAVERTREE,
+                    CONF_LONGITUDE: TEST_LONGITUDE_WAVERTREE,
+                },
+            },
+        )
+        await hass.async_block_till_done()
+
+    assert result3["type"] is FlowResultType.CREATE_ENTRY
+
+
+@pytest.mark.freeze_time(dt.datetime(2024, 11, 23, 12, tzinfo=dt.UTC))
+async def test_reauth_flow(
+    hass: HomeAssistant,
+    requests_mock: requests_mock.Mocker,
+    device_registry: dr.DeviceRegistry,
+    entry: MockConfigEntry,
+) -> None:
+    """Test handling authentication errors and reauth flow."""
+    mock_json = await async_load_json_object_fixture(hass, "metoffice.json", DOMAIN)
+    wavertree_daily = json.dumps(mock_json["wavertree_daily"])
+    wavertree_hourly = json.dumps(mock_json["wavertree_hourly"])
+    requests_mock.get(
+        "https://data.hub.api.metoffice.gov.uk/sitespecific/v0/point/daily",
+        text=wavertree_daily,
+    )
+    requests_mock.get(
+        "https://data.hub.api.metoffice.gov.uk/sitespecific/v0/point/hourly",
+        text=wavertree_hourly,
+    )
+
+    entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert len(device_registry.devices) == 1
+
+    requests_mock.get(
+        "https://data.hub.api.metoffice.gov.uk/sitespecific/v0/point/daily",
+        text="",
+        status_code=401,
+    )
+    requests_mock.get(
+        "https://data.hub.api.metoffice.gov.uk/sitespecific/v0/point/hourly",
+        text="",
+        status_code=401,
+    )
+
+    await entry.start_reauth_flow(hass)
+
+    flows = hass.config_entries.flow.async_progress()
+    assert len(flows) == 1
+    assert flows[0]["step_id"] == "reauth_confirm"
+
+    result = await hass.config_entries.flow.async_configure(
+        flows[0]["flow_id"],
+        {CONF_API_KEY: TEST_API_KEY},
+    )
+    await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": "invalid_auth"}
+
+    requests_mock.get(
+        "https://data.hub.api.metoffice.gov.uk/sitespecific/v0/point/daily",
+        text=wavertree_daily,
+    )
+    requests_mock.get(
+        "https://data.hub.api.metoffice.gov.uk/sitespecific/v0/point/hourly",
+        text=wavertree_hourly,
+    )
+
+    result = await hass.config_entries.flow.async_configure(
+        flows[0]["flow_id"],
+        {CONF_API_KEY: TEST_API_KEY},
+    )
+    await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reauth_successful"

@@ -1,19 +1,17 @@
 """The nexia integration base entity."""
 
+from typing import override
+
+from nexia.sensor import NexiaSensor
 from nexia.thermostat import NexiaThermostat
 from nexia.zone import NexiaThermostatZone
 
-from homeassistant.const import (
-    ATTR_IDENTIFIERS,
-    ATTR_NAME,
-    ATTR_SUGGESTED_AREA,
-    ATTR_VIA_DEVICE,
-)
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.dispatcher import (
     async_dispatcher_connect,
     async_dispatcher_send,
 )
-from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import (
@@ -30,44 +28,52 @@ class NexiaEntity(CoordinatorEntity[NexiaDataUpdateCoordinator]):
     """Base class for nexia entities."""
 
     _attr_attribution = ATTRIBUTION
+    _attr_device_info: DeviceInfo | None = None
 
-    def __init__(
-        self, coordinator: NexiaDataUpdateCoordinator, name: str, unique_id: str
-    ) -> None:
+    def __init__(self, coordinator: NexiaDataUpdateCoordinator, unique_id: str) -> None:
         """Initialize the entity."""
         super().__init__(coordinator)
         self._attr_unique_id = unique_id
-        self._attr_name = name
 
 
 class NexiaThermostatEntity(NexiaEntity):
     """Base class for nexia devices attached to a thermostat."""
 
-    def __init__(self, coordinator, thermostat, name, unique_id):
+    _attr_has_entity_name = True
+
+    def __init__(
+        self,
+        coordinator: NexiaDataUpdateCoordinator,
+        thermostat: NexiaThermostat,
+        unique_id: str,
+    ) -> None:
         """Initialize the entity."""
-        super().__init__(coordinator, name, unique_id)
-        self._thermostat: NexiaThermostat = thermostat
+        super().__init__(coordinator, unique_id)
+        self._thermostat = thermostat
+        thermostat_id = thermostat.thermostat_id
         self._attr_device_info = DeviceInfo(
             configuration_url=self.coordinator.nexia_home.root_url,
-            identifiers={(DOMAIN, self._thermostat.thermostat_id)},
+            identifiers={(DOMAIN, str(thermostat_id))},
             manufacturer=MANUFACTURER,
-            model=self._thermostat.get_model(),
-            name=self._thermostat.get_name(),
-            sw_version=self._thermostat.get_firmware(),
+            model=thermostat.get_model(),
+            name=thermostat.get_name(),
+            sw_version=thermostat.get_firmware(),
         )
+        self._thermostat_signal = f"{SIGNAL_THERMOSTAT_UPDATE}-{thermostat_id}"
 
-    async def async_added_to_hass(self):
+    @override
+    async def async_added_to_hass(self) -> None:
         """Listen for signals for services."""
         await super().async_added_to_hass()
         self.async_on_remove(
             async_dispatcher_connect(
                 self.hass,
-                f"{SIGNAL_THERMOSTAT_UPDATE}-{self._thermostat.thermostat_id}",
+                self._thermostat_signal,
                 self.async_write_ha_state,
             )
         )
 
-    def _signal_thermostat_update(self):
+    def _signal_thermostat_update(self) -> None:
         """Signal a thermostat update.
 
         Whenever the underlying library does an action against
@@ -76,11 +82,10 @@ class NexiaThermostatEntity(NexiaEntity):
 
         Update all the zones on the thermostat.
         """
-        async_dispatcher_send(
-            self.hass, f"{SIGNAL_THERMOSTAT_UPDATE}-{self._thermostat.thermostat_id}"
-        )
+        async_dispatcher_send(self.hass, self._thermostat_signal)
 
     @property
+    @override
     def available(self) -> bool:
         """Return True if thermostat is available and data is available."""
         return super().available and self._thermostat.is_online
@@ -89,30 +94,47 @@ class NexiaThermostatEntity(NexiaEntity):
 class NexiaThermostatZoneEntity(NexiaThermostatEntity):
     """Base class for nexia devices attached to a thermostat."""
 
-    def __init__(self, coordinator, zone, name, unique_id):
+    def __init__(
+        self,
+        coordinator: NexiaDataUpdateCoordinator,
+        zone: NexiaThermostatZone,
+        unique_id: str,
+        dev_info: DeviceInfo | None = None,
+    ) -> None:
         """Initialize the entity."""
-        super().__init__(coordinator, zone.thermostat, name, unique_id)
-        self._zone: NexiaThermostatZone = zone
-        zone_name = self._zone.get_name()
-        self._attr_device_info |= {
-            ATTR_IDENTIFIERS: {(DOMAIN, self._zone.zone_id)},
-            ATTR_NAME: zone_name,
-            ATTR_SUGGESTED_AREA: zone_name,
-            ATTR_VIA_DEVICE: (DOMAIN, self._zone.thermostat.thermostat_id),
-        }
+        super().__init__(coordinator, zone.thermostat, unique_id)
+        self._zone = zone
+        if dev_info is None:
+            thermostat = zone.thermostat
+            dev_info = DeviceInfo(
+                configuration_url=coordinator.nexia_home.root_url,
+                identifiers={(DOMAIN, str(zone.zone_id))},
+                manufacturer=MANUFACTURER,
+                model=thermostat.get_model(),
+                name=zone.get_name(),
+                sw_version=thermostat.get_firmware(),
+                via_device_id=dr.async_get_device_id_by_identifier(
+                    coordinator.hass,
+                    (DOMAIN, str(thermostat.thermostat_id)),
+                    config_entry_id=coordinator.config_entry.entry_id,
+                ),
+            )
+        self._attr_device_info = dev_info
+        self._zone_signal = f"{SIGNAL_ZONE_UPDATE}-{zone.zone_id}"
 
-    async def async_added_to_hass(self):
+    @override
+    async def async_added_to_hass(self) -> None:
         """Listen for signals for services."""
         await super().async_added_to_hass()
         self.async_on_remove(
             async_dispatcher_connect(
                 self.hass,
-                f"{SIGNAL_ZONE_UPDATE}-{self._zone.zone_id}",
+                self._zone_signal,
                 self.async_write_ha_state,
             )
         )
 
-    def _signal_zone_update(self):
+    def _signal_zone_update(self) -> None:
         """Signal a zone update.
 
         Whenever the underlying library does an action against
@@ -120,4 +142,37 @@ class NexiaThermostatZoneEntity(NexiaThermostatEntity):
 
         Update a single zone.
         """
-        async_dispatcher_send(self.hass, f"{SIGNAL_ZONE_UPDATE}-{self._zone.zone_id}")
+        async_dispatcher_send(self.hass, self._zone_signal)
+
+
+class NexiaRoomIQEntity(NexiaThermostatZoneEntity):
+    """Base class for RoomIQ sensor entities."""
+
+    def __init__(
+        self,
+        coordinator: NexiaDataUpdateCoordinator,
+        zone: NexiaThermostatZone,
+        sensor: NexiaSensor,
+        key: str,
+    ) -> None:
+        """Initialize the entity."""
+        dev_info: DeviceInfo | None = None
+        if sensor.has_online:
+            # has_online indicates the RoomIQ sensor connects remotely
+            dev_info = DeviceInfo(
+                configuration_url=coordinator.nexia_home.root_url,
+                identifiers={(DOMAIN, str(sensor.id))},
+                manufacturer=MANUFACTURER,
+                model=None,  # not reported
+                name=sensor.name,
+                suggested_area=sensor.name,
+                sw_version=None,  # not reported
+                via_device_id=dr.async_get_device_id_by_identifier(
+                    coordinator.hass,
+                    (DOMAIN, str(zone.zone_id)),
+                    config_entry_id=coordinator.config_entry.entry_id,
+                ),
+            )
+        super().__init__(coordinator, zone, f"{sensor.id}-{key}", dev_info)
+        self._attr_translation_key = key
+        self._sensor_id = sensor.id

@@ -1,29 +1,26 @@
 """Binary Sensors for Tesla Wall Connector."""
+
 from dataclasses import dataclass
 import logging
+from typing import override
 
 from homeassistant.components.binary_sensor import (
     BinarySensorDeviceClass,
     BinarySensorEntity,
     BinarySensorEntityDescription,
 )
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity import EntityCategory
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from . import (
-    WallConnectorData,
-    WallConnectorEntity,
-    WallConnectorLambdaValueGetterMixin,
-    prefix_entity_name,
-)
-from .const import DOMAIN, WALLCONNECTOR_DATA_VITALS
+from .const import WALLCONNECTOR_DATA_VITALS
+from .coordinator import WallConnectorConfigEntry, WallConnectorData
+from .entity import WallConnectorEntity, WallConnectorLambdaValueGetterMixin
 
 _LOGGER = logging.getLogger(__name__)
 
 
-@dataclass
+@dataclass(frozen=True)
 class WallConnectorBinarySensorDescription(
     BinarySensorEntityDescription, WallConnectorLambdaValueGetterMixin
 ):
@@ -33,14 +30,14 @@ class WallConnectorBinarySensorDescription(
 WALL_CONNECTOR_SENSORS = [
     WallConnectorBinarySensorDescription(
         key="vehicle_connected",
-        name=prefix_entity_name("Vehicle connected"),
+        translation_key="vehicle_connected",
         entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda data: data[WALLCONNECTOR_DATA_VITALS].vehicle_connected,
         device_class=BinarySensorDeviceClass.PLUG,
     ),
     WallConnectorBinarySensorDescription(
         key="contactor_closed",
-        name=prefix_entity_name("Contactor closed"),
+        translation_key="contactor_closed",
         entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda data: data[WALLCONNECTOR_DATA_VITALS].contactor_closed,
         device_class=BinarySensorDeviceClass.BATTERY_CHARGING,
@@ -50,22 +47,24 @@ WALL_CONNECTOR_SENSORS = [
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: ConfigEntry,
-    async_add_devices: AddEntitiesCallback,
+    config_entry: WallConnectorConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Create the Wall Connector sensor devices."""
-    wall_connector_data = hass.data[DOMAIN][config_entry.entry_id]
+    wall_connector_data = config_entry.runtime_data
 
     all_entities = [
         WallConnectorBinarySensorEntity(wall_connector_data, description)
         for description in WALL_CONNECTOR_SENSORS
     ]
 
-    async_add_devices(all_entities)
+    async_add_entities(all_entities)
 
 
 class WallConnectorBinarySensorEntity(WallConnectorEntity, BinarySensorEntity):
     """Wall Connector Sensor Entity."""
+
+    entity_description: WallConnectorBinarySensorDescription
 
     def __init__(
         self,
@@ -77,7 +76,8 @@ class WallConnectorBinarySensorEntity(WallConnectorEntity, BinarySensorEntity):
         super().__init__(wall_connectord_data)
 
     @property
-    def is_on(self):
+    @override
+    def is_on(self) -> bool:
         """Return the state of the sensor."""
 
         return self.entity_description.value_fn(self.coordinator.data)

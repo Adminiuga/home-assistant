@@ -1,0 +1,13 @@
+{
+  "domain": "ecoforest",
+  "name": "Ecoforest",
+  "categories": ["climate.thermostats_heating"],
+  "codeowners": ["@pjanuario"],
+  "config_flow": true,
+  "connectivity": ["network"],
+  "documentation": "https://www.home-assistant.io/integrations/ecoforest",
+  "integration_type": "device",
+  "iot_class": "local_polling",
+  "loggers": ["pyecoforest"],
+  "requirements": ["pyecoforest==0.4.0"]
+}

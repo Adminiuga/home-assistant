@@ -1,36 +1,33 @@
 """Model Classes for here_travel_time."""
-from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import time
+from datetime import datetime
 from typing import TypedDict
 
+from here_routing import RoutingMode, TrafficMode
 
-class HERERoutingData(TypedDict):
-    """Routing information calculated from a herepy.RoutingResponse."""
 
-    ATTR_ATTRIBUTION: str | None
-    ATTR_DURATION: float
-    ATTR_DURATION_IN_TRAFFIC: float
-    ATTR_DISTANCE: float
-    ATTR_ORIGIN: str
-    ATTR_DESTINATION: str
-    ATTR_ORIGIN_NAME: str
-    ATTR_DESTINATION_NAME: str
+class HERETravelTimeData(TypedDict):
+    """Routing information."""
+
+    attribution: str | None
+    duration: float
+    duration_in_traffic: float
+    distance: float
+    origin: str
+    destination: str
+    origin_name: str | None
+    destination_name: str | None
 
 
 @dataclass
-class HERETravelTimeConfig:
-    """Configuration for HereTravelTimeDataUpdateCoordinator."""
+class HERETravelTimeAPIParams:
+    """Configuration for polling the HERE API."""
 
-    destination_latitude: float | None
-    destination_longitude: float | None
-    destination_entity_id: str | None
-    origin_latitude: float | None
-    origin_longitude: float | None
-    origin_entity_id: str | None
+    destination: list[str]
+    origin: list[str]
     travel_mode: str
-    route_mode: str
-    units: str
-    arrival: time | None
-    departure: time | None
+    route_mode: RoutingMode
+    arrival: datetime | None
+    departure: datetime | None
+    traffic_mode: TrafficMode

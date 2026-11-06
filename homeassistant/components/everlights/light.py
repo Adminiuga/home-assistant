@@ -1,18 +1,17 @@
 """Support for EverLights lights."""
-from __future__ import annotations
 
 from datetime import timedelta
 import logging
-from typing import Any
+from typing import Any, cast, override
 
+import probatio
 import pyeverlights
-import voluptuous as vol
 
 from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
     ATTR_EFFECT,
     ATTR_HS_COLOR,
-    PLATFORM_SCHEMA,
+    PLATFORM_SCHEMA as LIGHT_PLATFORM_SCHEMA,
     ColorMode,
     LightEntity,
     LightEntityFeature,
@@ -20,18 +19,18 @@ from homeassistant.components.light import (
 from homeassistant.const import CONF_HOSTS
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import PlatformNotReady
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
-import homeassistant.util.color as color_util
+from homeassistant.util import color as color_util
 
 _LOGGER = logging.getLogger(__name__)
 
 SCAN_INTERVAL = timedelta(minutes=1)
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
-    {vol.Required(CONF_HOSTS): vol.All(cv.ensure_list, [cv.string])}
+PLATFORM_SCHEMA = LIGHT_PLATFORM_SCHEMA.extend(
+    {probatio.Required(CONF_HOSTS): probatio.All(probatio.EnsureList(), [cv.string])}
 )
 
 
@@ -65,9 +64,8 @@ async def async_setup_platform(
         except pyeverlights.ConnectionError as err:
             raise PlatformNotReady from err
 
-        else:
-            lights.append(EverLightsLight(api, pyeverlights.ZONE_1, status, effects))
-            lights.append(EverLightsLight(api, pyeverlights.ZONE_2, status, effects))
+        lights.append(EverLightsLight(api, pyeverlights.ZONE_1, status, effects))
+        lights.append(EverLightsLight(api, pyeverlights.ZONE_2, status, effects))
 
     async_add_entities(lights)
 
@@ -84,7 +82,7 @@ class EverLightsLight(LightEntity):
         api: pyeverlights.EverLights,
         channel: int,
         status: dict[str, Any],
-        effects,
+        effects: list[str],
     ) -> None:
         """Initialize the light."""
         self._api = api
@@ -100,14 +98,18 @@ class EverLightsLight(LightEntity):
         self._attr_unique_id = f"{self._mac}-{self._channel}"
 
     @property
+    @override
     def is_on(self) -> bool:
         """Return true if device is on."""
         return self._status[f"ch{self._channel}Active"] == 1
 
+    @override
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn the light on."""
-        hs_color = kwargs.get(ATTR_HS_COLOR, self._attr_hs_color)
-        brightness = kwargs.get(ATTR_BRIGHTNESS, self._attr_brightness)
+        hs_color = cast(
+            tuple[float, float], kwargs.get(ATTR_HS_COLOR, self._attr_hs_color)
+        )
+        brightness = cast(int, kwargs.get(ATTR_BRIGHTNESS, self._attr_brightness))
         effect = kwargs.get(ATTR_EFFECT)
 
         if effect is not None:
@@ -116,7 +118,7 @@ class EverLightsLight(LightEntity):
             rgb = color_int_to_rgb(colors[0])
             hsv = color_util.color_RGB_to_hsv(*rgb)
             hs_color = hsv[:2]
-            brightness = hsv[2] / 100 * 255
+            brightness = round(hsv[2] / 100 * 255)
 
         else:
             rgb = color_util.color_hsv_to_RGB(
@@ -130,6 +132,7 @@ class EverLightsLight(LightEntity):
         self._attr_brightness = brightness
         self._attr_effect = effect
 
+    @override
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn the light off."""
         await self._api.clear_pattern(self._channel)

@@ -1,67 +1,71 @@
 """Config flow for Somfy MyLink integration."""
-from __future__ import annotations
 
-import asyncio
 from copy import deepcopy
 import logging
+from typing import Any, override
 
-from somfy_mylink_synergy import SomfyMyLinkSynergy
-import voluptuous as vol
+import probatio
+from pysomfymylink import SomfyMyLink, SomfyMyLinkApiError, SomfyMyLinkConnectionError
 
-from homeassistant import config_entries, core, exceptions
-from homeassistant.components import dhcp
+from homeassistant.config_entries import (
+    ConfigEntryState,
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlowWithReload,
+)
 from homeassistant.const import CONF_HOST, CONF_PORT
-from homeassistant.core import callback
-from homeassistant.data_entry_flow import FlowResult
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.device_registry import format_mac
+from homeassistant.helpers.service_info.dhcp import DhcpServiceInfo
 
+from . import SomfyMyLinkConfigEntry
 from .const import (
     CONF_REVERSE,
     CONF_REVERSED_TARGET_IDS,
     CONF_SYSTEM_ID,
     CONF_TARGET_ID,
-    CONF_TARGET_NAME,
     DEFAULT_PORT,
     DOMAIN,
-    MYLINK_STATUS,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
 
-async def validate_input(hass: core.HomeAssistant, data):
+async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str, str]:
     """Validate the user input allows us to connect.
 
     Data has the keys from schema with values provided by the user.
     """
-    somfy_mylink = SomfyMyLinkSynergy(
-        data[CONF_SYSTEM_ID], data[CONF_HOST], data[CONF_PORT]
+    somfy_mylink = SomfyMyLink(
+        data[CONF_HOST], data[CONF_SYSTEM_ID], port=data[CONF_PORT]
     )
 
     try:
-        status_info = await somfy_mylink.status_info()
-    except asyncio.TimeoutError as ex:
+        await somfy_mylink.status_info()
+    except SomfyMyLinkConnectionError as ex:
         raise CannotConnect from ex
-
-    if not status_info or "error" in status_info:
-        _LOGGER.debug("Auth error: %s", status_info)
-        raise InvalidAuth
+    except SomfyMyLinkApiError as ex:
+        raise InvalidAuth from ex
 
     return {"title": f"MyLink {data[CONF_HOST]}"}
 
 
-class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
+class SomfyConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Somfy MyLink."""
 
     VERSION = 1
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize the somfy_mylink flow."""
-        self.host = None
-        self.mac = None
-        self.ip_address = None
+        self.host: str | None = None
+        self.mac: str | None = None
+        self.ip_address: str | None = None
 
-    async def async_step_dhcp(self, discovery_info: dhcp.DhcpServiceInfo) -> FlowResult:
+    @override
+    async def async_step_dhcp(
+        self, discovery_info: DhcpServiceInfo
+    ) -> ConfigFlowResult:
         """Handle dhcp discovery."""
         self._async_abort_entries_match({CONF_HOST: discovery_info.ip})
 
@@ -74,7 +78,10 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self.context["title_placeholders"] = {"ip": self.ip_address, "mac": self.mac}
         return await self.async_step_user()
 
-    async def async_step_user(self, user_input=None):
+    @override
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle the initial step."""
         errors = {}
 
@@ -87,7 +94,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 errors["base"] = "cannot_connect"
             except InvalidAuth:
                 errors["base"] = "invalid_auth"
-            except Exception:  # pylint: disable=broad-except
+            except Exception:
                 _LOGGER.exception("Unexpected exception")
                 errors["base"] = "unknown"
             else:
@@ -95,59 +102,51 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="user",
-            data_schema=vol.Schema(
+            data_schema=probatio.Schema(
                 {
-                    vol.Required(CONF_HOST, default=self.ip_address): str,
-                    vol.Required(CONF_SYSTEM_ID): str,
-                    vol.Optional(CONF_PORT, default=DEFAULT_PORT): int,
+                    probatio.Required(CONF_HOST, default=self.ip_address): str,
+                    probatio.Required(CONF_SYSTEM_ID): str,
+                    probatio.Optional(CONF_PORT, default=DEFAULT_PORT): int,
                 }
             ),
             errors=errors,
         )
 
-    async def async_step_import(self, user_input):
-        """Handle import."""
-        self._async_abort_entries_match({CONF_HOST: user_input[CONF_HOST]})
-        return await self.async_step_user(user_input)
-
     @staticmethod
     @callback
+    @override
     def async_get_options_flow(
-        config_entry: config_entries.ConfigEntry,
+        config_entry: SomfyMyLinkConfigEntry,
     ) -> OptionsFlowHandler:
         """Get the options flow for this handler."""
         return OptionsFlowHandler(config_entry)
 
 
-class OptionsFlowHandler(config_entries.OptionsFlow):
+class OptionsFlowHandler(OptionsFlowWithReload):
     """Handle a option flow for somfy_mylink."""
 
-    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
+    config_entry: SomfyMyLinkConfigEntry
+
+    def __init__(self, config_entry: SomfyMyLinkConfigEntry) -> None:
         """Initialize options flow."""
-        self.config_entry = config_entry
         self.options = deepcopy(dict(config_entry.options))
-        self._target_id = None
+        self._target_id: str | None = None
 
     @callback
-    def _async_callback_targets(self):
-        """Return the list of targets."""
-        return self.hass.data[DOMAIN][self.config_entry.entry_id][MYLINK_STATUS][
-            "result"
-        ]
-
-    @callback
-    def _async_get_target_name(self, target_id) -> str:
+    def _async_get_target_name(self, target_id: str) -> str:
         """Find the name of a target in the api data."""
-        mylink_targets = self._async_callback_targets()
-        for cover in mylink_targets:
-            if cover["targetID"] == target_id:
-                return cover["name"]
-        raise KeyError
+        names = {
+            shade.target_id: shade.name
+            for shade in self.config_entry.runtime_data.shades
+        }
+        return names[target_id]
 
-    async def async_step_init(self, user_input=None):
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle options flow."""
 
-        if self.config_entry.state is not config_entries.ConfigEntryState.LOADED:
+        if self.config_entry.state is not ConfigEntryState.LOADED:
             _LOGGER.error("MyLink must be connected to manage device options")
             return self.async_abort(reason="cannot_connect")
 
@@ -157,19 +156,23 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
 
             return self.async_create_entry(title="", data=self.options)
 
-        cover_dict = {None: None}
-        mylink_targets = self._async_callback_targets()
-        if mylink_targets:
-            for cover in mylink_targets:
-                cover_dict[cover["targetID"]] = cover["name"]
+        cover_dict: dict[str | None, str | None] = {None: None}
+        for shade in self.config_entry.runtime_data.shades:
+            cover_dict[shade.target_id] = shade.name
 
-        data_schema = vol.Schema({vol.Optional(CONF_TARGET_ID): vol.In(cover_dict)})
+        data_schema = probatio.Schema(
+            {probatio.Optional(CONF_TARGET_ID): probatio.In(cover_dict)}
+        )
 
         return self.async_show_form(step_id="init", data_schema=data_schema, errors={})
 
-    async def async_step_target_config(self, user_input=None, target_id=None):
+    async def async_step_target_config(
+        self, user_input: dict[str, bool] | None = None, target_id: str | None = None
+    ) -> ConfigFlowResult:
         """Handle options flow for target."""
-        reversed_target_ids = self.options.setdefault(CONF_REVERSED_TARGET_IDS, {})
+        reversed_target_ids: dict[str | None, bool] = self.options.setdefault(
+            CONF_REVERSED_TARGET_IDS, {}
+        )
 
         if user_input is not None:
             if user_input[CONF_REVERSE] != reversed_target_ids.get(self._target_id):
@@ -177,27 +180,28 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
             return await self.async_step_init()
 
         self._target_id = target_id
+        assert target_id is not None
 
         return self.async_show_form(
             step_id="target_config",
-            data_schema=vol.Schema(
+            data_schema=probatio.Schema(
                 {
-                    vol.Optional(
+                    probatio.Optional(
                         CONF_REVERSE,
                         default=reversed_target_ids.get(target_id, False),
                     ): bool
                 }
             ),
             description_placeholders={
-                CONF_TARGET_NAME: self._async_get_target_name(target_id),
+                "target_name": self._async_get_target_name(target_id),
             },
             errors={},
         )
 
 
-class CannotConnect(exceptions.HomeAssistantError):
+class CannotConnect(HomeAssistantError):
     """Error to indicate we cannot connect."""
 
 
-class InvalidAuth(exceptions.HomeAssistantError):
+class InvalidAuth(HomeAssistantError):
     """Error to indicate there is invalid auth."""

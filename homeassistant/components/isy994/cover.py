@@ -1,50 +1,46 @@
-"""Support for ISY994 covers."""
-from __future__ import annotations
+"""Support for ISY covers."""
 
-from typing import Any
+from typing import Any, cast, override
 
 from pyisy.constants import ISY_VALUE_UNKNOWN
 
 from homeassistant.components.cover import (
     ATTR_POSITION,
-    DOMAIN as COVER,
     CoverEntity,
     CoverEntityFeature,
 )
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .const import (
-    _LOGGER,
-    DOMAIN as ISY994_DOMAIN,
-    ISY994_NODES,
-    ISY994_PROGRAMS,
-    UOM_8_BIT_RANGE,
-    UOM_BARRIER,
-)
+from .const import LOGGER, UOM_8_BIT_RANGE
 from .entity import ISYNodeEntity, ISYProgramEntity
-from .helpers import migrate_old_unique_ids
+from .models import IsyConfigEntry
 
 
 async def async_setup_entry(
-    hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
+    hass: HomeAssistant,
+    entry: IsyConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    """Set up the ISY994 cover platform."""
-    hass_isy_data = hass.data[ISY994_DOMAIN][entry.entry_id]
-    entities: list[ISYCoverEntity | ISYCoverProgramEntity] = []
-    for node in hass_isy_data[ISY994_NODES][COVER]:
-        entities.append(ISYCoverEntity(node))
+    """Set up the ISY cover platform."""
+    isy_data = entry.runtime_data
+    devices = isy_data.devices
+    entities: list[ISYCoverEntity | ISYCoverProgramEntity] = [
+        ISYCoverEntity(node, devices.get(node.primary_node))
+        for node in isy_data.nodes[Platform.COVER]
+    ]
 
-    for name, status, actions in hass_isy_data[ISY994_PROGRAMS][COVER]:
-        entities.append(ISYCoverProgramEntity(name, status, actions))
+    entities.extend(
+        ISYCoverProgramEntity(name, status, actions)
+        for name, status, actions in isy_data.programs[Platform.COVER]
+    )
 
-    await migrate_old_unique_ids(hass, COVER, entities)
     async_add_entities(entities)
 
 
 class ISYCoverEntity(ISYNodeEntity, CoverEntity):
-    """Representation of an ISY994 cover device."""
+    """Representation of an ISY cover device."""
 
     _attr_supported_features = (
         CoverEntityFeature.OPEN
@@ -53,55 +49,62 @@ class ISYCoverEntity(ISYNodeEntity, CoverEntity):
     )
 
     @property
+    @override
     def current_cover_position(self) -> int | None:
         """Return the current cover position."""
         if self._node.status == ISY_VALUE_UNKNOWN:
             return None
         if self._node.uom == UOM_8_BIT_RANGE:
-            return round(self._node.status * 100.0 / 255.0)
+            return round(cast(float, self._node.status) * 100.0 / 255.0)
         return int(sorted((0, self._node.status, 100))[1])
 
     @property
+    @override
     def is_closed(self) -> bool | None:
-        """Get whether the ISY994 cover device is closed."""
+        """Get whether the ISY cover device is closed."""
         if self._node.status == ISY_VALUE_UNKNOWN:
             return None
         return bool(self._node.status == 0)
 
+    @override
     async def async_open_cover(self, **kwargs: Any) -> None:
-        """Send the open cover command to the ISY994 cover device."""
-        val = 100 if self._node.uom == UOM_BARRIER else None
-        if not await self._node.turn_on(val=val):
-            _LOGGER.error("Unable to open the cover")
+        """Send the open cover command to the ISY cover device."""
+        if not await self._node.turn_on():
+            LOGGER.error("Unable to open the cover")
 
+    @override
     async def async_close_cover(self, **kwargs: Any) -> None:
-        """Send the close cover command to the ISY994 cover device."""
+        """Send the close cover command to the ISY cover device."""
         if not await self._node.turn_off():
-            _LOGGER.error("Unable to close the cover")
+            LOGGER.error("Unable to close the cover")
 
+    @override
     async def async_set_cover_position(self, **kwargs: Any) -> None:
         """Move the cover to a specific position."""
         position = kwargs[ATTR_POSITION]
         if self._node.uom == UOM_8_BIT_RANGE:
             position = round(position * 255.0 / 100.0)
         if not await self._node.turn_on(val=position):
-            _LOGGER.error("Unable to set cover position")
+            LOGGER.error("Unable to set cover position")
 
 
 class ISYCoverProgramEntity(ISYProgramEntity, CoverEntity):
-    """Representation of an ISY994 cover program."""
+    """Representation of an ISY cover program."""
 
     @property
+    @override
     def is_closed(self) -> bool:
-        """Get whether the ISY994 cover program is closed."""
+        """Get whether the ISY cover program is closed."""
         return bool(self._node.status)
 
+    @override
     async def async_open_cover(self, **kwargs: Any) -> None:
-        """Send the open cover command to the ISY994 cover program."""
+        """Send the open cover command to the ISY cover program."""
         if not await self._actions.run_then():
-            _LOGGER.error("Unable to open the cover")
+            LOGGER.error("Unable to open the cover")
 
+    @override
     async def async_close_cover(self, **kwargs: Any) -> None:
-        """Send the close cover command to the ISY994 cover program."""
+        """Send the close cover command to the ISY cover program."""
         if not await self._actions.run_else():
-            _LOGGER.error("Unable to close the cover")
+            LOGGER.error("Unable to close the cover")

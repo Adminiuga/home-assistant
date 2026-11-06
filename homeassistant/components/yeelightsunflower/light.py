@@ -1,29 +1,30 @@
 """Support for Yeelight Sunflower color bulbs (not Yeelight Blue or WiFi)."""
-from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, override
 
-import voluptuous as vol
+import probatio
 import yeelightsunflower
 
 from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
     ATTR_HS_COLOR,
-    PLATFORM_SCHEMA,
+    PLATFORM_SCHEMA as LIGHT_PLATFORM_SCHEMA,
     ColorMode,
     LightEntity,
 )
 from homeassistant.const import CONF_HOST
 from homeassistant.core import HomeAssistant
-import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
-import homeassistant.util.color as color_util
+from homeassistant.util import color as color_util
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({vol.Required(CONF_HOST): cv.string})
+PLATFORM_SCHEMA = LIGHT_PLATFORM_SCHEMA.extend(
+    {probatio.Required(CONF_HOST): cv.string}
+)
 
 
 def setup_platform(
@@ -60,32 +61,35 @@ class SunflowerBulb(LightEntity):
         self._attr_name = f"sunflower_{self._light.zid}"
 
     @property
+    @override
     def brightness(self) -> int:
         """Return the brightness is 0-255; Yeelight's brightness is 0-100."""
         return int(self._brightness / 100 * 255)
 
     @property
+    @override
     def hs_color(self) -> tuple[float, float]:
         """Return the color property."""
         return color_util.color_RGB_to_hs(*self._rgb_color)
 
+    @override
     def turn_on(self, **kwargs: Any) -> None:
         """Instruct the light to turn on, optionally set colour/brightness."""
         # when no arguments, just turn light on (full brightness)
         if not kwargs:
             self._light.turn_on()
-        else:
-            if ATTR_HS_COLOR in kwargs and ATTR_BRIGHTNESS in kwargs:
-                rgb = color_util.color_hs_to_RGB(*kwargs[ATTR_HS_COLOR])
-                bright = int(kwargs[ATTR_BRIGHTNESS] / 255 * 100)
-                self._light.set_all(rgb[0], rgb[1], rgb[2], bright)
-            elif ATTR_HS_COLOR in kwargs:
-                rgb = color_util.color_hs_to_RGB(*kwargs[ATTR_HS_COLOR])
-                self._light.set_rgb_color(rgb[0], rgb[1], rgb[2])
-            elif ATTR_BRIGHTNESS in kwargs:
-                bright = int(kwargs[ATTR_BRIGHTNESS] / 255 * 100)
-                self._light.set_brightness(bright)
+        elif ATTR_HS_COLOR in kwargs and ATTR_BRIGHTNESS in kwargs:
+            rgb = color_util.color_hs_to_RGB(*kwargs[ATTR_HS_COLOR])
+            bright = int(kwargs[ATTR_BRIGHTNESS] / 255 * 100)
+            self._light.set_all(rgb[0], rgb[1], rgb[2], bright)
+        elif ATTR_HS_COLOR in kwargs:
+            rgb = color_util.color_hs_to_RGB(*kwargs[ATTR_HS_COLOR])
+            self._light.set_rgb_color(rgb[0], rgb[1], rgb[2])
+        elif ATTR_BRIGHTNESS in kwargs:
+            bright = int(kwargs[ATTR_BRIGHTNESS] / 255 * 100)
+            self._light.set_brightness(bright)
 
+    @override
     def turn_off(self, **kwargs: Any) -> None:
         """Instruct the light to turn off."""
         self._light.turn_off()

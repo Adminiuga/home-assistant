@@ -1,7 +1,6 @@
 """Provides device actions for NEW_NAME."""
-from __future__ import annotations
 
-import voluptuous as vol
+import probatio
 
 from homeassistant.const import (
     ATTR_ENTITY_ID,
@@ -13,8 +12,7 @@ from homeassistant.const import (
     SERVICE_TURN_ON,
 )
 from homeassistant.core import Context, HomeAssistant
-from homeassistant.helpers import entity_registry
-import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers import config_validation as cv, entity_registry as er
 
 from . import DOMAIN
 
@@ -23,8 +21,8 @@ ACTION_TYPES = {"turn_on", "turn_off"}
 
 ACTION_SCHEMA = cv.DEVICE_ACTION_BASE_SCHEMA.extend(
     {
-        vol.Required(CONF_TYPE): vol.In(ACTION_TYPES),
-        vol.Required(CONF_ENTITY_ID): cv.entity_domain(DOMAIN),
+        probatio.Required(CONF_TYPE): probatio.In(ACTION_TYPES),
+        probatio.Required(CONF_ENTITY_ID): cv.entity_domain(DOMAIN),
     }
 )
 
@@ -33,7 +31,7 @@ async def async_get_actions(
     hass: HomeAssistant, device_id: str
 ) -> list[dict[str, str]]:
     """List device actions for NEW_NAME devices."""
-    registry = entity_registry.async_get(hass)
+    registry = er.async_get(hass)
     actions = []
 
     # TODO Read this comment and remove it.
@@ -44,7 +42,7 @@ async def async_get_actions(
     # return zha_device.device_actions
 
     # Get all the integrations entities for this device
-    for entry in entity_registry.async_entries_for_device(registry, device_id):
+    for entry in er.async_entries_for_device(registry, device_id):
         if entry.domain != DOMAIN:
             continue
 

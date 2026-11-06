@@ -1,59 +1,18 @@
 {
   "domain": "unifiprotect",
   "name": "UniFi Protect",
-  "integration_type": "hub",
+  "categories": [
+    "security_safety.cameras",
+    "security_safety.doorbells_intercoms"
+  ],
+  "codeowners": ["@RaHehl"],
   "config_flow": true,
+  "connectivity": ["network"],
+  "dependencies": ["http", "repairs", "unifi_discovery"],
   "documentation": "https://www.home-assistant.io/integrations/unifiprotect",
-  "requirements": ["pyunifiprotect==4.4.1", "unifi-discovery==1.1.7"],
-  "dependencies": ["http"],
-  "codeowners": ["@briis", "@AngellusMortis", "@bdraco"],
-  "quality_scale": "platinum",
+  "integration_type": "hub",
   "iot_class": "local_push",
-  "dhcp": [
-    {
-      "macaddress": "B4FBE4*"
-    },
-    {
-      "macaddress": "802AA8*"
-    },
-    {
-      "macaddress": "F09FC2*"
-    },
-    {
-      "macaddress": "68D79A*"
-    },
-    {
-      "macaddress": "18E829*"
-    },
-    {
-      "macaddress": "245A4C*"
-    },
-    {
-      "macaddress": "784558*"
-    },
-    {
-      "macaddress": "E063DA*"
-    },
-    {
-      "macaddress": "265A4C*"
-    },
-    {
-      "macaddress": "74ACB9*"
-    }
-  ],
-  "ssdp": [
-    {
-      "manufacturer": "Ubiquiti Networks",
-      "modelDescription": "UniFi Dream Machine"
-    },
-    {
-      "manufacturer": "Ubiquiti Networks",
-      "modelDescription": "UniFi Dream Machine Pro"
-    },
-    {
-      "manufacturer": "Ubiquiti Networks",
-      "modelDescription": "UniFi Dream Machine SE"
-    }
-  ],
-  "loggers": ["pyunifiprotect", "unifi_discovery"]
+  "loggers": ["uiprotect"],
+  "quality_scale": "platinum",
+  "requirements": ["uiprotect==25.0.0"]
 }

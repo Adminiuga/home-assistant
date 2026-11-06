@@ -1,4 +1,7 @@
 """Test the NuHeat config flow."""
+
+from collections.abc import Generator
+from contextlib import contextmanager
 from http import HTTPStatus
 from unittest.mock import MagicMock, patch
 
@@ -7,30 +10,59 @@ import requests
 from homeassistant import config_entries
 from homeassistant.components.nuheat.const import CONF_SERIAL_NUMBER, DOMAIN
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
+from homeassistant.core import HomeAssistant
+from homeassistant.data_entry_flow import FlowResultType
 
 from .mocks import _get_mock_thermostat_run
 
+USER_INPUT = {
+    CONF_SERIAL_NUMBER: "12345",
+    CONF_USERNAME: "test-username",
+    CONF_PASSWORD: "test-password",
+}
 
-async def test_form_user(hass):
+
+@contextmanager
+def _patch_success() -> Generator[None]:
+    """Patch a successful login and entry setup."""
+    with (
+        patch(
+            "homeassistant.components.nuheat.config_flow.nuheat.NuHeat.authenticate",
+            return_value=True,
+        ),
+        patch(
+            "homeassistant.components.nuheat.config_flow.nuheat.NuHeat.get_thermostat",
+            return_value=_get_mock_thermostat_run(),
+        ),
+        patch("homeassistant.components.nuheat.async_setup_entry", return_value=None),
+    ):
+        yield
+
+
+async def test_form_user(hass: HomeAssistant) -> None:
     """Test we get the form with user source."""
 
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": config_entries.SOURCE_USER}
     )
-    assert result["type"] == "form"
+    assert result["type"] is FlowResultType.FORM
     assert result["errors"] == {}
 
     mock_thermostat = _get_mock_thermostat_run()
 
-    with patch(
-        "homeassistant.components.nuheat.config_flow.nuheat.NuHeat.authenticate",
-        return_value=True,
-    ), patch(
-        "homeassistant.components.nuheat.config_flow.nuheat.NuHeat.get_thermostat",
-        return_value=mock_thermostat,
-    ), patch(
-        "homeassistant.components.nuheat.async_setup_entry", return_value=True
-    ) as mock_setup_entry:
+    with (
+        patch(
+            "homeassistant.components.nuheat.config_flow.nuheat.NuHeat.authenticate",
+            return_value=True,
+        ),
+        patch(
+            "homeassistant.components.nuheat.config_flow.nuheat.NuHeat.get_thermostat",
+            return_value=mock_thermostat,
+        ),
+        patch(
+            "homeassistant.components.nuheat.async_setup_entry", return_value=None
+        ) as mock_setup_entry,
+    ):
         result2 = await hass.config_entries.flow.async_configure(
             result["flow_id"],
             {
@@ -41,17 +73,18 @@ async def test_form_user(hass):
         )
         await hass.async_block_till_done()
 
-    assert result2["type"] == "create_entry"
+    assert result2["type"] is FlowResultType.CREATE_ENTRY
     assert result2["title"] == "Master bathroom"
     assert result2["data"] == {
         CONF_SERIAL_NUMBER: "12345",
         CONF_USERNAME: "test-username",
         CONF_PASSWORD: "test-password",
     }
+    assert result2["result"].unique_id == "12345"
     assert len(mock_setup_entry.mock_calls) == 1
 
 
-async def test_form_invalid_auth(hass):
+async def test_form_invalid_auth(hass: HomeAssistant) -> None:
     """Test we handle invalid auth."""
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": config_entries.SOURCE_USER}
@@ -70,7 +103,7 @@ async def test_form_invalid_auth(hass):
             },
         )
 
-    assert result["type"] == "form"
+    assert result["type"] is FlowResultType.FORM
     assert result["errors"] == {"base": "invalid_auth"}
 
     response_mock = MagicMock()
@@ -88,11 +121,18 @@ async def test_form_invalid_auth(hass):
             },
         )
 
-    assert result2["type"] == "form"
+    assert result2["type"] is FlowResultType.FORM
     assert result2["errors"] == {"base": "invalid_auth"}
 
+    with _patch_success():
+        result3 = await hass.config_entries.flow.async_configure(
+            result["flow_id"], USER_INPUT
+        )
 
-async def test_form_invalid_thermostat(hass):
+    assert result3["type"] is FlowResultType.CREATE_ENTRY
+
+
+async def test_form_invalid_thermostat(hass: HomeAssistant) -> None:
     """Test we handle invalid thermostats."""
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": config_entries.SOURCE_USER}
@@ -101,12 +141,15 @@ async def test_form_invalid_thermostat(hass):
     response_mock = MagicMock()
     type(response_mock).status_code = HTTPStatus.INTERNAL_SERVER_ERROR
 
-    with patch(
-        "homeassistant.components.nuheat.config_flow.nuheat.NuHeat.authenticate",
-        return_value=True,
-    ), patch(
-        "homeassistant.components.nuheat.config_flow.nuheat.NuHeat.get_thermostat",
-        side_effect=requests.HTTPError(response=response_mock),
+    with (
+        patch(
+            "homeassistant.components.nuheat.config_flow.nuheat.NuHeat.authenticate",
+            return_value=True,
+        ),
+        patch(
+            "homeassistant.components.nuheat.config_flow.nuheat.NuHeat.get_thermostat",
+            side_effect=requests.HTTPError(response=response_mock),
+        ),
     ):
         result2 = await hass.config_entries.flow.async_configure(
             result["flow_id"],
@@ -117,11 +160,18 @@ async def test_form_invalid_thermostat(hass):
             },
         )
 
-    assert result2["type"] == "form"
+    assert result2["type"] is FlowResultType.FORM
     assert result2["errors"] == {"base": "invalid_thermostat"}
 
+    with _patch_success():
+        result3 = await hass.config_entries.flow.async_configure(
+            result["flow_id"], USER_INPUT
+        )
 
-async def test_form_cannot_connect(hass):
+    assert result3["type"] is FlowResultType.CREATE_ENTRY
+
+
+async def test_form_cannot_connect(hass: HomeAssistant) -> None:
     """Test we handle cannot connect error."""
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": config_entries.SOURCE_USER}
@@ -140,5 +190,12 @@ async def test_form_cannot_connect(hass):
             },
         )
 
-    assert result2["type"] == "form"
+    assert result2["type"] is FlowResultType.FORM
     assert result2["errors"] == {"base": "cannot_connect"}
+
+    with _patch_success():
+        result3 = await hass.config_entries.flow.async_configure(
+            result["flow_id"], USER_INPUT
+        )
+
+    assert result3["type"] is FlowResultType.CREATE_ENTRY

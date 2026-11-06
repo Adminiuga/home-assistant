@@ -1,6 +1,7 @@
 """Constants for the LaCrosse View integration."""
-import logging
+
+from datetime import timedelta
 
 DOMAIN = "lacrosse_view"
-LOGGER = logging.getLogger(__package__)
-SCAN_INTERVAL = 30
+SCAN_INTERVAL = 60
+STALE_DATA_THRESHOLD = timedelta(seconds=3600)

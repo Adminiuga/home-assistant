@@ -1,22 +1,21 @@
 """Config flow for BTHome Bluetooth integration."""
-from __future__ import annotations
 
 from collections.abc import Mapping
 import dataclasses
-from typing import Any
+from typing import Any, override
 
 from bthome_ble import BTHomeBluetoothDeviceData as DeviceData
 from bthome_ble.parser import EncryptionScheme
-import voluptuous as vol
+import probatio
 
 from homeassistant.components import onboarding
 from homeassistant.components.bluetooth import (
-    BluetoothServiceInfo,
+    BluetoothServiceInfoBleak,
     async_discovered_service_info,
 )
-from homeassistant.config_entries import ConfigFlow
+from homeassistant.config_entries import SOURCE_REAUTH, ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_ADDRESS
-from homeassistant.data_entry_flow import FlowResult
+from homeassistant.core import DOMAIN as HOMEASSISTANT_DOMAIN
 
 from .const import DOMAIN
 
@@ -26,11 +25,11 @@ class Discovery:
     """A discovered bluetooth device."""
 
     title: str
-    discovery_info: BluetoothServiceInfo
+    discovery_info: BluetoothServiceInfoBleak
     device: DeviceData
 
 
-def _title(discovery_info: BluetoothServiceInfo, device: DeviceData) -> str:
+def _title(discovery_info: BluetoothServiceInfoBleak, device: DeviceData) -> str:
     return device.title or device.get_device_name() or discovery_info.name
 
 
@@ -41,13 +40,14 @@ class BTHomeConfigFlow(ConfigFlow, domain=DOMAIN):
 
     def __init__(self) -> None:
         """Initialize the config flow."""
-        self._discovery_info: BluetoothServiceInfo | None = None
+        self._discovery_info: BluetoothServiceInfoBleak | None = None
         self._discovered_device: DeviceData | None = None
         self._discovered_devices: dict[str, Discovery] = {}
 
+    @override
     async def async_step_bluetooth(
-        self, discovery_info: BluetoothServiceInfo
-    ) -> FlowResult:
+        self, discovery_info: BluetoothServiceInfoBleak
+    ) -> ConfigFlowResult:
         """Handle the bluetooth discovery step."""
         await self.async_set_unique_id(discovery_info.address)
         self._abort_if_unique_id_configured()
@@ -61,13 +61,13 @@ class BTHomeConfigFlow(ConfigFlow, domain=DOMAIN):
         self._discovery_info = discovery_info
         self._discovered_device = device
 
-        if device.encryption_scheme == EncryptionScheme.BTHOME_BINDKEY:
+        if device.encryption_scheme is EncryptionScheme.BTHOME_BINDKEY:
             return await self.async_step_get_encryption_key()
         return await self.async_step_bluetooth_confirm()
 
     async def async_step_get_encryption_key(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Enter a bindkey for an encrypted BTHome device."""
         assert self._discovery_info
         assert self._discovered_device
@@ -75,12 +75,12 @@ class BTHomeConfigFlow(ConfigFlow, domain=DOMAIN):
         errors = {}
 
         if user_input is not None:
-            bindkey = user_input["bindkey"]
+            bindkey: str = user_input["bindkey"]
 
             if len(bindkey) != 32:
                 errors["bindkey"] = "expected_32_characters"
             else:
-                self._discovered_device.bindkey = bytes.fromhex(bindkey)
+                self._discovered_device.set_bindkey(bytes.fromhex(bindkey))
 
                 # If we got this far we already know supported will
                 # return true so we don't bother checking that again
@@ -95,26 +95,28 @@ class BTHomeConfigFlow(ConfigFlow, domain=DOMAIN):
         return self.async_show_form(
             step_id="get_encryption_key",
             description_placeholders=self.context["title_placeholders"],
-            data_schema=vol.Schema({vol.Required("bindkey"): vol.All(str, vol.Strip)}),
+            data_schema=probatio.Schema(
+                {probatio.Required("bindkey"): probatio.All(str, probatio.Strip)}
+            ),
             errors=errors,
         )
 
     async def async_step_bluetooth_confirm(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Confirm discovery."""
         if user_input is not None or not onboarding.async_is_onboarded(self.hass):
             return self._async_get_or_create_entry()
 
-        self._set_confirm_only()
         return self.async_show_form(
             step_id="bluetooth_confirm",
             description_placeholders=self.context["title_placeholders"],
         )
 
+    @override
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle the user step to pick discovered device."""
         if user_input is not None:
             address = user_input[CONF_ADDRESS]
@@ -127,12 +129,12 @@ class BTHomeConfigFlow(ConfigFlow, domain=DOMAIN):
             self._discovery_info = discovery.discovery_info
             self._discovered_device = discovery.device
 
-            if discovery.device.encryption_scheme == EncryptionScheme.BTHOME_BINDKEY:
+            if discovery.device.encryption_scheme is EncryptionScheme.BTHOME_BINDKEY:
                 return await self.async_step_get_encryption_key()
 
             return self._async_get_or_create_entry()
 
-        current_addresses = self._async_current_ids()
+        current_addresses = self._async_current_ids(include_ignore=False)
         for discovery_info in async_discovered_service_info(self.hass, False):
             address = discovery_info.address
             if address in current_addresses or address in self._discovered_devices:
@@ -154,42 +156,39 @@ class BTHomeConfigFlow(ConfigFlow, domain=DOMAIN):
         }
         return self.async_show_form(
             step_id="user",
-            data_schema=vol.Schema({vol.Required(CONF_ADDRESS): vol.In(titles)}),
+            data_schema=probatio.Schema(
+                {probatio.Required(CONF_ADDRESS): probatio.In(titles)}
+            ),
         )
 
-    async def async_step_reauth(self, entry_data: Mapping[str, Any]) -> FlowResult:
+    async def async_step_reauth(
+        self, entry_data: Mapping[str, Any]
+    ) -> ConfigFlowResult:
         """Handle a flow initialized by a reauth event."""
-        entry = self.hass.config_entries.async_get_entry(self.context["entry_id"])
-        assert entry is not None
-
         device: DeviceData = entry_data["device"]
         self._discovered_device = device
 
         self._discovery_info = device.last_service_info
 
-        if device.encryption_scheme == EncryptionScheme.BTHOME_BINDKEY:
+        if device.encryption_scheme is EncryptionScheme.BTHOME_BINDKEY:
             return await self.async_step_get_encryption_key()
 
         # Otherwise there wasn't actually encryption so abort
-        return self.async_abort(reason="reauth_successful")
+        return self.async_abort(
+            reason="reauth_successful", translation_domain=HOMEASSISTANT_DOMAIN
+        )
 
-    def _async_get_or_create_entry(self, bindkey=None):
-        data = {}
+    def _async_get_or_create_entry(
+        self, bindkey: str | None = None
+    ) -> ConfigFlowResult:
+        data: dict[str, Any] = {}
         if bindkey:
             data["bindkey"] = bindkey
 
-        if entry_id := self.context.get("entry_id"):
-            entry = self.hass.config_entries.async_get_entry(entry_id)
-            assert entry is not None
-
-            self.hass.config_entries.async_update_entry(entry, data=data)
-
-            # Reload the config entry to notify of updated config
-            self.hass.async_create_task(
-                self.hass.config_entries.async_reload(entry.entry_id)
+        if self.source == SOURCE_REAUTH:
+            return self.async_update_reload_and_abort(
+                self._get_reauth_entry(), data=data
             )
-
-            return self.async_abort(reason="reauth_successful")
 
         return self.async_create_entry(
             title=self.context["title_placeholders"]["name"],

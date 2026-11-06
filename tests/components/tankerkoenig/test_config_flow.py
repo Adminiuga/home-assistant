@@ -1,14 +1,18 @@
 """Tests for Tankerkoenig config flow."""
-from unittest.mock import patch
 
-from pytankerkoenig import customException
+from typing import Any
+from unittest.mock import AsyncMock, patch
 
-from homeassistant.components.tankerkoenig.const import (
-    CONF_FUEL_TYPES,
-    CONF_STATIONS,
-    DOMAIN,
+from aiotankerkoenig.exceptions import (
+    TankerkoenigConnectionError,
+    TankerkoenigError,
+    TankerkoenigInvalidKeyError,
 )
-from homeassistant.config_entries import SOURCE_IMPORT, SOURCE_REAUTH, SOURCE_USER
+import pytest
+from pytest_homeassistant.common import MockConfigEntry
+
+from homeassistant.components.tankerkoenig.const import CONF_STATIONS, DOMAIN
+from homeassistant.config_entries import SOURCE_USER
 from homeassistant.const import (
     CONF_API_KEY,
     CONF_LATITUDE,
@@ -20,13 +24,13 @@ from homeassistant.const import (
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.setup import async_setup_component
 
-from tests.common import MockConfigEntry
+from .const import NEARBY_STATIONS
 
 MOCK_USER_DATA = {
     CONF_NAME: "Home",
     CONF_API_KEY: "269534f6-xxxx-xxxx-xxxx-yyyyzzzzxxxx",
-    CONF_FUEL_TYPES: ["e5"],
     CONF_LOCATION: {CONF_LATITUDE: 51.0, CONF_LONGITUDE: 13.0},
     CONF_RADIUS: 2.0,
 }
@@ -47,68 +51,36 @@ MOCK_OPTIONS_DATA = {
     ],
 }
 
-MOCK_IMPORT_DATA = {
-    CONF_API_KEY: "269534f6-xxxx-xxxx-xxxx-yyyyzzzzxxxx",
-    CONF_FUEL_TYPES: ["e5"],
-    CONF_LOCATION: {CONF_LATITUDE: 51.0, CONF_LONGITUDE: 13.0},
-    CONF_RADIUS: 2.0,
-    CONF_STATIONS: [
-        "3bcd61da-yyyy-yyyy-yyyy-19d5523a7ae8",
-        "36b4b812-yyyy-yyyy-yyyy-c51735325858",
-    ],
-    CONF_SHOW_ON_MAP: True,
-}
 
-MOCK_NEARVY_STATIONS_OK = {
-    "ok": True,
-    "stations": [
-        {
-            "id": "3bcd61da-xxxx-xxxx-xxxx-19d5523a7ae8",
-            "brand": "BrandA",
-            "place": "CityA",
-            "street": "Main",
-            "houseNumber": "1",
-            "dist": 1,
-        },
-        {
-            "id": "36b4b812-xxxx-xxxx-xxxx-c51735325858",
-            "brand": "BrandB",
-            "place": "CityB",
-            "street": "School",
-            "houseNumber": "2",
-            "dist": 2,
-        },
-    ],
-}
-
-
-async def test_user(hass: HomeAssistant):
+async def test_user(hass: HomeAssistant) -> None:
     """Test starting a flow by user."""
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": SOURCE_USER}
     )
-    assert result["type"] == FlowResultType.FORM
+    assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "user"
 
-    with patch(
-        "homeassistant.components.tankerkoenig.async_setup_entry", return_value=True
-    ) as mock_setup_entry, patch(
-        "homeassistant.components.tankerkoenig.config_flow.getNearbyStations",
-        return_value=MOCK_NEARVY_STATIONS_OK,
+    with (
+        patch(
+            "homeassistant.components.tankerkoenig.async_setup_entry", return_value=None
+        ) as mock_setup_entry,
+        patch(
+            "homeassistant.components.tankerkoenig.config_flow.Tankerkoenig.nearby_stations",
+            return_value=NEARBY_STATIONS,
+        ),
     ):
         result = await hass.config_entries.flow.async_configure(
             result["flow_id"], user_input=MOCK_USER_DATA
         )
-        assert result["type"] == FlowResultType.FORM
+        assert result["type"] is FlowResultType.FORM
         assert result["step_id"] == "select_station"
 
         result = await hass.config_entries.flow.async_configure(
             result["flow_id"], user_input=MOCK_STATIONS_DATA
         )
-        assert result["type"] == FlowResultType.CREATE_ENTRY
+        assert result["type"] is FlowResultType.CREATE_ENTRY
         assert result["data"][CONF_NAME] == "Home"
         assert result["data"][CONF_API_KEY] == "269534f6-xxxx-xxxx-xxxx-yyyyzzzzxxxx"
-        assert result["data"][CONF_FUEL_TYPES] == ["e5"]
         assert result["data"][CONF_LOCATION] == {"latitude": 51.0, "longitude": 13.0}
         assert result["data"][CONF_RADIUS] == 2.0
         assert result["data"][CONF_STATIONS] == [
@@ -116,13 +88,14 @@ async def test_user(hass: HomeAssistant):
             "36b4b812-xxxx-xxxx-xxxx-c51735325858",
         ]
         assert result["options"][CONF_SHOW_ON_MAP]
+        assert result["result"].unique_id == "51.0_13.0"
 
         await hass.async_block_till_done()
 
     assert mock_setup_entry.called
 
 
-async def test_user_already_configured(hass: HomeAssistant):
+async def test_user_already_configured(hass: HomeAssistant) -> None:
     """Test starting a flow by user with an already configured region."""
 
     mock_config = MockConfigEntry(
@@ -135,143 +108,223 @@ async def test_user_already_configured(hass: HomeAssistant):
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": SOURCE_USER}
     )
-    assert result["type"] == FlowResultType.FORM
+    assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "user"
 
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"], user_input=MOCK_USER_DATA
     )
 
-    assert result["type"] == FlowResultType.ABORT
+    assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "already_configured"
 
 
-async def test_exception_security(hass: HomeAssistant):
-    """Test starting a flow by user with invalid api key."""
+@pytest.mark.parametrize(
+    ("side_effect", "errors"),
+    [
+        pytest.param(
+            TankerkoenigInvalidKeyError,
+            {CONF_API_KEY: "invalid_auth"},
+            id="invalid_key",
+        ),
+        pytest.param(
+            TankerkoenigConnectionError, {"base": "cannot_connect"}, id="connection"
+        ),
+        pytest.param(TankerkoenigError, {"base": "cannot_connect"}, id="api_error"),
+    ],
+)
+async def test_user_errors(
+    hass: HomeAssistant, side_effect: type[Exception], errors: dict[str, Any]
+) -> None:
+    """Test starting a flow by user with an error from the API."""
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": SOURCE_USER}
     )
-    assert result["type"] == FlowResultType.FORM
+    assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "user"
 
     with patch(
-        "homeassistant.components.tankerkoenig.config_flow.getNearbyStations",
-        side_effect=customException,
+        "homeassistant.components.tankerkoenig.config_flow.Tankerkoenig.nearby_stations",
+        side_effect=side_effect,
     ):
-
         result = await hass.config_entries.flow.async_configure(
             result["flow_id"], user_input=MOCK_USER_DATA
         )
-        assert result["type"] == FlowResultType.FORM
+        assert result["type"] is FlowResultType.FORM
         assert result["step_id"] == "user"
-        assert result["errors"][CONF_API_KEY] == "invalid_auth"
+        assert result["errors"] == errors
+
+    with (
+        patch(
+            "homeassistant.components.tankerkoenig.async_setup_entry", return_value=None
+        ),
+        patch(
+            "homeassistant.components.tankerkoenig.config_flow.Tankerkoenig.nearby_stations",
+            return_value=NEARBY_STATIONS,
+        ),
+    ):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], user_input=MOCK_USER_DATA
+        )
+        assert result["type"] is FlowResultType.FORM
+        assert result["step_id"] == "select_station"
+
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], user_input=MOCK_STATIONS_DATA
+        )
+        assert result["type"] is FlowResultType.CREATE_ENTRY
 
 
-async def test_user_no_stations(hass: HomeAssistant):
+async def test_user_no_stations(hass: HomeAssistant) -> None:
     """Test starting a flow by user which does not find any station."""
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": SOURCE_USER}
     )
-    assert result["type"] == FlowResultType.FORM
+    assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "user"
 
     with patch(
-        "homeassistant.components.tankerkoenig.config_flow.getNearbyStations",
-        return_value={"ok": True, "stations": []},
+        "homeassistant.components.tankerkoenig.config_flow.Tankerkoenig.nearby_stations",
+        return_value=[],
     ):
         result = await hass.config_entries.flow.async_configure(
             result["flow_id"], user_input=MOCK_USER_DATA
         )
-        assert result["type"] == FlowResultType.FORM
+        assert result["type"] is FlowResultType.FORM
         assert result["step_id"] == "user"
         assert result["errors"][CONF_RADIUS] == "no_stations"
 
-
-async def test_import(hass: HomeAssistant):
-    """Test starting a flow by import."""
-    with patch(
-        "homeassistant.components.tankerkoenig.async_setup_entry", return_value=True
-    ) as mock_setup_entry, patch(
-        "homeassistant.components.tankerkoenig.config_flow.getNearbyStations",
-        return_value=MOCK_NEARVY_STATIONS_OK,
+    with (
+        patch(
+            "homeassistant.components.tankerkoenig.async_setup_entry", return_value=None
+        ),
+        patch(
+            "homeassistant.components.tankerkoenig.config_flow.Tankerkoenig.nearby_stations",
+            return_value=NEARBY_STATIONS,
+        ),
     ):
-        result = await hass.config_entries.flow.async_init(
-            DOMAIN, context={"source": SOURCE_IMPORT}, data=MOCK_IMPORT_DATA
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], user_input=MOCK_USER_DATA
         )
-        assert result["type"] == FlowResultType.CREATE_ENTRY
-        assert result["type"] == FlowResultType.CREATE_ENTRY
-        assert result["data"][CONF_NAME] == "Home"
-        assert result["data"][CONF_API_KEY] == "269534f6-xxxx-xxxx-xxxx-yyyyzzzzxxxx"
-        assert result["data"][CONF_FUEL_TYPES] == ["e5"]
-        assert result["data"][CONF_LOCATION] == {"latitude": 51.0, "longitude": 13.0}
-        assert result["data"][CONF_RADIUS] == 2.0
-        assert result["data"][CONF_STATIONS] == [
-            "3bcd61da-xxxx-xxxx-xxxx-19d5523a7ae8",
-            "36b4b812-xxxx-xxxx-xxxx-c51735325858",
-            "3bcd61da-yyyy-yyyy-yyyy-19d5523a7ae8",
-            "36b4b812-yyyy-yyyy-yyyy-c51735325858",
-        ]
-        assert result["options"][CONF_SHOW_ON_MAP]
+        assert result["type"] is FlowResultType.FORM
+        assert result["step_id"] == "select_station"
 
-        await hass.async_block_till_done()
-
-    assert mock_setup_entry.called
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], user_input=MOCK_STATIONS_DATA
+        )
+        assert result["type"] is FlowResultType.CREATE_ENTRY
 
 
-async def test_reauth(hass: HomeAssistant):
+@pytest.mark.parametrize(
+    ("side_effect", "errors"),
+    [
+        pytest.param(
+            TankerkoenigInvalidKeyError("Booom!"),
+            {CONF_API_KEY: "invalid_auth"},
+            id="invalid_key",
+        ),
+        pytest.param(
+            TankerkoenigConnectionError("Booom!"),
+            {"base": "cannot_connect"},
+            id="connection",
+        ),
+        pytest.param(
+            TankerkoenigError("Booom!"), {"base": "cannot_connect"}, id="api_error"
+        ),
+    ],
+)
+async def test_reauth(
+    hass: HomeAssistant,
+    config_entry: MockConfigEntry,
+    side_effect: Exception,
+    errors: dict[str, Any],
+) -> None:
     """Test starting a flow by user to re-auth."""
+    config_entry.add_to_hass(hass)
+    # re-auth initialized
+    result = await config_entry.start_reauth_flow(hass)
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "reauth_confirm"
 
-    mock_config = MockConfigEntry(
-        domain=DOMAIN,
-        data={**MOCK_USER_DATA, **MOCK_STATIONS_DATA},
-        unique_id=f"{MOCK_USER_DATA[CONF_LOCATION][CONF_LATITUDE]}_{MOCK_USER_DATA[CONF_LOCATION][CONF_LONGITUDE]}",
-    )
-    mock_config.add_to_hass(hass)
-
-    with patch(
-        "homeassistant.components.tankerkoenig.async_setup_entry", return_value=True
-    ) as mock_setup_entry, patch(
-        "homeassistant.components.tankerkoenig.config_flow.getNearbyStations",
-    ) as mock_nearby_stations:
-        # re-auth initialized
-        result = await hass.config_entries.flow.async_init(
-            DOMAIN,
-            context={"source": SOURCE_REAUTH, "entry_id": mock_config.entry_id},
-            data=mock_config.data,
-        )
-        assert result["type"] == FlowResultType.FORM
-        assert result["step_id"] == "reauth_confirm"
-
+    with (
+        patch(
+            "homeassistant.components.tankerkoenig.async_setup_entry", return_value=None
+        ) as mock_setup_entry,
+        patch(
+            "homeassistant.components.tankerkoenig.config_flow.Tankerkoenig.nearby_stations",
+        ) as mock_nearby_stations,
+    ):
         # re-auth unsuccessful
-        mock_nearby_stations.return_value = {"ok": False}
+        mock_nearby_stations.side_effect = side_effect
         result = await hass.config_entries.flow.async_configure(
             result["flow_id"],
             user_input={
                 CONF_API_KEY: "269534f6-aaaa-bbbb-cccc-yyyyzzzzxxxx",
             },
         )
-        assert result["type"] == FlowResultType.FORM
+        assert result["type"] is FlowResultType.FORM
         assert result["step_id"] == "reauth_confirm"
-        assert result["errors"] == {CONF_API_KEY: "invalid_auth"}
+        assert result["errors"] == errors
 
         # re-auth successful
-        mock_nearby_stations.return_value = MOCK_NEARVY_STATIONS_OK
+        mock_nearby_stations.side_effect = None
         result = await hass.config_entries.flow.async_configure(
             result["flow_id"],
             user_input={
                 CONF_API_KEY: "269534f6-aaaa-bbbb-cccc-yyyyzzzzxxxx",
             },
         )
-        assert result["type"] == FlowResultType.ABORT
+        assert result["type"] is FlowResultType.ABORT
         assert result["reason"] == "reauth_successful"
 
     mock_setup_entry.assert_called()
 
-    entry = hass.config_entries.async_get_entry(mock_config.entry_id)
+    entry = hass.config_entries.async_get_entry(config_entry.entry_id)
     assert entry.data[CONF_API_KEY] == "269534f6-aaaa-bbbb-cccc-yyyyzzzzxxxx"
 
 
-async def test_options_flow(hass: HomeAssistant):
+async def test_options_flow(hass: HomeAssistant, tankerkoenig: AsyncMock) -> None:
+    """Test options flow."""
+
+    mock_config = MockConfigEntry(
+        domain=DOMAIN,
+        data=MOCK_OPTIONS_DATA,
+        options={CONF_SHOW_ON_MAP: True},
+        unique_id=f"{DOMAIN}_{MOCK_USER_DATA[CONF_LOCATION][CONF_LATITUDE]}_{MOCK_USER_DATA[CONF_LOCATION][CONF_LONGITUDE]}",
+    )
+    mock_config.add_to_hass(hass)
+    assert await async_setup_component(hass, DOMAIN, {})
+    await hass.async_block_till_done()
+
+    with (
+        patch(
+            "homeassistant.components.tankerkoenig.config_flow.Tankerkoenig.nearby_stations",
+            return_value=NEARBY_STATIONS,
+        ),
+        patch(
+            "homeassistant.config_entries.ConfigEntries.async_reload"
+        ) as mock_async_reload,
+    ):
+        result = await hass.config_entries.options.async_init(mock_config.entry_id)
+        assert result["type"] is FlowResultType.FORM
+        assert result["step_id"] == "init"
+
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"],
+            user_input={
+                CONF_SHOW_ON_MAP: False,
+                CONF_STATIONS: MOCK_OPTIONS_DATA[CONF_STATIONS],
+            },
+        )
+        assert result["type"] is FlowResultType.CREATE_ENTRY
+        assert not mock_config.options[CONF_SHOW_ON_MAP]
+
+        await hass.async_block_till_done()
+
+        assert mock_async_reload.call_count == 1
+
+
+async def test_options_flow_error(hass: HomeAssistant) -> None:
     """Test options flow."""
 
     mock_config = MockConfigEntry(
@@ -283,24 +336,52 @@ async def test_options_flow(hass: HomeAssistant):
     mock_config.add_to_hass(hass)
 
     with patch(
-        "homeassistant.components.tankerkoenig.async_setup_entry", return_value=True
-    ) as mock_setup_entry, patch(
-        "homeassistant.components.tankerkoenig.config_flow.getNearbyStations",
-        return_value=MOCK_NEARVY_STATIONS_OK,
-    ):
-        await hass.config_entries.async_setup(mock_config.entry_id)
-        await hass.async_block_till_done()
-        assert mock_setup_entry.called
-
+        "homeassistant.components.tankerkoenig.config_flow.Tankerkoenig.nearby_stations",
+        side_effect=TankerkoenigInvalidKeyError("Booom!"),
+    ) as mock_nearby_stations:
         result = await hass.config_entries.options.async_init(mock_config.entry_id)
-    assert result["type"] == FlowResultType.FORM
-    assert result["step_id"] == "init"
-    result = await hass.config_entries.options.async_configure(
-        result["flow_id"],
-        user_input={
-            CONF_SHOW_ON_MAP: False,
-            CONF_STATIONS: MOCK_OPTIONS_DATA[CONF_STATIONS],
-        },
+        assert result["type"] is FlowResultType.FORM
+        assert result["step_id"] == "init"
+        assert result["errors"] == {"base": "invalid_auth"}
+
+        mock_nearby_stations.return_value = NEARBY_STATIONS
+
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"],
+            user_input={
+                CONF_SHOW_ON_MAP: False,
+                CONF_STATIONS: MOCK_OPTIONS_DATA[CONF_STATIONS],
+            },
+        )
+        assert result["type"] is FlowResultType.CREATE_ENTRY
+        assert not mock_config.options[CONF_SHOW_ON_MAP]
+
+
+@pytest.mark.parametrize(
+    "side_effect",
+    [
+        pytest.param(TankerkoenigConnectionError("Booom!"), id="connection"),
+        pytest.param(TankerkoenigError("Booom!"), id="api_error"),
+    ],
+)
+async def test_options_flow_cannot_connect(
+    hass: HomeAssistant, side_effect: Exception
+) -> None:
+    """Test options flow aborts when the API can't be reached."""
+
+    mock_config = MockConfigEntry(
+        domain=DOMAIN,
+        data=MOCK_OPTIONS_DATA,
+        options={CONF_SHOW_ON_MAP: True},
+        unique_id=f"{DOMAIN}_{MOCK_USER_DATA[CONF_LOCATION][CONF_LATITUDE]}_{MOCK_USER_DATA[CONF_LOCATION][CONF_LONGITUDE]}",
     )
-    assert result["type"] == FlowResultType.CREATE_ENTRY
-    assert not mock_config.options[CONF_SHOW_ON_MAP]
+    mock_config.add_to_hass(hass)
+
+    with patch(
+        "homeassistant.components.tankerkoenig.config_flow.Tankerkoenig.nearby_stations",
+        side_effect=side_effect,
+    ):
+        result = await hass.config_entries.options.async_init(mock_config.entry_id)
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "cannot_connect"

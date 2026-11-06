@@ -1,23 +1,29 @@
 """Tests for the WiLight integration."""
+
 from unittest.mock import patch
 
 import pytest
 import pywilight
+from pywilight.wilight_device import PyWiLightDevice
 
 from homeassistant.components.switch import DOMAIN as SWITCH_DOMAIN
-from homeassistant.components.wilight import DOMAIN as WILIGHT_DOMAIN
-from homeassistant.components.wilight.switch import (
+from homeassistant.components.wilight.const import (
     ATTR_PAUSE_TIME,
+    ATTR_WATERING_TIME,
+    DOMAIN,
+)
+from homeassistant.components.wilight.services import (
     ATTR_TRIGGER,
+    ATTR_TRIGGER_INDEX,
+    SERVICE_SET_PAUSE_TIME,
+    SERVICE_SET_TRIGGER,
+    SERVICE_SET_WATERING_TIME,
+)
+from homeassistant.components.wilight.switch import (
     ATTR_TRIGGER_1,
     ATTR_TRIGGER_2,
     ATTR_TRIGGER_3,
     ATTR_TRIGGER_4,
-    ATTR_TRIGGER_INDEX,
-    ATTR_WATERING_TIME,
-    SERVICE_SET_PAUSE_TIME,
-    SERVICE_SET_TRIGGER,
-    SERVICE_SET_WATERING_TIME,
 )
 from homeassistant.const import (
     ATTR_ENTITY_ID,
@@ -38,6 +44,9 @@ from . import (
     WILIGHT_ID,
     setup_integration,
 )
+
+WATERING_ENTITY_ID = "switch.wl000000000099_1_watering"
+WATERING_INDEX = "0"
 
 
 @pytest.fixture(name="dummy_device_from_host_switch")
@@ -63,6 +72,7 @@ def mock_dummy_device_from_host_switch():
 
 async def test_loading_switch(
     hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
     dummy_device_from_host_switch,
 ) -> None:
     """Test the WiLight configuration entry loading."""
@@ -70,8 +80,6 @@ async def test_loading_switch(
     entry = await setup_integration(hass)
     assert entry
     assert entry.unique_id == WILIGHT_ID
-
-    entity_registry = er.async_get(hass)
 
     # First segment of the strip
     state = hass.states.get("switch.wl000000000099_1_watering")
@@ -159,7 +167,7 @@ async def test_switch_services(
 
     # Set watering time
     await hass.services.async_call(
-        WILIGHT_DOMAIN,
+        DOMAIN,
         SERVICE_SET_WATERING_TIME,
         {ATTR_WATERING_TIME: 30, ATTR_ENTITY_ID: "switch.wl000000000099_1_watering"},
         blocking=True,
@@ -172,7 +180,7 @@ async def test_switch_services(
 
     # Set pause time
     await hass.services.async_call(
-        WILIGHT_DOMAIN,
+        DOMAIN,
         SERVICE_SET_PAUSE_TIME,
         {ATTR_PAUSE_TIME: 18, ATTR_ENTITY_ID: "switch.wl000000000099_2_pause"},
         blocking=True,
@@ -185,7 +193,7 @@ async def test_switch_services(
 
     # Set trigger_1
     await hass.services.async_call(
-        WILIGHT_DOMAIN,
+        DOMAIN,
         SERVICE_SET_TRIGGER,
         {
             ATTR_TRIGGER_INDEX: "1",
@@ -202,7 +210,7 @@ async def test_switch_services(
 
     # Set trigger_2
     await hass.services.async_call(
-        WILIGHT_DOMAIN,
+        DOMAIN,
         SERVICE_SET_TRIGGER,
         {
             ATTR_TRIGGER_INDEX: "2",
@@ -219,7 +227,7 @@ async def test_switch_services(
 
     # Set trigger_3
     await hass.services.async_call(
-        WILIGHT_DOMAIN,
+        DOMAIN,
         SERVICE_SET_TRIGGER,
         {
             ATTR_TRIGGER_INDEX: "3",
@@ -236,7 +244,7 @@ async def test_switch_services(
 
     # Set trigger_4
     await hass.services.async_call(
-        WILIGHT_DOMAIN,
+        DOMAIN,
         SERVICE_SET_TRIGGER,
         {
             ATTR_TRIGGER_INDEX: "4",
@@ -252,13 +260,67 @@ async def test_switch_services(
     assert state.attributes.get(ATTR_TRIGGER_4) == "00008300"
 
     # Set watering time using WiLight Pause Switch to raise
-    with pytest.raises(ValueError) as exc_info:
+    with pytest.raises(TypeError) as exc_info:
         await hass.services.async_call(
-            WILIGHT_DOMAIN,
+            DOMAIN,
             SERVICE_SET_WATERING_TIME,
             {ATTR_WATERING_TIME: 30, ATTR_ENTITY_ID: "switch.wl000000000099_2_pause"},
             blocking=True,
         )
 
-        await hass.async_block_till_done()
     assert str(exc_info.value) == "Entity is not a WiLight valve switch"
+
+
+async def test_status_callback_after_entity_removed(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    dummy_device_from_host_switch: PyWiLightDevice,
+) -> None:
+    """Test a removed entity no longer handles status callbacks."""
+    await setup_integration(hass)
+    client = dummy_device_from_host_switch.client
+
+    entity_registry.async_remove(WATERING_ENTITY_ID)
+    await hass.async_block_till_done()
+    assert hass.states.get(WATERING_ENTITY_ID) is None
+
+    with patch(
+        "homeassistant.components.wilight.entity.WiLightDevice.async_write_ha_state"
+    ) as mock_write_ha_state:
+        # Triggers the status callback registered with pywilight.
+        await client.turn_on(WATERING_INDEX)
+        await hass.async_block_till_done()
+
+    mock_write_ha_state.assert_not_called()
+    assert hass.states.get(WATERING_ENTITY_ID) is None
+
+
+async def test_status_callback_after_entity_readded(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    dummy_device_from_host_switch: PyWiLightDevice,
+) -> None:
+    """Test re-adding an entity does not register another status callback."""
+    await setup_integration(hass)
+    client = dummy_device_from_host_switch.client
+
+    with patch.object(
+        client, "register_status_callback", wraps=client.register_status_callback
+    ) as mock_register:
+        # Changing the entity_id removes and re-adds the same entity object.
+        entity_registry.async_update_entity(
+            WATERING_ENTITY_ID, new_entity_id="switch.renamed_watering"
+        )
+        await hass.async_block_till_done()
+
+    mock_register.assert_not_called()
+    assert hass.states.get(WATERING_ENTITY_ID) is None
+    state = hass.states.get("switch.renamed_watering")
+    assert state
+    assert state.state == STATE_OFF
+
+    await client.turn_on(WATERING_INDEX)
+    await hass.async_block_till_done()
+    state = hass.states.get("switch.renamed_watering")
+    assert state
+    assert state.state == STATE_ON

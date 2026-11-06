@@ -1,35 +1,36 @@
-"""Helpers for config validation using voluptuous."""
-from __future__ import annotations
+"""Helpers for config validation using probatio."""
 
-from collections.abc import Callable, Hashable
+from collections.abc import Callable, Hashable, Iterable, Mapping
 import contextlib
+from contextvars import ContextVar
 from datetime import (
     date as date_sys,
     datetime as datetime_sys,
     time as time_sys,
     timedelta,
 )
-from enum import Enum
-import inspect
+from enum import Enum, StrEnum
+import functools
 import logging
 from numbers import Number
 import os
 import re
-from socket import (  # type: ignore[attr-defined]  # private, not in typeshed
-    _GLOBAL_DEFAULT_TIMEOUT,
-)
-from typing import Any, TypeVar, cast, overload
+from socket import _GLOBAL_DEFAULT_TIMEOUT  # type: ignore[attr-defined]  # private, not in typeshed
+import threading
+from typing import Any, cast
 from urllib.parse import urlparse
 from uuid import UUID
 
-import voluptuous as vol
-import voluptuous_serialize
+import probatio
 
 from homeassistant.const import (
     ATTR_AREA_ID,
     ATTR_DEVICE_ID,
     ATTR_ENTITY_ID,
+    ATTR_FLOOR_ID,
+    ATTR_LABEL_ID,
     CONF_ABOVE,
+    CONF_ACTION,
     CONF_ALIAS,
     CONF_ATTRIBUTE,
     CONF_BELOW,
@@ -51,14 +52,17 @@ from homeassistant.const import (
     CONF_EVENT,
     CONF_EVENT_DATA,
     CONF_EVENT_DATA_TEMPLATE,
+    CONF_EXCLUDE,
     CONF_FOR,
     CONF_FOR_EACH,
     CONF_ID,
     CONF_IF,
     CONF_MATCH,
+    CONF_NOTE,
     CONF_PARALLEL,
     CONF_PLATFORM,
     CONF_REPEAT,
+    CONF_RESPONSE_VARIABLE,
     CONF_SCAN_INTERVAL,
     CONF_SCENE,
     CONF_SEQUENCE,
@@ -66,11 +70,14 @@ from homeassistant.const import (
     CONF_SERVICE_DATA,
     CONF_SERVICE_DATA_TEMPLATE,
     CONF_SERVICE_TEMPLATE,
+    CONF_SET_CONVERSATION_RESPONSE,
     CONF_STATE,
     CONF_STOP,
     CONF_TARGET,
     CONF_THEN,
     CONF_TIMEOUT,
+    CONF_TRIGGER,
+    CONF_TRIGGERS,
     CONF_UNTIL,
     CONF_VALUE_TEMPLATE,
     CONF_VARIABLES,
@@ -82,87 +89,129 @@ from homeassistant.const import (
     ENTITY_MATCH_NONE,
     SUN_EVENT_SUNRISE,
     SUN_EVENT_SUNSET,
-    TEMP_CELSIUS,
-    TEMP_FAHRENHEIT,
     WEEKDAYS,
+    UnitOfTemperature,
 )
-from homeassistant.core import split_entity_id, valid_entity_id
-from homeassistant.exceptions import TemplateError
+from homeassistant.core import (
+    DOMAIN as HOMEASSISTANT_DOMAIN,
+    HomeAssistant,
+    async_get_hass,
+    async_get_hass_or_none,
+    split_entity_id,
+    valid_entity_id,
+)
+from homeassistant.exceptions import HomeAssistantError, TemplateError
 from homeassistant.generated import currencies
-from homeassistant.util import raise_if_invalid_path, slugify as util_slugify
-import homeassistant.util.dt as dt_util
+from homeassistant.generated.countries import COUNTRIES
+from homeassistant.generated.languages import LANGUAGES
+from homeassistant.util import (
+    dt as dt_util,
+    raise_if_invalid_path,
+    slugify as util_slugify,
+)
+from homeassistant.util.yaml.objects import NodeStrClass
 
 from . import script_variables as script_variables_helper, template as template_helper
-
-# pylint: disable=invalid-name
+from .frame import get_integration_logger
+from .typing import VolDictType, VolSchemaType
 
 TIME_PERIOD_ERROR = "offset {} should be format 'HH:MM', 'HH:MM:SS' or 'HH:MM:SS.F'"
 
-# Home Assistant types
-byte = vol.All(vol.Coerce(int), vol.Range(min=0, max=255))
-small_float = vol.All(vol.Coerce(float), vol.Range(min=0, max=1))
-positive_int = vol.All(vol.Coerce(int), vol.Range(min=0))
-positive_float = vol.All(vol.Coerce(float), vol.Range(min=0))
-latitude = vol.All(
-    vol.Coerce(float), vol.Range(min=-90, max=90), msg="invalid latitude"
-)
-longitude = vol.All(
-    vol.Coerce(float), vol.Range(min=-180, max=180), msg="invalid longitude"
-)
-gps = vol.ExactSequence([latitude, longitude])
-sun_event = vol.All(vol.Lower, vol.Any(SUN_EVENT_SUNSET, SUN_EVENT_SUNRISE))
-port = vol.All(vol.Coerce(int), vol.Range(min=1, max=65535))
 
-# typing typevar
-_T = TypeVar("_T")
+class MustValidateInExecutor(HomeAssistantError):
+    """Raised when validation must happen in an executor thread."""
+
+
+class _Hass(threading.local):
+    """Container which makes a HomeAssistant instance available to validators."""
+
+    hass: HomeAssistant | None = None
+
+
+_hass = _Hass()
+"""Set when doing async friendly schema validation."""
+
+
+def _async_get_hass_or_none() -> HomeAssistant | None:
+    """Return the HomeAssistant instance or None.
+
+    First tries core.async_get_hass_or_none, then _hass which is
+    set when doing async friendly schema validation.
+    """
+    return async_get_hass_or_none() or _hass.hass
+
+
+_validating_async: ContextVar[bool] = ContextVar("_validating_async", default=False)
+"""Set to True when doing async friendly schema validation."""
+
+
+def not_async_friendly[**_P, _R](validator: Callable[_P, _R]) -> Callable[_P, _R]:
+    """Mark a validator as not async friendly.
+
+    This makes validation happen in an executor thread if validation is done by
+    async_validate, otherwise does nothing.
+    """
+
+    @functools.wraps(validator)
+    def _not_async_friendly(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        if _validating_async.get() and async_get_hass_or_none():
+            # Raise if doing async friendly validation and validation
+            # is happening in the event loop
+            raise MustValidateInExecutor
+        return validator(*args, **kwargs)
+
+    return _not_async_friendly
+
+
+class UrlProtocolSchema(StrEnum):
+    """Valid URL protocol schema values."""
+
+    HTTP = "http"
+    HTTPS = "https"
+    HOMEASSISTANT = "homeassistant"
+
+
+EXTERNAL_URL_PROTOCOL_SCHEMA_LIST = frozenset(
+    {UrlProtocolSchema.HTTP, UrlProtocolSchema.HTTPS}
+)
+CONFIGURATION_URL_PROTOCOL_SCHEMA_LIST = frozenset(
+    {UrlProtocolSchema.HOMEASSISTANT, UrlProtocolSchema.HTTP, UrlProtocolSchema.HTTPS}
+)
+
+# Home Assistant types
+byte = probatio.All(probatio.Coerce(int), probatio.Byte())
+small_float = probatio.All(probatio.Coerce(float), probatio.SmallFloat())
+positive_int = probatio.All(probatio.Coerce(int), probatio.NonNegative())
+positive_float = probatio.All(probatio.Coerce(float), probatio.NonNegative())
+latitude = probatio.All(
+    probatio.Coerce(float), probatio.Latitude(), msg="invalid latitude"
+)
+longitude = probatio.All(
+    probatio.Coerce(float), probatio.Longitude(), msg="invalid longitude"
+)
+gps = probatio.ExactSequence([latitude, longitude])
+sun_event = probatio.All(
+    probatio.Lower, probatio.Any(SUN_EVENT_SUNSET, SUN_EVENT_SUNRISE)
+)
+port = probatio.Port()
 
 
 def path(value: Any) -> str:
     """Validate it's a safe path."""
     if not isinstance(value, str):
-        raise vol.Invalid("Expected a string")
+        raise probatio.Invalid("Expected a string")
 
     try:
         raise_if_invalid_path(value)
     except ValueError as err:
-        raise vol.Invalid("Invalid path") from err
+        raise probatio.Invalid("Invalid path") from err
 
     return value
 
 
-# Adapted from:
-# https://github.com/alecthomas/voluptuous/issues/115#issuecomment-144464666
-def has_at_least_one_key(*keys: Any) -> Callable[[dict], dict]:
-    """Validate that at least one key exists."""
-
-    def validate(obj: dict) -> dict:
-        """Test keys exist in dict."""
-        if not isinstance(obj, dict):
-            raise vol.Invalid("expected dictionary")
-
-        for k in obj:
-            if k in keys:
-                return obj
-        expected = ", ".join(str(k) for k in keys)
-        raise vol.Invalid(f"must contain at least one of {expected}.")
-
-    return validate
-
-
-def has_at_most_one_key(*keys: Any) -> Callable[[dict], dict]:
-    """Validate that zero keys exist or one key exists."""
-
-    def validate(obj: dict) -> dict:
-        """Test zero keys exist or one key exists in dict."""
-        if not isinstance(obj, dict):
-            raise vol.Invalid("expected dictionary")
-
-        if len(set(keys) & set(obj)) > 1:
-            expected = ", ".join(str(k) for k in keys)
-            raise vol.Invalid(f"must contain at most one of {expected}.")
-        return obj
-
-    return validate
+# Kept for custom integrations; core uses the probatio validators directly.
+has_at_least_one_key = probatio.AtLeastOne
+has_at_most_one_key = probatio.AtMostOne
 
 
 def boolean(value: Any) -> bool:
@@ -178,27 +227,25 @@ def boolean(value: Any) -> bool:
     elif isinstance(value, Number):
         # type ignore: https://github.com/python/mypy/issues/3186
         return value != 0  # type: ignore[comparison-overlap]
-    raise vol.Invalid(f"invalid boolean value {value}")
-
-
-_WS = re.compile("\\s*")
+    raise probatio.Invalid(f"invalid boolean value {value}")
 
 
 def whitespace(value: Any) -> str:
     """Validate result contains only whitespace."""
-    if isinstance(value, str) and _WS.fullmatch(value):
+    if isinstance(value, str) and (value == "" or value.isspace()):
         return value
 
-    raise vol.Invalid(f"contains non-whitespace: {value}")
+    raise probatio.Invalid(f"contains non-whitespace: {value}")
 
 
+@not_async_friendly
 def isdevice(value: Any) -> str:
     """Validate that value is a real device."""
     try:
         os.stat(value)
         return str(value)
     except OSError as err:
-        raise vol.Invalid(f"No device at {value} found") from err
+        raise probatio.Invalid(f"No device at {value} found") from err
 
 
 def matches_regex(regex: str) -> Callable[[Any], str]:
@@ -208,10 +255,10 @@ def matches_regex(regex: str) -> Callable[[Any], str]:
     def validator(value: Any) -> str:
         """Validate that value matches the given regex."""
         if not isinstance(value, str):
-            raise vol.Invalid(f"not a string value: {value}")
+            raise probatio.Invalid(f"not a string value: {value}")
 
         if not compiled.match(value):
-            raise vol.Invalid(
+            raise probatio.Invalid(
                 f"value {value} does not match regular expression {compiled.pattern}"
             )
 
@@ -224,61 +271,46 @@ def is_regex(value: Any) -> re.Pattern[Any]:
     """Validate that a string is a valid regular expression."""
     try:
         r = re.compile(value)
-        return r
     except TypeError as err:
-        raise vol.Invalid(
+        raise probatio.Invalid(
             f"value {value} is of the wrong type for a regular expression"
         ) from err
     except re.error as err:
-        raise vol.Invalid(f"value {value} is not a valid regular expression") from err
+        raise probatio.Invalid(
+            f"value {value} is not a valid regular expression"
+        ) from err
+    return r
 
 
+@not_async_friendly
 def isfile(value: Any) -> str:
     """Validate that the value is an existing file."""
     if value is None:
-        raise vol.Invalid("None is not file")
+        raise probatio.Invalid("None is not file")
     file_in = os.path.expanduser(str(value))
 
     if not os.path.isfile(file_in):
-        raise vol.Invalid("not a file")
+        raise probatio.Invalid("not a file")
     if not os.access(file_in, os.R_OK):
-        raise vol.Invalid("file not readable")
+        raise probatio.Invalid("file not readable")
     return file_in
 
 
+@not_async_friendly
 def isdir(value: Any) -> str:
     """Validate that the value is an existing dir."""
     if value is None:
-        raise vol.Invalid("not a directory")
+        raise probatio.Invalid("not a directory")
     dir_in = os.path.expanduser(str(value))
 
     if not os.path.isdir(dir_in):
-        raise vol.Invalid("not a directory")
+        raise probatio.Invalid("not a directory")
     if not os.access(dir_in, os.R_OK):
-        raise vol.Invalid("directory not readable")
+        raise probatio.Invalid("directory not readable")
     return dir_in
 
 
-@overload
-def ensure_list(value: None) -> list[Any]:
-    ...
-
-
-@overload
-def ensure_list(value: list[_T]) -> list[_T]:
-    ...
-
-
-@overload
-def ensure_list(value: list[_T] | _T) -> list[_T]:
-    ...
-
-
-def ensure_list(value: _T | None) -> list[_T] | list[Any]:
-    """Wrap value in list if it is not one."""
-    if value is None:
-        return []
-    return cast("list[_T]", value) if isinstance(value, list) else [value]
+ensure_list = probatio.EnsureList()
 
 
 def entity_id(value: Any) -> str:
@@ -287,24 +319,39 @@ def entity_id(value: Any) -> str:
     if valid_entity_id(str_value):
         return str_value
 
-    raise vol.Invalid(f"Entity ID {value} is an invalid entity ID")
+    raise probatio.Invalid(f"Entity ID {value} is an invalid entity ID")
+
+
+def strict_entity_id(value: Any) -> str:
+    """Validate Entity ID, strictly."""
+    if not isinstance(value, str):
+        raise probatio.Invalid(f"Entity ID {value} is not a string")
+
+    if valid_entity_id(value):
+        return value
+
+    raise probatio.Invalid(f"Entity ID {value} is not a valid entity ID")
 
 
 def entity_id_or_uuid(value: Any) -> str:
     """Validate Entity specified by entity_id or uuid."""
-    with contextlib.suppress(vol.Invalid):
+    with contextlib.suppress(probatio.Invalid):
         return entity_id(value)
-    with contextlib.suppress(vol.Invalid):
+    with contextlib.suppress(probatio.Invalid):
         return fake_uuid4_hex(value)
-    raise vol.Invalid(f"Entity {value} is neither a valid entity ID nor a valid UUID")
+    raise probatio.Invalid(
+        f"Entity {value} is neither a valid entity ID nor a valid UUID"
+    )
 
 
 def _entity_ids(value: str | list, allow_uuid: bool) -> list[str]:
     """Help validate entity IDs or UUIDs."""
     if value is None:
-        raise vol.Invalid("Entity IDs can not be None")
+        raise probatio.Invalid("Entity IDs cannot be None")
     if isinstance(value, str):
         value = [ent_id.strip() for ent_id in value.split(",")]
+    elif not isinstance(value, Iterable):
+        raise probatio.Invalid("Entity IDs must be a string or a list")
 
     validator = entity_id_or_uuid if allow_uuid else entity_id
     return [validator(ent_id) for ent_id in value]
@@ -320,15 +367,41 @@ def entity_ids_or_uuids(value: str | list) -> list[str]:
     return _entity_ids(value, True)
 
 
-comp_entity_ids = vol.Any(
-    vol.All(vol.Lower, vol.Any(ENTITY_MATCH_ALL, ENTITY_MATCH_NONE)), entity_ids
+comp_entity_ids = probatio.Any(
+    probatio.All(probatio.Lower, probatio.Any(ENTITY_MATCH_ALL, ENTITY_MATCH_NONE)),
+    entity_ids,
 )
 
 
-comp_entity_ids_or_uuids = vol.Any(
-    vol.All(vol.Lower, vol.Any(ENTITY_MATCH_ALL, ENTITY_MATCH_NONE)),
+comp_entity_ids_or_uuids = probatio.Any(
+    probatio.All(probatio.Lower, probatio.Any(ENTITY_MATCH_ALL, ENTITY_MATCH_NONE)),
     entity_ids_or_uuids,
 )
+
+
+def domain_key(config_key: Any) -> str:
+    """Validate a top level config key with an optional label and return the domain.
+
+    A domain is separated from a label by one or more spaces, empty labels are not
+    allowed.
+
+    Examples:
+    'hue' returns 'hue'
+    'hue 1' returns 'hue'
+    'hue  1' returns 'hue'
+    'hue ' raises
+    'hue  ' raises
+
+    """
+    if not isinstance(config_key, str):
+        raise probatio.Invalid("invalid domain", path=[config_key])
+
+    parts = config_key.partition(" ")
+    _domain = parts[0] if parts[2].strip(" ") else config_key
+    if not _domain or _domain.strip(" ") != _domain:
+        raise probatio.Invalid("invalid domain", path=[config_key])
+
+    return _domain
 
 
 def entity_domain(domain: str | list[str]) -> Callable[[Any], str]:
@@ -339,7 +412,7 @@ def entity_domain(domain: str | list[str]) -> Callable[[Any], str]:
         """Test if entity domain is domain."""
         validated = ent_domain(value)
         if len(validated) != 1:
-            raise vol.Invalid(f"Expected exactly 1 entity, got {len(validated)}")
+            raise probatio.Invalid(f"Expected exactly 1 entity, got {len(validated)}")
         return validated[0]
 
     return validate
@@ -362,7 +435,7 @@ def entities_domain(domain: str | list[str]) -> Callable[[str | list], list[str]
         values = entity_ids(values)
         for ent_id in values:
             if check_invalid(split_entity_id(ent_id)[0]):
-                raise vol.Invalid(
+                raise probatio.Invalid(
                     f"Entity ID '{ent_id}' does not belong to domain '{domain}'"
                 )
         return values
@@ -370,34 +443,61 @@ def entities_domain(domain: str | list[str]) -> Callable[[str | list], list[str]
     return validate
 
 
-def enum(enumClass: type[Enum]) -> vol.All:
+def enum(enumClass: type[Enum]) -> probatio.All:
     """Create validator for specified enum."""
-    return vol.All(vol.In(enumClass.__members__), enumClass.__getitem__)
+    return probatio.All(probatio.In(enumClass.__members__), enumClass.__getitem__)
+
+
+_WHITESPACE = re.compile(r"\s")
 
 
 def icon(value: Any) -> str:
     """Validate icon."""
-    str_value = str(value)
+    str_value = str(value).strip()
 
-    if ":" in str_value:
+    if ":" in str_value and not _WHITESPACE.search(str_value):
         return str_value
 
-    raise vol.Invalid('Icons should be specified in the form "prefix:name"')
+    raise probatio.Invalid('Icons should be specified in the form "prefix:name"')
 
 
-time_period_dict = vol.All(
+_COLOR_HEX = re.compile(r"^#[0-9A-F]{6}\Z", re.IGNORECASE)
+
+
+def color_hex(value: Any) -> str:
+    """Validate a hex color code."""
+    str_value = str(value)
+
+    if not _COLOR_HEX.match(str_value):
+        raise probatio.Invalid("Color should be in the format #RRGGBB")
+
+    return str_value
+
+
+_TIME_PERIOD_DICT_KEYS = ("days", "hours", "minutes", "seconds", "milliseconds")
+
+
+def _timedelta(**kwargs: float) -> timedelta:
+    """Create a timedelta, raising Invalid if it is out of range."""
+    try:
+        return timedelta(**kwargs)
+    except OverflowError as err:
+        raise probatio.Invalid("Time period is out of range") from err
+
+
+time_period_dict = probatio.All(
     dict,
-    vol.Schema(
+    probatio.Schema(
         {
-            "days": vol.Coerce(float),
-            "hours": vol.Coerce(float),
-            "minutes": vol.Coerce(float),
-            "seconds": vol.Coerce(float),
-            "milliseconds": vol.Coerce(float),
+            "days": probatio.Coerce(float),
+            "hours": probatio.Coerce(float),
+            "minutes": probatio.Coerce(float),
+            "seconds": probatio.Coerce(float),
+            "milliseconds": probatio.Coerce(float),
         }
     ),
-    has_at_least_one_key("days", "hours", "minutes", "seconds", "milliseconds"),
-    lambda value: timedelta(**value),
+    probatio.AtLeastOne(*_TIME_PERIOD_DICT_KEYS),
+    lambda value: _timedelta(**value),
 )
 
 
@@ -409,10 +509,10 @@ def time(value: Any) -> time_sys:
     try:
         time_val = dt_util.parse_time(value)
     except TypeError as err:
-        raise vol.Invalid("Not a parseable type") from err
+        raise probatio.Invalid("Not a parseable type") from err
 
     if time_val is None:
-        raise vol.Invalid(f"Invalid time specified: {value}")
+        raise probatio.Invalid(f"Invalid time specified: {value}")
 
     return time_val
 
@@ -425,10 +525,10 @@ def date(value: Any) -> date_sys:
     try:
         date_val = dt_util.parse_date(value)
     except TypeError as err:
-        raise vol.Invalid("Not a parseable type") from err
+        raise probatio.Invalid("Not a parseable type") from err
 
     if date_val is None:
-        raise vol.Invalid("Could not parse date")
+        raise probatio.Invalid("Could not parse date")
 
     return date_val
 
@@ -436,9 +536,9 @@ def date(value: Any) -> date_sys:
 def time_period_str(value: str) -> timedelta:
     """Validate and transform time offset."""
     if isinstance(value, int):  # type: ignore[unreachable]
-        raise vol.Invalid("Make sure you wrap time values in quotes")
+        raise probatio.Invalid("Make sure you wrap time values in quotes")
     if not isinstance(value, str):
-        raise vol.Invalid(TIME_PERIOD_ERROR.format(value))
+        raise probatio.Invalid(TIME_PERIOD_ERROR.format(value))
 
     negative_offset = False
     if value.startswith("-"):
@@ -449,7 +549,7 @@ def time_period_str(value: str) -> timedelta:
 
     parsed = value.split(":")
     if len(parsed) not in (2, 3):
-        raise vol.Invalid(TIME_PERIOD_ERROR.format(value))
+        raise probatio.Invalid(TIME_PERIOD_ERROR.format(value))
     try:
         hour = int(parsed[0])
         minute = int(parsed[1])
@@ -458,9 +558,9 @@ def time_period_str(value: str) -> timedelta:
         except IndexError:
             second = 0
     except ValueError as err:
-        raise vol.Invalid(TIME_PERIOD_ERROR.format(value)) from err
+        raise probatio.Invalid(TIME_PERIOD_ERROR.format(value)) from err
 
-    offset = timedelta(hours=hour, minutes=minute, seconds=second)
+    offset = _timedelta(hours=hour, minutes=minute, seconds=second)
 
     if negative_offset:
         offset *= -1
@@ -471,15 +571,17 @@ def time_period_str(value: str) -> timedelta:
 def time_period_seconds(value: float | str) -> timedelta:
     """Validate and transform seconds to a time offset."""
     try:
-        return timedelta(seconds=float(value))
+        return _timedelta(seconds=float(value))
     except (ValueError, TypeError) as err:
-        raise vol.Invalid(f"Expected seconds, got {value}") from err
+        raise probatio.Invalid(f"Expected seconds, got {value}") from err
 
 
-time_period = vol.Any(time_period_str, time_period_seconds, timedelta, time_period_dict)
+time_period = probatio.Any(
+    time_period_str, time_period_seconds, timedelta, time_period_dict
+)
 
 
-def match_all(value: _T) -> _T:
+def match_all[_T](value: _T) -> _T:
     """Validate that matches all values."""
     return value
 
@@ -487,15 +589,15 @@ def match_all(value: _T) -> _T:
 def positive_timedelta(value: timedelta) -> timedelta:
     """Validate timedelta is positive."""
     if value < timedelta(0):
-        raise vol.Invalid("Time period should be positive")
+        raise probatio.Invalid("Time period should be positive")
     return value
 
 
-positive_time_period_dict = vol.All(time_period_dict, positive_timedelta)
-positive_time_period = vol.All(time_period, positive_timedelta)
+positive_time_period_dict = probatio.All(time_period_dict, positive_timedelta)
+positive_time_period = probatio.All(time_period, positive_timedelta)
 
 
-def remove_falsy(value: list[_T]) -> list[_T]:
+def remove_falsy[_T](value: list[_T]) -> list[_T]:
     """Remove falsy values from a list."""
     return [v for v in value if v]
 
@@ -507,36 +609,43 @@ def service(value: Any) -> str:
     if valid_entity_id(str_value):
         return str_value
 
-    raise vol.Invalid(f"Service {value} does not match format <domain>.<name>")
+    raise probatio.Invalid(f"Service {value} does not match format <domain>.<name>")
 
 
 def slug(value: Any) -> str:
     """Validate value is a valid slug."""
     if value is None:
-        raise vol.Invalid("Slug should not be None")
+        raise probatio.Invalid("Slug should not be None")
     str_value = str(value)
     slg = util_slugify(str_value)
     if str_value == slg:
         return str_value
-    raise vol.Invalid(f"invalid slug {value} (try {slg})")
+    raise probatio.Invalid(f"invalid slug {value} (try {slg})")
+
+
+def underscore_slug(value: Any) -> str:
+    """Validate value is a valid slug, possibly starting with an underscore."""
+    if value.startswith("_"):
+        return f"_{slug(value[1:])}"
+    return slug(value)
 
 
 def schema_with_slug_keys(
-    value_schema: _T | Callable, *, slug_validator: Callable[[Any], str] = slug
+    value_schema: dict | Callable, *, slug_validator: Callable[[Any], str] = slug
 ) -> Callable:
     """Ensure dicts have slugs as keys.
 
-    Replacement of vol.Schema({cv.slug: value_schema}) to prevent misleading
-    "Extra keys" errors from voluptuous.
+    Replacement of probatio.Schema({cv.slug: value_schema}) to prevent misleading
+    "Extra keys" errors from probatio.
     """
-    schema = vol.Schema({str: value_schema})
+    schema = probatio.Schema({str: value_schema})
 
     def verify(value: dict) -> dict:
         """Validate all keys are slugs and then the value_schema."""
         if not isinstance(value, dict):
-            raise vol.Invalid("expected dictionary")
+            raise probatio.Invalid("expected dictionary")
 
-        for key in value.keys():
+        for key in value:
             slug_validator(key)
 
         return cast(dict, schema(value))
@@ -547,23 +656,27 @@ def schema_with_slug_keys(
 def slugify(value: Any) -> str:
     """Coerce a value to a slug."""
     if value is None:
-        raise vol.Invalid("Slug should not be None")
+        raise probatio.Invalid("Slug should not be None")
     slg = util_slugify(str(value))
     if slg:
         return slg
-    raise vol.Invalid(f"Unable to slugify {value}")
+    raise probatio.Invalid(f"Unable to slugify {value}")
 
 
 def string(value: Any) -> str:
-    """Coerce value to string, except for None."""
+    """Coerce value to string, except for None, list or dict."""
     if value is None:
-        raise vol.Invalid("string value is None")
+        raise probatio.Invalid("string value is None")
+
+    # This is expected to be the most common case, so check it first.
+    if type(value) is str or type(value) is NodeStrClass or isinstance(value, str):
+        return value
 
     if isinstance(value, template_helper.ResultWrapper):
         value = value.render_result
 
     elif isinstance(value, (list, dict)):
-        raise vol.Invalid("value should be a string")
+        raise probatio.Invalid("value should be a string")
 
     return str(value)
 
@@ -571,53 +684,58 @@ def string(value: Any) -> str:
 def string_with_no_html(value: Any) -> str:
     """Validate that the value is a string without HTML."""
     value = string(value)
-    regex = re.compile(r"<[a-z][\s\S]*>")
+    regex = re.compile(r"<[a-z].*?>", re.IGNORECASE)
     if regex.search(value):
-        raise vol.Invalid("the string should not contain HTML")
+        raise probatio.Invalid("the string should not contain HTML")
     return str(value)
 
 
-def temperature_unit(value: Any) -> str:
+def temperature_unit(value: Any) -> UnitOfTemperature:
     """Validate and transform temperature unit."""
     value = str(value).upper()
     if value == "C":
-        return TEMP_CELSIUS
+        return UnitOfTemperature.CELSIUS
     if value == "F":
-        return TEMP_FAHRENHEIT
-    raise vol.Invalid("invalid temperature unit (expected C or F)")
+        return UnitOfTemperature.FAHRENHEIT
+    raise probatio.Invalid("invalid temperature unit (expected C or F)")
 
 
-def template(value: Any | None) -> template_helper.Template:
+def template(value: Any) -> template_helper.Template:
     """Validate a jinja2 template."""
     if value is None:
-        raise vol.Invalid("template value is None")
+        raise probatio.Invalid("template value is None")
     if isinstance(value, (list, dict, template_helper.Template)):
-        raise vol.Invalid("template value should be a string")
+        raise probatio.Invalid("template value should be a string")
+    if not (hass := _async_get_hass_or_none()):
+        raise probatio.Invalid("Validates schema outside the event loop")
 
-    template_value = template_helper.Template(str(value))  # type: ignore[no-untyped-call]
+    template_value = template_helper.Template(str(value), hass)
 
     try:
         template_value.ensure_valid()
-        return template_value
     except TemplateError as ex:
-        raise vol.Invalid(f"invalid template ({ex})") from ex
+        raise probatio.Invalid(f"invalid template ({ex})") from ex
+    return template_value
 
 
-def dynamic_template(value: Any | None) -> template_helper.Template:
+def dynamic_template(value: Any) -> template_helper.Template:
     """Validate a dynamic (non static) jinja2 template."""
     if value is None:
-        raise vol.Invalid("template value is None")
+        raise probatio.Invalid("template value is None")
     if isinstance(value, (list, dict, template_helper.Template)):
-        raise vol.Invalid("template value should be a string")
+        raise probatio.Invalid("template value should be a string")
     if not template_helper.is_template_string(str(value)):
-        raise vol.Invalid("template value does not contain a dynamic template")
+        raise probatio.Invalid("template value does not contain a dynamic template")
+    if not (hass := _async_get_hass_or_none()):
+        raise probatio.Invalid("Validates schema outside the event loop")
 
-    template_value = template_helper.Template(str(value))  # type: ignore[no-untyped-call]
+    template_value = template_helper.Template(str(value), hass)
+
     try:
         template_value.ensure_valid()
-        return template_value
     except TemplateError as ex:
-        raise vol.Invalid(f"invalid template ({ex})") from ex
+        raise probatio.Invalid(f"invalid template ({ex})") from ex
+    return template_value
 
 
 def template_complex(value: Any) -> Any:
@@ -638,8 +756,24 @@ def template_complex(value: Any) -> Any:
     return value
 
 
-positive_time_period_template = vol.Any(
-    positive_time_period, template, template_complex
+def _positive_time_period_template_complex(value: Any) -> Any:
+    """Do basic validation of a positive time period expressed as a templated dict."""
+    if not isinstance(value, dict) or not value:
+        raise probatio.Invalid("template should be a dict")
+    for key, element in value.items():
+        if not isinstance(key, str):
+            raise probatio.Invalid("key should be a string")
+        if not template_helper.is_template_string(key):
+            probatio.In(_TIME_PERIOD_DICT_KEYS)(key)
+        if not isinstance(element, str) or (
+            isinstance(element, str) and not template_helper.is_template_string(element)
+        ):
+            probatio.All(probatio.Coerce(float), probatio.Range(min=0))(element)
+    return template_complex(value)
+
+
+positive_time_period_template = probatio.Any(
+    positive_time_period, dynamic_template, _positive_time_period_template_complex
 )
 
 
@@ -654,7 +788,7 @@ def datetime(value: Any) -> datetime_sys:
         date_val = None
 
     if date_val is None:
-        raise vol.Invalid(f"Invalid datetime specified: {value}")
+        raise probatio.Invalid(f"Invalid datetime specified: {value}")
 
     return date_val
 
@@ -663,13 +797,13 @@ def time_zone(value: str) -> str:
     """Validate timezone."""
     if dt_util.get_time_zone(value) is not None:
         return value
-    raise vol.Invalid(
+    raise probatio.Invalid(
         "Invalid time zone passed in. Valid options can be found here: "
         "http://en.wikipedia.org/wiki/List_of_tz_database_time_zones"
     )
 
 
-weekdays = vol.All(ensure_list, [vol.In(WEEKDAYS)])
+weekdays = probatio.All(ensure_list, [probatio.In(WEEKDAYS)])
 
 
 def socket_timeout(value: Any | None) -> object:
@@ -683,20 +817,42 @@ def socket_timeout(value: Any | None) -> object:
         float_value = float(value)
         if float_value > 0.0:
             return float_value
-        raise vol.Invalid("Invalid socket timeout value. float > 0.0 required.")
     except Exception as err:
-        raise vol.Invalid(f"Invalid socket timeout: {err}")
+        raise probatio.Invalid(f"Invalid socket timeout: {err}") from err
+    raise probatio.Invalid("Invalid socket timeout value. float > 0.0 required.")
 
 
-# pylint: disable=no-value-for-parameter
-def url(value: Any) -> str:
-    """Validate an URL."""
-    url_in = str(value)
+_URL_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+_URL_WHITESPACE = re.compile(r"\s")
 
-    if urlparse(url_in).scheme in ["http", "https"]:
-        return cast(str, vol.Schema(vol.Url())(url_in))
 
-    raise vol.Invalid("invalid url")
+def url(
+    value: Any,
+    _schema_list: frozenset[UrlProtocolSchema] = EXTERNAL_URL_PROTOCOL_SCHEMA_LIST,
+) -> str:
+    """Validate a URL."""
+    url_in = str(value).strip()
+    # urlparse silently drops tabs/newlines, so check the raw string
+    if _URL_CONTROL_CHARS.search(url_in):
+        raise probatio.Invalid("invalid url")
+    parsed = urlparse(url_in)
+
+    # HTTP clients encode spaces in the userinfo, path and query, but not the host
+    if parsed.scheme not in _schema_list or _URL_WHITESPACE.search(
+        parsed.hostname or ""
+    ):
+        raise probatio.Invalid("invalid url")
+
+    try:
+        _port = parsed.port
+    except ValueError as err:
+        raise probatio.Invalid("invalid url") from err
+    return cast(str, probatio.Schema(probatio.Url())(url_in))
+
+
+def configuration_url(value: Any) -> str:
+    """Validate a URL that allows the homeassistant schema."""
+    return url(value, CONFIGURATION_URL_PROTOCOL_SCHEMA_LIST)
 
 
 def url_no_path(value: Any) -> str:
@@ -704,16 +860,16 @@ def url_no_path(value: Any) -> str:
     url_in = url(value)
 
     if urlparse(url_in).path not in ("", "/"):
-        raise vol.Invalid("url it not allowed to have a path component")
+        raise probatio.Invalid("url is not allowed to have a path component")
 
     return url_in
 
 
 def x10_address(value: str) -> str:
     """Validate an x10 address."""
-    regex = re.compile(r"([A-Pa-p]{1})(?:[2-9]|1[0-6]?)$")
+    regex = re.compile(r"([A-Pa-p]{1})(?:[2-9]|1[0-6]?)\Z")
     if not regex.match(value):
-        raise vol.Invalid("Invalid X10 Address")
+        raise probatio.Invalid("Invalid X10 Address")
     return str(value).lower()
 
 
@@ -722,11 +878,13 @@ def uuid4_hex(value: Any) -> str:
     try:
         result = UUID(value, version=4)
     except (ValueError, AttributeError, TypeError) as error:
-        raise vol.Invalid("Invalid Version4 UUID", error_message=str(error))
+        raise probatio.Invalid(
+            "Invalid Version4 UUID", error_message=str(error)
+        ) from error
 
     if result.hex != value.lower():
         # UUID() will create a uuid4 if input is invalid
-        raise vol.Invalid("Invalid Version4 UUID")
+        raise probatio.Invalid("Invalid Version4 UUID")
 
     return result.hex
 
@@ -738,9 +896,9 @@ def fake_uuid4_hex(value: Any) -> str:
     """Validate a fake v4 UUID generated by random_uuid_hex."""
     try:
         if not _FAKE_UUID_4_HEX.match(value):
-            raise vol.Invalid("Invalid UUID")
+            raise probatio.Invalid("Invalid UUID")
     except TypeError as exc:
-        raise vol.Invalid("Invalid UUID") from exc
+        raise probatio.Invalid("Invalid UUID") from exc
     return cast(str, value)  # Pattern.match throws if input is not a string
 
 
@@ -761,11 +919,11 @@ class multi_select:
     def __call__(self, selected: list) -> list:
         """Validate input."""
         if not isinstance(selected, list):
-            raise vol.Invalid("Not a list")
+            raise probatio.Invalid("Not a list")
 
         for value in selected:
             if value not in self.options:
-                raise vol.Invalid(f"{value} is not a valid option")
+                raise probatio.Invalid(f"{value} is not a valid option")
 
         return selected
 
@@ -777,38 +935,34 @@ def _deprecated_or_removed(
     raise_if_present: bool,
     option_removed: bool,
 ) -> Callable[[dict], dict]:
-    """
-    Log key as deprecated and provide a replacement (if exists) or fail.
+    """Log key as deprecated and provide a replacement (if exists) or fail.
 
     Expected behavior:
         - Outputs or throws the appropriate deprecation warning if key is detected
-        - Outputs or throws the appropriate error if key is detected and removed from support
+        - Outputs or throws the appropriate error if key is detected
+          and removed from support
         - Processes schema moving the value from key to replacement_key
         - Processes schema changing nothing if only replacement_key provided
         - No warning if only replacement_key provided
         - No warning if neither key nor replacement_key are provided
             - Adds replacement_key with default value in this case
     """
-    module = inspect.getmodule(inspect.stack(context=0)[2].frame)
-    if module is not None:
-        module_name = module.__name__
-    else:
-        # If Python is unable to access the sources files, the call stack frame
-        # will be missing information, so let's guard.
-        # https://github.com/home-assistant/core/issues/24982
-        module_name = __name__
-    if option_removed:
-        logger_func = logging.getLogger(module_name).error
-        option_status = "has been removed"
-    else:
-        logger_func = logging.getLogger(module_name).warning
-        option_status = "is deprecated"
 
     def validator(config: dict) -> dict:
         """Check if key is in config and log warning or error."""
         if key in config:
+            if option_removed:
+                level = logging.ERROR
+                option_status = "has been removed"
+            else:
+                level = logging.WARNING
+                option_status = "is deprecated"
+
             try:
-                near = f"near {config.__config_file__}:{config.__line__} "  # type: ignore[attr-defined]
+                near = (
+                    f"near {config.__config_file__}"  # type: ignore[attr-defined]
+                    f":{config.__line__} "  # type: ignore[attr-defined]
+                )
             except AttributeError:
                 near = ""
             arguments: tuple[str, ...]
@@ -822,11 +976,11 @@ def _deprecated_or_removed(
                 arguments = (key, near, option_status)
 
             if raise_if_present:
-                raise vol.Invalid(warning % arguments)
+                raise probatio.Invalid(warning % arguments)
 
-            logger_func(warning, *arguments)
+            get_integration_logger(__name__).log(level, warning, *arguments)
             value = config[key]
-            if replacement_key:
+            if replacement_key or option_removed:
                 config.pop(key)
         else:
             value = default
@@ -839,7 +993,7 @@ def _deprecated_or_removed(
             ):
                 config[replacement_key] = value
 
-        return has_at_most_one_key(*keys)(config)
+        return probatio.AtMostOne(*keys)(config)
 
     return validator
 
@@ -850,11 +1004,11 @@ def deprecated(
     default: Any | None = None,
     raise_if_present: bool | None = False,
 ) -> Callable[[dict], dict]:
-    """
-    Log key as deprecated and provide a replacement (if exists).
+    """Log key as deprecated and provide a replacement (if exists).
 
     Expected behavior:
-        - Outputs the appropriate deprecation warning if key is detected or raises an exception
+        - Outputs the appropriate deprecation warning if key is detected
+          or raises an exception
         - Processes schema moving the value from key to replacement_key
         - Processes schema changing nothing if only replacement_key provided
         - No warning if only replacement_key provided
@@ -875,11 +1029,11 @@ def removed(
     default: Any | None = None,
     raise_if_present: bool | None = True,
 ) -> Callable[[dict], dict]:
-    """
-    Log key as deprecated and fail the config validation.
+    """Log key as deprecated and fail the config validation.
 
     Expected behavior:
-        - Outputs the appropriate error if key is detected and removed from support or raises an exception
+        - Outputs the appropriate error if key is detected and removed from
+          support or raises an exception.
     """
     return _deprecated_or_removed(
         key,
@@ -890,20 +1044,59 @@ def removed(
     )
 
 
+def renamed(
+    old_key: str,
+    new_key: str,
+) -> Callable[[Any], Any]:
+    """Replace key with a new key.
+
+    Fails if both the new and old key are present.
+    """
+
+    def validator(value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+
+        if old_key in value:
+            if new_key in value:
+                raise probatio.Invalid(
+                    f"Cannot specify both '{old_key}' and"
+                    f" '{new_key}'. Please use '{new_key}' only."
+                )
+            value[new_key] = value.pop(old_key)
+
+        return value
+
+    return validator
+
+
+type ValueSchemas = dict[Hashable, VolSchemaType | Callable[[Any], dict[str, Any]]]
+
+
 def key_value_schemas(
     key: str,
-    value_schemas: dict[Hashable, vol.Schema],
-    default_schema: vol.Schema | None = None,
+    value_schemas: ValueSchemas,
+    default_schema: VolSchemaType | Callable[[Any], dict[str, Any]] | None = None,
     default_description: str | None = None,
+    list_alternatives: bool = True,
 ) -> Callable[[Any], dict[Hashable, Any]]:
     """Create a validator that validates based on a value for specific key.
 
     This gives better error messages.
+
+    default_schema: An optional schema to use if the key value is not in value_schemas.
+    default_description: A description of what is expected by the default schema, this
+    will be added to the error message.
+    list_alternatives: If True, list the keys in `value_schemas` in the error message.
     """
+    if not list_alternatives and not default_description:
+        raise ValueError(
+            "default_description must be provided if list_alternatives is False"
+        )
 
     def key_value_validator(value: Any) -> dict[Hashable, Any]:
         if not isinstance(value, dict):
-            raise vol.Invalid("Expected a dictionary")
+            raise probatio.Invalid("Expected a dictionary")
 
         key_value = value.get(key)
 
@@ -911,13 +1104,17 @@ def key_value_schemas(
             return cast(dict[Hashable, Any], value_schemas[key_value](value))
 
         if default_schema:
-            with contextlib.suppress(vol.Invalid):
+            with contextlib.suppress(probatio.Invalid):
                 return cast(dict[Hashable, Any], default_schema(value))
 
-        alternatives = ", ".join(str(key) for key in value_schemas)
-        if default_description:
-            alternatives += ", " + default_description
-        raise vol.Invalid(
+        if list_alternatives:
+            alternatives = ", ".join(str(alternative) for alternative in value_schemas)
+            if default_description:
+                alternatives = f"{alternatives}, {default_description}"
+        else:
+            # mypy does not understand that default_description is not None here
+            alternatives = default_description  # type: ignore[assignment]
+        raise probatio.Invalid(
             f"Unexpected value for {key}: '{key_value}'. Expected {alternatives}"
         )
 
@@ -927,17 +1124,17 @@ def key_value_schemas(
 # Validator helpers
 
 
-def key_dependency(
+def key_dependency[_KT: Hashable, _VT](
     key: Hashable, dependency: Hashable
-) -> Callable[[dict[Hashable, Any]], dict[Hashable, Any]]:
+) -> Callable[[dict[_KT, _VT]], dict[_KT, _VT]]:
     """Validate that all dependencies exist for key."""
 
-    def validator(value: dict[Hashable, Any]) -> dict[Hashable, Any]:
+    def validator(value: dict[_KT, _VT]) -> dict[_KT, _VT]:
         """Test dependencies."""
         if not isinstance(value, dict):
-            raise vol.Invalid("key dependencies require a dict")
+            raise probatio.Invalid("key dependencies require a dict")
         if key in value and dependency not in value:
-            raise vol.Invalid(
+            raise probatio.Invalid(
                 f'dependency violation - key "{key}" requires '
                 f'key "{dependency}" to exist'
             )
@@ -948,8 +1145,15 @@ def key_dependency(
 
 
 def custom_serializer(schema: Any) -> Any:
-    """Serialize additional types for voluptuous_serialize."""
-    from . import selector  # pylint: disable=import-outside-toplevel
+    """Serialize additional types for to_field_list."""
+    return _custom_serializer(schema, allow_section=True)
+
+
+def _custom_serializer(schema: Any, *, allow_section: bool) -> Any:
+    """Serialize additional types for to_field_list."""
+    from homeassistant import data_entry_flow  # noqa: PLC0415
+
+    from . import selector  # noqa: PLC0415
 
     if schema is positive_time_period_dict:
         return {"type": "positive_time_period_dict"}
@@ -960,13 +1164,596 @@ def custom_serializer(schema: Any) -> Any:
     if schema is boolean:
         return {"type": "boolean"}
 
+    if isinstance(schema, data_entry_flow.section):
+        if not allow_section:
+            raise ValueError("Nesting expandable sections is not supported")
+        return {
+            "type": "expandable",
+            "schema": probatio.to_field_list(
+                schema.schema,
+                custom_serializer=functools.partial(
+                    _custom_serializer, allow_section=False
+                ),
+            ),
+            "expanded": not schema.options["collapsed"],
+        }
+
     if isinstance(schema, multi_select):
         return {"type": "multi_select", "options": schema.options}
 
     if isinstance(schema, selector.Selector):
         return schema.serialize()
 
-    return voluptuous_serialize.UNSUPPORTED
+    return probatio.UNSUPPORTED
+
+
+# Schemas
+def empty_config_schema(domain: str) -> Callable[[dict], dict]:
+    """Return a config schema which logs if there are configuration parameters."""
+
+    def validator(config: dict) -> dict:
+        if config_domain := config.get(domain):
+            get_integration_logger(__name__).error(
+                (
+                    "The %s integration does not support any configuration parameters, "
+                    "got %s. Please remove the configuration parameters from your "
+                    "configuration."
+                ),
+                domain,
+                config_domain,
+            )
+        return config
+
+    return validator
+
+
+def _no_yaml_config_schema(
+    domain: str,
+    issue_base: str,
+    translation_key: str,
+    translation_placeholders: dict[str, str],
+) -> Callable[[dict], dict]:
+    """Return a config schema which logs if attempted to setup from YAML."""
+
+    def raise_issue() -> None:
+        from .issue_registry import IssueSeverity, async_create_issue  # noqa: PLC0415
+
+        # HomeAssistantError is raised if called from the wrong thread
+        with contextlib.suppress(HomeAssistantError):
+            hass = async_get_hass()
+            async_create_issue(
+                hass,
+                HOMEASSISTANT_DOMAIN,
+                f"{issue_base}_{domain}",
+                is_fixable=False,
+                issue_domain=domain,
+                severity=IssueSeverity.ERROR,
+                translation_key=translation_key,
+                translation_placeholders={"domain": domain} | translation_placeholders,
+            )
+
+    def validator(config: dict) -> dict:
+        if domain in config:
+            get_integration_logger(__name__).error(
+                (
+                    "The %s integration does not support YAML setup, please remove it "
+                    "from your configuration file"
+                ),
+                domain,
+            )
+            raise_issue()
+        return config
+
+    return validator
+
+
+def config_entry_only_config_schema(domain: str) -> Callable[[dict], dict]:
+    """Return a config schema which logs if attempted to setup from YAML.
+
+    Use this when an integration's __init__.py defines setup or async_setup
+    but setup from yaml is not supported.
+    """
+
+    return _no_yaml_config_schema(
+        domain,
+        "config_entry_only",
+        "config_entry_only",
+        {"add_integration": f"/config/integrations/dashboard/add?domain={domain}"},
+    )
+
+
+def platform_only_config_schema(domain: str) -> Callable[[dict], dict]:
+    """Return a config schema which logs if attempted to setup from YAML.
+
+    Use this when an integration's __init__.py defines setup or async_setup
+    but setup from the integration key is not supported.
+    """
+
+    return _no_yaml_config_schema(
+        domain,
+        "platform_only",
+        "platform_only",
+        {},
+    )
+
+
+PLATFORM_SCHEMA = probatio.Schema(
+    {
+        probatio.Required(CONF_PLATFORM): string,
+        probatio.Optional(CONF_ENTITY_NAMESPACE): string,
+        probatio.Optional(CONF_SCAN_INTERVAL): time_period,
+    }
+)
+
+PLATFORM_SCHEMA_BASE = PLATFORM_SCHEMA.extend({}, extra=probatio.ALLOW_EXTRA)
+
+
+# The keys which select what a target refers to. A target may additionally
+# contain an exclude block, which uses the same keys.
+TARGET_ID_KEYS = (
+    ATTR_ENTITY_ID,
+    ATTR_DEVICE_ID,
+    ATTR_AREA_ID,
+    ATTR_FLOOR_ID,
+    ATTR_LABEL_ID,
+)
+
+TARGET_ID_FIELDS: VolDictType = {
+    probatio.Optional(ATTR_ENTITY_ID): probatio.All(ensure_list, [strict_entity_id]),
+    probatio.Optional(ATTR_DEVICE_ID): probatio.All(ensure_list, [str]),
+    probatio.Optional(ATTR_AREA_ID): probatio.All(ensure_list, [str]),
+    probatio.Optional(ATTR_FLOOR_ID): probatio.All(ensure_list, [str]),
+    probatio.Optional(ATTR_LABEL_ID): probatio.All(ensure_list, [str]),
+}
+
+TARGET_EXCLUDE_SCHEMA = probatio.Schema(TARGET_ID_FIELDS)
+
+TARGET_FIELDS: VolDictType = {
+    **TARGET_ID_FIELDS,
+    probatio.Optional(CONF_EXCLUDE): TARGET_EXCLUDE_SCHEMA,
+}
+
+
+def exclude_requires_target(value: dict[str, Any]) -> dict[str, Any]:
+    """Reject a target which only has an exclude block.
+
+    Not part of TARGET_FIELDS, which also validates partial targets while editing.
+    """
+    if CONF_EXCLUDE in value and not any(value.get(key) for key in TARGET_ID_KEYS):
+        raise probatio.Invalid("an exclude block requires a target to exclude from")
+    return value
+
+
+ENTITY_SERVICE_FIELDS: VolDictType = {
+    probatio.Optional(ATTR_ENTITY_ID): comp_entity_ids,
+    probatio.Optional(ATTR_DEVICE_ID): probatio.Any(
+        ENTITY_MATCH_NONE,
+        probatio.All(ensure_list, [str]),
+    ),
+    probatio.Optional(ATTR_AREA_ID): probatio.Any(
+        ENTITY_MATCH_NONE,
+        probatio.All(ensure_list, [str]),
+    ),
+    probatio.Optional(ATTR_FLOOR_ID): probatio.Any(
+        ENTITY_MATCH_NONE,
+        probatio.All(ensure_list, [str]),
+    ),
+    probatio.Optional(ATTR_LABEL_ID): probatio.Any(
+        ENTITY_MATCH_NONE,
+        probatio.All(ensure_list, [str]),
+    ),
+    probatio.Optional(CONF_EXCLUDE): TARGET_EXCLUDE_SCHEMA,
+}
+
+TARGET_SERVICE_FIELDS: VolDictType = {
+    # Same as ENTITY_SERVICE_FIELDS but supports specifying entity
+    # by entity registry ID.
+    **ENTITY_SERVICE_FIELDS,
+    probatio.Optional(ATTR_ENTITY_ID): comp_entity_ids_or_uuids,
+}
+
+_TARGET_SERVICE_FIELDS_TEMPLATED: VolDictType = {
+    # Either accept static entity IDs, a single dynamic template or a mixed list
+    # of static and dynamic templates. While this could be solved with a single
+    # complex template, handling it like this, keeps config validation useful.
+    # Entity ID can be specified as either a user visible one or by entity registry ID.
+    #
+    # The schema supports templates as it is meant to be used in the initial validation
+    # before templates are automatically rendered by the core logic.
+    probatio.Optional(ATTR_ENTITY_ID): probatio.Any(
+        comp_entity_ids_or_uuids,
+        dynamic_template,
+        probatio.All(list, template_complex),
+    ),
+    probatio.Optional(ATTR_DEVICE_ID): probatio.Any(
+        ENTITY_MATCH_NONE,
+        dynamic_template,
+        probatio.All(ensure_list, [probatio.Any(dynamic_template, str)]),
+    ),
+    probatio.Optional(ATTR_AREA_ID): probatio.Any(
+        ENTITY_MATCH_NONE,
+        dynamic_template,
+        probatio.All(ensure_list, [probatio.Any(dynamic_template, str)]),
+    ),
+    probatio.Optional(ATTR_FLOOR_ID): probatio.Any(
+        ENTITY_MATCH_NONE,
+        dynamic_template,
+        probatio.All(ensure_list, [probatio.Any(dynamic_template, str)]),
+    ),
+    probatio.Optional(ATTR_LABEL_ID): probatio.Any(
+        ENTITY_MATCH_NONE,
+        dynamic_template,
+        probatio.All(ensure_list, [probatio.Any(dynamic_template, str)]),
+    ),
+    probatio.Optional(CONF_EXCLUDE): probatio.Schema(
+        {
+            probatio.Optional(ATTR_ENTITY_ID): probatio.Any(
+                TARGET_ID_FIELDS[ATTR_ENTITY_ID],
+                dynamic_template,
+                probatio.All(list, template_complex),
+            ),
+            **{
+                probatio.Optional(key): probatio.Any(
+                    dynamic_template,
+                    probatio.All(ensure_list, [probatio.Any(dynamic_template, str)]),
+                )
+                for key in (ATTR_DEVICE_ID, ATTR_AREA_ID, ATTR_FLOOR_ID, ATTR_LABEL_ID)
+            },
+        }
+    ),
+}
+
+_HAS_ENTITY_SERVICE_FIELD = probatio.AtLeastOne(*TARGET_ID_KEYS)
+
+
+def is_entity_service_schema(validator: VolSchemaType) -> bool:
+    """Check if the passed validator is an entity schema validator.
+
+    The validator must be either of:
+    - A validator returned by cv._make_entity_service_schema
+    - A validator returned by cv._make_entity_service_schema, wrapped in a probatio.Schema
+    - A validator returned by cv._make_entity_service_schema, wrapped in a probatio.All
+    Nesting is allowed.
+    """
+    if hasattr(validator, "_entity_service_schema"):
+        return True
+    if isinstance(validator, (probatio.All)):
+        return any(is_entity_service_schema(val) for val in validator.validators)
+    if isinstance(validator, (probatio.Schema)):
+        return is_entity_service_schema(validator.schema)
+
+    return False
+
+
+def _make_entity_service_schema(schema: dict, extra: int) -> VolSchemaType:
+    """Create an entity service schema."""
+    validator = probatio.All(
+        probatio.Schema(
+            {
+                # The frontend stores data here. Don't use in core.
+                probatio.Remove("metadata"): dict,
+                **schema,
+                **ENTITY_SERVICE_FIELDS,
+            },
+            extra=extra,
+        ),
+        _HAS_ENTITY_SERVICE_FIELD,
+    )
+    setattr(validator, "_entity_service_schema", True)  # noqa: B010
+    # Wrap in a probatio.Schema so the probatio.All compiles its sub-validators once,
+    # instead of re-wrapping them in a new probatio.Schema on every validation as a
+    # top-level probatio.All does.
+    return probatio.Schema(validator)
+
+
+BASE_ENTITY_SCHEMA = _make_entity_service_schema({}, probatio.PREVENT_EXTRA)
+
+
+def make_entity_service_schema(
+    schema: dict | None, *, extra: int = probatio.PREVENT_EXTRA
+) -> VolSchemaType:
+    """Create an entity service schema."""
+    if not schema and extra == probatio.PREVENT_EXTRA:
+        # If the schema is empty and we don't allow extra keys, we can return
+        # the base schema and avoid compiling a new schema which is the case
+        # for ~50% of services.
+        return BASE_ENTITY_SCHEMA
+    return _make_entity_service_schema(schema or {}, extra)
+
+
+SCRIPT_CONVERSATION_RESPONSE_SCHEMA = probatio.Any(template, None)
+
+
+SCRIPT_VARIABLES_SCHEMA = probatio.All(
+    probatio.Schema({str: template_complex}),
+    # pylint: disable-next=unnecessary-lambda
+    lambda val: script_variables_helper.ScriptVariables(val),
+)
+
+
+def script_action(value: Any) -> dict:
+    """Validate a script action."""
+    if not isinstance(value, dict):
+        raise probatio.Invalid("expected dictionary")
+
+    try:
+        action = determine_script_action(value)
+    except ValueError as err:
+        raise probatio.Invalid(str(err)) from err
+
+    return ACTION_TYPE_SCHEMAS[action](value)
+
+
+SCRIPT_SCHEMA = probatio.All(ensure_list, [script_action])
+
+SCRIPT_ACTION_BASE_SCHEMA: VolDictType = {
+    probatio.Optional(CONF_ALIAS): string,
+    probatio.Remove(CONF_NOTE): str,  # Is only used in frontend
+    probatio.Optional(CONF_CONTINUE_ON_ERROR): boolean,
+    probatio.Optional(CONF_ENABLED): probatio.Any(boolean, template),
+}
+
+EVENT_SCHEMA = probatio.Schema(
+    {
+        **SCRIPT_ACTION_BASE_SCHEMA,
+        probatio.Required(CONF_EVENT): string,
+        probatio.Optional(CONF_EVENT_DATA): probatio.All(dict, template_complex),
+        probatio.Optional(CONF_EVENT_DATA_TEMPLATE): probatio.All(
+            dict, template_complex
+        ),
+    }
+)
+
+
+def _backward_compat_service_schema(value: Any | None) -> Any:
+    """Backward compatibility for service schemas."""
+
+    if not isinstance(value, dict):
+        return value
+
+    # `service` has been renamed to `action`
+    if CONF_SERVICE in value:
+        if CONF_ACTION in value:
+            raise probatio.Invalid(
+                "Cannot specify both 'service' and 'action'. Please use 'action' only."
+            )
+        value[CONF_ACTION] = value.pop(CONF_SERVICE)
+
+    return value
+
+
+SERVICE_SCHEMA = probatio.All(
+    _backward_compat_service_schema,
+    probatio.Schema(
+        {
+            **SCRIPT_ACTION_BASE_SCHEMA,
+            probatio.Exclusive(CONF_ACTION, "service name"): probatio.Any(
+                service, dynamic_template
+            ),
+            probatio.Exclusive(CONF_SERVICE_TEMPLATE, "service name"): probatio.Any(
+                service, dynamic_template
+            ),
+            probatio.Optional(CONF_SERVICE_DATA): probatio.Any(
+                template, probatio.All(dict, template_complex)
+            ),
+            probatio.Optional(CONF_SERVICE_DATA_TEMPLATE): probatio.Any(
+                template, probatio.All(dict, template_complex)
+            ),
+            probatio.Optional(CONF_ENTITY_ID): comp_entity_ids,
+            probatio.Optional(CONF_TARGET): probatio.Any(
+                probatio.All(_TARGET_SERVICE_FIELDS_TEMPLATED, exclude_requires_target),
+                dynamic_template,
+            ),
+            probatio.Optional(CONF_RESPONSE_VARIABLE): str,
+            # The frontend stores data here. Don't use in core.
+            probatio.Remove("metadata"): dict,
+        }
+    ),
+    probatio.AtLeastOne(CONF_ACTION, CONF_SERVICE_TEMPLATE),
+)
+
+NUMERIC_STATE_THRESHOLD_SCHEMA = probatio.Any(
+    probatio.Coerce(float),
+    probatio.All(str, entity_domain(["input_number", "number", "sensor", "zone"])),
+)
+
+CONDITION_BASE_SCHEMA: VolDictType = {
+    probatio.Optional(CONF_ALIAS): string,
+    probatio.Remove(CONF_NOTE): str,  # Is only used in frontend
+    probatio.Optional(CONF_ENABLED): probatio.Any(boolean, template),
+}
+
+NUMERIC_STATE_CONDITION_SCHEMA = probatio.All(
+    probatio.Schema(
+        {
+            **CONDITION_BASE_SCHEMA,
+            probatio.Required(CONF_CONDITION): "numeric_state",
+            probatio.Required(CONF_ENTITY_ID): entity_ids_or_uuids,
+            probatio.Optional(CONF_ATTRIBUTE): str,
+            CONF_BELOW: NUMERIC_STATE_THRESHOLD_SCHEMA,
+            CONF_ABOVE: NUMERIC_STATE_THRESHOLD_SCHEMA,
+            probatio.Optional(CONF_VALUE_TEMPLATE): template,
+        }
+    ),
+    probatio.AtLeastOne(CONF_BELOW, CONF_ABOVE),
+)
+
+INPUT_ENTITY_ID = re.compile(
+    r"^input_(?:select|text|number|boolean|datetime)\.(?!.+__)(?!_)[\da-z_]+(?<!_)$"
+)
+
+STATE_CONDITION_BASE_SCHEMA = {
+    **CONDITION_BASE_SCHEMA,
+    probatio.Required(CONF_CONDITION): "state",
+    probatio.Required(CONF_ENTITY_ID): entity_ids_or_uuids,
+    probatio.Optional(CONF_MATCH, default=ENTITY_MATCH_ALL): probatio.All(
+        probatio.Lower, probatio.Any(ENTITY_MATCH_ALL, ENTITY_MATCH_ANY)
+    ),
+    probatio.Optional(CONF_ATTRIBUTE): str,
+    probatio.Optional(CONF_FOR): positive_time_period_template,
+}
+
+STATE_CONDITION_STATE_SCHEMA = probatio.Schema(
+    {
+        **STATE_CONDITION_BASE_SCHEMA,
+        probatio.Required(CONF_STATE): probatio.Any(str, [str]),
+    }
+)
+
+STATE_CONDITION_ATTRIBUTE_SCHEMA = probatio.Schema(
+    {
+        **STATE_CONDITION_BASE_SCHEMA,
+        probatio.Required(CONF_STATE): match_all,
+    }
+)
+
+
+def STATE_CONDITION_SCHEMA(value: Any) -> dict[str, Any]:
+    """Validate a state condition."""
+    if not isinstance(value, dict):
+        raise probatio.Invalid("Expected a dictionary")
+
+    if CONF_ATTRIBUTE in value:
+        validated: dict[str, Any] = STATE_CONDITION_ATTRIBUTE_SCHEMA(value)
+    else:
+        validated = STATE_CONDITION_STATE_SCHEMA(value)
+
+    validated = key_dependency("for", "state")(validated)
+
+    if CONF_FOR in validated:
+        # `for` is anchored to the entity's last_changed, so it can't track an
+        # attribute or a state resolved from another entity. With a list of
+        # states, the entity must stay in one of them for the whole duration.
+        if CONF_ATTRIBUTE in validated:
+            raise probatio.Invalid("Cannot use 'for' with an attribute")
+        states = validated[CONF_STATE]
+        if not isinstance(states, list):
+            states = [states]
+        if any(INPUT_ENTITY_ID.match(state) for state in states):
+            raise probatio.Invalid(
+                "Cannot use 'for' with a state referencing an entity"
+            )
+
+    return validated
+
+
+TEMPLATE_CONDITION_SCHEMA = probatio.Schema(
+    {
+        **CONDITION_BASE_SCHEMA,
+        probatio.Required(CONF_CONDITION): "template",
+        probatio.Required(CONF_VALUE_TEMPLATE): template,
+    }
+)
+
+TIME_CONDITION_SCHEMA = probatio.All(
+    probatio.Schema(
+        {
+            **CONDITION_BASE_SCHEMA,
+            probatio.Required(CONF_CONDITION): "time",
+            probatio.Optional("before"): probatio.Any(
+                time,
+                probatio.All(str, entity_domain(["input_datetime", "time", "sensor"])),
+            ),
+            probatio.Optional("after"): probatio.Any(
+                time,
+                probatio.All(str, entity_domain(["input_datetime", "time", "sensor"])),
+            ),
+            probatio.Optional("weekday"): weekdays,
+        }
+    ),
+    probatio.AtLeastOne("before", "after", "weekday"),
+)
+
+TRIGGER_CONDITION_SCHEMA = probatio.Schema(
+    {
+        **CONDITION_BASE_SCHEMA,
+        probatio.Required(CONF_CONDITION): "trigger",
+        probatio.Required(CONF_ID): probatio.All(ensure_list, [string]),
+    }
+)
+
+AND_CONDITION_SCHEMA = probatio.Schema(
+    {
+        **CONDITION_BASE_SCHEMA,
+        probatio.Required(CONF_CONDITION): "and",
+        probatio.Required(CONF_CONDITIONS): probatio.All(
+            ensure_list,
+            # pylint: disable-next=unnecessary-lambda
+            [lambda value: CONDITION_SCHEMA(value)],
+        ),
+    }
+)
+
+AND_CONDITION_SHORTHAND_SCHEMA = probatio.Schema(
+    {
+        **CONDITION_BASE_SCHEMA,
+        probatio.Required("and"): probatio.All(
+            ensure_list,
+            # pylint: disable-next=unnecessary-lambda
+            [lambda value: CONDITION_SCHEMA(value)],
+        ),
+    }
+)
+
+OR_CONDITION_SCHEMA = probatio.Schema(
+    {
+        **CONDITION_BASE_SCHEMA,
+        probatio.Required(CONF_CONDITION): "or",
+        probatio.Required(CONF_CONDITIONS): probatio.All(
+            ensure_list,
+            # pylint: disable-next=unnecessary-lambda
+            [lambda value: CONDITION_SCHEMA(value)],
+        ),
+    }
+)
+
+OR_CONDITION_SHORTHAND_SCHEMA = probatio.Schema(
+    {
+        **CONDITION_BASE_SCHEMA,
+        probatio.Required("or"): probatio.All(
+            ensure_list,
+            # pylint: disable-next=unnecessary-lambda
+            [lambda value: CONDITION_SCHEMA(value)],
+        ),
+    }
+)
+
+NOT_CONDITION_SCHEMA = probatio.Schema(
+    {
+        **CONDITION_BASE_SCHEMA,
+        probatio.Required(CONF_CONDITION): "not",
+        probatio.Required(CONF_CONDITIONS): probatio.All(
+            ensure_list,
+            # pylint: disable-next=unnecessary-lambda
+            [lambda value: CONDITION_SCHEMA(value)],
+        ),
+    }
+)
+
+NOT_CONDITION_SHORTHAND_SCHEMA = probatio.Schema(
+    {
+        **CONDITION_BASE_SCHEMA,
+        probatio.Required("not"): probatio.All(
+            ensure_list,
+            # pylint: disable-next=unnecessary-lambda
+            [lambda value: CONDITION_SCHEMA(value)],
+        ),
+    }
+)
+
+DEVICE_CONDITION_BASE_SCHEMA = probatio.Schema(
+    {
+        **CONDITION_BASE_SCHEMA,
+        probatio.Required(CONF_CONDITION): "device",
+        probatio.Required(CONF_DEVICE_ID): str,
+        probatio.Required(CONF_DOMAIN): str,
+        probatio.Remove("metadata"): dict,
+    }
+)
+
+DEVICE_CONDITION_SCHEMA = DEVICE_CONDITION_BASE_SCHEMA.extend(
+    {}, extra=probatio.ALLOW_EXTRA
+)
 
 
 def expand_condition_shorthand(value: Any | None) -> Any:
@@ -987,7 +1774,7 @@ def expand_condition_shorthand(value: Any | None) -> Any:
                 CONF_CONDITIONS: value[key],
                 **{k: value[k] for k in value if k != key},
             }
-        except vol.MultipleInvalid:
+        except probatio.MultipleInvalid:
             pass
 
     if isinstance(value.get(CONF_CONDITION), list):
@@ -998,347 +1785,13 @@ def expand_condition_shorthand(value: Any | None) -> Any:
                 CONF_CONDITIONS: value[CONF_CONDITION],
                 **{k: value[k] for k in value if k != CONF_CONDITION},
             }
-        except vol.MultipleInvalid:
+        except probatio.MultipleInvalid:
             pass
 
     return value
 
 
-# Schemas
-PLATFORM_SCHEMA = vol.Schema(
-    {
-        vol.Required(CONF_PLATFORM): string,
-        vol.Optional(CONF_ENTITY_NAMESPACE): string,
-        vol.Optional(CONF_SCAN_INTERVAL): time_period,
-    }
-)
-
-PLATFORM_SCHEMA_BASE = PLATFORM_SCHEMA.extend({}, extra=vol.ALLOW_EXTRA)
-
-ENTITY_SERVICE_FIELDS = {
-    # Either accept static entity IDs, a single dynamic template or a mixed list
-    # of static and dynamic templates. While this could be solved with a single
-    # complex template, handling it like this, keeps config validation useful.
-    vol.Optional(ATTR_ENTITY_ID): vol.Any(
-        comp_entity_ids, dynamic_template, vol.All(list, template_complex)
-    ),
-    vol.Optional(ATTR_DEVICE_ID): vol.Any(
-        ENTITY_MATCH_NONE, vol.All(ensure_list, [vol.Any(dynamic_template, str)])
-    ),
-    vol.Optional(ATTR_AREA_ID): vol.Any(
-        ENTITY_MATCH_NONE, vol.All(ensure_list, [vol.Any(dynamic_template, str)])
-    ),
-}
-
-TARGET_SERVICE_FIELDS = {
-    # Same as ENTITY_SERVICE_FIELDS but supports specifying entity by entity registry
-    # ID.
-    # Either accept static entity IDs, a single dynamic template or a mixed list
-    # of static and dynamic templates. While this could be solved with a single
-    # complex template, handling it like this, keeps config validation useful.
-    vol.Optional(ATTR_ENTITY_ID): vol.Any(
-        comp_entity_ids_or_uuids, dynamic_template, vol.All(list, template_complex)
-    ),
-    vol.Optional(ATTR_DEVICE_ID): vol.Any(
-        ENTITY_MATCH_NONE, vol.All(ensure_list, [vol.Any(dynamic_template, str)])
-    ),
-    vol.Optional(ATTR_AREA_ID): vol.Any(
-        ENTITY_MATCH_NONE, vol.All(ensure_list, [vol.Any(dynamic_template, str)])
-    ),
-}
-
-
-def make_entity_service_schema(
-    schema: dict, *, extra: int = vol.PREVENT_EXTRA
-) -> vol.Schema:
-    """Create an entity service schema."""
-    return vol.Schema(
-        vol.All(
-            vol.Schema(
-                {
-                    # The frontend stores data here. Don't use in core.
-                    vol.Remove("metadata"): dict,
-                    **schema,
-                    **ENTITY_SERVICE_FIELDS,
-                },
-                extra=extra,
-            ),
-            has_at_least_one_key(*ENTITY_SERVICE_FIELDS),
-        )
-    )
-
-
-SCRIPT_VARIABLES_SCHEMA = vol.All(
-    vol.Schema({str: template_complex}),
-    # pylint: disable=unnecessary-lambda
-    lambda val: script_variables_helper.ScriptVariables(val),
-)
-
-
-def script_action(value: Any) -> dict:
-    """Validate a script action."""
-    if not isinstance(value, dict):
-        raise vol.Invalid("expected dictionary")
-
-    try:
-        action = determine_script_action(value)
-    except ValueError as err:
-        raise vol.Invalid(str(err))
-
-    return ACTION_TYPE_SCHEMAS[action](value)
-
-
-SCRIPT_SCHEMA = vol.All(ensure_list, [script_action])
-
-SCRIPT_ACTION_BASE_SCHEMA = {
-    vol.Optional(CONF_ALIAS): string,
-    vol.Optional(CONF_CONTINUE_ON_ERROR): boolean,
-    vol.Optional(CONF_ENABLED): boolean,
-}
-
-EVENT_SCHEMA = vol.Schema(
-    {
-        **SCRIPT_ACTION_BASE_SCHEMA,
-        vol.Required(CONF_EVENT): string,
-        vol.Optional(CONF_EVENT_DATA): vol.All(dict, template_complex),
-        vol.Optional(CONF_EVENT_DATA_TEMPLATE): vol.All(dict, template_complex),
-    }
-)
-
-SERVICE_SCHEMA = vol.All(
-    vol.Schema(
-        {
-            **SCRIPT_ACTION_BASE_SCHEMA,
-            vol.Exclusive(CONF_SERVICE, "service name"): vol.Any(
-                service, dynamic_template
-            ),
-            vol.Exclusive(CONF_SERVICE_TEMPLATE, "service name"): vol.Any(
-                service, dynamic_template
-            ),
-            vol.Optional(CONF_SERVICE_DATA): vol.Any(
-                template, vol.All(dict, template_complex)
-            ),
-            vol.Optional(CONF_SERVICE_DATA_TEMPLATE): vol.Any(
-                template, vol.All(dict, template_complex)
-            ),
-            vol.Optional(CONF_ENTITY_ID): comp_entity_ids,
-            vol.Optional(CONF_TARGET): vol.Any(TARGET_SERVICE_FIELDS, dynamic_template),
-            # The frontend stores data here. Don't use in core.
-            vol.Remove("metadata"): dict,
-        }
-    ),
-    has_at_least_one_key(CONF_SERVICE, CONF_SERVICE_TEMPLATE),
-)
-
-NUMERIC_STATE_THRESHOLD_SCHEMA = vol.Any(
-    vol.Coerce(float), vol.All(str, entity_domain(["input_number", "number", "sensor"]))
-)
-
-CONDITION_BASE_SCHEMA = {
-    vol.Optional(CONF_ALIAS): string,
-    vol.Optional(CONF_ENABLED): boolean,
-}
-
-NUMERIC_STATE_CONDITION_SCHEMA = vol.All(
-    vol.Schema(
-        {
-            **CONDITION_BASE_SCHEMA,
-            vol.Required(CONF_CONDITION): "numeric_state",
-            vol.Required(CONF_ENTITY_ID): entity_ids_or_uuids,
-            vol.Optional(CONF_ATTRIBUTE): str,
-            CONF_BELOW: NUMERIC_STATE_THRESHOLD_SCHEMA,
-            CONF_ABOVE: NUMERIC_STATE_THRESHOLD_SCHEMA,
-            vol.Optional(CONF_VALUE_TEMPLATE): template,
-        }
-    ),
-    has_at_least_one_key(CONF_BELOW, CONF_ABOVE),
-)
-
-STATE_CONDITION_BASE_SCHEMA = {
-    **CONDITION_BASE_SCHEMA,
-    vol.Required(CONF_CONDITION): "state",
-    vol.Required(CONF_ENTITY_ID): entity_ids_or_uuids,
-    vol.Optional(CONF_MATCH, default=ENTITY_MATCH_ALL): vol.All(
-        vol.Lower, vol.Any(ENTITY_MATCH_ALL, ENTITY_MATCH_ANY)
-    ),
-    vol.Optional(CONF_ATTRIBUTE): str,
-    vol.Optional(CONF_FOR): positive_time_period,
-    # To support use_trigger_value in automation
-    # Deprecated 2016/04/25
-    vol.Optional("from"): str,
-}
-
-STATE_CONDITION_STATE_SCHEMA = vol.Schema(
-    {
-        **STATE_CONDITION_BASE_SCHEMA,
-        vol.Required(CONF_STATE): vol.Any(str, [str]),
-    }
-)
-
-STATE_CONDITION_ATTRIBUTE_SCHEMA = vol.Schema(
-    {
-        **STATE_CONDITION_BASE_SCHEMA,
-        vol.Required(CONF_STATE): match_all,
-    }
-)
-
-
-def STATE_CONDITION_SCHEMA(value: Any) -> dict:  # pylint: disable=invalid-name
-    """Validate a state condition."""
-    if not isinstance(value, dict):
-        raise vol.Invalid("Expected a dictionary")
-
-    if CONF_ATTRIBUTE in value:
-        validated: dict = STATE_CONDITION_ATTRIBUTE_SCHEMA(value)
-    else:
-        validated = STATE_CONDITION_STATE_SCHEMA(value)
-
-    return key_dependency("for", "state")(validated)
-
-
-SUN_CONDITION_SCHEMA = vol.All(
-    vol.Schema(
-        {
-            **CONDITION_BASE_SCHEMA,
-            vol.Required(CONF_CONDITION): "sun",
-            vol.Optional("before"): sun_event,
-            vol.Optional("before_offset"): time_period,
-            vol.Optional("after"): vol.All(
-                vol.Lower, vol.Any(SUN_EVENT_SUNSET, SUN_EVENT_SUNRISE)
-            ),
-            vol.Optional("after_offset"): time_period,
-        }
-    ),
-    has_at_least_one_key("before", "after"),
-)
-
-TEMPLATE_CONDITION_SCHEMA = vol.Schema(
-    {
-        **CONDITION_BASE_SCHEMA,
-        vol.Required(CONF_CONDITION): "template",
-        vol.Required(CONF_VALUE_TEMPLATE): template,
-    }
-)
-
-TIME_CONDITION_SCHEMA = vol.All(
-    vol.Schema(
-        {
-            **CONDITION_BASE_SCHEMA,
-            vol.Required(CONF_CONDITION): "time",
-            vol.Optional("before"): vol.Any(
-                time, vol.All(str, entity_domain(["input_datetime", "sensor"]))
-            ),
-            vol.Optional("after"): vol.Any(
-                time, vol.All(str, entity_domain(["input_datetime", "sensor"]))
-            ),
-            vol.Optional("weekday"): weekdays,
-        }
-    ),
-    has_at_least_one_key("before", "after", "weekday"),
-)
-
-TRIGGER_CONDITION_SCHEMA = vol.Schema(
-    {
-        **CONDITION_BASE_SCHEMA,
-        vol.Required(CONF_CONDITION): "trigger",
-        vol.Required(CONF_ID): vol.All(ensure_list, [string]),
-    }
-)
-
-ZONE_CONDITION_SCHEMA = vol.Schema(
-    {
-        **CONDITION_BASE_SCHEMA,
-        vol.Required(CONF_CONDITION): "zone",
-        vol.Required(CONF_ENTITY_ID): entity_ids,
-        vol.Required("zone"): entity_ids,
-        # To support use_trigger_value in automation
-        # Deprecated 2016/04/25
-        vol.Optional("event"): vol.Any("enter", "leave"),
-    }
-)
-
-AND_CONDITION_SCHEMA = vol.Schema(
-    {
-        **CONDITION_BASE_SCHEMA,
-        vol.Required(CONF_CONDITION): "and",
-        vol.Required(CONF_CONDITIONS): vol.All(
-            ensure_list,
-            # pylint: disable=unnecessary-lambda
-            [lambda value: CONDITION_SCHEMA(value)],
-        ),
-    }
-)
-
-AND_CONDITION_SHORTHAND_SCHEMA = vol.Schema(
-    {
-        **CONDITION_BASE_SCHEMA,
-        vol.Required("and"): vol.All(
-            ensure_list,
-            # pylint: disable=unnecessary-lambda
-            [lambda value: CONDITION_SCHEMA(value)],
-        ),
-    }
-)
-
-OR_CONDITION_SCHEMA = vol.Schema(
-    {
-        **CONDITION_BASE_SCHEMA,
-        vol.Required(CONF_CONDITION): "or",
-        vol.Required(CONF_CONDITIONS): vol.All(
-            ensure_list,
-            # pylint: disable=unnecessary-lambda
-            [lambda value: CONDITION_SCHEMA(value)],
-        ),
-    }
-)
-
-OR_CONDITION_SHORTHAND_SCHEMA = vol.Schema(
-    {
-        **CONDITION_BASE_SCHEMA,
-        vol.Required("or"): vol.All(
-            ensure_list,
-            # pylint: disable=unnecessary-lambda
-            [lambda value: CONDITION_SCHEMA(value)],
-        ),
-    }
-)
-
-NOT_CONDITION_SCHEMA = vol.Schema(
-    {
-        **CONDITION_BASE_SCHEMA,
-        vol.Required(CONF_CONDITION): "not",
-        vol.Required(CONF_CONDITIONS): vol.All(
-            ensure_list,
-            # pylint: disable=unnecessary-lambda
-            [lambda value: CONDITION_SCHEMA(value)],
-        ),
-    }
-)
-
-NOT_CONDITION_SHORTHAND_SCHEMA = vol.Schema(
-    {
-        **CONDITION_BASE_SCHEMA,
-        vol.Required("not"): vol.All(
-            ensure_list,
-            # pylint: disable=unnecessary-lambda
-            [lambda value: CONDITION_SCHEMA(value)],
-        ),
-    }
-)
-
-DEVICE_CONDITION_BASE_SCHEMA = vol.Schema(
-    {
-        **CONDITION_BASE_SCHEMA,
-        vol.Required(CONF_CONDITION): "device",
-        vol.Required(CONF_DEVICE_ID): str,
-        vol.Required(CONF_DOMAIN): str,
-        vol.Remove("metadata"): dict,
-    }
-)
-
-DEVICE_CONDITION_SCHEMA = DEVICE_CONDITION_BASE_SCHEMA.extend({}, extra=vol.ALLOW_EXTRA)
-
-dynamic_template_condition_action = vol.All(
+dynamic_template_condition = probatio.All(
     # Wrap a shorthand template condition in a template condition
     dynamic_template,
     lambda config: {
@@ -1347,47 +1800,67 @@ dynamic_template_condition_action = vol.All(
     },
 )
 
-CONDITION_SHORTHAND_SCHEMA = vol.Schema(
+CONDITION_SHORTHAND_SCHEMA = probatio.Schema(
     {
         **CONDITION_BASE_SCHEMA,
-        vol.Required(CONF_CONDITION): vol.All(
+        probatio.Required(CONF_CONDITION): probatio.All(
             ensure_list,
-            # pylint: disable=unnecessary-lambda
+            # pylint: disable-next=unnecessary-lambda
             [lambda value: CONDITION_SCHEMA(value)],
         ),
     }
 )
 
-CONDITION_SCHEMA: vol.Schema = vol.Schema(
-    vol.Any(
-        vol.All(
+BUILT_IN_CONDITIONS: ValueSchemas = {
+    "and": AND_CONDITION_SCHEMA,
+    "device": DEVICE_CONDITION_SCHEMA,
+    "not": NOT_CONDITION_SCHEMA,
+    "numeric_state": NUMERIC_STATE_CONDITION_SCHEMA,
+    "or": OR_CONDITION_SCHEMA,
+    "state": STATE_CONDITION_SCHEMA,
+    "template": TEMPLATE_CONDITION_SCHEMA,
+    "time": TIME_CONDITION_SCHEMA,
+    "trigger": TRIGGER_CONDITION_SCHEMA,
+}
+
+
+# This is first round of validation, we don't want to mutate the config here already,
+# just ensure basics as condition type and alias are there.
+def _base_condition_validator(value: Any) -> Any:
+    probatio.Schema(
+        {
+            **CONDITION_BASE_SCHEMA,
+            probatio.Required(CONF_CONDITION): probatio.All(
+                str, probatio.NotIn(BUILT_IN_CONDITIONS)
+            ),
+        },
+        extra=probatio.ALLOW_EXTRA,
+    )(value)
+    return value
+
+
+CONDITION_SCHEMA: probatio.Schema = probatio.Schema(
+    probatio.Any(
+        probatio.All(
             expand_condition_shorthand,
             key_value_schemas(
                 CONF_CONDITION,
-                {
-                    "and": AND_CONDITION_SCHEMA,
-                    "device": DEVICE_CONDITION_SCHEMA,
-                    "not": NOT_CONDITION_SCHEMA,
-                    "numeric_state": NUMERIC_STATE_CONDITION_SCHEMA,
-                    "or": OR_CONDITION_SCHEMA,
-                    "state": STATE_CONDITION_SCHEMA,
-                    "sun": SUN_CONDITION_SCHEMA,
-                    "template": TEMPLATE_CONDITION_SCHEMA,
-                    "time": TIME_CONDITION_SCHEMA,
-                    "trigger": TRIGGER_CONDITION_SCHEMA,
-                    "zone": ZONE_CONDITION_SCHEMA,
-                },
+                BUILT_IN_CONDITIONS,
+                _base_condition_validator,
+                "a condition, a list of conditions or a valid template",
+                list_alternatives=False,
             ),
         ),
-        dynamic_template_condition_action,
+        dynamic_template_condition,
     )
 )
 
+CONDITIONS_SCHEMA = probatio.All(ensure_list, [CONDITION_SCHEMA])
 
-dynamic_template_condition_action = vol.All(
+dynamic_template_condition_action = probatio.All(
     # Wrap a shorthand template condition action in a template condition
-    vol.Schema(
-        {**CONDITION_BASE_SCHEMA, vol.Required(CONF_CONDITION): dynamic_template}
+    probatio.Schema(
+        {**CONDITION_BASE_SCHEMA, probatio.Required(CONF_CONDITION): dynamic_template}
     ),
     lambda config: {
         **config,
@@ -1397,166 +1870,225 @@ dynamic_template_condition_action = vol.All(
 )
 
 
-CONDITION_ACTION_SCHEMA: vol.Schema = vol.Schema(
-    vol.All(
+CONDITION_ACTION_SCHEMA: probatio.Schema = probatio.Schema(
+    probatio.All(
         expand_condition_shorthand,
         key_value_schemas(
             CONF_CONDITION,
-            {
-                "and": AND_CONDITION_SCHEMA,
-                "device": DEVICE_CONDITION_SCHEMA,
-                "not": NOT_CONDITION_SCHEMA,
-                "numeric_state": NUMERIC_STATE_CONDITION_SCHEMA,
-                "or": OR_CONDITION_SCHEMA,
-                "state": STATE_CONDITION_SCHEMA,
-                "sun": SUN_CONDITION_SCHEMA,
-                "template": TEMPLATE_CONDITION_SCHEMA,
-                "time": TIME_CONDITION_SCHEMA,
-                "trigger": TRIGGER_CONDITION_SCHEMA,
-                "zone": ZONE_CONDITION_SCHEMA,
-            },
-            dynamic_template_condition_action,
-            "a list of conditions or a valid template",
+            BUILT_IN_CONDITIONS,
+            probatio.Any(
+                dynamic_template_condition_action,
+                _base_condition_validator,
+            ),
+            "a condition, a list of conditions or a valid template",
+            list_alternatives=False,
         ),
     )
 )
 
-TRIGGER_BASE_SCHEMA = vol.Schema(
+
+def _trigger_pre_validator(value: Any | None) -> Any:
+    """Rewrite trigger `trigger` to `platform`.
+
+    `platform` has been renamed to `trigger` in user documentation and in the automation
+    editor. The Python trigger implementation still uses `platform`, so we need to
+    rename `trigger` to `platform.
+    """
+
+    if not isinstance(value, Mapping):
+        # If the value is not a mapping, we let that be handled by the TRIGGER_SCHEMA
+        return value
+
+    if CONF_TRIGGER in value:
+        if CONF_PLATFORM in value:
+            raise probatio.Invalid(
+                "Cannot specify both 'platform' and 'trigger'."
+                " Please use 'trigger' only."
+            )
+        value = dict(value)
+        value[CONF_PLATFORM] = value.pop(CONF_TRIGGER)
+    elif CONF_PLATFORM not in value:
+        raise probatio.Invalid("required key not provided", [CONF_TRIGGER])
+
+    return value
+
+
+TRIGGER_BASE_SCHEMA = probatio.Schema(
     {
-        vol.Optional(CONF_ALIAS): str,
-        vol.Required(CONF_PLATFORM): str,
-        vol.Optional(CONF_ID): str,
-        vol.Optional(CONF_VARIABLES): SCRIPT_VARIABLES_SCHEMA,
-        vol.Optional(CONF_ENABLED): boolean,
+        probatio.Optional(CONF_ALIAS): str,
+        probatio.Required(CONF_PLATFORM): str,
+        probatio.Optional(CONF_ID): str,
+        probatio.Optional(CONF_VARIABLES): SCRIPT_VARIABLES_SCHEMA,
+        probatio.Optional(CONF_ENABLED): probatio.Any(boolean, template),
+        probatio.Remove(CONF_NOTE): str,  # Is only used in frontend
     }
 )
 
 
-_base_trigger_validator_schema = TRIGGER_BASE_SCHEMA.extend({}, extra=vol.ALLOW_EXTRA)
+_base_trigger_validator_schema = TRIGGER_BASE_SCHEMA.extend(
+    {}, extra=probatio.ALLOW_EXTRA
+)
 
 
-# This is first round of validation, we don't want to process the config here already,
+def _base_trigger_list_flatten(triggers: list[Any]) -> list[Any]:
+    """Flatten trigger arrays with 'triggers:' sublists into one list."""
+    flatlist = []
+    for t in triggers:
+        if CONF_TRIGGERS in t and len(t) == 1:
+            triggerlist = ensure_list(t[CONF_TRIGGERS])
+            flatlist.extend(triggerlist)
+        else:
+            flatlist.append(t)
+
+    return flatlist
+
+
+# This is first round of validation, we don't want to mutate the config here already,
 # just ensure basics as platform and ID are there.
 def _base_trigger_validator(value: Any) -> Any:
     _base_trigger_validator_schema(value)
     return value
 
 
-TRIGGER_SCHEMA = vol.All(ensure_list, [_base_trigger_validator])
+TRIGGER_SCHEMA = probatio.All(
+    ensure_list,
+    _base_trigger_list_flatten,
+    [probatio.All(_trigger_pre_validator, _base_trigger_validator)],
+)
 
-_SCRIPT_DELAY_SCHEMA = vol.Schema(
+_SCRIPT_DELAY_SCHEMA = probatio.Schema(
     {
         **SCRIPT_ACTION_BASE_SCHEMA,
-        vol.Required(CONF_DELAY): positive_time_period_template,
+        probatio.Required(CONF_DELAY): positive_time_period_template,
     }
 )
 
-_SCRIPT_WAIT_TEMPLATE_SCHEMA = vol.Schema(
+_SCRIPT_WAIT_TEMPLATE_SCHEMA = probatio.Schema(
     {
         **SCRIPT_ACTION_BASE_SCHEMA,
-        vol.Required(CONF_WAIT_TEMPLATE): template,
-        vol.Optional(CONF_TIMEOUT): positive_time_period_template,
-        vol.Optional(CONF_CONTINUE_ON_TIMEOUT): boolean,
+        probatio.Required(CONF_WAIT_TEMPLATE): template,
+        probatio.Optional(CONF_TIMEOUT): positive_time_period_template,
+        probatio.Optional(CONF_CONTINUE_ON_TIMEOUT): boolean,
     }
 )
 
-DEVICE_ACTION_BASE_SCHEMA = vol.Schema(
+DEVICE_ACTION_BASE_SCHEMA = probatio.Schema(
     {
         **SCRIPT_ACTION_BASE_SCHEMA,
-        vol.Required(CONF_DEVICE_ID): string,
-        vol.Required(CONF_DOMAIN): str,
-        vol.Remove("metadata"): dict,
+        probatio.Required(CONF_DEVICE_ID): string,
+        probatio.Required(CONF_DOMAIN): str,
+        probatio.Remove("metadata"): dict,
     }
 )
 
-DEVICE_ACTION_SCHEMA = DEVICE_ACTION_BASE_SCHEMA.extend({}, extra=vol.ALLOW_EXTRA)
+DEVICE_ACTION_SCHEMA = DEVICE_ACTION_BASE_SCHEMA.extend({}, extra=probatio.ALLOW_EXTRA)
 
-_SCRIPT_SCENE_SCHEMA = vol.Schema(
-    {**SCRIPT_ACTION_BASE_SCHEMA, vol.Required(CONF_SCENE): entity_domain("scene")}
+_SCRIPT_SCENE_SCHEMA = probatio.Schema(
+    {**SCRIPT_ACTION_BASE_SCHEMA, probatio.Required(CONF_SCENE): entity_domain("scene")}
 )
 
-_SCRIPT_REPEAT_SCHEMA = vol.Schema(
+_SCRIPT_REPEAT_SCHEMA = probatio.Schema(
     {
         **SCRIPT_ACTION_BASE_SCHEMA,
-        vol.Required(CONF_REPEAT): vol.All(
+        probatio.Required(CONF_REPEAT): probatio.All(
             {
-                vol.Exclusive(CONF_COUNT, "repeat"): vol.Any(vol.Coerce(int), template),
-                vol.Exclusive(CONF_FOR_EACH, "repeat"): vol.Any(
-                    dynamic_template, vol.All(list, template_complex)
+                probatio.Exclusive(CONF_COUNT, "repeat"): probatio.Any(
+                    probatio.Coerce(int), template
                 ),
-                vol.Exclusive(CONF_WHILE, "repeat"): vol.All(
-                    ensure_list, [CONDITION_SCHEMA]
+                probatio.Exclusive(CONF_FOR_EACH, "repeat"): probatio.Any(
+                    dynamic_template, probatio.All(list, template_complex)
                 ),
-                vol.Exclusive(CONF_UNTIL, "repeat"): vol.All(
-                    ensure_list, [CONDITION_SCHEMA]
-                ),
-                vol.Required(CONF_SEQUENCE): SCRIPT_SCHEMA,
+                probatio.Exclusive(CONF_WHILE, "repeat"): CONDITIONS_SCHEMA,
+                probatio.Exclusive(CONF_UNTIL, "repeat"): CONDITIONS_SCHEMA,
+                probatio.Required(CONF_SEQUENCE): SCRIPT_SCHEMA,
             },
-            has_at_least_one_key(CONF_COUNT, CONF_FOR_EACH, CONF_WHILE, CONF_UNTIL),
+            probatio.AtLeastOne(CONF_COUNT, CONF_FOR_EACH, CONF_WHILE, CONF_UNTIL),
         ),
     }
 )
 
-_SCRIPT_CHOOSE_SCHEMA = vol.Schema(
+_SCRIPT_CHOOSE_SCHEMA = probatio.Schema(
     {
         **SCRIPT_ACTION_BASE_SCHEMA,
-        vol.Required(CONF_CHOOSE): vol.All(
+        probatio.Required(CONF_CHOOSE): probatio.All(
             ensure_list,
             [
                 {
-                    vol.Optional(CONF_ALIAS): string,
-                    vol.Required(CONF_CONDITIONS): vol.All(
-                        ensure_list, [CONDITION_SCHEMA]
-                    ),
-                    vol.Required(CONF_SEQUENCE): SCRIPT_SCHEMA,
+                    probatio.Optional(CONF_ALIAS): string,
+                    probatio.Remove(CONF_NOTE): str,  # Is only used in frontend
+                    probatio.Required(CONF_CONDITIONS): CONDITIONS_SCHEMA,
+                    probatio.Required(CONF_SEQUENCE): SCRIPT_SCHEMA,
                 }
             ],
         ),
-        vol.Optional(CONF_DEFAULT): SCRIPT_SCHEMA,
+        probatio.Optional(CONF_DEFAULT): SCRIPT_SCHEMA,
     }
 )
 
-_SCRIPT_WAIT_FOR_TRIGGER_SCHEMA = vol.Schema(
+_SCRIPT_WAIT_FOR_TRIGGER_SCHEMA = probatio.Schema(
     {
         **SCRIPT_ACTION_BASE_SCHEMA,
-        vol.Required(CONF_WAIT_FOR_TRIGGER): TRIGGER_SCHEMA,
-        vol.Optional(CONF_TIMEOUT): positive_time_period_template,
-        vol.Optional(CONF_CONTINUE_ON_TIMEOUT): boolean,
+        probatio.Required(CONF_WAIT_FOR_TRIGGER): TRIGGER_SCHEMA,
+        probatio.Optional(CONF_TIMEOUT): positive_time_period_template,
+        probatio.Optional(CONF_CONTINUE_ON_TIMEOUT): boolean,
     }
 )
 
-_SCRIPT_IF_SCHEMA = vol.Schema(
+_SCRIPT_IF_SCHEMA = probatio.Schema(
     {
         **SCRIPT_ACTION_BASE_SCHEMA,
-        vol.Required(CONF_IF): vol.All(ensure_list, [CONDITION_SCHEMA]),
-        vol.Required(CONF_THEN): SCRIPT_SCHEMA,
-        vol.Optional(CONF_ELSE): SCRIPT_SCHEMA,
+        probatio.Required(CONF_IF): CONDITIONS_SCHEMA,
+        probatio.Required(CONF_THEN): SCRIPT_SCHEMA,
+        probatio.Optional(CONF_ELSE): SCRIPT_SCHEMA,
     }
 )
 
-_SCRIPT_SET_SCHEMA = vol.Schema(
+_SCRIPT_SET_SCHEMA = probatio.Schema(
     {
         **SCRIPT_ACTION_BASE_SCHEMA,
-        vol.Required(CONF_VARIABLES): SCRIPT_VARIABLES_SCHEMA,
+        probatio.Required(CONF_VARIABLES): SCRIPT_VARIABLES_SCHEMA,
     }
 )
 
-_SCRIPT_STOP_SCHEMA = vol.Schema(
+_SCRIPT_SET_CONVERSATION_RESPONSE_SCHEMA = probatio.Schema(
     {
         **SCRIPT_ACTION_BASE_SCHEMA,
-        vol.Required(CONF_STOP): vol.Any(None, string),
-        vol.Optional(CONF_ERROR, default=False): boolean,
+        probatio.Required(
+            CONF_SET_CONVERSATION_RESPONSE
+        ): SCRIPT_CONVERSATION_RESPONSE_SCHEMA,
     }
 )
 
-_SCRIPT_PARALLEL_SEQUENCE = vol.Schema(
+
+def _stop_action_check_error_response(config: dict) -> dict:
+    """Validate that error stop actions don't have a response variable."""
+    if config.get(CONF_ERROR) and CONF_RESPONSE_VARIABLE in config:
+        raise probatio.Invalid("not allowed to add a response to an error stop action")
+    return config
+
+
+_SCRIPT_STOP_SCHEMA = probatio.All(
+    probatio.Schema(
+        {
+            **SCRIPT_ACTION_BASE_SCHEMA,
+            probatio.Required(CONF_STOP): probatio.Any(None, string),
+            probatio.Optional(CONF_ERROR): boolean,
+            probatio.Optional(CONF_RESPONSE_VARIABLE): str,
+        }
+    ),
+    _stop_action_check_error_response,
+)
+
+_SCRIPT_SEQUENCE_SCHEMA = probatio.Schema(
     {
         **SCRIPT_ACTION_BASE_SCHEMA,
-        vol.Required(CONF_SEQUENCE): SCRIPT_SCHEMA,
+        # The frontend stores data here. Don't use in core.
+        probatio.Remove("metadata"): dict,
+        probatio.Required(CONF_SEQUENCE): SCRIPT_SCHEMA,
     }
 )
 
-_parallel_sequence_action = vol.All(
+_parallel_sequence_action = probatio.All(
     # Wrap a shorthand sequences in a parallel action
     SCRIPT_SCHEMA,
     lambda config: {
@@ -1564,101 +2096,132 @@ _parallel_sequence_action = vol.All(
     },
 )
 
-_SCRIPT_PARALLEL_SCHEMA = vol.Schema(
+_SCRIPT_PARALLEL_SCHEMA = probatio.Schema(
     {
         **SCRIPT_ACTION_BASE_SCHEMA,
-        vol.Required(CONF_PARALLEL): vol.All(
-            ensure_list, [vol.Any(_SCRIPT_PARALLEL_SEQUENCE, _parallel_sequence_action)]
+        probatio.Required(CONF_PARALLEL): probatio.All(
+            ensure_list,
+            [probatio.Any(_SCRIPT_SEQUENCE_SCHEMA, _parallel_sequence_action)],
         ),
     }
 )
 
 
-SCRIPT_ACTION_DELAY = "delay"
-SCRIPT_ACTION_WAIT_TEMPLATE = "wait_template"
-SCRIPT_ACTION_CHECK_CONDITION = "condition"
-SCRIPT_ACTION_FIRE_EVENT = "event"
-SCRIPT_ACTION_CALL_SERVICE = "call_service"
-SCRIPT_ACTION_DEVICE_AUTOMATION = "device"
 SCRIPT_ACTION_ACTIVATE_SCENE = "scene"
-SCRIPT_ACTION_REPEAT = "repeat"
+SCRIPT_ACTION_CALL_SERVICE = "call_service"
+SCRIPT_ACTION_CHECK_CONDITION = "condition"
 SCRIPT_ACTION_CHOOSE = "choose"
-SCRIPT_ACTION_WAIT_FOR_TRIGGER = "wait_for_trigger"
-SCRIPT_ACTION_VARIABLES = "variables"
-SCRIPT_ACTION_STOP = "stop"
+SCRIPT_ACTION_DELAY = "delay"
+SCRIPT_ACTION_DEVICE_AUTOMATION = "device"
+SCRIPT_ACTION_FIRE_EVENT = "event"
 SCRIPT_ACTION_IF = "if"
 SCRIPT_ACTION_PARALLEL = "parallel"
+SCRIPT_ACTION_REPEAT = "repeat"
+SCRIPT_ACTION_SEQUENCE = "sequence"
+SCRIPT_ACTION_SET_CONVERSATION_RESPONSE = "set_conversation_response"
+SCRIPT_ACTION_STOP = "stop"
+SCRIPT_ACTION_VARIABLES = "variables"
+SCRIPT_ACTION_WAIT_FOR_TRIGGER = "wait_for_trigger"
+SCRIPT_ACTION_WAIT_TEMPLATE = "wait_template"
+
+
+ACTIONS_MAP = {
+    CONF_DELAY: SCRIPT_ACTION_DELAY,
+    CONF_WAIT_TEMPLATE: SCRIPT_ACTION_WAIT_TEMPLATE,
+    CONF_CONDITION: SCRIPT_ACTION_CHECK_CONDITION,
+    "and": SCRIPT_ACTION_CHECK_CONDITION,
+    "or": SCRIPT_ACTION_CHECK_CONDITION,
+    "not": SCRIPT_ACTION_CHECK_CONDITION,
+    CONF_EVENT: SCRIPT_ACTION_FIRE_EVENT,
+    CONF_DEVICE_ID: SCRIPT_ACTION_DEVICE_AUTOMATION,
+    CONF_SCENE: SCRIPT_ACTION_ACTIVATE_SCENE,
+    CONF_REPEAT: SCRIPT_ACTION_REPEAT,
+    CONF_CHOOSE: SCRIPT_ACTION_CHOOSE,
+    CONF_WAIT_FOR_TRIGGER: SCRIPT_ACTION_WAIT_FOR_TRIGGER,
+    CONF_VARIABLES: SCRIPT_ACTION_VARIABLES,
+    CONF_IF: SCRIPT_ACTION_IF,
+    CONF_ACTION: SCRIPT_ACTION_CALL_SERVICE,
+    CONF_SERVICE: SCRIPT_ACTION_CALL_SERVICE,
+    CONF_SERVICE_TEMPLATE: SCRIPT_ACTION_CALL_SERVICE,
+    CONF_STOP: SCRIPT_ACTION_STOP,
+    CONF_PARALLEL: SCRIPT_ACTION_PARALLEL,
+    CONF_SEQUENCE: SCRIPT_ACTION_SEQUENCE,
+    CONF_SET_CONVERSATION_RESPONSE: SCRIPT_ACTION_SET_CONVERSATION_RESPONSE,
+}
+
+ACTIONS_SET = set(ACTIONS_MAP)
 
 
 def determine_script_action(action: dict[str, Any]) -> str:
     """Determine action type."""
-    if CONF_DELAY in action:
-        return SCRIPT_ACTION_DELAY
-
-    if CONF_WAIT_TEMPLATE in action:
-        return SCRIPT_ACTION_WAIT_TEMPLATE
-
-    if any(key in action for key in (CONF_CONDITION, "and", "or", "not")):
-        return SCRIPT_ACTION_CHECK_CONDITION
-
-    if CONF_EVENT in action:
-        return SCRIPT_ACTION_FIRE_EVENT
-
-    if CONF_DEVICE_ID in action:
-        return SCRIPT_ACTION_DEVICE_AUTOMATION
-
-    if CONF_SCENE in action:
-        return SCRIPT_ACTION_ACTIVATE_SCENE
-
-    if CONF_REPEAT in action:
-        return SCRIPT_ACTION_REPEAT
-
-    if CONF_CHOOSE in action:
-        return SCRIPT_ACTION_CHOOSE
-
-    if CONF_WAIT_FOR_TRIGGER in action:
-        return SCRIPT_ACTION_WAIT_FOR_TRIGGER
-
-    if CONF_VARIABLES in action:
-        return SCRIPT_ACTION_VARIABLES
-
-    if CONF_IF in action:
-        return SCRIPT_ACTION_IF
-
-    if CONF_SERVICE in action or CONF_SERVICE_TEMPLATE in action:
-        return SCRIPT_ACTION_CALL_SERVICE
-
-    if CONF_STOP in action:
-        return SCRIPT_ACTION_STOP
-
-    if CONF_PARALLEL in action:
-        return SCRIPT_ACTION_PARALLEL
-
-    raise ValueError("Unable to determine action")
+    if not (actions := ACTIONS_SET.intersection(action)):
+        raise ValueError("Unable to determine action")
+    if len(actions) > 1:
+        # Ambiguous action, select the first one in the
+        # order of the ACTIONS_MAP
+        for action_key, _script_action in ACTIONS_MAP.items():
+            if action_key in actions:
+                return _script_action
+    return ACTIONS_MAP[actions.pop()]
 
 
 ACTION_TYPE_SCHEMAS: dict[str, Callable[[Any], dict]] = {
-    SCRIPT_ACTION_CALL_SERVICE: SERVICE_SCHEMA,
-    SCRIPT_ACTION_DELAY: _SCRIPT_DELAY_SCHEMA,
-    SCRIPT_ACTION_WAIT_TEMPLATE: _SCRIPT_WAIT_TEMPLATE_SCHEMA,
-    SCRIPT_ACTION_FIRE_EVENT: EVENT_SCHEMA,
-    SCRIPT_ACTION_CHECK_CONDITION: CONDITION_ACTION_SCHEMA,
-    SCRIPT_ACTION_DEVICE_AUTOMATION: DEVICE_ACTION_SCHEMA,
     SCRIPT_ACTION_ACTIVATE_SCENE: _SCRIPT_SCENE_SCHEMA,
-    SCRIPT_ACTION_REPEAT: _SCRIPT_REPEAT_SCHEMA,
+    SCRIPT_ACTION_CALL_SERVICE: SERVICE_SCHEMA,
+    SCRIPT_ACTION_CHECK_CONDITION: CONDITION_ACTION_SCHEMA,
     SCRIPT_ACTION_CHOOSE: _SCRIPT_CHOOSE_SCHEMA,
-    SCRIPT_ACTION_WAIT_FOR_TRIGGER: _SCRIPT_WAIT_FOR_TRIGGER_SCHEMA,
-    SCRIPT_ACTION_VARIABLES: _SCRIPT_SET_SCHEMA,
-    SCRIPT_ACTION_STOP: _SCRIPT_STOP_SCHEMA,
+    SCRIPT_ACTION_DELAY: _SCRIPT_DELAY_SCHEMA,
+    SCRIPT_ACTION_DEVICE_AUTOMATION: DEVICE_ACTION_SCHEMA,
+    SCRIPT_ACTION_FIRE_EVENT: EVENT_SCHEMA,
     SCRIPT_ACTION_IF: _SCRIPT_IF_SCHEMA,
     SCRIPT_ACTION_PARALLEL: _SCRIPT_PARALLEL_SCHEMA,
+    SCRIPT_ACTION_REPEAT: _SCRIPT_REPEAT_SCHEMA,
+    SCRIPT_ACTION_SEQUENCE: _SCRIPT_SEQUENCE_SCHEMA,
+    SCRIPT_ACTION_SET_CONVERSATION_RESPONSE: _SCRIPT_SET_CONVERSATION_RESPONSE_SCHEMA,
+    SCRIPT_ACTION_STOP: _SCRIPT_STOP_SCHEMA,
+    SCRIPT_ACTION_VARIABLES: _SCRIPT_SET_SCHEMA,
+    SCRIPT_ACTION_WAIT_FOR_TRIGGER: _SCRIPT_WAIT_FOR_TRIGGER_SCHEMA,
+    SCRIPT_ACTION_WAIT_TEMPLATE: _SCRIPT_WAIT_TEMPLATE_SCHEMA,
 }
 
 
-currency = vol.In(
+currency = probatio.In(
     currencies.ACTIVE_CURRENCIES, msg="invalid ISO 4217 formatted currency"
 )
 
-historic_currency = vol.In(
+historic_currency = probatio.In(
     currencies.HISTORIC_CURRENCIES, msg="invalid ISO 4217 formatted historic currency"
 )
+
+country = probatio.In(COUNTRIES, msg="invalid ISO 3166 formatted country")
+
+language = probatio.In(LANGUAGES, msg="invalid RFC 5646 formatted language")
+
+
+async def async_validate(
+    hass: HomeAssistant, validator: Callable[[Any], Any], value: Any
+) -> Any:
+    """Async friendly schema validation.
+
+    If a validator decorated with @not_async_friendly is called, validation will be
+    deferred to an executor. If not, validation will happen in the event loop.
+    """
+    _validating_async.set(True)
+    try:
+        return validator(value)
+    except MustValidateInExecutor:
+        return await hass.async_add_executor_job(
+            _validate_in_executor, hass, validator, value
+        )
+    finally:
+        _validating_async.set(False)
+
+
+def _validate_in_executor(
+    hass: HomeAssistant, validator: Callable[[Any], Any], value: Any
+) -> Any:
+    _hass.hass = hass
+    try:
+        return validator(value)
+    finally:
+        _hass.hass = None

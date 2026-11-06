@@ -1,16 +1,19 @@
 {
   "domain": "yamaha_musiccast",
   "name": "MusicCast",
+  "categories": ["media_entertainment.speakers_audio"],
+  "codeowners": ["@vigonotion", "@micha91"],
   "config_flow": true,
+  "connectivity": ["network"],
+  "dependencies": ["ssdp"],
   "documentation": "https://www.home-assistant.io/integrations/yamaha_musiccast",
-  "requirements": ["aiomusiccast==0.14.4"],
+  "integration_type": "device",
+  "iot_class": "local_push",
+  "loggers": ["aiomusiccast"],
+  "requirements": ["aiomusiccast==0.15.0"],
   "ssdp": [
     {
       "manufacturer": "Yamaha Corporation"
     }
-  ],
-  "dependencies": ["ssdp"],
-  "iot_class": "local_push",
-  "codeowners": ["@vigonotion", "@micha91"],
-  "loggers": ["aiomusiccast"]
+  ]
 }

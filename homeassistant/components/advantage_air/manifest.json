@@ -1,11 +1,13 @@
 {
   "domain": "advantage_air",
   "name": "Advantage Air",
-  "config_flow": true,
-  "documentation": "https://www.home-assistant.io/integrations/advantage_air",
+  "categories": ["climate.heat_pumps_air_conditioning"],
   "codeowners": ["@Bre77"],
-  "requirements": ["advantage_air==0.4.1"],
-  "quality_scale": "platinum",
+  "config_flow": true,
+  "connectivity": ["network"],
+  "documentation": "https://www.home-assistant.io/integrations/advantage_air",
+  "integration_type": "hub",
   "iot_class": "local_polling",
-  "loggers": ["advantage_air"]
+  "loggers": ["advantage_air"],
+  "requirements": ["advantage-air==0.4.4"]
 }

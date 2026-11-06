@@ -1,32 +1,30 @@
 """Support for Fibaro sensors."""
-from __future__ import annotations
 
 from contextlib import suppress
-from typing import Any
+from typing import override
+
+from pyfibaro.fibaro_device import DeviceModel
 
 from homeassistant.components.sensor import (
-    ENTITY_ID_FORMAT,
     SensorDeviceClass,
     SensorEntity,
     SensorEntityDescription,
     SensorStateClass,
 )
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
-    CONCENTRATION_PARTS_PER_MILLION,
     LIGHT_LUX,
-    PERCENTAGE,
     Platform,
     UnitOfEnergy,
     UnitOfPower,
+    UnitOfRatio,
     UnitOfTemperature,
 )
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.util import convert
 
-from . import FIBARO_DEVICES, FibaroDevice
-from .const import DOMAIN
+from . import FibaroConfigEntry, FibaroController
+from .entity import FibaroEntity
 
 # List of known sensors which represents a fibaro device
 MAIN_SENSOR_TYPES: dict[str, SensorEntityDescription] = {
@@ -39,20 +37,20 @@ MAIN_SENSOR_TYPES: dict[str, SensorEntityDescription] = {
     "com.fibaro.smokeSensor": SensorEntityDescription(
         key="com.fibaro.smokeSensor",
         name="Smoke",
-        native_unit_of_measurement=CONCENTRATION_PARTS_PER_MILLION,
+        native_unit_of_measurement=UnitOfRatio.PARTS_PER_MILLION,
         icon="mdi:fire",
     ),
     "CO2": SensorEntityDescription(
         key="CO2",
         name="CO2",
-        native_unit_of_measurement=CONCENTRATION_PARTS_PER_MILLION,
+        native_unit_of_measurement=UnitOfRatio.PARTS_PER_MILLION,
         device_class=SensorDeviceClass.CO2,
         state_class=SensorStateClass.MEASUREMENT,
     ),
     "com.fibaro.humiditySensor": SensorEntityDescription(
         key="com.fibaro.humiditySensor",
         name="Humidity",
-        native_unit_of_measurement=PERCENTAGE,
+        native_unit_of_measurement=UnitOfRatio.PERCENTAGE,
         device_class=SensorDeviceClass.HUMIDITY,
         state_class=SensorStateClass.MEASUREMENT,
     ),
@@ -100,73 +98,93 @@ FIBARO_TO_HASS_UNIT: dict[str, str] = {
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    entry: FibaroConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up the Fibaro controller devices."""
-    entities: list[SensorEntity] = []
 
-    for device in hass.data[DOMAIN][entry.entry_id][FIBARO_DEVICES][Platform.SENSOR]:
-        entity_description = MAIN_SENSOR_TYPES.get(device.type)
+    controller = entry.runtime_data
+    entities: list[SensorEntity] = [
+        FibaroSensor(device, MAIN_SENSOR_TYPES.get(device.type or ""), controller)
+        for device in controller.fibaro_devices[Platform.SENSOR]
+        # Some sensor devices do not have a value but report power or energy.
+        # These sensors are added to the sensor list but need to be excluded
+        # here as the FibaroSensor expects a value. One example is the
+        # Qubino 3 phase power meter.
+        if device.value.has_value
+    ]
 
-        # main sensors are created even if the entity type is not known
-        entities.append(FibaroSensor(device, entity_description))
-
-    for platform in (Platform.COVER, Platform.LIGHT, Platform.SENSOR, Platform.SWITCH):
-        for device in hass.data[DOMAIN][entry.entry_id][FIBARO_DEVICES][platform]:
-            for entity_description in ADDITIONAL_SENSOR_TYPES:
-                if entity_description.key in device.properties:
-                    entities.append(FibaroAdditionalSensor(device, entity_description))
+    entities.extend(
+        FibaroAdditionalSensor(device, entity_description, controller)
+        for platform in (
+            Platform.BINARY_SENSOR,
+            Platform.CLIMATE,
+            Platform.COVER,
+            Platform.LIGHT,
+            Platform.LOCK,
+            Platform.SENSOR,
+            Platform.SWITCH,
+        )
+        for device in controller.fibaro_devices[platform]
+        for entity_description in ADDITIONAL_SENSOR_TYPES
+        if entity_description.key in device.properties
+    )
 
     async_add_entities(entities, True)
 
 
-class FibaroSensor(FibaroDevice, SensorEntity):
+class FibaroSensor(FibaroEntity, SensorEntity):
     """Representation of a Fibaro Sensor."""
 
     def __init__(
-        self, fibaro_device: Any, entity_description: SensorEntityDescription | None
+        self,
+        fibaro_device: DeviceModel,
+        entity_description: SensorEntityDescription | None,
+        controller: FibaroController,
     ) -> None:
         """Initialize the sensor."""
-        super().__init__(fibaro_device)
+        super().__init__(fibaro_device, controller)
         if entity_description is not None:
             self.entity_description = entity_description
-        self.entity_id = ENTITY_ID_FORMAT.format(self.ha_id)
 
         # Map unit if it was not defined in the entity description
         # or there is no entity description at all
         with suppress(KeyError, ValueError):
-            if not self.native_unit_of_measurement:
+            if not self.native_unit_of_measurement and fibaro_device.unit:
                 self._attr_native_unit_of_measurement = FIBARO_TO_HASS_UNIT.get(
-                    fibaro_device.properties.unit, fibaro_device.properties.unit
+                    fibaro_device.unit, fibaro_device.unit
                 )
 
+    @override
     def update(self) -> None:
         """Update the state."""
-        with suppress(KeyError, ValueError):
-            self._attr_native_value = float(self.fibaro_device.properties.value)
+        super().update()
+        with suppress(TypeError):
+            self._attr_native_value = self.fibaro_device.value.float_value()
 
 
-class FibaroAdditionalSensor(FibaroDevice, SensorEntity):
+class FibaroAdditionalSensor(FibaroEntity, SensorEntity):
     """Representation of a Fibaro Additional Sensor."""
 
     def __init__(
-        self, fibaro_device: Any, entity_description: SensorEntityDescription
+        self,
+        fibaro_device: DeviceModel,
+        entity_description: SensorEntityDescription,
+        controller: FibaroController,
     ) -> None:
         """Initialize the sensor."""
-        super().__init__(fibaro_device)
+        super().__init__(fibaro_device, controller)
         self.entity_description = entity_description
 
         # To differentiate additional sensors from main sensors they need
         # to get different names and ids
-        self.entity_id = ENTITY_ID_FORMAT.format(
-            f"{self.ha_id}_{entity_description.key}"
-        )
-        self._attr_name = f"{fibaro_device.friendly_name} {entity_description.name}"
-        self._attr_unique_id = f"{fibaro_device.unique_id_str}_{entity_description.key}"
+        self._attr_name = f"{self._attr_name} {entity_description.name}"
+        self._attr_unique_id = f"{self._attr_unique_id}_{entity_description.key}"
 
+    @override
     def update(self) -> None:
         """Update the state."""
+        super().update()
         with suppress(KeyError, ValueError):
             self._attr_native_value = convert(
                 self.fibaro_device.properties[self.entity_description.key],

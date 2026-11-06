@@ -1,53 +1,87 @@
 """Support for Rituals Perfume Genie binary sensors."""
-from __future__ import annotations
 
-from pyrituals import Diffuser
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import override
+
+from ritualsgenie import RitualsGenieHub, RitualsGenieSensors, Sensor
 
 from homeassistant.components.binary_sensor import (
     BinarySensorDeviceClass,
     BinarySensorEntity,
+    BinarySensorEntityDescription,
 )
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity import EntityCategory
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.const import EntityCategory
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from . import RitualsDataUpdateCoordinator
-from .const import COORDINATORS, DEVICES, DOMAIN
-from .entity import DiffuserEntity
+from .coordinator import RitualsConfigEntry
+from .entity import DiffuserSensorsEntity, async_add_diffusers
 
-CHARGING_SUFFIX = " Battery Charging"
+PARALLEL_UPDATES = 0
+
+
+@dataclass(frozen=True, kw_only=True)
+class RitualsBinarySensorEntityDescription(BinarySensorEntityDescription):
+    """Class describing Rituals binary sensor entities."""
+
+    is_on_fn: Callable[[RitualsGenieSensors], bool | None]
+    has_fn: Callable[[RitualsGenieHub], bool]
+    sensor: Sensor
+
+
+ENTITY_DESCRIPTIONS = (
+    RitualsBinarySensorEntityDescription(
+        key="charging",
+        device_class=BinarySensorDeviceClass.BATTERY_CHARGING,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        is_on_fn=lambda sensors: sensors.battery_charging,
+        has_fn=lambda hub: hub.has_battery,
+        sensor=Sensor.BATTERY,
+    ),
+    RitualsBinarySensorEntityDescription(
+        key="cartridge",
+        translation_key="cartridge",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        is_on_fn=lambda sensors: sensors.has_cartridge,
+        has_fn=lambda _: True,
+        sensor=Sensor.PERFUME,
+    ),
+)
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    config_entry: RitualsConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up the diffuser binary sensors."""
-    diffusers = hass.data[DOMAIN][config_entry.entry_id][DEVICES]
-    coordinators = hass.data[DOMAIN][config_entry.entry_id][COORDINATORS]
+    runtime_data = config_entry.runtime_data
 
-    async_add_entities(
-        DiffuserBatteryChargingBinarySensor(diffuser, coordinators[hublot])
-        for hublot, diffuser in diffusers.items()
-        if diffuser.has_battery
-    )
+    @callback
+    def add_diffusers(hublots: list[str]) -> None:
+        async_add_entities(
+            RitualsBinarySensorEntity(
+                runtime_data.sensors[hublot], description, description.sensor
+            )
+            for hublot in hublots
+            for description in ENTITY_DESCRIPTIONS
+            if description.has_fn(runtime_data.hubs.data[hublot])
+        )
+
+    async_add_diffusers(config_entry, add_diffusers)
 
 
-class DiffuserBatteryChargingBinarySensor(DiffuserEntity, BinarySensorEntity):
-    """Representation of a diffuser battery charging binary sensor."""
+class RitualsBinarySensorEntity(DiffuserSensorsEntity, BinarySensorEntity):
+    """Defines a Rituals binary sensor entity."""
 
-    _attr_device_class = BinarySensorDeviceClass.BATTERY_CHARGING
-    _attr_entity_category = EntityCategory.DIAGNOSTIC
-
-    def __init__(
-        self, diffuser: Diffuser, coordinator: RitualsDataUpdateCoordinator
-    ) -> None:
-        """Initialize the battery charging binary sensor."""
-        super().__init__(diffuser, coordinator, CHARGING_SUFFIX)
+    entity_description: RitualsBinarySensorEntityDescription
 
     @property
-    def is_on(self) -> bool:
-        """Return the state of the battery charging binary sensor."""
-        return self._diffuser.charging
+    @override
+    def is_on(self) -> bool | None:
+        """Return the state of the binary sensor."""
+        if self.coordinator.data is None:
+            return None
+
+        return self.entity_description.is_on_fn(self.coordinator.data)

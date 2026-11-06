@@ -1,9 +1,15 @@
 {
   "domain": "snmp",
   "name": "SNMP",
-  "documentation": "https://www.home-assistant.io/integrations/snmp",
-  "requirements": ["pysnmplib==5.0.15"],
+  "categories": [
+    "computers_network.monitoring",
+    "presence_location.network_presence"
+  ],
   "codeowners": [],
+  "connectivity": ["network"],
+  "documentation": "https://www.home-assistant.io/integrations/snmp",
   "iot_class": "local_polling",
-  "loggers": ["pyasn1", "pysmi", "pysnmp"]
+  "loggers": ["pyasn1", "pysmi", "pysnmp"],
+  "quality_scale": "legacy",
+  "requirements": ["pysnmp==7.1.27"]
 }

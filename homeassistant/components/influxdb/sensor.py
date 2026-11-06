@@ -1,11 +1,10 @@
 """InfluxDB component which allows you to get data from an Influx database."""
-from __future__ import annotations
 
-import datetime
+import datetime as dt
 import logging
-from typing import Final
+from typing import Final, override
 
-import voluptuous as vol
+import probatio
 
 from homeassistant.components.sensor import (
     PLATFORM_SCHEMA as SENSOR_PLATFORM_SCHEMA,
@@ -13,16 +12,16 @@ from homeassistant.components.sensor import (
 )
 from homeassistant.const import (
     CONF_API_VERSION,
+    CONF_LANGUAGE,
     CONF_NAME,
     CONF_UNIQUE_ID,
     CONF_UNIT_OF_MEASUREMENT,
     CONF_VALUE_TEMPLATE,
     EVENT_HOMEASSISTANT_STOP,
-    STATE_UNKNOWN,
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import PlatformNotReady, TemplateError
-import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 from homeassistant.util import Throttle
@@ -36,7 +35,6 @@ from .const import (
     CONF_FIELD,
     CONF_GROUP_FUNCTION,
     CONF_IMPORTS,
-    CONF_LANGUAGE,
     CONF_MEASUREMENT_NAME,
     CONF_QUERIES,
     CONF_QUERIES_FLUX,
@@ -68,7 +66,7 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-SCAN_INTERVAL: Final = datetime.timedelta(seconds=60)
+SCAN_INTERVAL: Final = dt.timedelta(seconds=60)
 
 
 def _merge_connection_config_into_query(conf, query):
@@ -82,8 +80,9 @@ def validate_query_format_for_version(conf: dict) -> dict:
     """Ensure queries are provided in correct format based on API version."""
     if conf[CONF_API_VERSION] == API_VERSION_2:
         if CONF_QUERIES_FLUX not in conf:
-            raise vol.Invalid(
-                f"{CONF_QUERIES_FLUX} is required when {CONF_API_VERSION} is {API_VERSION_2}"
+            raise probatio.Invalid(
+                f"{CONF_QUERIES_FLUX} is required when {CONF_API_VERSION} is"
+                f" {API_VERSION_2}"
             )
 
         for query in conf[CONF_QUERIES_FLUX]:
@@ -94,8 +93,9 @@ def validate_query_format_for_version(conf: dict) -> dict:
 
     else:
         if CONF_QUERIES not in conf:
-            raise vol.Invalid(
-                f"{CONF_QUERIES} is required when {CONF_API_VERSION} is {DEFAULT_API_VERSION}"
+            raise probatio.Invalid(
+                f"{CONF_QUERIES} is required when {CONF_API_VERSION} is"
+                f" {DEFAULT_API_VERSION}"
             )
 
         for query in conf[CONF_QUERIES]:
@@ -107,44 +107,50 @@ def validate_query_format_for_version(conf: dict) -> dict:
     return conf
 
 
-_QUERY_SENSOR_SCHEMA = vol.Schema(
+_QUERY_SENSOR_SCHEMA = probatio.Schema(
     {
-        vol.Required(CONF_NAME): cv.string,
-        vol.Optional(CONF_UNIQUE_ID): cv.string,
-        vol.Optional(CONF_VALUE_TEMPLATE): cv.template,
-        vol.Optional(CONF_UNIT_OF_MEASUREMENT): cv.string,
+        probatio.Required(CONF_NAME): cv.string,
+        probatio.Optional(CONF_UNIQUE_ID): cv.string,
+        probatio.Optional(CONF_VALUE_TEMPLATE): cv.template,
+        probatio.Optional(CONF_UNIT_OF_MEASUREMENT): cv.string,
     }
 )
 
 _QUERY_SCHEMA = {
     LANGUAGE_INFLUXQL: _QUERY_SENSOR_SCHEMA.extend(
         {
-            vol.Optional(CONF_DB_NAME): cv.string,
-            vol.Required(CONF_MEASUREMENT_NAME): cv.string,
-            vol.Optional(
+            probatio.Optional(CONF_DB_NAME): cv.string,
+            probatio.Required(CONF_MEASUREMENT_NAME): cv.string,
+            probatio.Optional(
                 CONF_GROUP_FUNCTION, default=DEFAULT_GROUP_FUNCTION
             ): cv.string,
-            vol.Optional(CONF_FIELD, default=DEFAULT_FIELD): cv.string,
-            vol.Required(CONF_WHERE): cv.template,
+            probatio.Optional(CONF_FIELD, default=DEFAULT_FIELD): cv.string,
+            probatio.Required(CONF_WHERE): cv.template,
         }
     ),
     LANGUAGE_FLUX: _QUERY_SENSOR_SCHEMA.extend(
         {
-            vol.Optional(CONF_BUCKET): cv.string,
-            vol.Optional(CONF_RANGE_START, default=DEFAULT_RANGE_START): cv.string,
-            vol.Optional(CONF_RANGE_STOP, default=DEFAULT_RANGE_STOP): cv.string,
-            vol.Required(CONF_QUERY): cv.template,
-            vol.Optional(CONF_IMPORTS): vol.All(cv.ensure_list, [cv.string]),
-            vol.Optional(CONF_GROUP_FUNCTION): cv.string,
+            probatio.Optional(CONF_BUCKET): cv.string,
+            probatio.Optional(CONF_RANGE_START, default=DEFAULT_RANGE_START): cv.string,
+            probatio.Optional(CONF_RANGE_STOP, default=DEFAULT_RANGE_STOP): cv.string,
+            probatio.Required(CONF_QUERY): cv.template,
+            probatio.Optional(CONF_IMPORTS): probatio.All(
+                probatio.EnsureList(), [cv.string]
+            ),
+            probatio.Optional(CONF_GROUP_FUNCTION): cv.string,
         }
     ),
 }
 
-PLATFORM_SCHEMA = vol.All(
+PLATFORM_SCHEMA = probatio.All(
     SENSOR_PLATFORM_SCHEMA.extend(COMPONENT_CONFIG_SCHEMA_CONNECTION).extend(
         {
-            vol.Exclusive(CONF_QUERIES, "queries"): [_QUERY_SCHEMA[LANGUAGE_INFLUXQL]],
-            vol.Exclusive(CONF_QUERIES_FLUX, "queries"): [_QUERY_SCHEMA[LANGUAGE_FLUX]],
+            probatio.Exclusive(CONF_QUERIES, "queries"): [
+                _QUERY_SCHEMA[LANGUAGE_INFLUXQL]
+            ],
+            probatio.Exclusive(CONF_QUERIES_FLUX, "queries"): [
+                _QUERY_SCHEMA[LANGUAGE_FLUX]
+            ],
         }
     ),
     validate_version_specific_config,
@@ -164,7 +170,7 @@ def setup_platform(
         influx = get_influx_connection(config, test_read=True)
     except ConnectionError as exc:
         _LOGGER.error(exc)
-        raise PlatformNotReady() from exc
+        raise PlatformNotReady from exc
 
     entities = []
     if CONF_QUERIES_FLUX in config:
@@ -192,52 +198,46 @@ class InfluxSensor(SensorEntity):
         """Initialize the sensor."""
         self._name = query.get(CONF_NAME)
         self._unit_of_measurement = query.get(CONF_UNIT_OF_MEASUREMENT)
-        value_template = query.get(CONF_VALUE_TEMPLATE)
-        if value_template is not None:
-            self._value_template = value_template
-            self._value_template.hass = hass
-        else:
-            self._value_template = None
+        self._value_template = query.get(CONF_VALUE_TEMPLATE)
         self._state = None
         self._hass = hass
         self._attr_unique_id = query.get(CONF_UNIQUE_ID)
 
         if query[CONF_LANGUAGE] == LANGUAGE_FLUX:
-            query_clause = query.get(CONF_QUERY)
-            query_clause.hass = hass
             self.data = InfluxFluxSensorData(
                 influx,
                 query.get(CONF_BUCKET),
                 query.get(CONF_RANGE_START),
                 query.get(CONF_RANGE_STOP),
-                query_clause,
+                query.get(CONF_QUERY),
                 query.get(CONF_IMPORTS),
                 query.get(CONF_GROUP_FUNCTION),
             )
 
         else:
-            where_clause = query.get(CONF_WHERE)
-            where_clause.hass = hass
             self.data = InfluxQLSensorData(
                 influx,
                 query.get(CONF_DB_NAME),
                 query.get(CONF_GROUP_FUNCTION),
                 query.get(CONF_FIELD),
                 query.get(CONF_MEASUREMENT_NAME),
-                where_clause,
+                query.get(CONF_WHERE),
             )
 
     @property
+    @override
     def name(self):
         """Return the name of the sensor."""
         return self._name
 
     @property
+    @override
     def native_value(self):
         """Return the state of the sensor."""
         return self._state
 
     @property
+    @override
     def native_unit_of_measurement(self):
         """Return the unit of measurement of this entity, if any."""
         return self._unit_of_measurement
@@ -246,10 +246,10 @@ class InfluxSensor(SensorEntity):
         """Get the latest data from Influxdb and updates the states."""
         self.data.update()
         if (value := self.data.value) is None:
-            value = STATE_UNKNOWN
+            value = None
         if self._value_template is not None:
             value = self._value_template.render_with_possible_json_value(
-                str(value), STATE_UNKNOWN
+                str(value), None
             )
 
         self._state = value
@@ -270,7 +270,10 @@ class InfluxFluxSensorData:
         self.value = None
         self.full_query = None
 
-        self.query_prefix = f'from(bucket:"{bucket}") |> range(start: {range_start}, stop: {range_stop}) |>'
+        self.query_prefix = (
+            f'from(bucket:"{bucket}") |> range(start: {range_start}, stop:'
+            f" {range_stop}) |>"
+        )
         if imports is not None:
             for i in imports:
                 self.query_prefix = f'import "{i}" {self.query_prefix}'
@@ -334,7 +337,10 @@ class InfluxQLSensorData:
             _LOGGER.error(RENDERING_WHERE_ERROR_MESSAGE, ex)
             return
 
-        self.query = f"select {self.group}({self.field}) as {INFLUX_CONF_VALUE} from {self.measurement} where {where_clause}"
+        self.query = (
+            f"select {self.group}({self.field}) as {INFLUX_CONF_VALUE} from"  # noqa: S608
+            f" {self.measurement} where {where_clause}"
+        )
 
         _LOGGER.debug(RUNNING_QUERY_MESSAGE, self.query)
 

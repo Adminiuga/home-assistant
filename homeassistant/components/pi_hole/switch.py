@@ -1,58 +1,39 @@
 """Support for turning on and off Pi-hole system."""
-from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, override
 
 from hole.exceptions import HoleError
-import voluptuous as vol
 
 from homeassistant.components.switch import SwitchEntity
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_NAME
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers import config_validation as cv, entity_platform
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from . import PiHoleEntity
-from .const import (
-    DATA_KEY_API,
-    DATA_KEY_COORDINATOR,
-    DOMAIN as PIHOLE_DOMAIN,
-    SERVICE_DISABLE,
-    SERVICE_DISABLE_ATTR_DURATION,
-)
+from .const import DOMAIN
+from .coordinator import PiHoleConfigEntry
+from .entity import PiHoleEntity
 
 _LOGGER = logging.getLogger(__name__)
 
 
 async def async_setup_entry(
-    hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
+    hass: HomeAssistant,
+    entry: PiHoleConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up the Pi-hole switch."""
-    name = entry.data[CONF_NAME]
-    hole_data = hass.data[PIHOLE_DOMAIN][entry.entry_id]
+    name = entry.title
+    hole_data = entry.runtime_data
     switches = [
         PiHoleSwitch(
-            hole_data[DATA_KEY_API],
-            hole_data[DATA_KEY_COORDINATOR],
+            hole_data.api,
+            hole_data.coordinator,
             name,
             entry.entry_id,
         )
     ]
     async_add_entities(switches, True)
-
-    # register service
-    platform = entity_platform.async_get_current_platform()
-    platform.async_register_entity_service(
-        SERVICE_DISABLE,
-        {
-            vol.Required(SERVICE_DISABLE_ATTR_DURATION): vol.All(
-                cv.time_period_str, cv.positive_timedelta
-            ),
-        },
-        "async_disable",
-    )
 
 
 class PiHoleSwitch(PiHoleEntity, SwitchEntity):
@@ -61,28 +42,37 @@ class PiHoleSwitch(PiHoleEntity, SwitchEntity):
     _attr_icon = "mdi:pi-hole"
 
     @property
+    @override
     def name(self) -> str:
         """Return the name of the switch."""
         return self._name
 
     @property
+    @override
     def unique_id(self) -> str:
         """Return the unique id of the switch."""
         return f"{self._server_unique_id}/Switch"
 
     @property
+    @override
     def is_on(self) -> bool:
         """Return if the service is on."""
-        return self.api.data.get("status") == "enabled"  # type: ignore[no-any-return]
+        return self.api.status == "enabled"  # type: ignore[no-any-return]
 
+    @override
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn on the service."""
         try:
             await self.api.enable()
             await self.async_update()
         except HoleError as err:
-            _LOGGER.error("Unable to enable Pi-hole: %s", err)
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="enable_failed",
+                translation_placeholders={"error": str(err)},
+            ) from err
 
+    @override
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn off the service."""
         await self.async_disable()
@@ -102,4 +92,8 @@ class PiHoleSwitch(PiHoleEntity, SwitchEntity):
             await self.api.disable(duration_seconds)
             await self.async_update()
         except HoleError as err:
-            _LOGGER.error("Unable to disable Pi-hole: %s", err)
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="disable_failed",
+                translation_placeholders={"error": str(err)},
+            ) from err

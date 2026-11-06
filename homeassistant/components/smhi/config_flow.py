@@ -1,16 +1,18 @@
 """Config flow to configure SMHI component."""
-from __future__ import annotations
 
-from typing import Any
+from typing import Any, override
 
-from smhi.smhi_lib import Smhi, SmhiForecastException
-import voluptuous as vol
+import probatio
+from pysmhi import SmhiForecastException, SMHIPointForecast
 
-from homeassistant import config_entries
-from homeassistant.const import CONF_LATITUDE, CONF_LOCATION, CONF_LONGITUDE, CONF_NAME
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.const import CONF_LATITUDE, CONF_LOCATION, CONF_LONGITUDE
 from homeassistant.core import HomeAssistant
-from homeassistant.data_entry_flow import FlowResult
-from homeassistant.helpers import aiohttp_client
+from homeassistant.helpers import (
+    aiohttp_client,
+    device_registry as dr,
+    entity_registry as er,
+)
 from homeassistant.helpers.selector import LocationSelector
 
 from .const import DEFAULT_NAME, DOMAIN, HOME_LOCATION_NAME
@@ -21,23 +23,24 @@ async def async_check_location(
 ) -> bool:
     """Return true if location is ok."""
     session = aiohttp_client.async_get_clientsession(hass)
-    smhi_api = Smhi(longitude, latitude, session=session)
+    smhi_api = SMHIPointForecast(str(longitude), str(latitude), session=session)
     try:
-        await smhi_api.async_get_forecast()
+        await smhi_api.async_get_daily_forecast()
     except SmhiForecastException:
         return False
 
     return True
 
 
-class SmhiFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
+class SmhiFlowHandler(ConfigFlow, domain=DOMAIN):
     """Config flow for SMHI component."""
 
-    VERSION = 2
+    VERSION = 3
 
+    @override
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle a flow initialized by the user."""
 
         errors: dict[str, str] = {}
@@ -53,10 +56,6 @@ class SmhiFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
                 ):
                     name = HOME_LOCATION_NAME
 
-                user_input[CONF_NAME] = (
-                    HOME_LOCATION_NAME if name == HOME_LOCATION_NAME else DEFAULT_NAME
-                )
-
                 await self.async_set_unique_id(f"{lat}-{lon}")
                 self._abort_if_unique_id_configured()
                 return self.async_create_entry(title=name, data=user_input)
@@ -69,8 +68,75 @@ class SmhiFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         }
         return self.async_show_form(
             step_id="user",
-            data_schema=vol.Schema(
-                {vol.Required(CONF_LOCATION, default=home_location): LocationSelector()}
+            data_schema=probatio.Schema(
+                {
+                    probatio.Required(
+                        CONF_LOCATION, default=home_location
+                    ): LocationSelector()
+                }
             ),
             errors=errors,
+        )
+
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle a reconfiguration flow initialized by the user."""
+        errors: dict[str, str] = {}
+        reconfigure_entry = self._get_reconfigure_entry()
+
+        if user_input is not None:
+            lat: float = user_input[CONF_LOCATION][CONF_LATITUDE]
+            lon: float = user_input[CONF_LOCATION][CONF_LONGITUDE]
+            if await async_check_location(self.hass, lon, lat):
+                unique_id = f"{lat}-{lon}"
+                await self.async_set_unique_id(unique_id)
+                self._abort_if_unique_id_configured()
+
+                old_lat = reconfigure_entry.data[CONF_LOCATION][CONF_LATITUDE]
+                old_lon = reconfigure_entry.data[CONF_LOCATION][CONF_LONGITUDE]
+
+                old_id = f"{old_lat}, {old_lon}"
+                new_id = f"{lat}, {lon}"
+
+                # Sensor unique IDs are the location followed by "-<key>"
+                entity_reg = er.async_get(self.hass)
+                for entity_entry in er.async_entries_for_config_entry(
+                    entity_reg, reconfigure_entry.entry_id
+                ):
+                    if entity_entry.unique_id == old_id or (
+                        entity_entry.unique_id.startswith(f"{old_id}-")
+                    ):
+                        new_unique_id = new_id + entity_entry.unique_id.removeprefix(
+                            old_id
+                        )
+                        # A stale entity of an earlier location can hold it already
+                        if not entity_reg.async_get_entity_id(
+                            entity_entry.domain, DOMAIN, new_unique_id
+                        ):
+                            entity_reg.async_update_entity(
+                                entity_entry.entity_id, new_unique_id=new_unique_id
+                            )
+
+                device_reg = dr.async_get(self.hass)
+                if device := device_reg.async_get_device_by_identifier(
+                    (DOMAIN, old_id), reconfigure_entry.entry_id
+                ):
+                    device_reg.async_update_device(
+                        device.id, new_identifiers={(DOMAIN, new_id)}
+                    )
+
+                return self.async_update_reload_and_abort(
+                    reconfigure_entry,
+                    unique_id=unique_id,
+                    data_updates=user_input,
+                )
+            errors["base"] = "wrong_location"
+
+        schema = self.add_suggested_values_to_schema(
+            probatio.Schema({probatio.Required(CONF_LOCATION): LocationSelector()}),
+            reconfigure_entry.data,
+        )
+        return self.async_show_form(
+            step_id="reconfigure", data_schema=schema, errors=errors
         )

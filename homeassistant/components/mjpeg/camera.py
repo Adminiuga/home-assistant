@@ -1,15 +1,14 @@
 """Support for IP Cameras."""
-from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterable
-from contextlib import closing
+from collections.abc import AsyncIterator
+from contextlib import suppress
+from typing import override
 
 import aiohttp
 from aiohttp import web
-import async_timeout
-import requests
-from requests.auth import HTTPBasicAuth, HTTPDigestAuth
+import httpx2
+from yarl import URL
 
 from homeassistant.components.camera import Camera
 from homeassistant.config_entries import ConfigEntry
@@ -22,20 +21,25 @@ from homeassistant.const import (
     HTTP_DIGEST_AUTHENTICATION,
 )
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.aiohttp_client import (
     async_aiohttp_proxy_web,
     async_get_clientsession,
 )
-from homeassistant.helpers.entity import DeviceInfo
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.httpx_client import get_async_client
 
-from .const import CONF_MJPEG_URL, CONF_STILL_IMAGE_URL, DOMAIN, LOGGER
+from .const import CONF_MJPEG_URL, CONF_STILL_IMAGE_URL, DOMAIN
+
+TIMEOUT = 10
+BUFFER_SIZE = 102400
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up a MJPEG IP Camera based on a config entry."""
     async_add_entities(
@@ -58,11 +62,11 @@ async def async_setup_entry(
     )
 
 
-def extract_image_from_mjpeg(stream: Iterable[bytes]) -> bytes | None:
+async def async_extract_image_from_mjpeg(stream: AsyncIterator[bytes]) -> bytes | None:
     """Take in a MJPEG stream object, return the jpg from it."""
     data = b""
 
-    for chunk in stream:
+    async for chunk in stream:
         data += chunk
         jpg_end = data.find(b"\xff\xd9")
 
@@ -104,13 +108,17 @@ class MjpegCamera(Camera):
         self._mjpeg_url = mjpeg_url
         self._still_image_url = still_image_url
 
-        self._auth = None
+        self._auth_headers: dict[str, str] | None = None
         if (
             self._username
             and self._password
             and self._authentication == HTTP_BASIC_AUTHENTICATION
         ):
-            self._auth = aiohttp.BasicAuth(self._username, password=self._password)
+            self._auth_headers = {
+                "Authorization": aiohttp.encode_basic_auth(
+                    self._username, self._password
+                )
+            }
         self._verify_ssl = verify_ssl
 
         if unique_id is not None:
@@ -118,68 +126,121 @@ class MjpegCamera(Camera):
         if device_info is not None:
             self._attr_device_info = device_info
 
+    @override
+    async def stream_source(self) -> str:
+        """Return the stream source."""
+        url = URL(self._mjpeg_url)
+        if self._username:
+            url = url.with_user(self._username)
+        if self._password:
+            url = url.with_password(self._password)
+        return str(url)
+
+    @override
     async def async_camera_image(
         self, width: int | None = None, height: int | None = None
     ) -> bytes | None:
         """Return a still image response from the camera."""
-        # DigestAuth is not supported
         if (
             self._authentication == HTTP_DIGEST_AUTHENTICATION
             or self._still_image_url is None
         ):
-            image = await self.hass.async_add_executor_job(self.camera_image)
-            return image
+            return await self._async_digest_or_fallback_camera_image()
 
         websession = async_get_clientsession(self.hass, verify_ssl=self._verify_ssl)
         try:
-            async with async_timeout.timeout(10):
-                response = await websession.get(self._still_image_url, auth=self._auth)
+            async with asyncio.timeout(TIMEOUT):
+                response = await websession.get(
+                    self._still_image_url, headers=self._auth_headers
+                )
 
-                image = await response.read()
-                return image
+                return await response.read()
 
-        except asyncio.TimeoutError:
-            LOGGER.error("Timeout getting camera image from %s", self.name)
+        except TimeoutError as err:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="timeout_getting_image",
+                translation_placeholders={"name": str(self.name)},
+            ) from err
 
         except aiohttp.ClientError as err:
-            LOGGER.error("Error getting new camera image from %s: %s", self.name, err)
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="error_getting_image",
+                translation_placeholders={"name": str(self.name)},
+            ) from err
 
-        return None
+    def _get_httpx_auth(self) -> httpx2.Auth:
+        """Return a httpx auth object."""
+        username = "" if self._username is None else self._username
+        digest_auth = self._authentication == HTTP_DIGEST_AUTHENTICATION
+        cls = httpx2.DigestAuth if digest_auth else httpx2.BasicAuth
+        return cls(username, self._password)
 
-    def camera_image(
-        self, width: int | None = None, height: int | None = None
-    ) -> bytes | None:
-        """Return a still image response from the camera."""
-        if self._username and self._password:
-            if self._authentication == HTTP_DIGEST_AUTHENTICATION:
-                auth: HTTPDigestAuth | HTTPBasicAuth = HTTPDigestAuth(
-                    self._username, self._password
+    async def _async_digest_or_fallback_camera_image(self) -> bytes | None:
+        """Return a still image response from the camera using digest authentication."""
+        client = get_async_client(self.hass, verify_ssl=self._verify_ssl)
+        auth = self._get_httpx_auth()
+        try:
+            if self._still_image_url:
+                # Fallback to MJPEG stream if still image URL is not available
+                with suppress(TimeoutError, httpx2.HTTPError):
+                    return (
+                        await client.get(
+                            self._still_image_url, auth=auth, timeout=TIMEOUT
+                        )
+                    ).content
+
+            async with client.stream(
+                "get", self._mjpeg_url, auth=auth, timeout=TIMEOUT
+            ) as stream:
+                return await async_extract_image_from_mjpeg(
+                    stream.aiter_bytes(BUFFER_SIZE)
                 )
-            else:
-                auth = HTTPBasicAuth(self._username, self._password)
-            req = requests.get(
-                self._mjpeg_url,
-                auth=auth,
-                stream=True,
-                timeout=10,
-                verify=self._verify_ssl,
-            )
-        else:
-            req = requests.get(self._mjpeg_url, stream=True, timeout=10)
 
-        with closing(req) as response:
-            return extract_image_from_mjpeg(response.iter_content(102400))
+        except (TimeoutError, httpx2.TimeoutException) as err:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="timeout_getting_image",
+                translation_placeholders={"name": str(self.name)},
+            ) from err
 
+        except httpx2.HTTPError as err:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="error_getting_image",
+                translation_placeholders={"name": str(self.name)},
+            ) from err
+
+    async def _handle_async_mjpeg_digest_stream(
+        self, request: web.Request
+    ) -> web.StreamResponse | None:
+        """Generate an HTTP MJPEG stream from the camera using digest authentication."""
+        async with get_async_client(self.hass, verify_ssl=self._verify_ssl).stream(
+            "get", self._mjpeg_url, auth=self._get_httpx_auth(), timeout=TIMEOUT
+        ) as stream:
+            response = web.StreamResponse(headers=stream.headers)
+            await response.prepare(request)
+            # Stream until we are done or client disconnects
+            with suppress(TimeoutError, httpx2.HTTPError):
+                async for chunk in stream.aiter_bytes(BUFFER_SIZE):
+                    if not self.hass.is_running:
+                        break
+                    async with asyncio.timeout(TIMEOUT):
+                        await response.write(chunk)
+        return response
+
+    @override
     async def handle_async_mjpeg_stream(
         self, request: web.Request
     ) -> web.StreamResponse | None:
         """Generate an HTTP MJPEG stream from the camera."""
-        # aiohttp don't support DigestAuth -> Fallback
+        # aiohttp don't support DigestAuth so we use httpx
         if self._authentication == HTTP_DIGEST_AUTHENTICATION:
-            return await super().handle_async_mjpeg_stream(request)
+            return await self._handle_async_mjpeg_digest_stream(request)
 
         # connect to stream
         websession = async_get_clientsession(self.hass, verify_ssl=self._verify_ssl)
-        stream_coro = websession.get(self._mjpeg_url, auth=self._auth)
+        stream_coro = websession.get(self._mjpeg_url, headers=self._auth_headers)
 
         return await async_aiohttp_proxy_web(self.hass, request, stream_coro)

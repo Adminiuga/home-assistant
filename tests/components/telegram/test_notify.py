@@ -1,45 +1,25 @@
-"""The tests for the telegram.notify platform."""
-from unittest.mock import patch
+"""Tests for the removed Telegram notify platform."""
 
-from homeassistant import config as hass_config
-import homeassistant.components.notify as notify
-from homeassistant.components.telegram import DOMAIN
-from homeassistant.const import SERVICE_RELOAD
+from homeassistant.components import notify
+from homeassistant.components.telegram.notify import DOMAIN
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.setup import async_setup_component
 
-from tests.common import get_fixture_path
 
+async def test_integration_removed_issue(
+    hass: HomeAssistant, issue_registry: ir.IssueRegistry
+) -> None:
+    """Test a YAML notify configuration raises the integration removed issue."""
+    assert await async_setup_component(
+        hass,
+        notify.DOMAIN,
+        {notify.DOMAIN: [{"platform": DOMAIN, "name": DOMAIN, "chat_id": 1}]},
+    )
+    await hass.async_block_till_done()
 
-async def test_reload_notify(hass):
-    """Verify we can reload the notify service."""
-
-    with patch("homeassistant.components.telegram_bot.async_setup", return_value=True):
-        assert await async_setup_component(
-            hass,
-            notify.DOMAIN,
-            {
-                notify.DOMAIN: [
-                    {
-                        "name": DOMAIN,
-                        "platform": DOMAIN,
-                        "chat_id": 1,
-                    },
-                ]
-            },
-        )
-        await hass.async_block_till_done()
-
-    assert hass.services.has_service(notify.DOMAIN, DOMAIN)
-
-    yaml_path = get_fixture_path("configuration.yaml", "telegram")
-    with patch.object(hass_config, "YAML_CONFIG_FILE", yaml_path):
-        await hass.services.async_call(
-            DOMAIN,
-            SERVICE_RELOAD,
-            {},
-            blocking=True,
-        )
-        await hass.async_block_till_done()
-
+    issue = issue_registry.async_get_issue(DOMAIN, DOMAIN)
+    assert issue is not None
+    assert issue.translation_key == "integration_removed"
+    assert issue.severity is ir.IssueSeverity.ERROR
     assert not hass.services.has_service(notify.DOMAIN, DOMAIN)
-    assert hass.services.has_service(notify.DOMAIN, "telegram_reloaded")

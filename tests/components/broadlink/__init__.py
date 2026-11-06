@@ -1,10 +1,14 @@
 """Tests for the Broadlink integration."""
+
 from dataclasses import dataclass
-from unittest.mock import MagicMock, patch
+import inspect
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import broadlink_async as blk
+from pytest_homeassistant.common import MockConfigEntry
 
 from homeassistant.components.broadlink.const import DOMAIN
-
-from tests.common import MockConfigEntry
+from homeassistant.core import HomeAssistant
 
 # Do not edit/remove. Adding is ok.
 BROADLINK_DEVICES = {
@@ -88,7 +92,55 @@ BROADLINK_DEVICES = {
         57,
         5,
     ),
+    "Guest room": (
+        "192.168.0.66",
+        "34ea34b61d2e",
+        "HY02/HY03",
+        "Hysen",
+        "HYS",
+        0x4EAD,
+        10024,
+        5,
+    ),
+    "Study": (
+        "192.168.0.17",
+        "34ea34b61d2f",
+        "RM5 plus",
+        "Broadlink",
+        "RM5PLUS",
+        0x5224,
+        57,
+        5,
+    ),
 }
+
+
+def _async_api_methods() -> frozenset[str]:
+    """Names of every coroutine method on any device class in the library."""
+    names: set[str] = set()
+    for _, cls in inspect.getmembers(blk, inspect.isclass):
+        if issubclass(cls, blk.Device):
+            names.update(
+                name for name, _ in inspect.getmembers(cls, inspect.iscoroutinefunction)
+            )
+    return frozenset(names)
+
+
+ASYNC_API_METHODS = _async_api_methods()
+
+
+def mock_api_base() -> MagicMock:
+    """Return a mock device whose coroutine methods await to plain mocks.
+
+    Attributes such as ``host`` and ``mac`` stay ordinary values; every
+    method that is a coroutine on the real library becomes an ``AsyncMock``
+    returning a ``MagicMock``, so code that reads the result (``data.get``)
+    does not receive another coroutine.
+    """
+    mock_api = MagicMock()
+    for name in ASYNC_API_METHODS:
+        setattr(mock_api, name, AsyncMock(return_value=MagicMock()))
+    return mock_api
 
 
 @dataclass
@@ -104,20 +156,34 @@ class BroadlinkDevice:
     """Representation of a Broadlink device."""
 
     def __init__(
-        self, name, host, mac, model, manufacturer, type_, devtype, fwversion, timeout
-    ):
+        self,
+        name: str,
+        host: str,
+        mac: str,
+        model: str,
+        manufacturer: str,
+        type_: str,
+        devtype: int,
+        fwversion: int,
+        timeout: int,
+    ) -> None:
         """Initialize the device."""
-        self.name: str = name
-        self.host: str = host
-        self.mac: str = mac
-        self.model: str = model
-        self.manufacturer: str = manufacturer
-        self.type: str = type_
-        self.devtype: int = devtype
-        self.timeout: int = timeout
-        self.fwversion: int = fwversion
+        self.name = name
+        self.host = host
+        self.mac = mac
+        self.model = model
+        self.manufacturer = manufacturer
+        self.type = type_
+        self.devtype = devtype
+        self.timeout = timeout
+        self.fwversion = fwversion
 
-    async def setup_entry(self, hass, mock_api=None, mock_entry=None):
+    async def setup_entry(
+        self,
+        hass: HomeAssistant,
+        mock_api: MagicMock | None = None,
+        mock_entry: MockConfigEntry | None = None,
+    ) -> MockSetup:
         """Set up the device."""
         mock_api = mock_api or self.get_mock_api()
         mock_entry = mock_entry or self.get_mock_entry()
@@ -134,7 +200,7 @@ class BroadlinkDevice:
 
     def get_mock_api(self):
         """Return a mock device (API)."""
-        mock_api = MagicMock()
+        mock_api = mock_api_base()
         mock_api.name = self.name
         mock_api.host = (self.host, 80)
         mock_api.mac = bytes.fromhex(self.mac)
@@ -167,6 +233,31 @@ class BroadlinkDevice:
         }
 
 
+class BroadlinkMP1BG1Device(BroadlinkDevice):
+    """Mock device for MP1 and BG1 with special mocking of api return values."""
+
+    def get_mock_api(self):
+        """Return a mock device (API) with support for check_power calls."""
+        mock_api = super().get_mock_api()
+        mock_api.check_power.return_value = {"s1": 0, "s2": 0, "s3": 0, "s4": 0}
+        return mock_api
+
+
+class BroadlinkSP4BDevice(BroadlinkDevice):
+    """Mock device for SP4b with special mocking of api return values."""
+
+    def get_mock_api(self):
+        """Return a mock device (API) with support for get_state calls."""
+        mock_api = super().get_mock_api()
+        mock_api.get_state.return_value = {"pwr": 0}
+        return mock_api
+
+
 def get_device(name):
     """Get a device by name."""
+    dev_type = BROADLINK_DEVICES[name][5]
+    if dev_type == 0x4EB5:
+        return BroadlinkMP1BG1Device(name, *BROADLINK_DEVICES[name])
+    if dev_type == 0x5115:
+        return BroadlinkSP4BDevice(name, *BROADLINK_DEVICES[name])
     return BroadlinkDevice(name, *BROADLINK_DEVICES[name])

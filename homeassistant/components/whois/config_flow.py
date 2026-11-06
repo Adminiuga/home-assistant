@@ -1,20 +1,21 @@
 """Config flow to configure the Whois integration."""
-from __future__ import annotations
 
-from typing import Any
+from functools import partial
+from typing import Any, override
 
-import voluptuous as vol
-import whois
-from whois.exceptions import (
-    FailedParsingWhoisOutput,
-    UnknownDateFormat,
-    UnknownTld,
-    WhoisCommandFailed,
+import probatio
+import whoisdomain
+from whoisdomain.exceptions import (
+    FailedParsingWhoisOutputError,
+    UnknownDateFormatError,
+    UnknownTldError,
+    WhoisCommandFailedError,
+    WhoisPrivateRegistryError,
+    WhoisQuotaExceededError,
 )
 
-from homeassistant.config_entries import ConfigFlow
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_DOMAIN
-from homeassistant.data_entry_flow import FlowResult
 
 from .const import DOMAIN
 
@@ -26,9 +27,10 @@ class WhoisFlowHandler(ConfigFlow, domain=DOMAIN):
 
     imported_name: str | None = None
 
+    @override
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle a flow initialized by the user."""
         errors = {}
 
@@ -39,15 +41,21 @@ class WhoisFlowHandler(ConfigFlow, domain=DOMAIN):
             self._abort_if_unique_id_configured()
 
             try:
-                await self.hass.async_add_executor_job(whois.query, domain)
-            except UnknownTld:
+                await self.hass.async_add_executor_job(
+                    partial(whoisdomain.query, domain, whoisOnly=True)
+                )
+            except UnknownTldError:
                 errors["base"] = "unknown_tld"
-            except WhoisCommandFailed:
+            except WhoisCommandFailedError:
                 errors["base"] = "whois_command_failed"
-            except FailedParsingWhoisOutput:
+            except FailedParsingWhoisOutputError:
                 errors["base"] = "unexpected_response"
-            except UnknownDateFormat:
+            except UnknownDateFormatError:
                 errors["base"] = "unknown_date_format"
+            except WhoisPrivateRegistryError:
+                errors["base"] = "private_registry"
+            except WhoisQuotaExceededError:
+                errors["base"] = "quota_exceeded"
             else:
                 return self.async_create_entry(
                     title=self.imported_name or user_input[CONF_DOMAIN],
@@ -60,9 +68,9 @@ class WhoisFlowHandler(ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="user",
-            data_schema=vol.Schema(
+            data_schema=probatio.Schema(
                 {
-                    vol.Required(
+                    probatio.Required(
                         CONF_DOMAIN, default=user_input.get(CONF_DOMAIN, "")
                     ): str,
                 }

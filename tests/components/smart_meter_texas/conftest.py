@@ -1,9 +1,18 @@
 """Test configuration and mocks for Smart Meter Texas."""
-import asyncio
+
+from collections.abc import Generator
 from http import HTTPStatus
+from itertools import cycle
 import json
+from typing import Any
+from unittest.mock import patch
 
 import pytest
+from pytest_homeassistant.common import MockConfigEntry, load_fixture
+from pytest_homeassistant.test_util.aiohttp import (
+    AiohttpClientMocker,
+    AiohttpClientMockResponse,
+)
 from smart_meter_texas.const import (
     AUTH_ENDPOINT,
     BASE_ENDPOINT,
@@ -19,11 +28,17 @@ from homeassistant.components.homeassistant import (
 )
 from homeassistant.components.smart_meter_texas.const import DOMAIN
 from homeassistant.const import ATTR_ENTITY_ID
+from homeassistant.core import HomeAssistant
 from homeassistant.setup import async_setup_component
 
-from tests.common import MockConfigEntry, load_fixture
-
 TEST_ENTITY_ID = "sensor.electric_meter_123456789"
+
+
+@pytest.fixture(autouse=True)
+def mock_od_read_retry_time() -> Generator[None]:
+    """Don't wait between on-demand meter read polls."""
+    with patch("smart_meter_texas.OD_READ_RETRY_TIME", 0):
+        yield
 
 
 def load_smt_fixture(name):
@@ -32,14 +47,23 @@ def load_smt_fixture(name):
     return json.loads(json_fixture)
 
 
-async def setup_integration(hass, config_entry, aioclient_mock, **kwargs):
+async def setup_integration(
+    hass: HomeAssistant,
+    config_entry: MockConfigEntry,
+    aioclient_mock: AiohttpClientMocker,
+    **kwargs: Any,
+) -> None:
     """Initialize the Smart Meter Texas integration for testing."""
     mock_connection(aioclient_mock, **kwargs)
     await hass.config_entries.async_setup(config_entry.entry_id)
     await hass.async_block_till_done()
 
 
-async def refresh_data(hass, config_entry, aioclient_mock):
+async def refresh_data(
+    hass: HomeAssistant,
+    config_entry: MockConfigEntry,
+    aioclient_mock: AiohttpClientMocker,
+) -> None:
     """Request a DataUpdateCoordinator refresh."""
     mock_connection(aioclient_mock)
     await async_setup_component(hass, HA_DOMAIN, {})
@@ -53,12 +77,16 @@ async def refresh_data(hass, config_entry, aioclient_mock):
 
 
 def mock_connection(
-    aioclient_mock, auth_fail=False, auth_timeout=False, bad_reading=False
+    aioclient_mock,
+    auth_fail=False,
+    auth_timeout=False,
+    bad_reading=False,
+    stale_reading=False,
 ):
     """Mock all calls to the API."""
     aioclient_mock.get(BASE_URL)
 
-    auth_endpoint = f"{BASE_ENDPOINT}{AUTH_ENDPOINT}"
+    auth_endpoint = AUTH_ENDPOINT
     if not auth_fail and not auth_timeout:
         aioclient_mock.post(
             auth_endpoint,
@@ -71,27 +99,43 @@ def mock_connection(
             json={"errormessage": "ERR-USR-INVALIDPASSWORDERROR"},
         )
     else:  # auth_timeout
-        aioclient_mock.post(auth_endpoint, exc=asyncio.TimeoutError)
+        aioclient_mock.post(auth_endpoint, exc=TimeoutError)
 
     aioclient_mock.post(
         f"{BASE_ENDPOINT}{METER_ENDPOINT}",
         json=load_smt_fixture("meter"),
     )
     aioclient_mock.post(f"{BASE_ENDPOINT}{OD_READ_ENDPOINT}", json={"data": None})
-    if not bad_reading:
-        aioclient_mock.post(
-            f"{BASE_ENDPOINT}{LATEST_OD_READ_ENDPOINT}",
-            json=load_smt_fixture("latestodrread"),
-        )
-    else:
+    latest_reading = load_smt_fixture("latestodrread")
+    if bad_reading:
         aioclient_mock.post(
             f"{BASE_ENDPOINT}{LATEST_OD_READ_ENDPOINT}",
             json={},
         )
+    elif stale_reading:
+        aioclient_mock.post(
+            f"{BASE_ENDPOINT}{LATEST_OD_READ_ENDPOINT}",
+            json=latest_reading,
+        )
+    else:
+        # read_meter() fetches the previous reading before requesting a new one
+        # and ignores any reading with the same date.
+        previous_reading = {
+            "data": {**latest_reading["data"], "odrdate": "08/15/2020 13:52:40"}
+        }
+        responses = cycle((previous_reading, latest_reading))
+
+        async def latest_od_read(method, url, data):
+            return AiohttpClientMockResponse(method, url, json=next(responses))
+
+        aioclient_mock.post(
+            f"{BASE_ENDPOINT}{LATEST_OD_READ_ENDPOINT}",
+            side_effect=latest_od_read,
+        )
 
 
 @pytest.fixture(name="config_entry")
-def mock_config_entry(hass):
+def mock_config_entry(hass: HomeAssistant) -> MockConfigEntry:
     """Return a mock config entry."""
     config_entry = MockConfigEntry(
         domain=DOMAIN,

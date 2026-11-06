@@ -1,44 +1,54 @@
 """Test the smarttub config flow."""
+
 from unittest.mock import patch
 
+import pytest
+from pytest_homeassistant.common import MockConfigEntry
 from smarttub import LoginFailed
 
-from homeassistant import config_entries, data_entry_flow
+from homeassistant import config_entries
 from homeassistant.components.smarttub.const import DOMAIN
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
+from homeassistant.core import HomeAssistant
+from homeassistant.data_entry_flow import FlowResultType
 
-from tests.common import MockConfigEntry
+
+@pytest.fixture
+def mock_setup_entry():
+    """Mock the integration setup."""
+    with patch(
+        "homeassistant.components.smarttub.async_setup_entry",
+        return_value=None,
+    ) as mock:
+        yield mock
 
 
-async def test_form(hass):
-    """Test we get the form."""
+async def test_user_flow(hass: HomeAssistant, mock_setup_entry, account) -> None:
+    """Test the user config flow creates an entry with correct data."""
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": config_entries.SOURCE_USER}
     )
-    assert result["type"] == "form"
+    assert result["type"] is FlowResultType.FORM
     assert result["errors"] == {}
 
-    with patch(
-        "homeassistant.components.smarttub.async_setup_entry",
-        return_value=True,
-    ) as mock_setup_entry:
-        result = await hass.config_entries.flow.async_configure(
-            result["flow_id"],
-            {CONF_EMAIL: "test-email", CONF_PASSWORD: "test-password"},
-        )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_EMAIL: "test-email", CONF_PASSWORD: "test-password"},
+    )
 
-        assert result["type"] == "create_entry"
-        assert result["title"] == "test-email"
-        assert result["data"] == {
-            CONF_EMAIL: "test-email",
-            CONF_PASSWORD: "test-password",
-        }
-        await hass.async_block_till_done()
-        mock_setup_entry.assert_called_once()
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["title"] == "test-email"
+    assert result["data"] == {
+        CONF_EMAIL: "test-email",
+        CONF_PASSWORD: "test-password",
+    }
+    assert result["result"].unique_id == account.id
+    mock_setup_entry.assert_called_once()
 
 
-async def test_form_invalid_auth(hass, smarttub_api):
-    """Test we handle invalid auth."""
+@pytest.mark.usefixtures("mock_setup_entry")
+async def test_form_invalid_auth(hass: HomeAssistant, smarttub_api) -> None:
+    """Test we handle invalid auth and can recover."""
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": config_entries.SOURCE_USER}
     )
@@ -50,50 +60,43 @@ async def test_form_invalid_auth(hass, smarttub_api):
         {CONF_EMAIL: "test-email", CONF_PASSWORD: "test-password"},
     )
 
-    assert result["type"] == "form"
+    assert result["type"] is FlowResultType.FORM
     assert result["errors"] == {"base": "invalid_auth"}
 
+    smarttub_api.login.side_effect = None
 
-async def test_reauth_success(hass, smarttub_api, account):
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_EMAIL: "test-email", CONF_PASSWORD: "test-password"},
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+
+
+async def test_reauth_success(hass: HomeAssistant, smarttub_api, config_entry) -> None:
     """Test reauthentication flow."""
-    mock_entry = MockConfigEntry(
-        domain=DOMAIN,
-        data={CONF_EMAIL: "test-email", CONF_PASSWORD: "test-password"},
-        unique_id=account.id,
-    )
-    mock_entry.add_to_hass(hass)
+    config_entry.add_to_hass(hass)
 
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN,
-        context={
-            "source": config_entries.SOURCE_REAUTH,
-            "unique_id": mock_entry.unique_id,
-            "entry_id": mock_entry.entry_id,
-        },
-        data=mock_entry.data,
-    )
+    result = await config_entry.start_reauth_flow(hass)
 
-    assert result["type"] == data_entry_flow.FlowResultType.FORM
+    assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "reauth_confirm"
 
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"], {CONF_EMAIL: "test-email3", CONF_PASSWORD: "test-password3"}
     )
 
-    assert result["type"] == data_entry_flow.FlowResultType.ABORT
+    assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "reauth_successful"
-    assert mock_entry.data[CONF_EMAIL] == "test-email3"
-    assert mock_entry.data[CONF_PASSWORD] == "test-password3"
+    assert config_entry.data[CONF_EMAIL] == "test-email3"
+    assert config_entry.data[CONF_PASSWORD] == "test-password3"
 
 
-async def test_reauth_wrong_account(hass, smarttub_api, account):
-    """Test reauthentication flow if the user enters credentials for a different already-configured account."""
-    mock_entry1 = MockConfigEntry(
-        domain=DOMAIN,
-        data={CONF_EMAIL: "test-email1", CONF_PASSWORD: "test-password1"},
-        unique_id=account.id,
-    )
-    mock_entry1.add_to_hass(hass)
+async def test_reauth_wrong_account(
+    hass: HomeAssistant, smarttub_api, account, config_entry
+) -> None:
+    """Test reauth flow with credentials for a different account."""
+    config_entry.add_to_hass(hass)
 
     mock_entry2 = MockConfigEntry(
         domain=DOMAIN,
@@ -103,23 +106,15 @@ async def test_reauth_wrong_account(hass, smarttub_api, account):
     mock_entry2.add_to_hass(hass)
 
     # we try to reauth account #2, and the user successfully authenticates to account #1
-    account.id = mock_entry1.unique_id
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN,
-        context={
-            "source": config_entries.SOURCE_REAUTH,
-            "unique_id": mock_entry2.unique_id,
-            "entry_id": mock_entry2.entry_id,
-        },
-        data=mock_entry2.data,
-    )
+    account.id = config_entry.unique_id
+    result = await mock_entry2.start_reauth_flow(hass)
 
-    assert result["type"] == data_entry_flow.FlowResultType.FORM
+    assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "reauth_confirm"
 
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"], {CONF_EMAIL: "test-email1", CONF_PASSWORD: "test-password1"}
     )
 
-    assert result["type"] == data_entry_flow.FlowResultType.ABORT
+    assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "already_configured"

@@ -1,9 +1,12 @@
 {
   "domain": "egardia",
   "name": "Egardia",
-  "documentation": "https://www.home-assistant.io/integrations/egardia",
-  "requirements": ["pythonegardia==1.0.40"],
+  "categories": ["security_safety.alarm_systems"],
   "codeowners": ["@jeroenterheerdt"],
+  "connectivity": ["network"],
+  "documentation": "https://www.home-assistant.io/integrations/egardia",
   "iot_class": "local_polling",
-  "loggers": ["pythonegardia"]
+  "loggers": ["pythonegardia"],
+  "quality_scale": "legacy",
+  "requirements": ["pythonegardia==1.0.52"]
 }

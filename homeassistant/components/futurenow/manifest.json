@@ -1,8 +1,11 @@
 {
   "domain": "futurenow",
   "name": "P5 FutureNow",
-  "documentation": "https://www.home-assistant.io/integrations/futurenow",
-  "requirements": ["pyfnip==0.2"],
+  "categories": ["plugs_switches", "lighting.lighting_systems"],
   "codeowners": [],
-  "iot_class": "local_polling"
+  "connectivity": ["network"],
+  "documentation": "https://www.home-assistant.io/integrations/futurenow",
+  "iot_class": "local_polling",
+  "quality_scale": "legacy",
+  "requirements": ["pyfnip==0.2"]
 }

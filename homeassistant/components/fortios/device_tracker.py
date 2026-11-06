@@ -1,54 +1,54 @@
-"""
-Support to use FortiOS device like FortiGate as device tracker.
+"""Support to use FortiOS device like FortiGate as device tracker.
 
-This component is part of the device_tracker platform.
+This FortiOS integration provides a device_tracker platform.
 """
-from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, override
 
 from awesomeversion import AwesomeVersion
 from fortiosapi import FortiOSAPI
-import voluptuous as vol
+import probatio
 
 from homeassistant.components.device_tracker import (
-    DOMAIN,
-    PLATFORM_SCHEMA as BASE_PLATFORM_SCHEMA,
+    DOMAIN as DEVICE_TRACKER_DOMAIN,
+    PLATFORM_SCHEMA as DEVICE_TRACKER_PLATFORM_SCHEMA,
     DeviceScanner,
 )
 from homeassistant.const import CONF_HOST, CONF_TOKEN, CONF_VERIFY_SSL
 from homeassistant.core import HomeAssistant
-import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.typing import ConfigType
 
 _LOGGER = logging.getLogger(__name__)
 DEFAULT_VERIFY_SSL = False
 
 
-PLATFORM_SCHEMA = BASE_PLATFORM_SCHEMA.extend(
+PLATFORM_SCHEMA = DEVICE_TRACKER_PLATFORM_SCHEMA.extend(
     {
-        vol.Required(CONF_HOST): cv.string,
-        vol.Required(CONF_TOKEN): cv.string,
-        vol.Optional(CONF_VERIFY_SSL, default=DEFAULT_VERIFY_SSL): cv.boolean,
+        probatio.Required(CONF_HOST): cv.string,
+        probatio.Required(probatio.Secret(CONF_TOKEN)): cv.string,
+        probatio.Optional(CONF_VERIFY_SSL, default=DEFAULT_VERIFY_SSL): cv.boolean,
     }
 )
 
 
 def get_scanner(hass: HomeAssistant, config: ConfigType) -> FortiOSDeviceScanner | None:
     """Validate the configuration and return a FortiOSDeviceScanner."""
-    host = config[DOMAIN][CONF_HOST]
-    verify_ssl = config[DOMAIN][CONF_VERIFY_SSL]
-    token = config[DOMAIN][CONF_TOKEN]
+    config = config[DEVICE_TRACKER_DOMAIN]
+
+    host = config[CONF_HOST]
+    verify_ssl = config[CONF_VERIFY_SSL]
+    token = config[CONF_TOKEN]
 
     fgt = FortiOSAPI()
 
     try:
-        fgt.tokenlogin(host, token, verify_ssl)
+        fgt.tokenlogin(host, token, verify_ssl, None, 12, "root")
     except ConnectionError as ex:
         _LOGGER.error("ConnectionError to FortiOS API: %s", ex)
         return None
-    except Exception as ex:  # pylint: disable=broad-except
+    except Exception as ex:  # noqa: BLE001
         _LOGGER.error("Failed to login to FortiOS API: %s", ex)
         return None
 
@@ -68,7 +68,7 @@ def get_scanner(hass: HomeAssistant, config: ConfigType) -> FortiOSDeviceScanner
 
 
 class FortiOSDeviceScanner(DeviceScanner):
-    """This class queries a FortiOS unit for connected devices."""
+    """Class which queries a FortiOS unit for connected devices."""
 
     def __init__(self, fgt) -> None:
         """Initialize the scanner."""
@@ -78,7 +78,12 @@ class FortiOSDeviceScanner(DeviceScanner):
 
     def update(self):
         """Update clients from the device."""
-        clients_json = self._fgt.monitor("user/device/query", "")
+        clients_json = self._fgt.monitor(
+            "user/device/query",
+            "",
+            parameters={"filter": "format=master_mac|hostname|is_online"},
+        )
+
         self._clients_json = clients_json
 
         self._clients = []
@@ -86,16 +91,22 @@ class FortiOSDeviceScanner(DeviceScanner):
         if clients_json:
             try:
                 for client in clients_json["results"]:
-                    if client["is_online"]:
-                        self._clients.append(client["mac"].upper())
+                    if (
+                        "is_online" in client
+                        and "master_mac" in client
+                        and client["is_online"]
+                    ):
+                        self._clients.append(client["master_mac"].upper())
             except KeyError as kex:
                 _LOGGER.error("Key not found in clients: %s", kex)
 
+    @override
     def scan_devices(self):
         """Scan for new devices and return a list with found device IDs."""
         self.update()
         return self._clients
 
+    @override
     def get_device_name(self, device):
         """Return the name of the given device or None if we don't know."""
         _LOGGER.debug("Getting name of device %s", device)
@@ -107,17 +118,10 @@ class FortiOSDeviceScanner(DeviceScanner):
             return None
 
         for client in data["results"]:
-            if client["mac"] == device:
-                try:
+            if "master_mac" in client and client["master_mac"] == device:
+                if "hostname" in client:
                     name = client["hostname"]
-                    _LOGGER.debug("Getting device name=%s", name)
-                    return name
-                except KeyError as kex:
-                    _LOGGER.debug(
-                        "No hostname found for %s in client data: %s",
-                        device,
-                        kex,
-                    )
-                    return device.replace(":", "_")
-
+                else:
+                    name = client["master_mac"].replace(":", "_")
+                return name
         return None

@@ -1,8 +1,11 @@
 {
   "domain": "rest",
   "name": "RESTful",
-  "documentation": "https://www.home-assistant.io/integrations/rest",
-  "requirements": ["jsonpath==0.82", "xmltodict==0.13.0"],
+  "categories": ["diy_makers.web_data_connectors"],
   "codeowners": [],
-  "iot_class": "local_polling"
+  "connectivity": ["cloud", "network"],
+  "documentation": "https://www.home-assistant.io/integrations/rest",
+  "integration_type": "service",
+  "iot_class": "local_polling",
+  "requirements": ["jsonpath-python==1.1.6", "xmltodict==1.0.4"]
 }

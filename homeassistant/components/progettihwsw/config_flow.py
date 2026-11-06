@@ -1,21 +1,28 @@
 """Config flow for ProgettiHWSW Automation integration."""
 
-from ProgettiHWSW.ProgettiHWSWAPI import ProgettiHWSWAPI
-import voluptuous as vol
+import logging
+from typing import TYPE_CHECKING, Any, override
 
-from homeassistant import config_entries, core, exceptions
+import probatio
+from ProgettiHWSW.ProgettiHWSWAPI import ProgettiHWSWAPI
+
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 
 from .const import DOMAIN
 
-DATA_SCHEMA = vol.Schema(
-    {vol.Required("host"): str, vol.Required("port", default=80): int}
+_LOGGER = logging.getLogger(__name__)
+
+DATA_SCHEMA = probatio.Schema(
+    {probatio.Required("host"): str, probatio.Required("port", default=80): int}
 )
 
 
-async def validate_input(hass: core.HomeAssistant, data):
+async def validate_input(hass: HomeAssistant, data):
     """Validate the user host input."""
 
-    api_instance = ProgettiHWSWAPI(f'{data["host"]}:{data["port"]}')
+    api_instance = ProgettiHWSWAPI(f"{data['host']}:{data['port']}")
     is_valid = await api_instance.check_board()
 
     if not is_valid:
@@ -23,26 +30,29 @@ async def validate_input(hass: core.HomeAssistant, data):
 
     return {
         "title": is_valid["title"],
-        "relay_count": is_valid["relay_count"],
-        "input_count": is_valid["input_count"],
-        "is_old": is_valid["is_old"],
+        "relay_count": len(is_valid["relays"]),
+        "input_count": len(is_valid["inputs"]),
+        "is_old": is_valid["temps"],
     }
 
 
-class ProgettiHWSWConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
+class ProgettiHWSWConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for ProgettiHWSW Automation."""
 
     VERSION = 1
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize class variables."""
-        self.s1_in = None
+        self.s1_in: dict[str, Any] | None = None
 
-    async def async_step_relay_modes(self, user_input=None):
+    async def async_step_relay_modes(
+        self, user_input: dict[str, str] | None = None
+    ) -> ConfigFlowResult:
         """Manage relay modes step."""
-        errors = {}
+        errors: dict[str, str] = {}
+        if TYPE_CHECKING:
+            assert self.s1_in is not None
         if user_input is not None:
-
             whole_data = user_input
             whole_data.update(self.s1_in)
 
@@ -51,8 +61,8 @@ class ProgettiHWSWConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         relay_modes_schema = {}
         for i in range(1, int(self.s1_in["relay_count"]) + 1):
             relay_modes_schema[
-                vol.Required(f"relay_{str(i)}", default="bistable")
-            ] = vol.In(
+                probatio.Required(f"relay_{i!s}", default="bistable")
+            ] = probatio.In(
                 {
                     "bistable": "Bistable (ON/OFF Mode)",
                     "monostable": "Monostable (Timer Mode)",
@@ -61,11 +71,14 @@ class ProgettiHWSWConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="relay_modes",
-            data_schema=vol.Schema(relay_modes_schema),
+            data_schema=probatio.Schema(relay_modes_schema),
             errors=errors,
         )
 
-    async def async_step_user(self, user_input=None):
+    @override
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle the initial step."""
         errors = {}
         if user_input is not None:
@@ -77,7 +90,8 @@ class ProgettiHWSWConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 info = await validate_input(self.hass, user_input)
             except CannotConnect:
                 errors["base"] = "cannot_connect"
-            except Exception:  # pylint: disable=broad-except
+            except Exception:
+                _LOGGER.exception("Unexpected exception")
                 errors["base"] = "unknown"
             else:
                 user_input.update(info)
@@ -89,13 +103,13 @@ class ProgettiHWSWConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
 
-class CannotConnect(exceptions.HomeAssistantError):
+class CannotConnect(HomeAssistantError):
     """Error to indicate we cannot identify host."""
 
 
-class WrongInfo(exceptions.HomeAssistantError):
+class WrongInfo(HomeAssistantError):
     """Error to indicate we cannot validate relay modes input."""
 
 
-class ExistingEntry(exceptions.HomeAssistantError):
+class ExistingEntry(HomeAssistantError):
     """Error to indicate we cannot validate relay modes input."""

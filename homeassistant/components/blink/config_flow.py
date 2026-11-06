@@ -1,180 +1,242 @@
 """Config flow to configure Blink."""
-from __future__ import annotations
 
 from collections.abc import Mapping
 import logging
-from typing import Any
+from typing import Any, override
 
-from blinkpy.auth import Auth, LoginError, TokenRefreshFailed
+from blinkpy.auth import Auth, BlinkTwoFARequiredError, LoginError, TokenRefreshFailed
 from blinkpy.blinkpy import Blink, BlinkSetupError
-import voluptuous as vol
+import probatio
 
-from homeassistant import config_entries, core, exceptions
-from homeassistant.const import (
-    CONF_PASSWORD,
-    CONF_PIN,
-    CONF_SCAN_INTERVAL,
-    CONF_USERNAME,
+from homeassistant.config_entries import (
+    SOURCE_REAUTH,
+    SOURCE_RECONFIGURE,
+    ConfigFlow,
+    ConfigFlowResult,
 )
+from homeassistant.const import CONF_PASSWORD, CONF_PIN, CONF_USERNAME
 from homeassistant.core import callback
-from homeassistant.data_entry_flow import FlowResult
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from .const import DEFAULT_SCAN_INTERVAL, DEVICE_ID, DOMAIN
+from .const import DOMAIN, LEGACY_HARDWARE_ID
 
 _LOGGER = logging.getLogger(__name__)
 
 
-def validate_input(hass: core.HomeAssistant, auth):
+async def validate_input(blink: Blink) -> None:
     """Validate the user input allows us to connect."""
     try:
-        auth.startup()
+        result = await blink.start()
     except (LoginError, TokenRefreshFailed) as err:
         raise InvalidAuth from err
-    if auth.check_key_required():
-        raise Require2FA
+    if result is False:
+        raise InvalidAuth
 
 
-def _send_blink_2fa_pin(auth, pin):
+async def _send_blink_2fa_pin(blink: Blink, pin: str | None) -> None:
     """Send 2FA pin to blink servers."""
-    blink = Blink()
-    blink.auth = auth
-    blink.setup_login_ids()
-    blink.setup_urls()
-    return auth.send_auth_key(blink, pin)
+    if not await blink.send_2fa_code(pin):
+        raise InvalidAuth
 
 
-class BlinkConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
+class BlinkConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a Blink config flow."""
 
-    VERSION = 3
+    VERSION = 5
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize the blink flow."""
-        self.auth = None
+        self.auth: Auth | None = None
+        self.blink: Blink | None = None
 
-    @staticmethod
-    @callback
-    def async_get_options_flow(
-        config_entry: config_entries.ConfigEntry,
-    ) -> BlinkOptionsFlowHandler:
-        """Get options flow for this handler."""
-        return BlinkOptionsFlowHandler(config_entry)
+    def _existing_hardware_id(self) -> str | None:
+        """Return the stored hardware_id for a reauth/reconfigure, or None if legacy or absent."""
+        if self.source == SOURCE_REAUTH:
+            entry = self._get_reauth_entry()
+        elif self.source == SOURCE_RECONFIGURE:
+            entry = self._get_reconfigure_entry()
+        else:
+            return None
+        hardware_id = entry.data.get("hardware_id")
+        if hardware_id and hardware_id != LEGACY_HARDWARE_ID:
+            return hardware_id
+        return None
 
-    async def async_step_user(self, user_input=None):
+    async def _async_check_unique_id(self, user_input: dict[str, Any]) -> None:
+        """Set the unique ID and abort if the account is already configured."""
+        await self.async_set_unique_id(user_input[CONF_USERNAME])
+        if self.source not in (SOURCE_REAUTH, SOURCE_RECONFIGURE):
+            self._abort_if_unique_id_configured()
+
+    async def _handle_user_input(self, user_input: dict[str, Any]):
+        """Handle user input."""
+        # Omit hardware_id on new installs so blinkpy mints a per-install UUID;
+        # reuse a stored non-legacy id so device identity stays stable on reauth.
+        login_data: dict[str, Any] = {**user_input}
+        if hardware_id := self._existing_hardware_id():
+            login_data["hardware_id"] = hardware_id
+        self.auth = Auth(
+            login_data,
+            no_prompt=True,
+            session=async_get_clientsession(self.hass),
+        )
+        self.blink = Blink(session=async_get_clientsession(self.hass))
+        self.blink.auth = self.auth
+        await validate_input(self.blink)
+        return self._async_finish_flow()
+
+    @override
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle a flow initiated by the user."""
         errors = {}
-        data = {CONF_USERNAME: "", CONF_PASSWORD: "", "device_id": DEVICE_ID}
         if user_input is not None:
-            data[CONF_USERNAME] = user_input["username"]
-            data[CONF_PASSWORD] = user_input["password"]
-
-            self.auth = Auth(data, no_prompt=True)
-            await self.async_set_unique_id(data[CONF_USERNAME])
-
+            await self._async_check_unique_id(user_input)
             try:
-                await self.hass.async_add_executor_job(
-                    validate_input, self.hass, self.auth
-                )
-                return self._async_finish_flow()
-            except Require2FA:
+                return await self._handle_user_input(user_input)
+            except BlinkTwoFARequiredError:
                 return await self.async_step_2fa()
             except InvalidAuth:
                 errors["base"] = "invalid_auth"
-            except Exception:  # pylint: disable=broad-except
+            except Exception:
                 _LOGGER.exception("Unexpected exception")
                 errors["base"] = "unknown"
-
-        data_schema = {
-            vol.Required("username"): str,
-            vol.Required("password"): str,
-        }
 
         return self.async_show_form(
             step_id="user",
-            data_schema=vol.Schema(data_schema),
+            data_schema=probatio.Schema(
+                {
+                    probatio.Required(CONF_USERNAME): str,
+                    probatio.Required(probatio.Secret(CONF_PASSWORD)): str,
+                }
+            ),
             errors=errors,
         )
 
-    async def async_step_2fa(self, user_input=None):
+    async def async_step_2fa(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle 2FA step."""
         errors = {}
         if user_input is not None:
-            pin = user_input.get(CONF_PIN)
             try:
-                valid_token = await self.hass.async_add_executor_job(
-                    _send_blink_2fa_pin, self.auth, pin
-                )
+                await _send_blink_2fa_pin(self.blink, user_input.get(CONF_PIN))
             except BlinkSetupError:
                 errors["base"] = "cannot_connect"
-            except Exception:  # pylint: disable=broad-except
+            except TokenRefreshFailed:
+                errors["base"] = "invalid_access_token"
+            except InvalidAuth:
+                errors["base"] = "invalid_auth"
+            except Exception:
                 _LOGGER.exception("Unexpected exception")
                 errors["base"] = "unknown"
-
             else:
-                if valid_token:
-                    return self._async_finish_flow()
-                errors["base"] = "invalid_access_token"
+                return self._async_finish_flow()
 
         return self.async_show_form(
             step_id="2fa",
-            data_schema=vol.Schema(
-                {vol.Optional("pin"): vol.All(str, vol.Length(min=1))}
+            data_schema=probatio.Schema(
+                {
+                    probatio.Optional(probatio.Secret(CONF_PIN)): probatio.All(
+                        str, probatio.NonEmpty()
+                    )
+                }
             ),
             errors=errors,
         )
 
-    async def async_step_reauth(self, entry_data: Mapping[str, Any]) -> FlowResult:
-        """Perform reauth upon migration of old entries."""
-        return await self.async_step_user(dict(entry_data))
+    async def async_step_reauth(
+        self, entry_data: Mapping[str, Any]
+    ) -> ConfigFlowResult:
+        """Perform reauth after an authentication error."""
+        return await self.async_step_reauth_confirm(None)
+
+    async def async_step_reauth_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle reauth confirmation."""
+        errors = {}
+        if user_input is not None:
+            await self._async_check_unique_id(user_input)
+            try:
+                return await self._handle_user_input(user_input)
+            except BlinkTwoFARequiredError:
+                return await self.async_step_2fa()
+            except InvalidAuth:
+                errors["base"] = "invalid_auth"
+            except Exception:
+                _LOGGER.exception("Unexpected exception")
+                errors["base"] = "unknown"
+
+        config_entry = self._get_reauth_entry()
+        return self.async_show_form(
+            step_id="reauth_confirm",
+            data_schema=probatio.Schema(
+                {
+                    probatio.Required(
+                        CONF_USERNAME, default=config_entry.data[CONF_USERNAME]
+                    ): str,
+                    probatio.Required(
+                        probatio.Secret(CONF_PASSWORD),
+                        default=config_entry.data[CONF_PASSWORD],
+                    ): str,
+                }
+            ),
+            errors=errors,
+            description_placeholders={"username": config_entry.data[CONF_USERNAME]},
+        )
+
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle reconfiguration initiated by the user."""
+        errors = {}
+        if user_input is not None:
+            await self._async_check_unique_id(user_input)
+            try:
+                return await self._handle_user_input(user_input)
+            except BlinkTwoFARequiredError:
+                return await self.async_step_2fa()
+            except InvalidAuth:
+                errors["base"] = "invalid_auth"
+            except Exception:
+                _LOGGER.exception("Unexpected exception")
+                errors["base"] = "unknown"
+
+        config_entry = self._get_reconfigure_entry()
+        return self.async_show_form(
+            step_id="reconfigure",
+            data_schema=probatio.Schema(
+                {
+                    probatio.Required(
+                        CONF_USERNAME, default=config_entry.data[CONF_USERNAME]
+                    ): str,
+                    probatio.Required(
+                        probatio.Secret(CONF_PASSWORD),
+                        default=config_entry.data[CONF_PASSWORD],
+                    ): str,
+                }
+            ),
+            errors=errors,
+        )
 
     @callback
-    def _async_finish_flow(self):
+    def _async_finish_flow(self) -> ConfigFlowResult:
         """Finish with setup."""
+        assert self.auth
+
+        if self.source in (SOURCE_REAUTH, SOURCE_RECONFIGURE):
+            return self.async_update_reload_and_abort(
+                self._get_reauth_entry()
+                if self.source == SOURCE_REAUTH
+                else self._get_reconfigure_entry(),
+                data_updates=self.auth.login_attributes,
+            )
+
         return self.async_create_entry(title=DOMAIN, data=self.auth.login_attributes)
 
 
-class BlinkOptionsFlowHandler(config_entries.OptionsFlow):
-    """Handle Blink options."""
-
-    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
-        """Initialize Blink options flow."""
-        self.config_entry = config_entry
-        self.options = dict(config_entry.options)
-        self.blink = None
-
-    async def async_step_init(self, user_input=None):
-        """Manage the Blink options."""
-        self.blink = self.hass.data[DOMAIN][self.config_entry.entry_id]
-        self.options[CONF_SCAN_INTERVAL] = self.blink.refresh_rate
-
-        return await self.async_step_simple_options()
-
-    async def async_step_simple_options(self, user_input=None):
-        """For simple options."""
-        if user_input is not None:
-            self.options.update(user_input)
-            self.blink.refresh_rate = user_input[CONF_SCAN_INTERVAL]
-            return self.async_create_entry(title="", data=self.options)
-
-        options = self.config_entry.options
-        scan_interval = options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
-
-        return self.async_show_form(
-            step_id="simple_options",
-            data_schema=vol.Schema(
-                {
-                    vol.Optional(
-                        CONF_SCAN_INTERVAL,
-                        default=scan_interval,
-                    ): int
-                }
-            ),
-        )
-
-
-class Require2FA(exceptions.HomeAssistantError):
-    """Error to indicate we require 2FA."""
-
-
-class InvalidAuth(exceptions.HomeAssistantError):
+class InvalidAuth(HomeAssistantError):
     """Error to indicate there is invalid auth."""

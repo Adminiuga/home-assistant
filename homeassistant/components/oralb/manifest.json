@@ -1,15 +1,19 @@
 {
   "domain": "oralb",
   "name": "Oral-B",
-  "config_flow": true,
-  "documentation": "https://www.home-assistant.io/integrations/oralb",
   "bluetooth": [
     {
       "manufacturer_id": 220
     }
   ],
-  "requirements": ["oralb-ble==0.13.0"],
-  "dependencies": ["bluetooth"],
-  "codeowners": ["@bdraco"],
-  "iot_class": "local_push"
+  "categories": ["health_wellbeing"],
+  "codeowners": ["@bdraco", "@Lash-L"],
+  "config_flow": true,
+  "connectivity": ["bluetooth"],
+  "dependencies": ["bluetooth_adapters"],
+  "documentation": "https://www.home-assistant.io/integrations/oralb",
+  "integration_type": "device",
+  "iot_class": "local_push",
+  "loggers": ["oralb_ble"],
+  "requirements": ["oralb-ble==1.1.3"]
 }

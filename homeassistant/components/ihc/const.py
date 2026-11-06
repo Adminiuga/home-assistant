@@ -1,9 +1,6 @@
 """IHC component constants."""
-from homeassistant.const import Platform
 
-ATTR_IHC_ID = "ihc_id"
-ATTR_VALUE = "value"
-ATTR_CONTROLLER_ID = "controller_id"
+from homeassistant.const import Platform
 
 AUTO_SETUP_YAML = "ihc_auto_setup.yaml"
 
@@ -14,7 +11,6 @@ CONF_INFO = "info"
 CONF_INVERTING = "inverting"
 CONF_LIGHT = "light"
 CONF_NODE = "node"
-CONF_NOTE = "note"
 CONF_OFF_ID = "off_id"
 CONF_ON_ID = "on_id"
 CONF_POSITION = "position"
@@ -32,8 +28,3 @@ IHC_PLATFORMS = (
     Platform.SENSOR,
     Platform.SWITCH,
 )
-
-SERVICE_SET_RUNTIME_VALUE_BOOL = "set_runtime_value_bool"
-SERVICE_SET_RUNTIME_VALUE_FLOAT = "set_runtime_value_float"
-SERVICE_SET_RUNTIME_VALUE_INT = "set_runtime_value_int"
-SERVICE_PULSE = "pulse"

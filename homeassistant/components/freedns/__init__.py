@@ -1,16 +1,16 @@
 """Integrate with FreeDNS Dynamic DNS service at freedns.afraid.org."""
+
 import asyncio
-from datetime import timedelta
+from datetime import datetime, timedelta
 import logging
 
 import aiohttp
-import async_timeout
-import voluptuous as vol
+import probatio
 
 from homeassistant.const import CONF_ACCESS_TOKEN, CONF_SCAN_INTERVAL, CONF_URL
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.typing import ConfigType
 
@@ -23,19 +23,21 @@ DEFAULT_INTERVAL = timedelta(minutes=10)
 TIMEOUT = 10
 UPDATE_URL = "https://freedns.afraid.org/dynamic/update.php"
 
-CONFIG_SCHEMA = vol.Schema(
+CONFIG_SCHEMA = probatio.Schema(
     {
-        DOMAIN: vol.Schema(
+        DOMAIN: probatio.Schema(
             {
-                vol.Exclusive(CONF_URL, DOMAIN): cv.string,
-                vol.Exclusive(CONF_ACCESS_TOKEN, DOMAIN): cv.string,
-                vol.Optional(CONF_SCAN_INTERVAL, default=DEFAULT_INTERVAL): vol.All(
-                    cv.time_period, cv.positive_timedelta
-                ),
+                probatio.Exclusive(CONF_URL, DOMAIN): cv.string,
+                probatio.Exclusive(
+                    probatio.Secret(CONF_ACCESS_TOKEN), DOMAIN
+                ): cv.string,
+                probatio.Optional(
+                    CONF_SCAN_INTERVAL, default=DEFAULT_INTERVAL
+                ): probatio.All(cv.time_period, cv.positive_timedelta),
             }
         )
     },
-    extra=vol.ALLOW_EXTRA,
+    extra=probatio.ALLOW_EXTRA,
 )
 
 
@@ -53,11 +55,13 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     if result is False:
         return False
 
-    async def update_domain_callback(now):
+    async def update_domain_callback(now: datetime) -> None:
         """Update the FreeDNS entry."""
         await _update_freedns(hass, session, url, auth_token)
 
-    async_track_time_interval(hass, update_domain_callback, update_interval)
+    async_track_time_interval(
+        hass, update_domain_callback, update_interval, cancel_on_shutdown=True
+    )
 
     return True
 
@@ -74,7 +78,7 @@ async def _update_freedns(hass, session, url, auth_token):
         params[auth_token] = ""
 
     try:
-        async with async_timeout.timeout(TIMEOUT):
+        async with asyncio.timeout(TIMEOUT):
             resp = await session.get(url, params=params)
             body = await resp.text()
 
@@ -95,7 +99,7 @@ async def _update_freedns(hass, session, url, auth_token):
     except aiohttp.ClientError:
         _LOGGER.warning("Can't connect to FreeDNS API")
 
-    except asyncio.TimeoutError:
+    except TimeoutError:
         _LOGGER.warning("Timeout from FreeDNS API at %s", url)
 
     return False

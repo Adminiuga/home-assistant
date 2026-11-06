@@ -1,0 +1,1473 @@
+"""Tests for the Mastodon services."""
+
+from datetime import timedelta
+from pathlib import Path
+from unittest.mock import AsyncMock, Mock, patch
+
+from mastodon.Mastodon import (
+    MastodonAPIError,
+    MastodonNotFoundError,
+    MastodonUnauthorizedError,
+    MediaAttachment,
+)
+import probatio
+import pytest
+from pytest_homeassistant.common import MockConfigEntry
+from syrupy.assertion import SnapshotAssertion
+
+from homeassistant.components import media_source
+from homeassistant.components.mastodon.const import (
+    ATTR_ACCOUNT_NAME,
+    ATTR_ATTRIBUTION_DOMAINS,
+    ATTR_AVATAR,
+    ATTR_AVATAR_DESCRIPTION,
+    ATTR_AVATAR_MIME_TYPE,
+    ATTR_BOT,
+    ATTR_CONTENT_WARNING,
+    ATTR_DELETE_AVATAR,
+    ATTR_DELETE_HEADER,
+    ATTR_DISCOVERABLE,
+    ATTR_DISPLAY_NAME,
+    ATTR_DURATION,
+    ATTR_FIELDS,
+    ATTR_FOCUS_X,
+    ATTR_FOCUS_Y,
+    ATTR_HEADER,
+    ATTR_HEADER_DESCRIPTION,
+    ATTR_HEADER_MIME_TYPE,
+    ATTR_HIDE_NOTIFICATIONS,
+    ATTR_IDEMPOTENCY_KEY,
+    ATTR_IN_REPLY_TO,
+    ATTR_LANGUAGE,
+    ATTR_MEDIA,
+    ATTR_MEDIA_DESCRIPTION,
+    ATTR_MEDIA_SOURCE,
+    ATTR_NOTE,
+    ATTR_QUOTE_APPROVAL_POLICY,
+    ATTR_QUOTED_STATUS,
+    ATTR_STATUS,
+    ATTR_THUMBNAIL,
+    ATTR_VISIBILITY,
+    DOMAIN,
+)
+from homeassistant.components.mastodon.services import (
+    SERVICE_GET_ACCOUNT,
+    SERVICE_MUTE_ACCOUNT,
+    SERVICE_POST,
+    SERVICE_UNMUTE_ACCOUNT,
+    SERVICE_UPDATE_PROFILE,
+)
+from homeassistant.config_entries import ConfigEntryState
+from homeassistant.const import ATTR_CONFIG_ENTRY_ID, ATTR_LOCKED
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
+from homeassistant.helpers import issue_registry as ir
+from homeassistant.setup import async_setup_component
+
+from . import setup_integration
+
+MEDIA_IMAGES = {
+    "media-source://camera/camera.demo_camera": media_source.MediaImage(
+        b"I play the sax\n", "image/jpeg"
+    ),
+    "media-source://image/image.test": media_source.MediaImage(
+        b"\x89PNG\n", "image/png"
+    ),
+}
+
+
+async def test_get_account_success(
+    hass: HomeAssistant,
+    mock_mastodon_client: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+    snapshot: SnapshotAssertion,
+) -> None:
+    """Test the get_account service successfully returns account data."""
+    await setup_integration(hass, mock_config_entry)
+
+    response = await hass.services.async_call(
+        DOMAIN,
+        SERVICE_GET_ACCOUNT,
+        {
+            ATTR_CONFIG_ENTRY_ID: mock_config_entry.entry_id,
+            ATTR_ACCOUNT_NAME: "@trwnh@mastodon.social",
+        },
+        blocking=True,
+        return_response=True,
+    )
+
+    assert response == snapshot
+    mock_mastodon_client.account_lookup.assert_called_once_with(
+        acct="@trwnh@mastodon.social"
+    )
+
+
+async def test_get_account_failure(
+    hass: HomeAssistant,
+    mock_mastodon_client: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test the get_account service handles API errors."""
+    await setup_integration(hass, mock_config_entry)
+
+    # Test API error (this is the only error type currently caught by the service)
+    mock_mastodon_client.account_lookup.side_effect = MastodonAPIError("API error")
+    with pytest.raises(
+        HomeAssistantError,
+        match='Unable to get account "@test@mastodon.social"',
+    ):
+        await hass.services.async_call(
+            DOMAIN,
+            SERVICE_GET_ACCOUNT,
+            {
+                ATTR_CONFIG_ENTRY_ID: mock_config_entry.entry_id,
+                ATTR_ACCOUNT_NAME: "@test@mastodon.social",
+            },
+            blocking=True,
+            return_response=True,
+        )
+
+
+@pytest.mark.parametrize(
+    (
+        "service_data",
+        "expected_notifications",
+        "expected_duration",
+    ),
+    [
+        (
+            {ATTR_ACCOUNT_NAME: "@trwnh@mastodon.social"},
+            True,
+            None,
+        ),
+        (
+            {
+                ATTR_ACCOUNT_NAME: "@trwnh@mastodon.social",
+                ATTR_HIDE_NOTIFICATIONS: False,
+            },
+            False,
+            None,
+        ),
+        (
+            {
+                ATTR_ACCOUNT_NAME: "@trwnh@mastodon.social",
+                ATTR_DURATION: timedelta(hours=2),
+            },
+            True,
+            7200,
+        ),
+        (
+            {
+                ATTR_ACCOUNT_NAME: "@trwnh@mastodon.social",
+                ATTR_DURATION: timedelta(hours=12),
+                ATTR_HIDE_NOTIFICATIONS: False,
+            },
+            False,
+            43200,
+        ),
+    ],
+)
+async def test_mute_account_success(
+    hass: HomeAssistant,
+    mock_mastodon_client: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+    snapshot: SnapshotAssertion,
+    service_data: dict[str, str | int | bool],
+    expected_notifications: bool,
+    expected_duration: int | None,
+) -> None:
+    """Test the mute_account service mutes the target account with all options."""
+    await setup_integration(hass, mock_config_entry)
+
+    await hass.services.async_call(
+        DOMAIN,
+        SERVICE_MUTE_ACCOUNT,
+        {ATTR_CONFIG_ENTRY_ID: mock_config_entry.entry_id} | service_data,
+        blocking=True,
+        return_response=False,
+    )
+
+    mock_mastodon_client.account_lookup.assert_called_once_with(
+        acct=service_data[ATTR_ACCOUNT_NAME]
+    )
+    account = mock_mastodon_client.account_lookup.return_value
+    assert mock_mastodon_client.account_mute.call_count == 1
+    call_args, call_kwargs = mock_mastodon_client.account_mute.call_args
+
+    if call_kwargs:
+        actual_id = call_kwargs["id"]
+        actual_notifications = call_kwargs["notifications"]
+        actual_duration = call_kwargs.get("duration")
+    else:
+        _, positional_args, _ = call_args
+        actual_id, actual_notifications, actual_duration = positional_args
+
+    assert actual_id == account.id
+    assert actual_notifications == expected_notifications
+    assert actual_duration == expected_duration
+
+
+async def test_mute_account_duration_too_long(
+    hass: HomeAssistant,
+    mock_mastodon_client: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test mute_account rejects overly long durations."""
+    await setup_integration(hass, mock_config_entry)
+
+    with (
+        patch("homeassistant.components.mastodon.services.MAX_DURATION_SECONDS", 5),
+        pytest.raises(ServiceValidationError) as err,
+    ):
+        await hass.services.async_call(
+            DOMAIN,
+            SERVICE_MUTE_ACCOUNT,
+            {
+                ATTR_CONFIG_ENTRY_ID: mock_config_entry.entry_id,
+                ATTR_ACCOUNT_NAME: "@trwnh@mastodon.social",
+                ATTR_DURATION: timedelta(seconds=10),
+            },
+            blocking=True,
+            return_response=False,
+        )
+
+    assert err.value.translation_key == "mute_duration_too_long"
+    mock_mastodon_client.account_mute.assert_not_called()
+
+
+async def test_mute_account_failure_not_found(
+    hass: HomeAssistant,
+    mock_mastodon_client: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test mute_account raises validation when account does not exist."""
+    await setup_integration(hass, mock_config_entry)
+
+    mock_mastodon_client.account_lookup.side_effect = MastodonNotFoundError(
+        "account not found"
+    )
+
+    with pytest.raises(ServiceValidationError):
+        await hass.services.async_call(
+            DOMAIN,
+            SERVICE_MUTE_ACCOUNT,
+            {
+                ATTR_CONFIG_ENTRY_ID: mock_config_entry.entry_id,
+                ATTR_ACCOUNT_NAME: "@trwnh@mastodon.social",
+            },
+            blocking=True,
+            return_response=False,
+        )
+
+    mock_mastodon_client.account_lookup.assert_called_once_with(
+        acct="@trwnh@mastodon.social"
+    )
+    mock_mastodon_client.account_mute.assert_not_called()
+
+
+async def test_mute_account_failure_api_error(
+    hass: HomeAssistant,
+    mock_mastodon_client: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test mute_account wraps API errors with translated message."""
+    await setup_integration(hass, mock_config_entry)
+
+    mock_mastodon_client.account_mute.side_effect = MastodonAPIError("mute failed")
+
+    with pytest.raises(
+        HomeAssistantError,
+        match='Unable to mute account "@trwnh@mastodon.social"',
+    ):
+        await hass.services.async_call(
+            DOMAIN,
+            SERVICE_MUTE_ACCOUNT,
+            {
+                ATTR_CONFIG_ENTRY_ID: mock_config_entry.entry_id,
+                ATTR_ACCOUNT_NAME: "@trwnh@mastodon.social",
+            },
+            blocking=True,
+            return_response=False,
+        )
+
+    mock_mastodon_client.account_lookup.assert_called_once_with(
+        acct="@trwnh@mastodon.social"
+    )
+    account = mock_mastodon_client.account_lookup.return_value
+    mock_mastodon_client.account_mute.assert_called_once_with(
+        id=account.id, notifications=True, duration=None
+    )
+
+
+async def test_unmute_account_success(
+    hass: HomeAssistant,
+    mock_mastodon_client: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test the unmute_account service unmutes the target account."""
+    await setup_integration(hass, mock_config_entry)
+
+    await hass.services.async_call(
+        DOMAIN,
+        SERVICE_UNMUTE_ACCOUNT,
+        {
+            ATTR_CONFIG_ENTRY_ID: mock_config_entry.entry_id,
+            ATTR_ACCOUNT_NAME: "@trwnh@mastodon.social",
+        },
+        blocking=True,
+        return_response=False,
+    )
+
+    mock_mastodon_client.account_lookup.assert_called_once_with(
+        acct="@trwnh@mastodon.social"
+    )
+    account = mock_mastodon_client.account_lookup.return_value
+    mock_mastodon_client.account_unmute.assert_called_once_with(id=account.id)
+
+
+async def test_unmute_account_failure_not_found(
+    hass: HomeAssistant,
+    mock_mastodon_client: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test unmute_account raises validation when account does not exist."""
+    await setup_integration(hass, mock_config_entry)
+
+    mock_mastodon_client.account_lookup.side_effect = MastodonNotFoundError(
+        "account not found"
+    )
+
+    with pytest.raises(ServiceValidationError):
+        await hass.services.async_call(
+            DOMAIN,
+            SERVICE_UNMUTE_ACCOUNT,
+            {
+                ATTR_CONFIG_ENTRY_ID: mock_config_entry.entry_id,
+                ATTR_ACCOUNT_NAME: "@trwnh@mastodon.social",
+            },
+            blocking=True,
+            return_response=False,
+        )
+
+    mock_mastodon_client.account_lookup.assert_called_once_with(
+        acct="@trwnh@mastodon.social"
+    )
+    mock_mastodon_client.account_unmute.assert_not_called()
+
+
+async def test_unmute_account_failure_api_error(
+    hass: HomeAssistant,
+    mock_mastodon_client: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test unmute_account wraps API errors with translated message."""
+    await setup_integration(hass, mock_config_entry)
+
+    mock_mastodon_client.account_unmute.side_effect = MastodonAPIError("unmute failed")
+
+    with pytest.raises(
+        HomeAssistantError,
+        match='Unable to unmute account "@trwnh@mastodon.social"',
+    ):
+        await hass.services.async_call(
+            DOMAIN,
+            SERVICE_UNMUTE_ACCOUNT,
+            {
+                ATTR_CONFIG_ENTRY_ID: mock_config_entry.entry_id,
+                ATTR_ACCOUNT_NAME: "@trwnh@mastodon.social",
+            },
+            blocking=True,
+            return_response=False,
+        )
+
+    mock_mastodon_client.account_lookup.assert_called_once_with(
+        acct="@trwnh@mastodon.social"
+    )
+    account = mock_mastodon_client.account_lookup.return_value
+    mock_mastodon_client.account_unmute.assert_called_once_with(id=account.id)
+
+
+@pytest.mark.parametrize(
+    ("payload", "kwargs"),
+    [
+        (
+            {
+                ATTR_STATUS: "test toot",
+            },
+            {
+                "status": "test toot",
+                "spoiler_text": None,
+                "visibility": None,
+                "quote_approval_policy": None,
+                "idempotency_key": None,
+                "language": None,
+                "media_ids": [],
+                "sensitive": None,
+                "in_reply_to_id": None,
+                "quoted_status_id": None,
+            },
+        ),
+        (
+            {ATTR_STATUS: "test toot", ATTR_VISIBILITY: "private"},
+            {
+                "status": "test toot",
+                "spoiler_text": None,
+                "visibility": "private",
+                "quote_approval_policy": None,
+                "idempotency_key": None,
+                "language": None,
+                "media_ids": [],
+                "sensitive": None,
+                "in_reply_to_id": None,
+                "quoted_status_id": None,
+            },
+        ),
+        (
+            {
+                ATTR_STATUS: "test toot",
+                ATTR_CONTENT_WARNING: "Spoiler",
+                ATTR_VISIBILITY: "private",
+            },
+            {
+                "status": "test toot",
+                "spoiler_text": "Spoiler",
+                "visibility": "private",
+                "quote_approval_policy": None,
+                "idempotency_key": None,
+                "language": None,
+                "media_ids": [],
+                "sensitive": None,
+                "in_reply_to_id": None,
+                "quoted_status_id": None,
+            },
+        ),
+        (
+            {
+                ATTR_STATUS: "test toot",
+                ATTR_CONTENT_WARNING: "Spoiler",
+                ATTR_LANGUAGE: "nl",
+                ATTR_MEDIA: "/image.jpg",
+            },
+            {
+                "status": "test toot",
+                "spoiler_text": "Spoiler",
+                "visibility": None,
+                "quote_approval_policy": None,
+                "idempotency_key": None,
+                "language": "nl",
+                "media_ids": [MediaAttachment(id=1)],
+                "sensitive": None,
+                "in_reply_to_id": None,
+                "quoted_status_id": None,
+            },
+        ),
+        (
+            {
+                ATTR_STATUS: "test toot",
+                ATTR_CONTENT_WARNING: "Spoiler",
+                ATTR_LANGUAGE: "en",
+                ATTR_MEDIA: "/image.jpg",
+                ATTR_MEDIA_DESCRIPTION: "A test image",
+            },
+            {
+                "status": "test toot",
+                "spoiler_text": "Spoiler",
+                "visibility": None,
+                "quote_approval_policy": None,
+                "idempotency_key": None,
+                "language": "en",
+                "media_ids": [MediaAttachment(id=1)],
+                "sensitive": None,
+                "in_reply_to_id": None,
+                "quoted_status_id": None,
+            },
+        ),
+        (
+            {ATTR_STATUS: "test toot", ATTR_LANGUAGE: "invalid-lang"},
+            {
+                "status": "test toot",
+                "language": "invalid-lang",
+                "spoiler_text": None,
+                "visibility": None,
+                "quote_approval_policy": None,
+                "idempotency_key": None,
+                "media_ids": [],
+                "sensitive": None,
+                "in_reply_to_id": None,
+                "quoted_status_id": None,
+            },
+        ),
+        (
+            {
+                ATTR_STATUS: "test toot\nwith idempotency",
+                ATTR_IDEMPOTENCY_KEY: "post_once_only",
+            },
+            {
+                "status": "test toot\nwith idempotency",
+                "idempotency_key": "post_once_only",
+                "language": None,
+                "spoiler_text": None,
+                "visibility": None,
+                "quote_approval_policy": None,
+                "media_ids": [],
+                "sensitive": None,
+                "in_reply_to_id": None,
+                "quoted_status_id": None,
+            },
+        ),
+        (
+            {ATTR_STATUS: "test toot", ATTR_QUOTE_APPROVAL_POLICY: "followers"},
+            {
+                "status": "test toot",
+                "spoiler_text": None,
+                "visibility": None,
+                "quote_approval_policy": "followers",
+                "idempotency_key": None,
+                "language": None,
+                "media_ids": [],
+                "sensitive": None,
+                "in_reply_to_id": None,
+                "quoted_status_id": None,
+            },
+        ),
+        (
+            {ATTR_STATUS: "test toot", ATTR_IN_REPLY_TO: "1234567890"},
+            {
+                "status": "test toot",
+                "spoiler_text": None,
+                "visibility": None,
+                "quote_approval_policy": None,
+                "idempotency_key": None,
+                "language": None,
+                "media_ids": [],
+                "sensitive": None,
+                "in_reply_to_id": "1234567890",
+                "quoted_status_id": None,
+            },
+        ),
+        (
+            {ATTR_STATUS: "test toot", ATTR_QUOTED_STATUS: "1234567890"},
+            {
+                "status": "test toot",
+                "spoiler_text": None,
+                "visibility": None,
+                "quote_approval_policy": None,
+                "idempotency_key": None,
+                "language": None,
+                "media_ids": [],
+                "sensitive": None,
+                "in_reply_to_id": None,
+                "quoted_status_id": "1234567890",
+            },
+        ),
+    ],
+)
+@pytest.mark.parametrize("return_response", [True, False])
+async def test_service_post(
+    hass: HomeAssistant,
+    mock_mastodon_client: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+    payload: dict[str, str],
+    kwargs: dict[str, str | None],
+    return_response: bool,
+) -> None:
+    """Test the post service."""
+
+    await setup_integration(hass, mock_config_entry)
+
+    with (
+        patch.object(hass.config, "is_allowed_path", return_value=True),
+        patch.object(
+            mock_mastodon_client, "media_post", return_value=MediaAttachment(id="1")
+        ),
+    ):
+        response = await hass.services.async_call(
+            DOMAIN,
+            SERVICE_POST,
+            {
+                ATTR_CONFIG_ENTRY_ID: mock_config_entry.entry_id,
+            }
+            | payload,
+            blocking=True,
+            return_response=return_response,
+        )
+
+    mock_mastodon_client.status_post.assert_called_with(**kwargs)
+
+    mock_mastodon_client.status_post.reset_mock()
+    assert bool(response) is return_response
+
+
+async def test_service_post_local_media_source(
+    hass: HomeAssistant,
+    mock_mastodon_client: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test the post service with media from local media source."""
+    assert await async_setup_component(hass, "media_source", {})
+    await setup_integration(hass, mock_config_entry)
+
+    await hass.services.async_call(
+        DOMAIN,
+        SERVICE_POST,
+        {
+            ATTR_CONFIG_ENTRY_ID: mock_config_entry.entry_id,
+            ATTR_STATUS: "test toot",
+            ATTR_MEDIA: [
+                {
+                    ATTR_MEDIA_SOURCE: {
+                        "media_content_id": "media-source://media_source/local/screenshot.jpg",
+                        "media_content_type": "image/jpeg",
+                    },
+                    ATTR_MEDIA_DESCRIPTION: "I play the sax",
+                    ATTR_FOCUS_X: -0.5,
+                    ATTR_FOCUS_Y: 0.5,
+                },
+                {
+                    ATTR_MEDIA_SOURCE: {
+                        "media_content_id": "media-source://media_source/local/screenshot2.jpg",
+                        "media_content_type": "image/jpeg",
+                    },
+                },
+            ],
+        },
+        blocking=True,
+    )
+
+    assert mock_mastodon_client.media_post.call_count == 2
+    mock_mastodon_client.media_post.assert_any_call(
+        media_file=Path("tests/testing_config/media/screenshot.jpg").resolve(),
+        mime_type="image/jpeg",
+        description="I play the sax",
+        focus=(-0.5, 0.5),
+        thumbnail=None,
+        thumbnail_mime_type=None,
+        synchronous=True,
+    )
+    mock_mastodon_client.media_post.assert_any_call(
+        media_file=Path("tests/testing_config/media/screenshot2.jpg").resolve(),
+        mime_type="image/jpeg",
+        description=None,
+        focus=None,
+        thumbnail=None,
+        thumbnail_mime_type=None,
+        synchronous=True,
+    )
+    mock_mastodon_client.status_post.assert_called_once_with(
+        media_ids=[
+            MediaAttachment(id=1),
+            MediaAttachment(id=2),
+        ],
+        status="test toot",
+        visibility=None,
+        quote_approval_policy=None,
+        idempotency_key=None,
+        spoiler_text=None,
+        language=None,
+        sensitive=None,
+        in_reply_to_id=None,
+        quoted_status_id=None,
+    )
+
+
+async def test_service_post_camera_source(
+    hass: HomeAssistant,
+    mock_mastodon_client: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test the post service with media from camera source."""
+    await setup_integration(hass, mock_config_entry)
+    with (
+        patch(
+            "homeassistant.components.mastodon.services.async_get_media_image",
+            return_value=media_source.MediaImage(b"I play the sax\n", "image/jpeg"),
+        ) as mock_get_image,
+    ):
+        await hass.services.async_call(
+            DOMAIN,
+            SERVICE_POST,
+            {
+                ATTR_CONFIG_ENTRY_ID: mock_config_entry.entry_id,
+                ATTR_STATUS: "test toot",
+                ATTR_MEDIA: [
+                    {
+                        ATTR_MEDIA_SOURCE: {
+                            "media_content_id": "media-source://camera/camera.demo_camera",
+                            "media_content_type": "image/jpeg",
+                        },
+                        ATTR_MEDIA_DESCRIPTION: "I play the sax",
+                        ATTR_FOCUS_X: -0.5,
+                        ATTR_FOCUS_Y: 0.5,
+                    }
+                ],
+            },
+            blocking=True,
+        )
+    mock_get_image.assert_called_once_with(
+        hass, "media-source://camera/camera.demo_camera"
+    )
+    mock_mastodon_client.media_post.assert_called_once_with(
+        media_file=b"I play the sax\n",
+        mime_type="image/jpeg",
+        description="I play the sax",
+        focus=(-0.5, 0.5),
+        thumbnail=None,
+        thumbnail_mime_type=None,
+        synchronous=True,
+    )
+    mock_mastodon_client.status_post.assert_called_once_with(
+        media_ids=[MediaAttachment(id=1)],
+        status="test toot",
+        visibility=None,
+        quote_approval_policy=None,
+        idempotency_key=None,
+        spoiler_text=None,
+        language=None,
+        sensitive=None,
+        in_reply_to_id=None,
+        quoted_status_id=None,
+    )
+
+
+async def test_service_post_image_source(
+    hass: HomeAssistant,
+    mock_mastodon_client: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test the post service with media from image source."""
+    await setup_integration(hass, mock_config_entry)
+    with (
+        patch(
+            "homeassistant.components.mastodon.services.async_get_media_image",
+            return_value=media_source.MediaImage(b"I play the sax\n", "image/jpeg"),
+        ) as mock_get_image,
+    ):
+        await hass.services.async_call(
+            DOMAIN,
+            SERVICE_POST,
+            {
+                ATTR_CONFIG_ENTRY_ID: mock_config_entry.entry_id,
+                ATTR_STATUS: "test toot",
+                ATTR_MEDIA: [
+                    {
+                        ATTR_MEDIA_SOURCE: {
+                            "media_content_id": "media-source://image/image.test",
+                            "media_content_type": "image/jpeg",
+                        },
+                        ATTR_MEDIA_DESCRIPTION: "I play the sax",
+                        ATTR_FOCUS_X: -0.5,
+                        ATTR_FOCUS_Y: 0.5,
+                    }
+                ],
+            },
+            blocking=True,
+        )
+    mock_get_image.assert_called_once_with(hass, "media-source://image/image.test")
+    mock_mastodon_client.media_post.assert_called_once_with(
+        media_file=b"I play the sax\n",
+        mime_type="image/jpeg",
+        description="I play the sax",
+        focus=(-0.5, 0.5),
+        thumbnail=None,
+        thumbnail_mime_type=None,
+        synchronous=True,
+    )
+    mock_mastodon_client.status_post.assert_called_once_with(
+        media_ids=[MediaAttachment(id=1)],
+        status="test toot",
+        visibility=None,
+        quote_approval_policy=None,
+        idempotency_key=None,
+        spoiler_text=None,
+        language=None,
+        sensitive=None,
+        in_reply_to_id=None,
+        quoted_status_id=None,
+    )
+
+
+async def test_service_post_tts_source(
+    hass: HomeAssistant,
+    mock_mastodon_client: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test the post service with media from tts source."""
+    await setup_integration(hass, mock_config_entry)
+    with (
+        patch(
+            "homeassistant.components.tts.async_get_media_source_audio",
+            return_value=("mp3", b"Tooooot"),
+        ) as mock_get_media_source_audio,
+        patch(
+            "homeassistant.components.mastodon.services.async_get_media_image",
+            return_value=media_source.MediaImage(b"I play the sax\n", "image/jpeg"),
+        ) as mock_get_image,
+    ):
+        await hass.services.async_call(
+            DOMAIN,
+            SERVICE_POST,
+            {
+                ATTR_CONFIG_ENTRY_ID: mock_config_entry.entry_id,
+                ATTR_STATUS: "test toot",
+                ATTR_MEDIA: [
+                    {
+                        ATTR_MEDIA_SOURCE: {
+                            "media_content_id": "media-source://tts/demo?message=Tooooot&language=en",
+                            "media_content_type": "audio/mp3",
+                        },
+                        ATTR_MEDIA_DESCRIPTION: "I play the sax",
+                        ATTR_THUMBNAIL: {
+                            "media_content_id": "media-source://image/image.test",
+                            "media_content_type": "image/png",
+                        },
+                    }
+                ],
+            },
+            blocking=True,
+        )
+    mock_get_media_source_audio.assert_called_once_with(
+        hass, "media-source://tts/demo?message=Tooooot&language=en"
+    )
+    mock_get_image.assert_called_once_with(hass, "media-source://image/image.test")
+    mock_mastodon_client.media_post.assert_called_once_with(
+        media_file=b"Tooooot",
+        mime_type="audio/mpeg",
+        description="I play the sax",
+        focus=None,
+        thumbnail=b"I play the sax\n",
+        thumbnail_mime_type="image/jpeg",
+        synchronous=True,
+    )
+    mock_mastodon_client.status_post.assert_called_once_with(
+        media_ids=[MediaAttachment(id=1)],
+        status="test toot",
+        visibility=None,
+        quote_approval_policy=None,
+        idempotency_key=None,
+        spoiler_text=None,
+        language=None,
+        sensitive=None,
+        in_reply_to_id=None,
+        quoted_status_id=None,
+    )
+
+
+@pytest.mark.usefixtures("mock_mastodon_client")
+async def test_service_post_media_source_not_supported(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test the post service with media from unsupported source."""
+    await setup_integration(hass, mock_config_entry)
+    with (
+        patch(
+            "homeassistant.components.mastodon.services.async_resolve_media",
+            return_value=media_source.PlayMedia(
+                url="https://gameclipscontent-d2009.media.xboxlive.com/123456789",
+                mime_type="video/mp4",
+                path=None,
+            ),
+        ),
+        pytest.raises(ServiceValidationError) as err,
+    ):
+        await hass.services.async_call(
+            DOMAIN,
+            SERVICE_POST,
+            {
+                ATTR_CONFIG_ENTRY_ID: mock_config_entry.entry_id,
+                ATTR_STATUS: "test toot",
+                ATTR_MEDIA: [
+                    {
+                        ATTR_MEDIA_SOURCE: {
+                            "media_content_id": "media-source://xbox/123456789/",
+                            "media_content_type": "video/mp4",
+                        }
+                    }
+                ],
+            },
+            blocking=True,
+        )
+    assert err.value.translation_key == "media_source_not_supported"
+    assert err.value.translation_placeholders == {
+        "media_content_id": "media-source://xbox/123456789/"
+    }
+
+
+@pytest.mark.parametrize(
+    ("payload", "translation_key"),
+    [
+        (
+            {
+                ATTR_MEDIA: [
+                    {
+                        ATTR_MEDIA_SOURCE: {
+                            "media_content_id": "media-source://media_source/local/screenshot.jpg",
+                            "media_content_type": "image/jpeg",
+                        },
+                        ATTR_THUMBNAIL: {
+                            "media_content_id": "media-source://image/image.test",
+                            "media_content_type": "image/png",
+                        },
+                    }
+                ]
+            },
+            "media_thumbnail_not_allowed",
+        ),
+        (
+            {
+                ATTR_MEDIA: [
+                    {
+                        ATTR_MEDIA_SOURCE: {
+                            "media_content_id": "media-source://media_source/local/test.mp3",
+                            "media_content_type": "audio/mp3",
+                        },
+                    },
+                    {
+                        ATTR_MEDIA_SOURCE: {
+                            "media_content_id": "media-source://media_source/local/screenshot.jpg",
+                            "media_content_type": "image/jpeg",
+                        },
+                    },
+                ]
+            },
+            "media_not_allowed_with_other_media",
+        ),
+        (
+            {
+                ATTR_MEDIA: [
+                    {
+                        ATTR_MEDIA_SOURCE: {
+                            "media_content_id": "media-source://media_source/local/test.mp3",
+                            "media_content_type": "audio/mp3",
+                        },
+                        ATTR_THUMBNAIL: {
+                            "media_content_id": "media-source://media_source/local/test.mp3",
+                            "media_content_type": "audio/mp3",
+                        },
+                    }
+                ]
+            },
+            "media_thumbnail_not_an_image",
+        ),
+        (
+            {
+                ATTR_MEDIA: [
+                    {
+                        ATTR_MEDIA_SOURCE: {
+                            "media_content_id": "media-source://media_source/local/not_media.txt",
+                            "media_content_type": "plain/text",
+                        },
+                    }
+                ]
+            },
+            "media_type_not_supported",
+        ),
+        (
+            {
+                ATTR_MEDIA: [
+                    {
+                        ATTR_MEDIA_SOURCE: {
+                            "media_content_id": "media-source://tts/demo?message=Tooooot&language=en",
+                            "media_content_type": "audio/mp3",
+                        },
+                    }
+                ]
+            },
+            "media_type_unknown",
+        ),
+    ],
+)
+@pytest.mark.usefixtures("mock_mastodon_client")
+async def test_service_post_media_source_errors(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    payload: dict[str, str],
+    translation_key: str,
+) -> None:
+    """Test the post service errors with media source."""
+    assert await async_setup_component(hass, "media_source", {})
+    await setup_integration(hass, mock_config_entry)
+    with (
+        patch(
+            "homeassistant.components.tts.async_get_media_source_audio",
+            return_value=("midi", b"Tooooot"),
+        ),
+        pytest.raises(ServiceValidationError) as err,
+    ):
+        await hass.services.async_call(
+            DOMAIN,
+            SERVICE_POST,
+            {
+                ATTR_CONFIG_ENTRY_ID: mock_config_entry.entry_id,
+                ATTR_STATUS: "test toot",
+            }
+            | payload,
+            blocking=True,
+        )
+    assert err.value.translation_key == translation_key
+
+
+async def test_service_post_media_source_upload_error(
+    hass: HomeAssistant,
+    mock_mastodon_client: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test the post service with media from unsupported source."""
+    assert await async_setup_component(hass, "media_source", {})
+    await setup_integration(hass, mock_config_entry)
+
+    mock_mastodon_client.media_post.side_effect = MastodonAPIError
+
+    with pytest.raises(HomeAssistantError) as err:
+        await hass.services.async_call(
+            DOMAIN,
+            SERVICE_POST,
+            {
+                ATTR_CONFIG_ENTRY_ID: mock_config_entry.entry_id,
+                ATTR_STATUS: "test toot",
+                ATTR_MEDIA: [
+                    {
+                        ATTR_MEDIA_SOURCE: {
+                            "media_content_id": "media-source://media_source/local/Epic Sax Guy 10 Hours.mp4",
+                            "media_content_type": "video/mp4",
+                        },
+                    }
+                ],
+            },
+            blocking=True,
+        )
+    assert err.value.translation_key == "unable_to_upload_media"
+
+
+@pytest.mark.usefixtures("mock_mastodon_client")
+async def test_service_post_absolute_path_deprecated(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    issue_registry: ir.IssueRegistry,
+) -> None:
+    """Test the post service with deprecated absolute path raises an issue."""
+    await setup_integration(hass, mock_config_entry)
+    with patch.object(hass.config, "is_allowed_path", return_value=True):
+        await hass.services.async_call(
+            DOMAIN,
+            SERVICE_POST,
+            {
+                ATTR_CONFIG_ENTRY_ID: mock_config_entry.entry_id,
+                ATTR_STATUS: "test toot",
+                ATTR_MEDIA: "/image.jpg",
+            },
+            blocking=True,
+        )
+
+    assert issue_registry.async_get_issue(
+        domain=DOMAIN, issue_id="deprecated_media_path"
+    )
+
+
+@pytest.mark.parametrize(
+    ("payload", "kwargs"),
+    [
+        (
+            {
+                ATTR_STATUS: "test toot",
+            },
+            {"status": "test toot", "spoiler_text": None, "visibility": None},
+        ),
+        (
+            {
+                ATTR_STATUS: "test toot",
+                ATTR_CONTENT_WARNING: "Spoiler",
+                ATTR_MEDIA: "/image.jpg",
+            },
+            {
+                "status": "test toot",
+                "spoiler_text": "Spoiler",
+                "visibility": None,
+                "quote_approval_policy": None,
+                "idempotency_key": None,
+                "media_ids": "1",
+                "media_description": None,
+                "sensitive": None,
+            },
+        ),
+    ],
+)
+async def test_post_service_failed(
+    hass: HomeAssistant,
+    mock_mastodon_client: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+    payload: dict[str, str],
+    kwargs: dict[str, str | None],
+) -> None:
+    """Test the post service raising an error."""
+    mock_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    hass.config.is_allowed_path = Mock(return_value=True)
+    mock_mastodon_client.media_post.return_value = MediaAttachment(id="1")
+
+    mock_mastodon_client.status_post.side_effect = MastodonAPIError
+
+    with pytest.raises(HomeAssistantError, match="Unable to send message"):
+        await hass.services.async_call(
+            DOMAIN,
+            SERVICE_POST,
+            {ATTR_CONFIG_ENTRY_ID: mock_config_entry.entry_id} | payload,
+            blocking=True,
+            return_response=False,
+        )
+
+
+async def test_post_media_upload_failed(
+    hass: HomeAssistant,
+    mock_mastodon_client: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test the post service raising an error because media upload fails."""
+    mock_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    payload = {"status": "test toot", "media": "/fail.jpg"}
+
+    mock_mastodon_client.media_post.side_effect = MastodonAPIError
+
+    with (
+        patch.object(hass.config, "is_allowed_path", return_value=True),
+        pytest.raises(HomeAssistantError, match="Unable to upload image /fail.jpg"),
+    ):
+        await hass.services.async_call(
+            DOMAIN,
+            SERVICE_POST,
+            {ATTR_CONFIG_ENTRY_ID: mock_config_entry.entry_id} | payload,
+            blocking=True,
+            return_response=False,
+        )
+
+
+async def test_post_path_not_whitelisted(
+    hass: HomeAssistant,
+    mock_mastodon_client: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test post service error when file path is not whitelisted."""
+    mock_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    payload = {"status": "test toot", "media": "/fail.jpg"}
+
+    with pytest.raises(
+        HomeAssistantError, match="/fail.jpg is not a whitelisted directory"
+    ):
+        await hass.services.async_call(
+            DOMAIN,
+            SERVICE_POST,
+            {ATTR_CONFIG_ENTRY_ID: mock_config_entry.entry_id} | payload,
+            blocking=True,
+            return_response=False,
+        )
+
+
+@pytest.mark.usefixtures("mock_mastodon_client")
+async def test_idempotency_key_too_short(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test post service error when idempotency key is too short."""
+    mock_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    payload = {"status": "test toot", "idempotency_key": "abc"}
+
+    with pytest.raises(
+        probatio.error.MultipleInvalid,
+        match="length of value must be at least 4 at 'idempotency_key'",
+    ):
+        await hass.services.async_call(
+            DOMAIN,
+            SERVICE_POST,
+            {ATTR_CONFIG_ENTRY_ID: mock_config_entry.entry_id} | payload,
+            blocking=True,
+            return_response=False,
+        )
+
+
+async def test_service_entry_availability(
+    hass: HomeAssistant,
+    mock_mastodon_client: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test the services without valid entry."""
+    mock_config_entry.add_to_hass(hass)
+    mock_config_entry2 = MockConfigEntry(domain=DOMAIN)
+    mock_config_entry2.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    payload = {"status": "test toot"}
+
+    with pytest.raises(ServiceValidationError) as err:
+        await hass.services.async_call(
+            DOMAIN,
+            SERVICE_POST,
+            {ATTR_CONFIG_ENTRY_ID: mock_config_entry2.entry_id} | payload,
+            blocking=True,
+            return_response=False,
+        )
+    assert err.value.translation_key == "service_config_entry_not_loaded"
+
+    with pytest.raises(ServiceValidationError) as err:
+        await hass.services.async_call(
+            DOMAIN,
+            SERVICE_POST,
+            {ATTR_CONFIG_ENTRY_ID: "bad-config_id"} | payload,
+            blocking=True,
+            return_response=False,
+        )
+    assert err.value.translation_key == "service_config_entry_not_found"
+
+
+@pytest.mark.parametrize(
+    ("payload", "kwargs"),
+    [
+        (
+            {ATTR_DISPLAY_NAME: "Test User"},
+            {ATTR_DISPLAY_NAME: "Test User"},
+        ),
+        (
+            {ATTR_NOTE: "bio"},
+            {ATTR_NOTE: "bio"},
+        ),
+        (
+            {ATTR_LOCKED: True},
+            {ATTR_LOCKED: True},
+        ),
+        (
+            {ATTR_BOT: False},
+            {ATTR_BOT: False},
+        ),
+        (
+            {ATTR_DISCOVERABLE: True},
+            {ATTR_DISCOVERABLE: True},
+        ),
+        (
+            {ATTR_FIELDS: [{"name": "Pronouns", "value": "He/Him, They/Them"}]},
+            {ATTR_FIELDS: [("Pronouns", "He/Him, They/Them")]},
+        ),
+        (
+            {ATTR_ATTRIBUTION_DOMAINS: ["example.com", "test.com"]},
+            {ATTR_ATTRIBUTION_DOMAINS: ["example.com", "test.com"]},
+        ),
+        (
+            {
+                ATTR_AVATAR: {
+                    "media_content_id": "media-source://camera/camera.demo_camera",
+                    "media_content_type": "image/jpeg",
+                }
+            },
+            {ATTR_AVATAR: b"I play the sax\n", ATTR_AVATAR_MIME_TYPE: "image/jpeg"},
+        ),
+        (
+            {
+                ATTR_AVATAR: {
+                    "media_content_id": "media-source://media_source/local/screenshot.jpg",
+                    "media_content_type": "image/jpeg",
+                }
+            },
+            {
+                ATTR_AVATAR: Path(
+                    "tests/testing_config/media/screenshot.jpg"
+                ).resolve(),
+                ATTR_AVATAR_MIME_TYPE: "image/jpeg",
+            },
+        ),
+        (
+            {
+                ATTR_AVATAR: {
+                    "media_content_id": "media-source://image/image.test",
+                    "media_content_type": "image/png",
+                }
+            },
+            {ATTR_AVATAR: b"\x89PNG\n", ATTR_AVATAR_MIME_TYPE: "image/png"},
+        ),
+        (
+            {
+                ATTR_HEADER: {
+                    "media_content_id": "media-source://camera/camera.demo_camera",
+                    "media_content_type": "image/jpeg",
+                }
+            },
+            {ATTR_HEADER: b"I play the sax\n", ATTR_HEADER_MIME_TYPE: "image/jpeg"},
+        ),
+        (
+            {
+                ATTR_HEADER: {
+                    "media_content_id": "media-source://image/image.test",
+                    "media_content_type": "image/png",
+                }
+            },
+            {ATTR_HEADER: b"\x89PNG\n", ATTR_HEADER_MIME_TYPE: "image/png"},
+        ),
+        (
+            {
+                ATTR_HEADER: {
+                    "media_content_id": "media-source://media_source/local/screenshot.jpg",
+                    "media_content_type": "image/jpeg",
+                }
+            },
+            {
+                ATTR_HEADER: Path(
+                    "tests/testing_config/media/screenshot.jpg"
+                ).resolve(),
+                ATTR_HEADER_MIME_TYPE: "image/jpeg",
+            },
+        ),
+        (
+            {ATTR_AVATAR_DESCRIPTION: "Alex wearing a green shirt and glasses."},
+            {ATTR_AVATAR_DESCRIPTION: "Alex wearing a green shirt and glasses."},
+        ),
+        (
+            {ATTR_HEADER_DESCRIPTION: "Mountain landscape at sunset."},
+            {ATTR_HEADER_DESCRIPTION: "Mountain landscape at sunset."},
+        ),
+    ],
+)
+@pytest.mark.parametrize("return_response", [True, False])
+async def test_service_update_profile(
+    hass: HomeAssistant,
+    mock_mastodon_client: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+    payload: dict[str, str],
+    kwargs: dict[str, str | None],
+    return_response: bool,
+) -> None:
+    """Test the update profile service."""
+    assert await async_setup_component(hass, "media_source", {})
+    await setup_integration(hass, mock_config_entry)
+
+    assert mock_config_entry.state is ConfigEntryState.LOADED
+    with patch(
+        "homeassistant.components.mastodon.services.async_get_media_image",
+        side_effect=lambda hass, media_content_id: MEDIA_IMAGES.get(media_content_id),
+    ):
+        response = await hass.services.async_call(
+            DOMAIN,
+            SERVICE_UPDATE_PROFILE,
+            {ATTR_CONFIG_ENTRY_ID: mock_config_entry.entry_id, **payload},
+            blocking=True,
+            return_response=return_response,
+        )
+
+    mock_mastodon_client.account_update_credentials.assert_called_with(**kwargs)
+    assert bool(response) is return_response
+
+
+@pytest.mark.parametrize(
+    ("payload", "call_method"),
+    [
+        ({ATTR_DELETE_HEADER: True}, "account_delete_header"),
+        ({ATTR_DELETE_AVATAR: True}, "account_delete_avatar"),
+    ],
+)
+@pytest.mark.parametrize("return_response", [True, False])
+async def test_service_update_profile_delete_pictures(
+    hass: HomeAssistant,
+    mock_mastodon_client: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+    payload: dict[str, str],
+    call_method: str,
+    return_response: bool,
+) -> None:
+    """Test the update profile service for deleting pictures."""
+    assert await async_setup_component(hass, "media_source", {})
+    await setup_integration(hass, mock_config_entry)
+
+    assert mock_config_entry.state is ConfigEntryState.LOADED
+
+    response = await hass.services.async_call(
+        DOMAIN,
+        SERVICE_UPDATE_PROFILE,
+        {ATTR_CONFIG_ENTRY_ID: mock_config_entry.entry_id, **payload},
+        blocking=True,
+        return_response=return_response,
+    )
+
+    getattr(mock_mastodon_client, call_method).assert_called_once()
+    assert bool(response) is return_response
+
+
+@pytest.mark.parametrize(
+    ("exception", "translation_key"),
+    [
+        (MastodonAPIError, "unable_to_update_profile"),
+        (MastodonUnauthorizedError, "auth_failed"),
+    ],
+)
+async def test_service_update_profile_exceptions(
+    hass: HomeAssistant,
+    mock_mastodon_client: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+    exception: type[Exception],
+    translation_key: str,
+) -> None:
+    """Test the update profile service exceptions."""
+    await setup_integration(hass, mock_config_entry)
+
+    assert mock_config_entry.state is ConfigEntryState.LOADED
+
+    mock_mastodon_client.account_update_credentials.side_effect = exception
+
+    with pytest.raises(HomeAssistantError) as err:
+        await hass.services.async_call(
+            DOMAIN,
+            SERVICE_UPDATE_PROFILE,
+            {
+                ATTR_CONFIG_ENTRY_ID: mock_config_entry.entry_id,
+                ATTR_DISPLAY_NAME: "Test User",
+            },
+            blocking=True,
+            return_response=True,
+        )
+
+    assert err.value.translation_key == translation_key
+
+
+@pytest.mark.usefixtures("mock_mastodon_client")
+async def test_service_update_profile_media_source_not_supported(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test the update profile service with unsupported media source."""
+
+    await setup_integration(hass, mock_config_entry)
+
+    assert mock_config_entry.state is ConfigEntryState.LOADED
+
+    with (
+        patch(
+            "homeassistant.components.mastodon.services.async_resolve_media",
+            return_value=media_source.PlayMedia(
+                url="https://gameclipscontent-d2009.media.xboxlive.com/123456789",
+                mime_type="video/mp4",
+                path=None,
+            ),
+        ),
+        pytest.raises(HomeAssistantError) as err,
+    ):
+        await hass.services.async_call(
+            DOMAIN,
+            SERVICE_UPDATE_PROFILE,
+            {
+                ATTR_CONFIG_ENTRY_ID: mock_config_entry.entry_id,
+                ATTR_AVATAR: {
+                    "media_content_id": "media-source://xbox/123456789/",
+                    "media_content_type": "video",
+                },
+            },
+            blocking=True,
+            return_response=True,
+        )
+    assert err.value.translation_key == "media_source_not_supported"

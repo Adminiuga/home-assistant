@@ -1,0 +1,216 @@
+"""Test camera helper functions."""
+
+from typing import Any
+
+import pytest
+from pytest_homeassistant.common import async_fire_time_changed
+
+from homeassistant.components.camera.const import (
+    DATA_CAMERA_PREFS,
+    DOMAIN,
+    PREF_PRELOAD_STREAM,
+)
+from homeassistant.components.camera.prefs import (
+    CameraPreferences,
+    DynamicStreamSettings,
+    get_dynamic_camera_stream_settings,
+)
+from homeassistant.components.stream import Orientation
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import entity_registry as er
+
+
+async def test_get_dynamic_camera_stream_settings_missing_prefs(
+    hass: HomeAssistant,
+) -> None:
+    """Test get_dynamic_camera_stream_settings when camera prefs are not set up."""
+    with pytest.raises(HomeAssistantError, match="Camera integration not set up"):
+        await get_dynamic_camera_stream_settings(hass, "camera.test")
+
+
+async def test_get_dynamic_camera_stream_settings_success(hass: HomeAssistant) -> None:
+    """Test successful retrieval of dynamic camera stream settings."""
+    # Set up camera preferences
+    prefs = CameraPreferences(hass)
+    await prefs.async_load()
+    hass.data[DATA_CAMERA_PREFS] = prefs
+
+    # Test with default settings
+    settings = await get_dynamic_camera_stream_settings(hass, "camera.test")
+    assert settings.orientation == Orientation.NO_TRANSFORM
+    assert settings.preload_stream is False
+
+
+async def test_get_dynamic_camera_stream_settings_with_custom_orientation(
+    hass: HomeAssistant,
+) -> None:
+    """Test get_dynamic_camera_stream_settings with custom orientation set."""
+    # Set up camera preferences
+    prefs = CameraPreferences(hass)
+    await prefs.async_load()
+    hass.data[DATA_CAMERA_PREFS] = prefs
+
+    # Set custom orientation - this requires entity registry
+    # For this test, we'll directly manipulate the internal state
+    # since entity registry setup is complex for a unit test
+    test_settings = DynamicStreamSettings(
+        orientation=Orientation.ROTATE_LEFT, preload_stream=False
+    )
+    prefs._dynamic_stream_settings_by_entity_id["camera.test"] = test_settings
+
+    settings = await get_dynamic_camera_stream_settings(hass, "camera.test")
+    assert settings.orientation == Orientation.ROTATE_LEFT
+    assert settings.preload_stream is False
+
+
+async def test_get_dynamic_camera_stream_settings_with_preload_stream(
+    hass: HomeAssistant,
+) -> None:
+    """Test get_dynamic_camera_stream_settings with preload stream enabled."""
+    # Set up camera preferences
+    prefs = CameraPreferences(hass)
+    await prefs.async_load()
+    hass.data[DATA_CAMERA_PREFS] = prefs
+
+    # Set preload stream by directly setting the dynamic stream settings
+    test_settings = DynamicStreamSettings(
+        orientation=Orientation.NO_TRANSFORM, preload_stream=True
+    )
+    prefs._dynamic_stream_settings_by_entity_id["camera.test"] = test_settings
+
+    settings = await get_dynamic_camera_stream_settings(hass, "camera.test")
+    assert settings.orientation == Orientation.NO_TRANSFORM
+    assert settings.preload_stream is True
+
+
+async def test_entity_id_change_disabled_camera(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    entity_registry: er.EntityRegistry,
+) -> None:
+    """Test prefs move on rename of a camera which is not loaded."""
+    entity_registry.async_get_or_create(
+        DOMAIN,
+        "test",
+        "unique",
+        suggested_object_id="old",
+        disabled_by=er.RegistryEntryDisabler.USER,
+    )
+    prefs = CameraPreferences(hass)
+    await prefs.async_load()
+    await prefs.async_update(
+        "camera.old", preload_stream=True, orientation=Orientation.ROTATE_LEFT
+    )
+    settings = await prefs.get_dynamic_stream_settings("camera.old")
+
+    entity_registry.async_update_entity("camera.old", new_entity_id="camera.new")
+    async_fire_time_changed(hass)
+    await hass.async_block_till_done()
+
+    assert await prefs.get_dynamic_stream_settings("camera.new") is settings
+    assert settings == DynamicStreamSettings(
+        preload_stream=True, orientation=Orientation.ROTATE_LEFT
+    )
+    assert hass_storage[DOMAIN]["data"] == {"camera.new": {PREF_PRELOAD_STREAM: True}}
+    # The old entity_id gets fresh defaults
+    assert (
+        await prefs.get_dynamic_stream_settings("camera.old") == DynamicStreamSettings()
+    )
+
+
+async def test_entity_removed(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    entity_registry: er.EntityRegistry,
+) -> None:
+    """Test prefs are dropped when the camera is removed from the registry."""
+    entity_registry.async_get_or_create(
+        DOMAIN, "test", "unique", suggested_object_id="old"
+    )
+    prefs = CameraPreferences(hass)
+    await prefs.async_load()
+    await prefs.async_update("camera.old", preload_stream=True)
+    settings = await prefs.get_dynamic_stream_settings("camera.old")
+
+    entity_registry.async_remove("camera.old")
+    async_fire_time_changed(hass)
+    await hass.async_block_till_done()
+
+    assert hass_storage[DOMAIN]["data"] == {}
+    # A camera created later with the same entity_id does not inherit the prefs
+    new_settings = await prefs.get_dynamic_stream_settings("camera.old")
+    assert new_settings is not settings
+    assert new_settings == DynamicStreamSettings()
+
+
+async def test_entity_id_change_drops_stale_prefs(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    entity_registry: er.EntityRegistry,
+) -> None:
+    """Test leftover prefs of a removed camera are not inherited on rename."""
+    hass_storage[DOMAIN] = {
+        "version": 1,
+        "data": {"camera.new": {PREF_PRELOAD_STREAM: True}},
+    }
+    entity_registry.async_get_or_create(
+        DOMAIN, "test", "unique", suggested_object_id="old"
+    )
+    prefs = CameraPreferences(hass)
+    await prefs.async_load()
+    stale_settings = await prefs.get_dynamic_stream_settings("camera.new")
+
+    entity_registry.async_update_entity("camera.old", new_entity_id="camera.new")
+    async_fire_time_changed(hass)
+    await hass.async_block_till_done()
+
+    settings = await prefs.get_dynamic_stream_settings("camera.new")
+    assert settings is not stale_settings
+    assert settings == DynamicStreamSettings()
+    assert hass_storage[DOMAIN]["data"] == {}
+
+
+async def test_entity_id_change_other_domain(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    entity_registry: er.EntityRegistry,
+) -> None:
+    """Test renaming a non-camera entity does not touch camera prefs."""
+    hass_storage[DOMAIN] = {
+        "version": 1,
+        "data": {"sensor.new": {PREF_PRELOAD_STREAM: True}},
+    }
+    entity_registry.async_get_or_create(
+        "sensor", "test", "unique", suggested_object_id="old"
+    )
+    prefs = CameraPreferences(hass)
+    await prefs.async_load()
+
+    entity_registry.async_update_entity("sensor.old", new_entity_id="sensor.new")
+    await hass.async_block_till_done()
+
+    assert (await prefs.get_dynamic_stream_settings("sensor.new")).preload_stream
+
+
+@pytest.mark.parametrize(
+    "orientation", [Orientation.NO_TRANSFORM, Orientation.ROTATE_LEFT]
+)
+async def test_get_dynamic_camera_stream_settings_stored_orientation(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    orientation: Orientation,
+) -> None:
+    """Test a stored orientation is loaded as an Orientation."""
+    prefs = CameraPreferences(hass)
+    await prefs.async_load()
+    hass.data[DATA_CAMERA_PREFS] = prefs
+
+    entry = entity_registry.async_get_or_create("camera", "test", "unique_id")
+    # Entity registry options are loaded from JSON as a plain int
+    entity_registry.async_update_entity_options(
+        entry.entity_id, "camera", {"orientation": int(orientation)}
+    )
+
+    settings = await get_dynamic_camera_stream_settings(hass, entry.entity_id)
+    assert settings.orientation is orientation

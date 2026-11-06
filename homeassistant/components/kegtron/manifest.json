@@ -1,16 +1,19 @@
 {
   "domain": "kegtron",
   "name": "Kegtron",
-  "config_flow": true,
-  "documentation": "https://www.home-assistant.io/integrations/kegtron",
   "bluetooth": [
     {
       "connectable": false,
       "manufacturer_id": 65535
     }
   ],
-  "requirements": ["kegtron-ble==0.4.0"],
-  "dependencies": ["bluetooth"],
+  "categories": ["appliances_cleaning.cooking"],
   "codeowners": ["@Ernst79"],
-  "iot_class": "local_push"
+  "config_flow": true,
+  "connectivity": ["bluetooth"],
+  "dependencies": ["bluetooth_adapters"],
+  "documentation": "https://www.home-assistant.io/integrations/kegtron",
+  "integration_type": "device",
+  "iot_class": "local_push",
+  "requirements": ["kegtron-ble==1.0.2"]
 }

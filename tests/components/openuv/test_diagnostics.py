@@ -1,24 +1,33 @@
 """Test OpenUV diagnostics."""
+
+from pytest_homeassistant.common import ANY
+from pytest_homeassistant.components.diagnostics import get_diagnostics_for_config_entry
+from pytest_homeassistant.typing import ClientSessionGenerator
+
 from homeassistant.components.diagnostics import REDACTED
+from homeassistant.core import HomeAssistant
 from homeassistant.setup import async_setup_component
 
-from tests.components.diagnostics import get_diagnostics_for_config_entry
 
-
-async def test_entry_diagnostics(hass, config_entry, hass_client, setup_openuv):
+async def test_entry_diagnostics(
+    hass: HomeAssistant,
+    config_entry,
+    hass_client: ClientSessionGenerator,
+    setup_config_entry,
+) -> None:
     """Test config entry diagnostics."""
     await async_setup_component(hass, "homeassistant", {})
     assert await get_diagnostics_for_config_entry(hass, hass_client, config_entry) == {
         "entry": {
             "entry_id": config_entry.entry_id,
-            "version": 2,
+            "version": 3,
+            "minor_version": 1,
             "domain": "openuv",
             "title": REDACTED,
             "data": {
                 "api_key": REDACTED,
                 "elevation": 0,
-                "latitude": REDACTED,
-                "longitude": REDACTED,
+                "location": {"latitude": REDACTED, "longitude": REDACTED},
             },
             "options": {"from_window": 3.5, "to_window": 3.5},
             "pref_disable_new_entities": False,
@@ -26,12 +35,17 @@ async def test_entry_diagnostics(hass, config_entry, hass_client, setup_openuv):
             "source": "user",
             "unique_id": REDACTED,
             "disabled_by": None,
+            "created_at": ANY,
+            "modified_at": ANY,
+            "discovery_keys": {},
+            "subentries": [],
         },
         "data": {
             "protection_window": {
-                "from_time": "2018-07-30T15:17:49.750Z",
+                "is_on": False,
+                "from_time": "2018-07-30T15:17:49.750000+00:00",
                 "from_uv": 3.2509,
-                "to_time": "2018-07-30T22:47:49.750Z",
+                "to_time": "2018-07-30T22:47:49.750000+00:00",
                 "to_uv": 3.6483,
             },
             "uv": {

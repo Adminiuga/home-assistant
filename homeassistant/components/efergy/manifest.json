@@ -1,11 +1,13 @@
 {
   "domain": "efergy",
   "name": "Efergy",
-  "config_flow": true,
-  "documentation": "https://www.home-assistant.io/integrations/efergy",
-  "requirements": ["pyefergy==22.1.1"],
+  "categories": ["energy.meters_monitoring"],
   "codeowners": ["@tkdrob"],
+  "config_flow": true,
+  "connectivity": ["cloud"],
+  "documentation": "https://www.home-assistant.io/integrations/efergy",
+  "integration_type": "hub",
   "iot_class": "cloud_polling",
   "loggers": ["iso4217", "pyefergy"],
-  "integration_type": "hub"
+  "requirements": ["pyefergy==22.5.0"]
 }

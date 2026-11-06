@@ -1,9 +1,12 @@
 {
   "domain": "ebusd",
   "name": "ebusd",
-  "documentation": "https://www.home-assistant.io/integrations/ebusd",
-  "requirements": ["ebusdpy==0.0.17"],
+  "categories": ["climate.thermostats_heating", "diy_makers.boards_hardware"],
   "codeowners": [],
+  "connectivity": ["network"],
+  "documentation": "https://www.home-assistant.io/integrations/ebusd",
   "iot_class": "local_polling",
-  "loggers": ["ebusdpy"]
+  "loggers": ["ebusdpy"],
+  "quality_scale": "legacy",
+  "requirements": ["ebusdpy==0.0.17"]
 }

@@ -1,10 +1,13 @@
 {
   "domain": "aurora",
   "name": "Aurora",
-  "documentation": "https://www.home-assistant.io/integrations/aurora",
-  "config_flow": true,
+  "categories": ["weather_alerts.forecasts"],
   "codeowners": ["@djtimca"],
-  "requirements": ["auroranoaa==0.0.2"],
+  "config_flow": true,
+  "connectivity": ["cloud"],
+  "documentation": "https://www.home-assistant.io/integrations/aurora",
+  "integration_type": "service",
   "iot_class": "cloud_polling",
-  "loggers": ["auroranoaa"]
+  "loggers": ["auroranoaa"],
+  "requirements": ["auroranoaa==0.0.5"]
 }

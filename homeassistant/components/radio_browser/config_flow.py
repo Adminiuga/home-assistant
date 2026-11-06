@@ -1,10 +1,12 @@
 """Config flow for Radio Browser integration."""
-from __future__ import annotations
 
-from typing import Any
+from typing import Any, override
 
-from homeassistant.config_entries import ConfigFlow
-from homeassistant.data_entry_flow import FlowResult
+from radios import RadioBrowser, RadioBrowserError
+
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.const import __version__
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .const import DOMAIN
 
@@ -14,20 +16,28 @@ class RadioBrowserConfigFlow(ConfigFlow, domain=DOMAIN):
 
     VERSION = 1
 
+    @override
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle the initial step."""
-        if self._async_current_entries():
-            return self.async_abort(reason="single_instance_allowed")
-
+        errors: dict[str, str] = {}
         if user_input is not None:
-            return self.async_create_entry(title="Radio Browser", data={})
+            radios = RadioBrowser(
+                session=async_get_clientsession(self.hass),
+                user_agent=f"HomeAssistant/{__version__}",
+            )
+            try:
+                await radios.stats()
+            except RadioBrowserError:
+                errors["base"] = "cannot_connect"
+            else:
+                return self.async_create_entry(title="Radio Browser", data={})
 
-        return self.async_show_form(step_id="user")
+        return self.async_show_form(step_id="user", errors=errors)
 
     async def async_step_onboarding(
         self, data: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle a flow initialized by onboarding."""
         return self.async_create_entry(title="Radio Browser", data={})

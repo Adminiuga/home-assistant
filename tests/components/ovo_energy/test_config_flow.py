@@ -1,19 +1,49 @@
 """Test the OVO Energy config flow."""
+
+from collections.abc import Generator
+from contextlib import contextmanager
 from unittest.mock import patch
 
 import aiohttp
+from pytest_homeassistant.common import MockConfigEntry
 
-from homeassistant import config_entries, data_entry_flow
-from homeassistant.components.ovo_energy.const import DOMAIN
+from homeassistant import config_entries
+from homeassistant.components.ovo_energy.const import CONF_ACCOUNT, DOMAIN
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant
-
-from tests.common import MockConfigEntry
+from homeassistant.data_entry_flow import FlowResultType
 
 FIXTURE_REAUTH_INPUT = {CONF_PASSWORD: "something1"}
-FIXTURE_USER_INPUT = {CONF_USERNAME: "example@example.com", CONF_PASSWORD: "something"}
+FIXTURE_USER_INPUT = {
+    CONF_USERNAME: "example@example.com",
+    CONF_PASSWORD: "something",
+    CONF_ACCOUNT: "123456",
+}
 
 UNIQUE_ID = "example@example.com"
+
+
+@contextmanager
+def _patch_success() -> Generator[None]:
+    """Patch the OVO Energy client to authenticate successfully."""
+    with (
+        patch(
+            "homeassistant.components.ovo_energy.config_flow.OVOEnergy.authenticate",
+            return_value=True,
+        ),
+        patch(
+            "homeassistant.components.ovo_energy.config_flow.OVOEnergy.bootstrap_accounts",
+        ),
+        patch(
+            "homeassistant.components.ovo_energy.config_flow.OVOEnergy.username",
+            "some_name",
+        ),
+        patch(
+            "homeassistant.components.ovo_energy.async_setup_entry",
+            return_value=None,
+        ),
+    ):
+        yield
 
 
 async def test_show_form(hass: HomeAssistant) -> None:
@@ -22,7 +52,7 @@ async def test_show_form(hass: HomeAssistant) -> None:
         DOMAIN, context={"source": config_entries.SOURCE_USER}
     )
 
-    assert result["type"] == data_entry_flow.FlowResultType.FORM
+    assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "user"
 
 
@@ -32,21 +62,33 @@ async def test_authorization_error(hass: HomeAssistant) -> None:
         DOMAIN, context={"source": config_entries.SOURCE_USER}
     )
 
-    assert result["type"] == data_entry_flow.FlowResultType.FORM
+    assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "user"
 
-    with patch(
-        "homeassistant.components.ovo_energy.config_flow.OVOEnergy.authenticate",
-        return_value=False,
+    with (
+        patch(
+            "homeassistant.components.ovo_energy.config_flow.OVOEnergy.authenticate",
+            return_value=False,
+        ),
+        patch(
+            "homeassistant.components.ovo_energy.config_flow.OVOEnergy.bootstrap_accounts",
+        ),
     ):
         result2 = await hass.config_entries.flow.async_configure(
             result["flow_id"],
             FIXTURE_USER_INPUT,
         )
 
-    assert result2["type"] == data_entry_flow.FlowResultType.FORM
+    assert result2["type"] is FlowResultType.FORM
     assert result2["step_id"] == "user"
     assert result2["errors"] == {"base": "invalid_auth"}
+
+    with _patch_success():
+        result3 = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            FIXTURE_USER_INPUT,
+        )
+    assert result3["type"] is FlowResultType.CREATE_ENTRY
 
 
 async def test_connection_error(hass: HomeAssistant) -> None:
@@ -55,7 +97,7 @@ async def test_connection_error(hass: HomeAssistant) -> None:
         DOMAIN, context={"source": config_entries.SOURCE_USER}
     )
 
-    assert result["type"] == data_entry_flow.FlowResultType.FORM
+    assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "user"
 
     with patch(
@@ -67,9 +109,16 @@ async def test_connection_error(hass: HomeAssistant) -> None:
             FIXTURE_USER_INPUT,
         )
 
-    assert result2["type"] == data_entry_flow.FlowResultType.FORM
+    assert result2["type"] is FlowResultType.FORM
     assert result2["step_id"] == "user"
     assert result2["errors"] == {"base": "cannot_connect"}
+
+    with _patch_success():
+        result3 = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            FIXTURE_USER_INPUT,
+        )
+    assert result3["type"] is FlowResultType.CREATE_ENTRY
 
 
 async def test_full_flow_implementation(hass: HomeAssistant) -> None:
@@ -78,105 +127,141 @@ async def test_full_flow_implementation(hass: HomeAssistant) -> None:
         DOMAIN, context={"source": config_entries.SOURCE_USER}
     )
 
-    assert result["type"] == data_entry_flow.FlowResultType.FORM
+    assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "user"
 
-    with patch(
-        "homeassistant.components.ovo_energy.config_flow.OVOEnergy.authenticate",
-        return_value=True,
-    ), patch(
-        "homeassistant.components.ovo_energy.async_setup_entry",
-        return_value=True,
+    with (
+        patch(
+            "homeassistant.components.ovo_energy.config_flow.OVOEnergy.authenticate",
+            return_value=True,
+        ),
+        patch(
+            "homeassistant.components.ovo_energy.config_flow.OVOEnergy.bootstrap_accounts",
+        ),
+        patch(
+            "homeassistant.components.ovo_energy.config_flow.OVOEnergy.username",
+            "some_name",
+        ),
+        patch(
+            "homeassistant.components.ovo_energy.async_setup_entry",
+            return_value=None,
+        ),
     ):
         result2 = await hass.config_entries.flow.async_configure(
             result["flow_id"],
             FIXTURE_USER_INPUT,
         )
 
-    assert result2["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
+    assert result2["type"] is FlowResultType.CREATE_ENTRY
     assert result2["data"][CONF_USERNAME] == FIXTURE_USER_INPUT[CONF_USERNAME]
     assert result2["data"][CONF_PASSWORD] == FIXTURE_USER_INPUT[CONF_PASSWORD]
+    assert result2["data"][CONF_ACCOUNT] == FIXTURE_USER_INPUT[CONF_ACCOUNT]
+    assert result2["result"].unique_id == UNIQUE_ID
 
 
 async def test_reauth_authorization_error(hass: HomeAssistant) -> None:
     """Test we show user form on authorization error."""
+    mock_config = MockConfigEntry(
+        domain=DOMAIN, unique_id=UNIQUE_ID, data=FIXTURE_USER_INPUT
+    )
+    mock_config.add_to_hass(hass)
+    result = await mock_config.start_reauth_flow(hass)
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "reauth_confirm"
     with patch(
         "homeassistant.components.ovo_energy.config_flow.OVOEnergy.authenticate",
         return_value=False,
     ):
-        result = await hass.config_entries.flow.async_init(
-            DOMAIN,
-            context={"source": config_entries.SOURCE_REAUTH},
-            data=FIXTURE_USER_INPUT,
-        )
-
-        assert result["type"] == data_entry_flow.FlowResultType.FORM
-        assert result["step_id"] == "reauth"
-
         result2 = await hass.config_entries.flow.async_configure(
             result["flow_id"],
             FIXTURE_REAUTH_INPUT,
         )
         await hass.async_block_till_done()
 
-        assert result2["type"] == data_entry_flow.FlowResultType.FORM
-        assert result2["step_id"] == "reauth"
+        assert result2["type"] is FlowResultType.FORM
+        assert result2["step_id"] == "reauth_confirm"
         assert result2["errors"] == {"base": "authorization_error"}
+
+    with _patch_success():
+        result3 = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            FIXTURE_REAUTH_INPUT,
+        )
+        await hass.async_block_till_done()
+    assert result3["type"] is FlowResultType.ABORT
+    assert result3["reason"] == "reauth_successful"
 
 
 async def test_reauth_connection_error(hass: HomeAssistant) -> None:
     """Test we show user form on connection error."""
+    mock_config = MockConfigEntry(
+        domain=DOMAIN, unique_id=UNIQUE_ID, data=FIXTURE_USER_INPUT
+    )
+    mock_config.add_to_hass(hass)
+    result = await mock_config.start_reauth_flow(hass)
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "reauth_confirm"
+    assert result["errors"] == {}
+
     with patch(
         "homeassistant.components.ovo_energy.config_flow.OVOEnergy.authenticate",
         side_effect=aiohttp.ClientError,
     ):
-        result = await hass.config_entries.flow.async_init(
-            DOMAIN,
-            context={"source": config_entries.SOURCE_REAUTH},
-            data=FIXTURE_USER_INPUT,
-        )
-
-        assert result["type"] == data_entry_flow.FlowResultType.FORM
-        assert result["step_id"] == "reauth"
-
         result2 = await hass.config_entries.flow.async_configure(
             result["flow_id"],
             FIXTURE_REAUTH_INPUT,
         )
         await hass.async_block_till_done()
 
-        assert result2["type"] == data_entry_flow.FlowResultType.FORM
-        assert result2["step_id"] == "reauth"
+        assert result2["type"] is FlowResultType.FORM
+        assert result2["step_id"] == "reauth_confirm"
         assert result2["errors"] == {"base": "connection_error"}
+
+    with _patch_success():
+        result3 = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            FIXTURE_REAUTH_INPUT,
+        )
+        await hass.async_block_till_done()
+    assert result3["type"] is FlowResultType.ABORT
+    assert result3["reason"] == "reauth_successful"
 
 
 async def test_reauth_flow(hass: HomeAssistant) -> None:
     """Test reauth works."""
+    mock_config = MockConfigEntry(
+        domain=DOMAIN, unique_id=UNIQUE_ID, data=FIXTURE_USER_INPUT
+    )
+    mock_config.add_to_hass(hass)
+    result = await mock_config.start_reauth_flow(hass)
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "reauth_confirm"
+    assert result["errors"] == {}
+
     with patch(
         "homeassistant.components.ovo_energy.config_flow.OVOEnergy.authenticate",
         return_value=False,
     ):
-        mock_config = MockConfigEntry(
-            domain=DOMAIN, unique_id=UNIQUE_ID, data=FIXTURE_USER_INPUT
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            FIXTURE_REAUTH_INPUT,
         )
-        mock_config.add_to_hass(hass)
-
-        result = await hass.config_entries.flow.async_init(
-            DOMAIN,
-            context={"source": config_entries.SOURCE_REAUTH},
-            data=FIXTURE_USER_INPUT,
-        )
-
-        assert result["type"] == data_entry_flow.FlowResultType.FORM
-        assert result["step_id"] == "reauth"
+        assert result["type"] is FlowResultType.FORM
+        assert result["step_id"] == "reauth_confirm"
         assert result["errors"] == {"base": "authorization_error"}
 
-    with patch(
-        "homeassistant.components.ovo_energy.config_flow.OVOEnergy.authenticate",
-        return_value=True,
-    ), patch(
-        "homeassistant.components.ovo_energy.config_flow.OVOEnergy.username",
-        return_value=FIXTURE_USER_INPUT[CONF_USERNAME],
+    with (
+        patch(
+            "homeassistant.components.ovo_energy.config_flow.OVOEnergy.authenticate",
+            return_value=True,
+        ),
+        patch(
+            "homeassistant.components.ovo_energy.config_flow.OVOEnergy.username",
+            return_value=FIXTURE_USER_INPUT[CONF_USERNAME],
+        ),
     ):
         result2 = await hass.config_entries.flow.async_configure(
             result["flow_id"],
@@ -184,5 +269,5 @@ async def test_reauth_flow(hass: HomeAssistant) -> None:
         )
         await hass.async_block_till_done()
 
-        assert result2["type"] == data_entry_flow.FlowResultType.ABORT
+        assert result2["type"] is FlowResultType.ABORT
         assert result2["reason"] == "reauth_successful"

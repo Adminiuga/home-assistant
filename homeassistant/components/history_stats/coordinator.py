@@ -1,17 +1,25 @@
 """History stats data coordinator."""
-from __future__ import annotations
 
 from datetime import timedelta
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any, override
 
-from homeassistant.core import CALLBACK_TYPE, Event, HomeAssistant, callback
+from homeassistant.core import (
+    CALLBACK_TYPE,
+    Event,
+    EventStateChangedData,
+    HomeAssistant,
+    callback,
+)
 from homeassistant.exceptions import TemplateError
 from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.start import async_at_start
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .data import HistoryStats, HistoryStatsState
+
+if TYPE_CHECKING:
+    from . import HistoryStatsConfigEntry
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -20,22 +28,26 @@ UPDATE_INTERVAL = timedelta(minutes=1)
 
 
 class HistoryStatsUpdateCoordinator(DataUpdateCoordinator[HistoryStatsState]):
-    """DataUpdateCoordinator to gather data for a specific TPLink device."""
+    """DataUpdateCoordinator for history stats."""
 
     def __init__(
         self,
         hass: HomeAssistant,
         history_stats: HistoryStats,
+        config_entry: HistoryStatsConfigEntry | None,
         name: str,
+        preview: bool = False,
     ) -> None:
         """Initialize DataUpdateCoordinator."""
         self._history_stats = history_stats
         self._subscriber_count = 0
         self._at_start_listener: CALLBACK_TYPE | None = None
         self._track_events_listener: CALLBACK_TYPE | None = None
+        self._preview = preview
         super().__init__(
             hass,
             _LOGGER,
+            config_entry=config_entry,
             name=name,
             update_interval=UPDATE_INTERVAL,
         )
@@ -81,14 +93,34 @@ class HistoryStatsUpdateCoordinator(DataUpdateCoordinator[HistoryStatsState]):
         self._track_events_listener = async_track_state_change_event(
             self.hass, [self._history_stats.entity_id], self._async_update_from_event
         )
+        self.hass.async_create_task(self._async_poll_after_start())
 
-    async def _async_update_from_event(self, event: Event) -> None:
+    async def _async_poll_after_start(self) -> None:
+        """Once we subscribe to tracking events at start, check the entity state one time."""
+        new_state = self.hass.states.get(self._history_stats.entity_id)
+        if new_state:
+            self.async_set_updated_data(
+                await self._history_stats.async_update(new_state)
+            )
+
+    async def _async_update_from_event(
+        self, event: Event[EventStateChangedData]
+    ) -> None:
         """Process an update from an event."""
-        self.async_set_updated_data(await self._history_stats.async_update(event))
+        self.async_set_updated_data(
+            await self._history_stats.async_update(event.data["new_state"])
+        )
 
+    @override
     async def _async_update_data(self) -> HistoryStatsState:
         """Fetch update the history stats state."""
         try:
             return await self._history_stats.async_update(None)
         except (TemplateError, TypeError, ValueError) as ex:
             raise UpdateFailed(ex) from ex
+
+    @override
+    async def async_refresh(self) -> None:
+        """Refresh data and log errors."""
+        log_failures = not self._preview
+        await self._async_refresh(log_failures)

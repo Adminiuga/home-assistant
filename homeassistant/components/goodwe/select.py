@@ -1,59 +1,78 @@
 """GoodWe PV inverter selection settings entities."""
-import logging
 
-from goodwe import Inverter, InverterError
+import logging
+from typing import override
+
+from goodwe import Inverter, InverterError, OperationMode
 
 from homeassistant.components.select import SelectEntity, SelectEntityDescription
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity import DeviceInfo, EntityCategory
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .const import DOMAIN, KEY_DEVICE_INFO, KEY_INVERTER
+from .const import DOMAIN
+from .coordinator import GoodweConfigEntry
 
 _LOGGER = logging.getLogger(__name__)
 
 
+_MODE_TO_OPTION: dict[OperationMode, str] = {
+    OperationMode.GENERAL: "general",
+    OperationMode.OFF_GRID: "off_grid",
+    OperationMode.BACKUP: "backup",
+    OperationMode.ECO: "eco",
+    OperationMode.PEAK_SHAVING: "peak_shaving",
+    OperationMode.ECO_CHARGE: "eco_charge",
+    OperationMode.ECO_DISCHARGE: "eco_discharge",
+}
+
+_OPTION_TO_MODE: dict[str, OperationMode] = {
+    value: key for key, value in _MODE_TO_OPTION.items()
+}
+
 OPERATION_MODE = SelectEntityDescription(
     key="operation_mode",
-    name="Inverter operation mode",
-    icon="mdi:solar-power",
     entity_category=EntityCategory.CONFIG,
-    options=[
-        "General mode",
-        "Off grid mode",
-        "Backup mode",
-        "Eco mode",
-    ],
+    translation_key="operation_mode",
 )
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    config_entry: GoodweConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up the inverter select entities from a config entry."""
-    inverter = hass.data[DOMAIN][config_entry.entry_id][KEY_INVERTER]
-    device_info = hass.data[DOMAIN][config_entry.entry_id][KEY_DEVICE_INFO]
+    inverter = config_entry.runtime_data.inverter
+    device_info = config_entry.runtime_data.device_info
 
+    supported_modes = await inverter.get_operation_modes(False)
     # read current operating mode from the inverter
     try:
         active_mode = await inverter.get_operation_mode()
-    except (InverterError, ValueError):
+    except InverterError, ValueError:
         # Inverter model does not support this setting
         _LOGGER.debug("Could not read inverter operation mode")
     else:
-        if (options := OPERATION_MODE.options) and 0 <= active_mode < len(options):
+        active_mode_option = _MODE_TO_OPTION.get(active_mode)
+        if active_mode_option is not None:
             async_add_entities(
                 [
                     InverterOperationModeEntity(
                         device_info,
                         OPERATION_MODE,
                         inverter,
-                        options[active_mode],
+                        [v for k, v in _MODE_TO_OPTION.items() if k in supported_modes],
+                        active_mode_option,
                     )
                 ]
+            )
+        else:
+            _LOGGER.warning(
+                "Active mode %s not found in Goodwe Inverter Operation"
+                " Mode Entity. Skipping entity creation",
+                active_mode,
             )
 
 
@@ -61,23 +80,33 @@ class InverterOperationModeEntity(SelectEntity):
     """Entity representing the inverter operation mode."""
 
     _attr_should_poll = False
+    _attr_has_entity_name = True
 
     def __init__(
         self,
         device_info: DeviceInfo,
         description: SelectEntityDescription,
         inverter: Inverter,
+        supported_options: list[str],
         current_mode: str,
     ) -> None:
         """Initialize the inverter operation mode setting entity."""
         self.entity_description = description
-        self._attr_unique_id = f"{DOMAIN}-{description.key}-{inverter.serial_number}"
+        # Legacy format, kept as migrating existing unique IDs is not worth the risk
+        self._attr_unique_id = f"{DOMAIN}-{description.key}-{inverter.serial_number}"  # pylint: disable=home-assistant-entity-unique-id-redundant-domain
         self._attr_device_info = device_info
+        self._attr_options = supported_options
         self._attr_current_option = current_mode
         self._inverter: Inverter = inverter
 
+    async def async_update(self) -> None:
+        """Get the current value from inverter."""
+        value = await self._inverter.get_operation_mode()
+        self._attr_current_option = _MODE_TO_OPTION[value]
+
+    @override
     async def async_select_option(self, option: str) -> None:
         """Change the selected option."""
-        await self._inverter.set_operation_mode(self.options.index(option))
+        await self._inverter.set_operation_mode(_OPTION_TO_MODE[option])
         self._attr_current_option = option
         self.async_write_ha_state()

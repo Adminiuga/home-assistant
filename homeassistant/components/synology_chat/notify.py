@@ -1,32 +1,40 @@
 """SynologyChat platform for notify component."""
+
 from http import HTTPStatus
 import json
 import logging
+from typing import Any, override
 
+import probatio
 import requests
-import voluptuous as vol
 
 from homeassistant.components.notify import (
     ATTR_DATA,
-    PLATFORM_SCHEMA,
+    PLATFORM_SCHEMA as NOTIFY_PLATFORM_SCHEMA,
     BaseNotificationService,
 )
 from homeassistant.const import CONF_RESOURCE, CONF_VERIFY_SSL
-import homeassistant.helpers.config_validation as cv
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
 ATTR_FILE_URL = "file_url"
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
+PLATFORM_SCHEMA = NOTIFY_PLATFORM_SCHEMA.extend(
     {
-        vol.Required(CONF_RESOURCE): cv.url,
-        vol.Optional(CONF_VERIFY_SSL, default=True): cv.boolean,
+        probatio.Required(CONF_RESOURCE): cv.url,
+        probatio.Optional(CONF_VERIFY_SSL, default=True): cv.boolean,
     }
 )
 
 _LOGGER = logging.getLogger(__name__)
 
 
-def get_service(hass, config, discovery_info=None):
+def get_service(
+    hass: HomeAssistant,
+    config: ConfigType,
+    discovery_info: DiscoveryInfoType | None = None,
+) -> SynologyChatNotificationService:
     """Get the Synology Chat notification service."""
     resource = config.get(CONF_RESOURCE)
     verify_ssl = config.get(CONF_VERIFY_SSL)
@@ -42,7 +50,8 @@ class SynologyChatNotificationService(BaseNotificationService):
         self._resource = resource
         self._verify_ssl = verify_ssl
 
-    def send_message(self, message="", **kwargs):
+    @override
+    def send_message(self, message: str = "", **kwargs: Any) -> None:
         """Send a message to a user."""
         data = {"text": message}
 

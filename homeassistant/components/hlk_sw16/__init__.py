@@ -1,18 +1,19 @@
 """Support for HLK-SW16 relay switches."""
+
+import asyncio
 import logging
+from typing import Any
 
 from hlk_sw16 import create_hlk_sw16_connection
-import voluptuous as vol
+from hlk_sw16.protocol import SW16Client
+import probatio
 
 from homeassistant.config_entries import SOURCE_IMPORT, ConfigEntry
 from homeassistant.const import CONF_HOST, CONF_NAME, CONF_PORT, CONF_SWITCHES, Platform
-from homeassistant.core import HomeAssistant, callback
-import homeassistant.helpers.config_validation as cv
-from homeassistant.helpers.dispatcher import (
-    async_dispatcher_connect,
-    async_dispatcher_send,
-)
-from homeassistant.helpers.entity import Entity
+from homeassistant.core import DOMAIN as HOMEASSISTANT_DOMAIN, HomeAssistant, callback
+from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.helpers import config_validation as cv, issue_registry as ir
+from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.typing import ConfigType
 
 from .const import (
@@ -21,30 +22,31 @@ from .const import (
     DEFAULT_PORT,
     DEFAULT_RECONNECT_INTERVAL,
     DOMAIN,
+    INTEGRATION_TITLE,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS = [Platform.SWITCH]
 
-DATA_DEVICE_REGISTER = "hlk_sw16_device_register"
-DATA_DEVICE_LISTENER = "hlk_sw16_device_listener"
+SWITCH_SCHEMA = probatio.Schema({probatio.Optional(CONF_NAME): cv.string})
 
-SWITCH_SCHEMA = vol.Schema({vol.Optional(CONF_NAME): cv.string})
-
-RELAY_ID = vol.All(
-    vol.Any(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, "a", "b", "c", "d", "e", "f"), vol.Coerce(str)
+RELAY_ID = probatio.All(
+    probatio.Any(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, "a", "b", "c", "d", "e", "f"),
+    probatio.Coerce(str),
 )
 
-CONFIG_SCHEMA = vol.Schema(
+CONFIG_SCHEMA = probatio.Schema(
     {
-        DOMAIN: vol.Schema(
+        DOMAIN: probatio.Schema(
             {
-                cv.string: vol.Schema(
+                cv.string: probatio.Schema(
                     {
-                        vol.Required(CONF_HOST): cv.string,
-                        vol.Optional(CONF_PORT, default=DEFAULT_PORT): cv.port,
-                        vol.Required(CONF_SWITCHES): vol.Schema(
+                        probatio.Required(CONF_HOST): cv.string,
+                        probatio.Optional(
+                            CONF_PORT, default=DEFAULT_PORT
+                        ): probatio.Port(),
+                        probatio.Required(CONF_SWITCHES): probatio.Schema(
                             {RELAY_ID: SWITCH_SCHEMA}
                         ),
                     }
@@ -52,8 +54,10 @@ CONFIG_SCHEMA = vol.Schema(
             }
         )
     },
-    extra=vol.ALLOW_EXTRA,
+    extra=probatio.ALLOW_EXTRA,
 )
+
+type HlkConfigEntry = ConfigEntry[SW16Client]
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
@@ -61,26 +65,79 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     if DOMAIN not in config:
         return True
 
-    for device_id in config[DOMAIN]:
-        conf = config[DOMAIN][device_id]
-        hass.async_create_task(
-            hass.config_entries.flow.async_init(
-                DOMAIN,
-                context={"source": SOURCE_IMPORT},
-                data={CONF_HOST: conf[CONF_HOST], CONF_PORT: conf[CONF_PORT]},
-            )
+    hass.async_create_task(
+        _async_import_yaml(
+            hass,
+            [
+                {CONF_HOST: conf[CONF_HOST], CONF_PORT: conf[CONF_PORT]}
+                for conf in config[DOMAIN].values()
+            ],
         )
+    )
     return True
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def _async_import_yaml(
+    hass: HomeAssistant, import_data: list[dict[str, Any]]
+) -> None:
+    """Import the YAML devices into config entries."""
+    # Eager tasks register the import flows before setup waits for them.
+    results = await asyncio.gather(
+        *(
+            hass.async_create_task(
+                hass.config_entries.flow.async_init(
+                    DOMAIN, context={"source": SOURCE_IMPORT}, data=data
+                )
+            )
+            for data in import_data
+        )
+    )
+    failed_reasons = {
+        result["reason"]
+        for result in results
+        if result["type"] is FlowResultType.ABORT
+        and result["reason"] != "already_configured"
+    }
+    for reason in failed_reasons:
+        ir.async_create_issue(
+            hass,
+            DOMAIN,
+            f"deprecated_yaml_import_issue_{reason}",
+            breaks_in_ha_version="2027.6.0",
+            is_fixable=False,
+            issue_domain=DOMAIN,
+            severity=ir.IssueSeverity.WARNING,
+            translation_key=f"deprecated_yaml_import_issue_{reason}",
+            translation_placeholders={
+                "domain": DOMAIN,
+                "integration_title": INTEGRATION_TITLE,
+            },
+        )
+    # The shared issue tells users to remove all YAML, which would drop failed devices.
+    if failed_reasons:
+        return
+
+    ir.async_create_issue(
+        hass,
+        HOMEASSISTANT_DOMAIN,
+        f"deprecated_yaml_{DOMAIN}",
+        breaks_in_ha_version="2027.6.0",
+        is_fixable=False,
+        issue_domain=DOMAIN,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key="deprecated_yaml",
+        translation_placeholders={
+            "domain": DOMAIN,
+            "integration_title": INTEGRATION_TITLE,
+        },
+    )
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: HlkConfigEntry) -> None:
     """Set up the HLK-SW16 switch."""
-    hass.data.setdefault(DOMAIN, {})
     host = entry.data[CONF_HOST]
     port = entry.data[CONF_PORT]
     address = f"{host}:{port}"
-
-    hass.data[DOMAIN][entry.entry_id] = {}
 
     @callback
     def disconnected():
@@ -109,83 +166,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         keep_alive_interval=DEFAULT_KEEP_ALIVE_INTERVAL,
     )
 
-    hass.data[DOMAIN][entry.entry_id][DATA_DEVICE_REGISTER] = client
+    entry.runtime_data = client
 
     # Load entities
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     _LOGGER.debug("Connected to HLK-SW16 device: %s", address)
 
-    return True
 
-
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_unload_entry(hass: HomeAssistant, entry: HlkConfigEntry) -> None:
     """Unload a config entry."""
-    client = hass.data[DOMAIN][entry.entry_id].pop(DATA_DEVICE_REGISTER)
-    client.stop()
-    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-    if unload_ok:
-        if hass.data[DOMAIN][entry.entry_id]:
-            hass.data[DOMAIN].pop(entry.entry_id)
-        if not hass.data[DOMAIN]:
-            hass.data.pop(DOMAIN)
-    return unload_ok
-
-
-class SW16Device(Entity):
-    """Representation of a HLK-SW16 device.
-
-    Contains the common logic for HLK-SW16 entities.
-    """
-
-    _attr_should_poll = False
-
-    def __init__(self, device_port, entry_id, client):
-        """Initialize the device."""
-        # HLK-SW16 specific attributes for every component type
-        self._entry_id = entry_id
-        self._device_port = device_port
-        self._is_on = None
-        self._client = client
-        self._name = device_port
-
-    @property
-    def unique_id(self):
-        """Return a unique ID."""
-        return f"{self._entry_id}_{self._device_port}"
-
-    @callback
-    def handle_event_callback(self, event):
-        """Propagate changes through ha."""
-        _LOGGER.debug("Relay %s new state callback: %r", self.unique_id, event)
-        self._is_on = event
-        self.async_write_ha_state()
-
-    @property
-    def name(self):
-        """Return a name for the device."""
-        return self._name
-
-    @property
-    def available(self):
-        """Return True if entity is available."""
-        return bool(self._client.is_connected)
-
-    @callback
-    def _availability_callback(self, availability):
-        """Update availability state."""
-        self.async_write_ha_state()
-
-    async def async_added_to_hass(self):
-        """Register update callback."""
-        self._client.register_status_callback(
-            self.handle_event_callback, self._device_port
-        )
-        self._is_on = await self._client.status(self._device_port)
-        self.async_on_remove(
-            async_dispatcher_connect(
-                self.hass,
-                f"hlk_sw16_device_available_{self._entry_id}",
-                self._availability_callback,
-            )
-        )
+    entry.runtime_data.stop()
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)

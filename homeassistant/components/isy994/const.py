@@ -1,5 +1,8 @@
-"""Constants for the ISY994 Platform."""
+"""Constants for the ISY Platform."""
+
 import logging
+
+from pyisy.constants import PROP_ON_LEVEL, PROP_RAMP_RATE
 
 from homeassistant.components.binary_sensor import BinarySensorDeviceClass
 from homeassistant.components.climate import (
@@ -12,102 +15,86 @@ from homeassistant.components.climate import (
     HVACAction,
     HVACMode,
 )
+from homeassistant.components.lock import LockState
+from homeassistant.components.sensor import SensorDeviceClass
 from homeassistant.const import (
-    CONCENTRATION_PARTS_PER_MILLION,
     CURRENCY_CENT,
     CURRENCY_DOLLAR,
     DEGREE,
-    ELECTRIC_CURRENT_MILLIAMPERE,
-    ELECTRIC_POTENTIAL_MILLIVOLT,
-    ELECTRIC_POTENTIAL_VOLT,
-    ENERGY_KILO_WATT_HOUR,
-    ENERGY_WATT_HOUR,
-    FREQUENCY_HERTZ,
-    IRRADIATION_WATTS_PER_SQUARE_METER,
-    LENGTH_CENTIMETERS,
-    LENGTH_FEET,
-    LENGTH_INCHES,
-    LENGTH_KILOMETERS,
-    LENGTH_METERS,
-    LENGTH_MILES,
-    LENGTH_MILLIMETERS,
     LIGHT_LUX,
-    MASS_KILOGRAMS,
-    MASS_POUNDS,
-    PERCENTAGE,
-    POWER_KILO_WATT,
-    POWER_WATT,
-    PRESSURE_HPA,
-    PRESSURE_INHG,
-    PRESSURE_MBAR,
     REVOLUTIONS_PER_MINUTE,
     SERVICE_LOCK,
     SERVICE_UNLOCK,
-    SOUND_PRESSURE_DB,
-    SOUND_PRESSURE_WEIGHTED_DBA,
-    SPEED_KILOMETERS_PER_HOUR,
-    SPEED_METERS_PER_SECOND,
-    SPEED_MILES_PER_HOUR,
+    SIGNAL_STRENGTH_DECIBELS_MILLIWATT,
     STATE_CLOSED,
     STATE_CLOSING,
-    STATE_LOCKED,
     STATE_OFF,
     STATE_ON,
     STATE_OPEN,
     STATE_OPENING,
     STATE_PROBLEM,
     STATE_UNKNOWN,
-    STATE_UNLOCKED,
-    TEMP_CELSIUS,
-    TEMP_FAHRENHEIT,
-    TEMP_KELVIN,
-    TIME_DAYS,
-    TIME_HOURS,
-    TIME_MILLISECONDS,
-    TIME_MINUTES,
-    TIME_MONTHS,
-    TIME_SECONDS,
-    TIME_YEARS,
     UV_INDEX,
-    VOLUME_CUBIC_FEET,
-    VOLUME_CUBIC_METERS,
-    VOLUME_FLOW_RATE_CUBIC_FEET_PER_MINUTE,
-    VOLUME_FLOW_RATE_CUBIC_METERS_PER_HOUR,
-    VOLUME_GALLONS,
-    VOLUME_LITERS,
     Platform,
+    UnitOfApparentPower,
+    UnitOfDensity,
+    UnitOfElectricCurrent,
+    UnitOfElectricPotential,
+    UnitOfEnergy,
+    UnitOfFrequency,
+    UnitOfIrradiance,
+    UnitOfLength,
+    UnitOfMass,
+    UnitOfPower,
+    UnitOfPressure,
+    UnitOfRatio,
+    UnitOfReactivePower,
+    UnitOfSoundPressure,
+    UnitOfSpeed,
+    UnitOfTemperature,
+    UnitOfTime,
+    UnitOfVolume,
+    UnitOfVolumeFlowRate,
     UnitOfVolumetricFlux,
 )
 
-_LOGGER = logging.getLogger(__package__)
+LOGGER = logging.getLogger(__package__)
 
 DOMAIN = "isy994"
 
 MANUFACTURER = "Universal Devices, Inc"
 
+CONF_NETWORK = "network"
 CONF_IGNORE_STRING = "ignore_string"
 CONF_SENSOR_STRING = "sensor_string"
 CONF_VAR_SENSOR_STRING = "variable_sensor_string"
-CONF_TLS_VER = "tls"
 CONF_RESTORE_LIGHT_STATE = "restore_light_state"
 
 DEFAULT_IGNORE_STRING = "{IGNORE ME}"
 DEFAULT_SENSOR_STRING = "sensor"
 DEFAULT_RESTORE_LIGHT_STATE = False
-DEFAULT_TLS_VERSION = 1.1
+DEFAULT_VERIFY_SSL = False
 DEFAULT_PROGRAM_STRING = "HA."
 DEFAULT_VAR_SENSOR_STRING = "HA."
 
 KEY_ACTIONS = "actions"
 KEY_STATUS = "status"
 
-PLATFORMS = [
+EVENT_ISY994_CONTROL = "isy994_control"
+
+NODE_PLATFORMS = [
     Platform.BINARY_SENSOR,
     Platform.CLIMATE,
     Platform.COVER,
     Platform.FAN,
     Platform.LIGHT,
     Platform.LOCK,
+    Platform.SENSOR,
+    Platform.SWITCH,
+]
+NODE_AUX_PROP_PLATFORMS = [
+    Platform.NUMBER,
+    Platform.SELECT,
     Platform.SENSOR,
     Platform.SWITCH,
 ]
@@ -118,6 +105,22 @@ PROGRAM_PLATFORMS = [
     Platform.LOCK,
     Platform.SWITCH,
 ]
+ROOT_NODE_PLATFORMS = [Platform.BUTTON]
+VARIABLE_PLATFORMS = [Platform.NUMBER, Platform.SENSOR]
+
+# Platforms that classify in parallel with NODE_PLATFORMS — a node placed in
+# one of these still falls through to its primary platform classification.
+NODE_PARALLEL_PLATFORMS = [Platform.EVENT]
+
+# Set of all platforms used by integration
+PLATFORMS = {
+    *NODE_PLATFORMS,
+    *NODE_AUX_PROP_PLATFORMS,
+    *NODE_PARALLEL_PLATFORMS,
+    *PROGRAM_PLATFORMS,
+    *ROOT_NODE_PLATFORMS,
+    *VARIABLE_PLATFORMS,
+}
 
 SUPPORTED_BIN_SENS_CLASSES = ["moisture", "opening", "motion", "climate"]
 
@@ -125,10 +128,14 @@ SUPPORTED_BIN_SENS_CLASSES = ["moisture", "opening", "motion", "climate"]
 # (they can turn off, and report their state)
 ISY_GROUP_PLATFORM = Platform.SWITCH
 
-ISY994_ISY = "isy"
-ISY994_NODES = "isy994_nodes"
-ISY994_PROGRAMS = "isy994_programs"
-ISY994_VARIABLES = "isy994_variables"
+ISY_CONF_UUID = "uuid"
+ISY_CONF_NAME = "name"
+ISY_CONF_MODEL = "model"
+ISY_CONF_FIRMWARE = "firmware"
+
+ISY_CONN_PORT = "port"
+ISY_CONN_ADDRESS = "addr"
+ISY_CONN_TLS = "tls"
 
 FILTER_UOM = "uom"
 FILTER_STATES = "states"
@@ -189,8 +196,6 @@ UOM_INDEX = "25"
 UOM_ON_OFF = "2"
 UOM_PERCENTAGE = "51"
 
-SENSOR_AUX = "sensor_aux"
-
 # Do not use the Home Assistant consts for the states here - we're matching exact API
 # responses, not using them for Home Assistant states
 # Insteon Types: https://www.universal-devices.com/developers/wsdk/5.0.4/1_fam.xml
@@ -214,19 +219,21 @@ NODE_FILTERS: dict[Platform, dict[str, list[str]]] = {
             "7.13.",
             TYPE_CATEGORY_SAFETY,
         ],  # Does a startswith() match; include the dot
-        FILTER_ZWAVE_CAT: (["104", "112", "138"] + list(map(str, range(148, 180)))),
+        FILTER_ZWAVE_CAT: (["104", "112", "138", *map(str, range(148, 180))]),
     },
     Platform.SENSOR: {
         # This is just a more-readable way of including MOST uoms between 1-100
         # (Remember that range() is non-inclusive of the stop value)
         FILTER_UOM: (
-            ["1"]
-            + list(map(str, range(3, 11)))
-            + list(map(str, range(12, 51)))
-            + list(map(str, range(52, 66)))
-            + list(map(str, range(69, 78)))
-            + ["79"]
-            + list(map(str, range(82, 97)))
+            [
+                "1",
+                *map(str, range(3, 11)),
+                *map(str, range(12, 51)),
+                *map(str, range(52, 66)),
+                *map(str, range(69, 78)),
+                "79",
+                *map(str, range(82, 97)),
+            ]
         ),
         FILTER_STATES: [],
         FILTER_NODE_DEF_ID: [
@@ -238,7 +245,7 @@ NODE_FILTERS: dict[Platform, dict[str, list[str]]] = {
             "RemoteLinc2_ADV",
         ],
         FILTER_INSTEON_TYPE: ["0.16.", "0.17.", "0.18.", "9.0.", "9.7."],
-        FILTER_ZWAVE_CAT: (["118", "143"] + list(map(str, range(180, 186)))),
+        FILTER_ZWAVE_CAT: (["118", "143", *map(str, range(180, 186))]),
     },
     Platform.LOCK: {
         FILTER_UOM: ["11"],
@@ -259,7 +266,7 @@ NODE_FILTERS: dict[Platform, dict[str, list[str]]] = {
         FILTER_STATES: ["open", "closed", "closing", "opening", "stopped"],
         FILTER_NODE_DEF_ID: ["DimmerMotorSwitch_ADV"],
         FILTER_INSTEON_TYPE: [TYPE_CATEGORY_COVER],
-        FILTER_ZWAVE_CAT: [],
+        FILTER_ZWAVE_CAT: ["106", "107"],
     },
     Platform.LIGHT: {
         FILTER_UOM: ["51"],
@@ -315,64 +322,109 @@ NODE_FILTERS: dict[Platform, dict[str, list[str]]] = {
         FILTER_INSTEON_TYPE: ["4.8", TYPE_CATEGORY_CLIMATE],
         FILTER_ZWAVE_CAT: ["140"],
     },
+    # Additive: a node matching here still gets its primary classification.
+    Platform.EVENT: {
+        FILTER_UOM: [],
+        FILTER_STATES: [],
+        FILTER_NODE_DEF_ID: [
+            "BallastRelayLampSwitch",
+            "BallastRelayLampSwitch_ADV",
+            "DimmerLampSwitch",
+            "DimmerLampSwitch_ADV",
+            "DimmerSwitchOnly",
+            "DimmerSwitchOnly_ADV",
+            "KeypadButton",
+            "KeypadButton_ADV",
+            "KeypadDimmer",
+            "KeypadDimmer_ADV",
+            "KeypadRelay",
+            "KeypadRelay_ADV",
+            "RelayLampOnly",
+            "RelayLampOnly_ADV",
+            "RelayLampSwitch",
+            "RelayLampSwitch_ADV",
+            "RelaySwitchOnlyPlusQuery",
+            "RelaySwitchOnlyPlusQuery_ADV",
+        ],
+        # Type prefixes derived from observed eisy node families
+        # (SwitchLinc / KeypadLinc / InLineLinc / BallastLinc) — catches
+        # legacy non-_ADV firmware variants of the same hardware.
+        FILTER_INSTEON_TYPE: [
+            "1.14.",
+            "1.32.",
+            "1.45.",
+            "1.65.",
+            "1.66.",
+            "2.42.",
+            "2.44.",
+            "2.55.",
+            "2.57.",
+            "3.32.",
+        ],
+        FILTER_ZWAVE_CAT: [],
+    },
+}
+NODE_AUX_FILTERS: dict[str, Platform] = {
+    PROP_ON_LEVEL: Platform.NUMBER,
+    PROP_RAMP_RATE: Platform.SELECT,
 }
 
 UOM_FRIENDLY_NAME = {
-    "1": "A",
+    "1": UnitOfElectricCurrent.AMPERE,
     UOM_ON_OFF: "",  # Binary, no unit
-    "3": f"btu/{TIME_HOURS}",
-    "4": TEMP_CELSIUS,
-    "5": LENGTH_CENTIMETERS,
-    "6": VOLUME_CUBIC_FEET,
-    "7": VOLUME_FLOW_RATE_CUBIC_FEET_PER_MINUTE,
-    "8": VOLUME_CUBIC_METERS,
-    "9": TIME_DAYS,
-    "10": TIME_DAYS,
-    "12": SOUND_PRESSURE_DB,
-    "13": SOUND_PRESSURE_WEIGHTED_DBA,
+    "3": UnitOfPower.BTU_PER_HOUR,
+    "4": UnitOfTemperature.CELSIUS,
+    "5": UnitOfLength.CENTIMETERS,
+    "6": UnitOfVolume.CUBIC_FEET,
+    "7": UnitOfVolumeFlowRate.CUBIC_FEET_PER_MINUTE,
+    "8": UnitOfVolume.CUBIC_METERS,
+    "9": UnitOfTime.DAYS,
+    "10": UnitOfTime.DAYS,
+    "12": UnitOfSoundPressure.DECIBEL,
+    "13": UnitOfSoundPressure.WEIGHTED_DECIBEL_A,
     "14": DEGREE,
     "16": "macroseismic",
-    "17": TEMP_FAHRENHEIT,
-    "18": LENGTH_FEET,
-    "19": TIME_HOURS,
-    "20": TIME_HOURS,
-    "21": "%AH",
-    "22": "%RH",
-    "23": PRESSURE_INHG,
+    "17": UnitOfTemperature.FAHRENHEIT,
+    "18": UnitOfLength.FEET,
+    "19": UnitOfTime.HOURS,
+    "20": UnitOfTime.HOURS,
+    "21": UnitOfRatio.PERCENTAGE,
+    "22": UnitOfRatio.PERCENTAGE,
+    "23": UnitOfPressure.INHG,
     "24": UnitOfVolumetricFlux.INCHES_PER_HOUR,
     UOM_INDEX: UOM_INDEX,  # Index type. Use "node.formatted" for value
-    "26": TEMP_KELVIN,
+    "26": UnitOfTemperature.KELVIN,
     "27": "keyword",
-    "28": MASS_KILOGRAMS,
+    "28": UnitOfMass.KILOGRAMS,
     "29": "kV",
-    "30": POWER_KILO_WATT,
-    "31": "kPa",
-    "32": SPEED_KILOMETERS_PER_HOUR,
-    "33": ENERGY_KILO_WATT_HOUR,
+    "30": UnitOfPower.KILO_WATT,
+    "31": UnitOfPressure.KPA,
+    "32": UnitOfSpeed.KILOMETERS_PER_HOUR,
+    "33": UnitOfEnergy.KILO_WATT_HOUR,
     "34": "liedu",
-    "35": VOLUME_LITERS,
+    "35": UnitOfVolume.LITERS,
     "36": LIGHT_LUX,
     "37": "mercalli",
-    "38": LENGTH_METERS,
-    "39": VOLUME_FLOW_RATE_CUBIC_METERS_PER_HOUR,
-    "40": SPEED_METERS_PER_SECOND,
-    "41": ELECTRIC_CURRENT_MILLIAMPERE,
-    "42": TIME_MILLISECONDS,
-    "43": ELECTRIC_POTENTIAL_MILLIVOLT,
-    "44": TIME_MINUTES,
-    "45": TIME_MINUTES,
+    "38": UnitOfLength.METERS,
+    "39": UnitOfVolumeFlowRate.CUBIC_METERS_PER_HOUR,
+    "40": UnitOfSpeed.METERS_PER_SECOND,
+    "41": UnitOfElectricCurrent.MILLIAMPERE,
+    "42": UnitOfTime.MILLISECONDS,
+    "43": UnitOfElectricPotential.MILLIVOLT,
+    "44": UnitOfTime.MINUTES,
+    "45": UnitOfTime.MINUTES,
     "46": UnitOfVolumetricFlux.MILLIMETERS_PER_HOUR,
-    "47": TIME_MONTHS,
-    "48": SPEED_MILES_PER_HOUR,
-    "49": SPEED_METERS_PER_SECOND,
+    "47": UnitOfTime.MONTHS,
+    "48": UnitOfSpeed.MILES_PER_HOUR,
+    "49": UnitOfSpeed.METERS_PER_SECOND,
     "50": "Ω",
-    UOM_PERCENTAGE: PERCENTAGE,
-    "52": MASS_POUNDS,
+    UOM_PERCENTAGE: UnitOfRatio.PERCENTAGE,
+    "52": UnitOfMass.POUNDS,
     "53": "pf",
-    "54": CONCENTRATION_PARTS_PER_MILLION,
+    "54": UnitOfRatio.PARTS_PER_MILLION,
     "55": "pulse count",
-    "57": TIME_SECONDS,
-    "58": TIME_SECONDS,
+    "57": UnitOfTime.SECONDS,
+    "58": UnitOfTime.SECONDS,
     "59": "S/m",
     "60": "m_b",
     "61": "M_L",
@@ -380,30 +432,30 @@ UOM_FRIENDLY_NAME = {
     "63": "M_S",
     "64": "shindo",
     "65": "SML",
-    "69": VOLUME_GALLONS,
+    "69": UnitOfVolume.GALLONS,
     "71": UV_INDEX,
-    "72": ELECTRIC_POTENTIAL_VOLT,
-    "73": POWER_WATT,
-    "74": IRRADIATION_WATTS_PER_SQUARE_METER,
+    "72": UnitOfElectricPotential.VOLT,
+    "73": UnitOfPower.WATT,
+    "74": UnitOfIrradiance.WATTS_PER_SQUARE_METER,
     "75": "weekday",
     "76": DEGREE,
-    "77": TIME_YEARS,
-    "82": LENGTH_MILLIMETERS,
-    "83": LENGTH_KILOMETERS,
+    "77": UnitOfTime.YEARS,
+    "82": UnitOfLength.MILLIMETERS,
+    "83": UnitOfLength.KILOMETERS,
     "85": "Ω",
     "86": "kΩ",
-    "87": f"{VOLUME_CUBIC_METERS}/{VOLUME_CUBIC_METERS}",
+    "87": f"{UnitOfVolume.CUBIC_METERS}/{UnitOfVolume.CUBIC_METERS}",
     "88": "Water activity",
     "89": REVOLUTIONS_PER_MINUTE,
-    "90": FREQUENCY_HERTZ,
+    "90": UnitOfFrequency.HERTZ,
     "91": DEGREE,
     "92": f"{DEGREE} South",
     UOM_8_BIT_RANGE: "",  # Range 0-255, no unit.
     UOM_DOUBLE_TEMP: UOM_DOUBLE_TEMP,
-    "102": "kWs",
+    "102": "kWs",  # Kilowatt Seconds
     "103": CURRENCY_DOLLAR,
     "104": CURRENCY_CENT,
-    "105": LENGTH_INCHES,
+    "105": UnitOfLength.INCHES,
     "106": UnitOfVolumetricFlux.MILLIMETERS_PER_DAY,
     "107": "",  # raw 1-byte unsigned value
     "108": "",  # raw 2-byte unsigned value
@@ -413,17 +465,40 @@ UOM_FRIENDLY_NAME = {
     "112": "",  # raw 2-byte signed value
     "113": "",  # raw 3-byte signed value
     "114": "",  # raw 4-byte signed value
-    "116": LENGTH_MILES,
-    "117": PRESSURE_MBAR,
-    "118": PRESSURE_HPA,
-    "119": ENERGY_WATT_HOUR,
+    "116": UnitOfLength.MILES,
+    "117": UnitOfPressure.MBAR,
+    "118": UnitOfPressure.HPA,
+    "119": UnitOfEnergy.WATT_HOUR,
     "120": UnitOfVolumetricFlux.INCHES_PER_DAY,
+    "122": UnitOfDensity.MICROGRAMS_PER_CUBIC_METER,  # Microgram per cubic meter
+    "123": f"bq/{UnitOfVolume.CUBIC_METERS}",  # Becquerel per cubic meter
+    "124": f"pCi/{UnitOfVolume.LITERS}",  # Picocuries per liter
+    "125": "pH",
+    "126": "bpm",  # Beats per Minute
+    "127": UnitOfPressure.MMHG,
+    "128": "J",
+    "129": "BMI",  # Body Mass Index
+    "130": UnitOfVolumeFlowRate.LITERS_PER_HOUR,
+    "131": SIGNAL_STRENGTH_DECIBELS_MILLIWATT,
+    "132": "bpm",  # Breaths per minute
+    "133": UnitOfFrequency.KILOHERTZ,
+    "134": f"{UnitOfLength.METERS}/{UnitOfTime.SECONDS}²",
+    "135": UnitOfApparentPower.VOLT_AMPERE,  # Volt-Amp
+    "136": UnitOfReactivePower.VOLT_AMPERE_REACTIVE,  # VAR = Volt-Amp Reactive
+    "137": "",  # NTP DateTime - Number of seconds since 1900
+    "138": UnitOfPressure.PSI,
+    "139": DEGREE,  # Degree 0-360
+    "140": f"{UnitOfMass.MILLIGRAMS}/{UnitOfVolume.LITERS}",
+    "141": "N",  # Netwon
+    "142": f"{UnitOfVolume.GALLONS}/{UnitOfTime.SECONDS}",
+    "143": UnitOfVolumeFlowRate.GALLONS_PER_MINUTE,
+    "144": UnitOfVolumeFlowRate.GALLONS_PER_HOUR,
 }
 
 UOM_TO_STATES = {
     "11": {  # Deadbolt Status
-        0: STATE_UNLOCKED,
-        100: STATE_LOCKED,
+        0: LockState.UNLOCKED,
+        100: LockState.LOCKED,
         101: STATE_UNKNOWN,
         102: STATE_PROBLEM,
     },
@@ -567,14 +642,12 @@ UOM_TO_STATES = {
         4: "highly polluted",
     },
     UOM_BARRIER: {  # Barrier Status
-        **{
-            0: STATE_CLOSED,
-            100: STATE_OPEN,
-            101: STATE_UNKNOWN,
-            102: "stopped",
-            103: STATE_CLOSING,
-            104: STATE_OPENING,
-        },
+        0: STATE_CLOSED,
+        100: STATE_OPEN,
+        101: STATE_UNKNOWN,
+        102: "stopped",
+        103: STATE_CLOSING,
+        104: STATE_OPENING,
         **{
             b: f"{b} %" for a, b in enumerate(list(range(1, 100)))
         },  # 1-99 are percentage open
@@ -626,6 +699,13 @@ HA_HVAC_TO_ISY = {
 }
 
 HA_FAN_TO_ISY = {FAN_ON: "on", FAN_AUTO: "auto"}
+
+TOTAL_INCREASING_DEVICE_CLASSES = {
+    SensorDeviceClass.ENERGY,
+    SensorDeviceClass.WATER,
+    SensorDeviceClass.GAS,
+    SensorDeviceClass.PRECIPITATION,
+}
 
 BINARY_SENSOR_DEVICE_TYPES_ISY = {
     BinarySensorDeviceClass.MOISTURE: ["16.8.", "16.13.", "16.14."],

@@ -1,0 +1,133 @@
+"""The OpenRouter integration."""
+
+from openai import AsyncOpenAI, AuthenticationError, OpenAIError
+from python_open_router import (
+    OpenRouterAuthenticationError,
+    OpenRouterClient,
+    OpenRouterConnectionError,
+    OpenRouterError,
+)
+
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import CONF_API_KEY, CONF_MODEL, Platform
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryError, ConfigEntryNotReady
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.httpx_client import get_async_client
+
+from .const import CONF_OUTPUT_MODALITIES, CONF_WEB_SEARCH, DOMAIN, LOGGER
+
+PLATFORMS = [Platform.AI_TASK, Platform.CONVERSATION]
+
+type OpenRouterConfigEntry = ConfigEntry[AsyncOpenAI]
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: OpenRouterConfigEntry) -> None:
+    """Set up OpenRouter from a config entry."""
+    client = AsyncOpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=entry.data[CONF_API_KEY],
+        http_client=get_async_client(hass),
+    )
+
+    # Cache current platform data which gets added to each request
+    # (caching done by library)
+    _ = await hass.async_add_executor_job(client.platform_headers)
+
+    try:
+        async for _ in client.with_options(timeout=10.0).models.list():
+            break
+    except AuthenticationError as err:
+        raise ConfigEntryError(
+            translation_domain=DOMAIN, translation_key="invalid_api_key"
+        ) from err
+    except OpenAIError as err:
+        raise ConfigEntryNotReady(
+            translation_domain=DOMAIN,
+            translation_key="api_error",
+            translation_placeholders={"error": str(err)},
+        ) from err
+
+    entry.runtime_data = client
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
+
+
+async def _async_update_listener(
+    hass: HomeAssistant, entry: OpenRouterConfigEntry
+) -> None:
+    """Handle update."""
+    await hass.config_entries.async_reload(entry.entry_id)
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: OpenRouterConfigEntry) -> None:
+    """Unload OpenRouter."""
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)
+
+
+async def async_migrate_entry(
+    hass: HomeAssistant, entry: OpenRouterConfigEntry
+) -> None:
+    """Migrate config entry."""
+    LOGGER.debug("Migrating from version %s.%s", entry.version, entry.minor_version)
+
+    if entry.version == 1 and entry.minor_version < 3:
+        for subentry in entry.subentries.values():
+            current_value = subentry.data.get(CONF_WEB_SEARCH)
+
+            updated_data = {
+                **subentry.data,
+                CONF_WEB_SEARCH: "plugin" if current_value is True else "off",
+            }
+
+            hass.config_entries.async_update_subentry(
+                entry, subentry, data=updated_data
+            )
+
+        hass.config_entries.async_update_entry(entry, minor_version=3)
+
+    if entry.version == 1 and entry.minor_version < 4:
+        client = OpenRouterClient(
+            entry.data[CONF_API_KEY], async_get_clientsession(hass)
+        )
+        try:
+            models = {model.id: model for model in await client.get_models()}
+        except OpenRouterAuthenticationError as err:
+            raise ConfigEntryError(
+                translation_domain=DOMAIN, translation_key="invalid_api_key"
+            ) from err
+        except OpenRouterConnectionError as err:
+            raise ConfigEntryNotReady(
+                translation_domain=DOMAIN, translation_key="cannot_connect"
+            ) from err
+        except OpenRouterError as err:
+            raise ConfigEntryError(
+                translation_domain=DOMAIN, translation_key="fetch_models_failed"
+            ) from err
+
+        for subentry in entry.subentries.values():
+            if subentry.subentry_type != "ai_task_data":
+                continue
+            if CONF_OUTPUT_MODALITIES in subentry.data:
+                continue
+
+            model = models.get(subentry.data[CONF_MODEL])
+            modalities = (
+                [str(modality) for modality in model.architecture.output_modalities]
+                if model
+                else []
+            )
+
+            hass.config_entries.async_update_subentry(
+                entry,
+                subentry,
+                data={**subentry.data, CONF_OUTPUT_MODALITIES: modalities},
+            )
+
+        hass.config_entries.async_update_entry(entry, minor_version=4)
+
+    LOGGER.info(
+        "Migration to version %s.%s successful", entry.version, entry.minor_version
+    )

@@ -1,0 +1,13 @@
+{
+  "domain": "ambient_network",
+  "name": "Ambient Weather Network",
+  "categories": ["weather_alerts"],
+  "codeowners": ["@thomaskistler"],
+  "config_flow": true,
+  "connectivity": ["cloud"],
+  "documentation": "https://www.home-assistant.io/integrations/ambient_network",
+  "integration_type": "service",
+  "iot_class": "cloud_polling",
+  "loggers": ["aioambient"],
+  "requirements": ["aioambient==2024.08.0"]
+}

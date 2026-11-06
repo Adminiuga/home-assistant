@@ -1,12 +1,14 @@
 """Provide functionality to record stream."""
-from __future__ import annotations
 
+from collections import deque
 from io import DEFAULT_BUFFER_SIZE, BytesIO
 import logging
+import math
 import os
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, override
 
 import av
+import av.container
 
 from homeassistant.core import HomeAssistant, callback
 
@@ -19,7 +21,7 @@ from .core import PROVIDERS, IdleTimer, Segment, StreamOutput, StreamSettings
 from .fmp4utils import read_init, transform_init
 
 if TYPE_CHECKING:
-    import deque
+    from homeassistant.components.camera import DynamicStreamSettings
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -38,12 +40,14 @@ class RecorderOutput(StreamOutput):
         hass: HomeAssistant,
         idle_timer: IdleTimer,
         stream_settings: StreamSettings,
+        dynamic_stream_settings: DynamicStreamSettings,
     ) -> None:
         """Initialize recorder output."""
-        super().__init__(hass, idle_timer, stream_settings)
+        super().__init__(hass, idle_timer, stream_settings, dynamic_stream_settings)
         self.video_path: str
 
     @property
+    @override
     def name(self) -> str:
         """Return provider name."""
         return RECORDER_PROVIDER
@@ -52,6 +56,7 @@ class RecorderOutput(StreamOutput):
         """Prepend segments to existing list."""
         self._segments.extendleft(reversed(segments))
 
+    @override
     def cleanup(self) -> None:
         """Handle cleanup."""
         self.idle_timer.idle = True
@@ -68,17 +73,22 @@ class RecorderOutput(StreamOutput):
         output_a = None
 
         last_stream_id = -1
-        # The running duration of processed segments. Note that this is in av.time_base
-        # units which seem to be defined inversely to how stream time_bases are defined
+        # The end of the recording's presentation so far. Note that this is in
+        # av.time_base units which seem to be defined inversely to how stream
+        # time_bases are defined
         running_duration = 0
 
-        last_sequence = float("-inf")
+        last_sequence = -math.inf
 
         def write_segment(segment: Segment) -> None:
             """Write a segment to output."""
-            nonlocal output, output_v, output_a, last_stream_id, running_duration, last_sequence
-            # Because the stream_worker is in a different thread from the record service,
-            # the lookback segments may still have some overlap with the recorder segments
+            # fmt: off
+            nonlocal output, output_v, output_a
+            nonlocal last_stream_id, running_duration, last_sequence
+            # fmt: on
+            # Because the stream_worker is in a different
+            # thread from the record service, the lookback
+            # segments may still overlap with recorder ones
             if segment.sequence <= last_sequence:
                 return
             last_sequence = segment.sequence
@@ -100,26 +110,25 @@ class RecorderOutput(StreamOutput):
 
             # Create output on first segment
             if not output:
+                container_options: dict[str, str] = {
+                    "video_track_timescale": str(int(1 / source_v.time_base)),
+                    "movflags": "frag_keyframe+empty_moov",
+                    "min_frag_duration": str(self.stream_settings.min_segment_duration),
+                }
                 output = av.open(
                     self.video_path + ".tmp",
                     "w",
                     format=RECORDER_CONTAINER_FORMAT,
-                    container_options={
-                        "video_track_timescale": str(int(1 / source_v.time_base)),
-                        "movflags": "frag_keyframe+empty_moov",
-                        "min_frag_duration": str(
-                            self.stream_settings.min_segment_duration
-                        ),
-                    },
+                    container_options=container_options,
                 )
 
             # Add output streams if necessary
             if not output_v:
-                output_v = output.add_stream(template=source_v)
-                context = output_v.codec_context
-                context.flags |= "GLOBAL_HEADER"
+                output_v = output.add_stream_from_template(source_v)
+                if source_v.name == "hevc":
+                    output_v.codec_context.codec_tag = "hvc1"
             if source_a and not output_a:
-                output_a = output.add_stream(template=source_a)
+                output_a = output.add_stream_from_template(source_a)
 
             # Recalculate pts adjustments on first segment and on any discontinuity
             # We are assuming time base is the same across all discontinuities
@@ -137,24 +146,34 @@ class RecorderOutput(StreamOutput):
 
             # Remux video
             for packet in source.demux():
-                if packet.dts is None:
+                if packet.pts is None:
                     continue
-                packet.pts += pts_adjuster[packet.stream.type]
-                packet.dts += pts_adjuster[packet.stream.type]
-                packet.stream = output_v if packet.stream.type == "video" else output_a
+                packet.pts += pts_adjuster[packet.stream.type]  # type: ignore[operator]
+                packet.dts += pts_adjuster[packet.stream.type]  # type: ignore[operator]
+                # With B-frames the last frame in decode order does not end last
+                running_duration = max(
+                    running_duration,
+                    math.ceil(
+                        av.time_base
+                        * (packet.pts + (packet.duration or 0))
+                        * packet.time_base
+                    ),
+                )
+                stream = output_v if packet.stream.type == "video" else output_a
+                assert stream
+                packet.stream = stream
                 output.mux(packet)
-
-            running_duration += source.duration - source.start_time
 
             source.close()
 
         def write_transform_matrix_and_rename(video_path: str) -> None:
             """Update the transform matrix and write to the desired filename."""
-            with open(video_path + ".tmp", mode="rb") as in_file, open(
-                video_path, mode="wb"
-            ) as out_file:
+            with (
+                open(video_path + ".tmp", mode="rb") as in_file,
+                open(video_path, mode="wb") as out_file,
+            ):
                 init = transform_init(
-                    read_init(in_file), self.stream_settings.orientation
+                    read_init(in_file), self.dynamic_stream_settings.orientation
                 )
                 out_file.write(init)
                 in_file.seek(len(init))
@@ -162,9 +181,7 @@ class RecorderOutput(StreamOutput):
                     out_file.write(chunk)
             os.remove(video_path + ".tmp")
 
-        def finish_writing(
-            segments: deque[Segment], output: av.OutputContainer, video_path: str
-        ) -> None:
+        def finish_writing(segments: deque[Segment]) -> None:
             """Finish writing output."""
             # Should only have 0 or 1 segments, but loop through just in case
             while segments:
@@ -174,11 +191,14 @@ class RecorderOutput(StreamOutput):
                 return
             output.close()
             try:
-                write_transform_matrix_and_rename(video_path)
+                write_transform_matrix_and_rename(self.video_path)
             except FileNotFoundError:
                 _LOGGER.error(
-                    "Error writing to '%s'. There are likely multiple recordings writing to the same file",
-                    video_path,
+                    (
+                        "Error writing to '%s'. There are likely multiple recordings"
+                        " writing to the same file"
+                    ),
+                    self.video_path,
                 )
 
         # Write lookback segments
@@ -196,6 +216,4 @@ class RecorderOutput(StreamOutput):
                 write_segment, self._segments.popleft()
             )
         # Write remaining segments and close output
-        await self._hass.async_add_executor_job(
-            finish_writing, self._segments, output, self.video_path
-        )
+        await self._hass.async_add_executor_job(finish_writing, self._segments)

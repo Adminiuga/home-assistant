@@ -1,17 +1,19 @@
 """Test the Android IP Webcam config flow."""
+
+from http import HTTPStatus
 from unittest.mock import Mock, patch
 
 import aiohttp
+from pytest_homeassistant.common import MockConfigEntry, async_load_fixture
+from pytest_homeassistant.test_util.aiohttp import AiohttpClientMocker
 
 from homeassistant import config_entries
 from homeassistant.components.android_ip_webcam.const import DOMAIN
+from homeassistant.const import CONTENT_TYPE_JSON
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
 
 from .test_init import MOCK_CONFIG_DATA
-
-from tests.common import MockConfigEntry
-from tests.test_util.aiohttp import AiohttpClientMocker
 
 
 async def test_form(hass: HomeAssistant, aioclient_mock_fixture) -> None:
@@ -19,12 +21,12 @@ async def test_form(hass: HomeAssistant, aioclient_mock_fixture) -> None:
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": config_entries.SOURCE_USER}
     )
-    assert result["type"] == FlowResultType.FORM
+    assert result["type"] is FlowResultType.FORM
     assert result["errors"] is None
 
     with patch(
         "homeassistant.components.android_ip_webcam.async_setup_entry",
-        return_value=True,
+        return_value=None,
     ) as mock_setup_entry:
         result2 = await hass.config_entries.flow.async_configure(
             result["flow_id"],
@@ -35,7 +37,7 @@ async def test_form(hass: HomeAssistant, aioclient_mock_fixture) -> None:
         )
         await hass.async_block_till_done()
 
-    assert result2["type"] == FlowResultType.CREATE_ENTRY
+    assert result2["type"] is FlowResultType.CREATE_ENTRY
     assert result2["title"] == "1.1.1.1"
     assert result2["data"] == {
         "host": "1.1.1.1",
@@ -54,7 +56,7 @@ async def test_device_already_configured(
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": config_entries.SOURCE_USER}
     )
-    assert result["type"] == FlowResultType.FORM
+    assert result["type"] is FlowResultType.FORM
 
     result2 = await hass.config_entries.flow.async_configure(
         result["flow_id"],
@@ -65,7 +67,7 @@ async def test_device_already_configured(
     )
     await hass.async_block_till_done()
 
-    assert result2["type"] == FlowResultType.ABORT
+    assert result2["type"] is FlowResultType.ABORT
     assert result2["reason"] == "already_configured"
 
 
@@ -86,8 +88,33 @@ async def test_form_invalid_auth(
         {"host": "1.1.1.1", "port": 8080, "username": "user", "password": "wrong-pass"},
     )
 
-    assert result2["type"] == FlowResultType.FORM
+    assert result2["type"] is FlowResultType.FORM
     assert result2["errors"] == {"username": "invalid_auth", "password": "invalid_auth"}
+
+    aioclient_mock.clear_requests()
+    aioclient_mock.get(
+        "http://1.1.1.1:8080/status.json?show_avail=1",
+        text=await async_load_fixture(hass, "android_ip_webcam/status_data.json"),
+        status=HTTPStatus.OK,
+        headers={"Content-Type": CONTENT_TYPE_JSON},
+    )
+    aioclient_mock.get(
+        "http://1.1.1.1:8080/sensors.json",
+        text=await async_load_fixture(hass, "android_ip_webcam/sensor_data.json"),
+        status=HTTPStatus.OK,
+        headers={"Content-Type": CONTENT_TYPE_JSON},
+    )
+    with patch(
+        "homeassistant.components.android_ip_webcam.async_setup_entry",
+        return_value=None,
+    ):
+        result3 = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {"host": "1.1.1.1", "port": 8080, "username": "user", "password": "pass"},
+        )
+        await hass.async_block_till_done()
+
+    assert result3["type"] is FlowResultType.CREATE_ENTRY
 
 
 async def test_form_cannot_connect(
@@ -109,5 +136,32 @@ async def test_form_cannot_connect(
         },
     )
 
-    assert result2["type"] == FlowResultType.FORM
+    assert result2["type"] is FlowResultType.FORM
     assert result2["errors"] == {"base": "cannot_connect"}
+
+    aioclient_mock.clear_requests()
+    aioclient_mock.get(
+        "http://1.1.1.1:8080/status.json?show_avail=1",
+        text=await async_load_fixture(hass, "android_ip_webcam/status_data.json"),
+        status=HTTPStatus.OK,
+        headers={"Content-Type": CONTENT_TYPE_JSON},
+    )
+    aioclient_mock.get(
+        "http://1.1.1.1:8080/sensors.json",
+        text=await async_load_fixture(hass, "android_ip_webcam/sensor_data.json"),
+        status=HTTPStatus.OK,
+        headers={"Content-Type": CONTENT_TYPE_JSON},
+    )
+    with patch(
+        "homeassistant.components.android_ip_webcam.async_setup_entry",
+        return_value=None,
+    ):
+        result3 = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {
+                "host": "1.1.1.1",
+            },
+        )
+        await hass.async_block_till_done()
+
+    assert result3["type"] is FlowResultType.CREATE_ENTRY

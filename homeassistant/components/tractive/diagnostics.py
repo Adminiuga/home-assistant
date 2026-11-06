@@ -1,28 +1,43 @@
 """Diagnostics support for Tractive."""
-from __future__ import annotations
+
+from typing import Any
 
 from homeassistant.components.diagnostics import async_redact_data
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
+from homeassistant.const import (
+    ATTR_DEVICE_ID,
+    CONF_EMAIL,
+    CONF_PASSWORD,
+    CONF_UNIQUE_ID,
+)
 from homeassistant.core import HomeAssistant
 
-from .const import DOMAIN, TRACKABLES
+from .coordinator import TractiveConfigEntry
 
-TO_REDACT = {CONF_PASSWORD, CONF_EMAIL, "title", "_id"}
+TO_REDACT = {
+    ATTR_DEVICE_ID,
+    CONF_EMAIL,
+    CONF_PASSWORD,
+    CONF_UNIQUE_ID,
+    "_id",
+    "birthday",
+    "chip_id",
+    "home_location",
+    "instagram_username",
+    "name",
+    "title",
+}
 
 
 async def async_get_config_entry_diagnostics(
-    hass: HomeAssistant, config_entry: ConfigEntry
-) -> dict:
+    hass: HomeAssistant, config_entry: TractiveConfigEntry
+) -> dict[str, Any]:
     """Return diagnostics for a config entry."""
-    trackables = hass.data[DOMAIN][config_entry.entry_id][TRACKABLES]
+    trackables = config_entry.runtime_data.trackables
 
-    diagnostics_data = async_redact_data(
+    return async_redact_data(
         {
             "config_entry": config_entry.as_dict(),
-            "trackables": [item.trackable for item in trackables],
+            "trackables": [item.pet_details for item in trackables],
         },
         TO_REDACT,
     )
-
-    return diagnostics_data

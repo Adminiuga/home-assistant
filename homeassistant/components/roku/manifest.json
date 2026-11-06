@@ -1,22 +1,23 @@
 {
   "domain": "roku",
   "name": "Roku",
+  "categories": ["media_entertainment.tv_streaming"],
+  "codeowners": ["@ctalkington"],
+  "config_flow": true,
+  "connectivity": ["network"],
   "documentation": "https://www.home-assistant.io/integrations/roku",
-  "integration_type": "device",
-  "requirements": ["rokuecp==0.17.0"],
   "homekit": {
     "models": ["3820X", "3810X", "4660X", "7820X", "C105X", "C135X"]
   },
+  "integration_type": "device",
+  "iot_class": "local_polling",
+  "loggers": ["rokuecp"],
+  "requirements": ["rokuecp==0.19.5"],
   "ssdp": [
     {
-      "st": "roku:ecp",
+      "deviceType": "urn:roku-com:device:player:1-0",
       "manufacturer": "Roku",
-      "deviceType": "urn:roku-com:device:player:1-0"
+      "st": "roku:ecp"
     }
-  ],
-  "codeowners": ["@ctalkington"],
-  "quality_scale": "silver",
-  "config_flow": true,
-  "iot_class": "local_polling",
-  "loggers": ["rokuecp"]
+  ]
 }

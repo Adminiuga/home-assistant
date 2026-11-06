@@ -1,5 +1,4 @@
 """The Tasmota integration."""
-from __future__ import annotations
 
 import logging
 
@@ -15,7 +14,7 @@ from hatasmota.models import TasmotaDeviceConfig
 from hatasmota.mqtt import TasmotaMQTTClient
 
 from homeassistant.components import mqtt
-from homeassistant.components.mqtt.subscription import (
+from homeassistant.components.mqtt import (
     async_prepare_subscribe_topics,
     async_subscribe_topics,
     async_unsubscribe_topics,
@@ -23,11 +22,7 @@ from homeassistant.components.mqtt.subscription import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import device_registry as dr
-from homeassistant.helpers.device_registry import (
-    CONNECTION_NETWORK_MAC,
-    DeviceRegistry,
-    async_entries_for_config_entry,
-)
+from homeassistant.helpers.device_registry import CONNECTION_NETWORK_MAC, DeviceRegistry
 
 from . import device_automation, discovery
 from .const import (
@@ -40,15 +35,15 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Set up Tasmota from a config entry."""
     hass.data[DATA_UNSUB] = []
 
     async def _publish(
         topic: str,
         payload: mqtt.PublishPayloadType,
-        qos: int | None,
-        retain: bool | None,
+        qos: int,
+        retain: bool,
     ) -> None:
         await mqtt.async_publish(hass, topic, payload, qos, retain)
 
@@ -81,16 +76,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass, discovery_prefix, entry, tasmota_mqtt, async_discover_device
     )
 
-    return True
 
-
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Unload a config entry."""
 
     # cleanup platforms
-    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-    if not unload_ok:
-        return False
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)
 
     # disable discovery
     await discovery.async_stop(hass)
@@ -102,13 +93,11 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     for platform in PLATFORMS:
         hass.data.pop(DATA_REMOVE_DISCOVER_COMPONENT.format(platform))()
 
-    # deattach device triggers
+    # detach device triggers
     device_registry = dr.async_get(hass)
-    devices = async_entries_for_config_entry(device_registry, entry.entry_id)
+    devices = dr.async_entries_for_config_entry(device_registry, entry.entry_id)
     for device in devices:
         await device_automation.async_remove_automations(hass, device.id)
-
-    return True
 
 
 async def _remove_device(
@@ -119,15 +108,15 @@ async def _remove_device(
     device_registry: DeviceRegistry,
 ) -> None:
     """Remove a discovered Tasmota device."""
-    device = device_registry.async_get_device(set(), {(CONNECTION_NETWORK_MAC, mac)})
+    device = device_registry.async_get_device_by_connection(
+        (CONNECTION_NETWORK_MAC, mac), config_entry.entry_id
+    )
 
-    if device is None or config_entry.entry_id not in device.config_entries:
+    if device is None:
         return
 
     _LOGGER.debug("Removing tasmota from device %s", mac)
-    device_registry.async_update_device(
-        device.id, remove_config_entry_id=config_entry.entry_id
-    )
+    device_registry.async_remove_device(device.id)
 
 
 def _update_device(
@@ -165,9 +154,12 @@ async def async_setup_device(
 
 
 async def async_remove_config_entry_device(
-    hass: HomeAssistant, config_entry: ConfigEntry, device_entry: dr.DeviceEntry
+    hass: HomeAssistant, config_entry: ConfigEntry, device_entry: dr.AnyDeviceEntry
 ) -> bool:
     """Remove Tasmota config entry from a device."""
+    if not isinstance(device_entry, dr.DeviceEntry):
+        # This integration does not create child devices.
+        return False
 
     connections = device_entry.connections
     macs = [c[1] for c in connections if c[0] == CONNECTION_NETWORK_MAC]

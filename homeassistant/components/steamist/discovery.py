@@ -1,5 +1,4 @@
 """The Steamist integration discovery."""
-from __future__ import annotations
 
 import asyncio
 import logging
@@ -14,7 +13,8 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import device_registry as dr, discovery_flow
 from homeassistant.util.network import is_ip_address
 
-from .const import DISCOVER_SCAN_TIMEOUT, DISCOVERY, DOMAIN
+from .const import DATA_DISCOVERY, DISCOVER_SCAN_TIMEOUT, DOMAIN
+from .coordinator import SteamistConfigEntry
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -34,7 +34,7 @@ def async_is_steamist_device(device: Device30303) -> bool:
 @callback
 def async_update_entry_from_discovery(
     hass: HomeAssistant,
-    entry: config_entries.ConfigEntry,
+    entry: SteamistConfigEntry,
     device: Device30303,
 ) -> bool:
     """Update a config entry from a discovery."""
@@ -61,16 +61,18 @@ async def async_discover_devices(
         targets = [address]
     else:
         targets = [
-            str(address)
-            for address in await network.async_get_ipv4_broadcast_addresses(hass)
+            str(broadcast_address)
+            for broadcast_address in await network.async_get_ipv4_broadcast_addresses(
+                hass
+            )
         ]
 
     scanner = AIODiscovery30303()
     for idx, discovered in enumerate(
         await asyncio.gather(
             *[
-                scanner.async_scan(timeout=timeout, address=address)
-                for address in targets
+                scanner.async_scan(timeout=timeout, address=target_address)
+                for target_address in targets
             ],
             return_exceptions=True,
         )
@@ -111,8 +113,7 @@ async def async_discover_device(hass: HomeAssistant, host: str) -> Device30303 |
 @callback
 def async_get_discovery(hass: HomeAssistant, host: str) -> Device30303 | None:
     """Check if a device was already discovered via a broadcast discovery."""
-    discoveries: list[Device30303] = hass.data[DOMAIN][DISCOVERY]
-    return async_find_discovery_by_ip(discoveries, host)
+    return async_find_discovery_by_ip(hass.data[DATA_DISCOVERY], host)
 
 
 @callback

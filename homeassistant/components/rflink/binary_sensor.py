@@ -1,13 +1,11 @@
 """Support for Rflink binary sensors."""
-from __future__ import annotations
 
-from typing import Any
+from typing import Any, override
 
-import voluptuous as vol
+import probatio
 
 from homeassistant.components.binary_sensor import (
     DEVICE_CLASSES_SCHEMA,
-    PLATFORM_SCHEMA,
     BinarySensorDeviceClass,
     BinarySensorEntity,
 )
@@ -19,37 +17,34 @@ from homeassistant.const import (
     STATE_ON,
 )
 from homeassistant.core import HomeAssistant, callback
-import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers import config_validation as cv, event as evt
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-import homeassistant.helpers.event as evt
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
-from . import CONF_ALIASES, RflinkDevice
+from .const import CONF_ALIASES
+from .entity import RflinkDevice
 
 CONF_OFF_DELAY = "off_delay"
 DEFAULT_FORCE_UPDATE = False
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
-    {
-        vol.Optional(CONF_DEVICES, default={}): {
-            cv.string: vol.Schema(
-                {
-                    vol.Optional(CONF_NAME): cv.string,
-                    vol.Optional(CONF_DEVICE_CLASS): DEVICE_CLASSES_SCHEMA,
-                    vol.Optional(
-                        CONF_FORCE_UPDATE, default=DEFAULT_FORCE_UPDATE
-                    ): cv.boolean,
-                    vol.Optional(CONF_OFF_DELAY): cv.positive_int,
-                    vol.Optional(CONF_ALIASES, default=[]): vol.All(
-                        cv.ensure_list, [cv.string]
-                    ),
-                }
-            )
-        }
-    },
-    extra=vol.ALLOW_EXTRA,
-)
+RFLINK_PLATFORM = {
+    probatio.Optional(CONF_DEVICES, default={}): {
+        cv.string: probatio.Schema(
+            {
+                probatio.Optional(CONF_NAME): cv.string,
+                probatio.Optional(CONF_DEVICE_CLASS): DEVICE_CLASSES_SCHEMA,
+                probatio.Optional(
+                    CONF_FORCE_UPDATE, default=DEFAULT_FORCE_UPDATE
+                ): cv.boolean,
+                probatio.Optional(CONF_OFF_DELAY): cv.positive_int,
+                probatio.Optional(CONF_ALIASES, default=[]): probatio.All(
+                    probatio.EnsureList(), [cv.string]
+                ),
+            }
+        )
+    }
+}
 
 
 def devices_from_config(domain_config):
@@ -69,7 +64,9 @@ async def async_setup_platform(
     discovery_info: DiscoveryInfoType | None = None,
 ) -> None:
     """Set up the Rflink platform."""
-    async_add_entities(devices_from_config(config))
+    if discovery_info is None:
+        return
+    async_add_entities(devices_from_config(discovery_info))
 
 
 class RflinkBinarySensor(RflinkDevice, BinarySensorEntity, RestoreEntity):
@@ -91,6 +88,7 @@ class RflinkBinarySensor(RflinkDevice, BinarySensorEntity, RestoreEntity):
         self._delay_listener = None
         super().__init__(device_id, **kwargs)
 
+    @override
     async def async_added_to_hass(self) -> None:
         """Restore RFLink BinarySensor state."""
         await super().async_added_to_hass()
@@ -100,6 +98,7 @@ class RflinkBinarySensor(RflinkDevice, BinarySensorEntity, RestoreEntity):
             else:
                 self._state = False
 
+    @override
     def _handle_event(self, event):
         """Domain specific event handler."""
         command = event["command"]
@@ -124,6 +123,7 @@ class RflinkBinarySensor(RflinkDevice, BinarySensorEntity, RestoreEntity):
             )
 
     @property
-    def is_on(self):
+    @override
+    def is_on(self) -> bool | None:
         """Return true if the binary sensor is on."""
         return self._state

@@ -1,14 +1,14 @@
 """Tests for the Sun config flow."""
+
 from unittest.mock import patch
 
 import pytest
+from pytest_homeassistant.common import MockConfigEntry
 
 from homeassistant.components.sun.const import DOMAIN
 from homeassistant.config_entries import SOURCE_IMPORT, SOURCE_USER
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
-
-from tests.common import MockConfigEntry
 
 
 async def test_full_user_flow(hass: HomeAssistant) -> None:
@@ -17,20 +17,19 @@ async def test_full_user_flow(hass: HomeAssistant) -> None:
         DOMAIN, context={"source": SOURCE_USER}
     )
 
-    assert result.get("type") == FlowResultType.FORM
-    assert result.get("step_id") == SOURCE_USER
-    assert "flow_id" in result
+    assert result.get("type") is FlowResultType.FORM
+    assert result.get("step_id") == "user"
 
     with patch(
         "homeassistant.components.sun.async_setup_entry",
-        return_value=True,
+        return_value=None,
     ) as mock_setup_entry:
         result = await hass.config_entries.flow.async_configure(
             result["flow_id"],
             user_input={},
         )
 
-    assert result.get("type") == FlowResultType.CREATE_ENTRY
+    assert result.get("type") is FlowResultType.CREATE_ENTRY
     assert result.get("title") == "Sun"
     assert result.get("data") == {}
     assert result.get("options") == {}
@@ -51,7 +50,7 @@ async def test_single_instance_allowed(
         DOMAIN, context={"source": source}
     )
 
-    assert result.get("type") == FlowResultType.ABORT
+    assert result.get("type") is FlowResultType.ABORT
     assert result.get("reason") == "single_instance_allowed"
 
 
@@ -65,7 +64,7 @@ async def test_import_flow(
         data={},
     )
 
-    assert result.get("type") == FlowResultType.CREATE_ENTRY
+    assert result.get("type") is FlowResultType.CREATE_ENTRY
     assert result.get("title") == "Sun"
     assert result.get("data") == {}
     assert result.get("options") == {}

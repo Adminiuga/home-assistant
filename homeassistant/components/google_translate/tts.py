@@ -1,139 +1,177 @@
 """Support for the Google speech service."""
+
 from io import BytesIO
 import logging
+from typing import Any, override
 
 from gtts import gTTS, gTTSError
-import voluptuous as vol
+import probatio
 
-from homeassistant.components.tts import CONF_LANG, PLATFORM_SCHEMA, Provider
+from homeassistant.components.tts import (
+    CONF_LANG,
+    PLATFORM_SCHEMA as TTS_PLATFORM_SCHEMA,
+    Provider,
+    TextToSpeechEntity,
+    TtsAudioType,
+)
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
+
+from .const import (
+    CONF_TLD,
+    DEFAULT_LANG,
+    DEFAULT_TLD,
+    DOMAIN,
+    MAP_LANG_TLD,
+    SUPPORT_LANGUAGES,
+    SUPPORT_TLD,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
-SUPPORT_LANGUAGES = [
-    "af",
-    "ar",
-    "bg",
-    "bn",
-    "bs",
-    "ca",
-    "cs",
-    "cy",
-    "da",
-    "de",
-    "el",
-    "en",
-    "eo",
-    "es",
-    "et",
-    "fi",
-    "fr",
-    "gu",
-    "hi",
-    "hr",
-    "hu",
-    "hy",
-    "id",
-    "is",
-    "it",
-    "iw",
-    "ja",
-    "jw",
-    "km",
-    "kn",
-    "ko",
-    "la",
-    "lv",
-    "mk",
-    "ml",
-    "mr",
-    "my",
-    "ne",
-    "nl",
-    "no",
-    "pl",
-    "pt",
-    "ro",
-    "ru",
-    "si",
-    "sk",
-    "sq",
-    "sr",
-    "su",
-    "sv",
-    "sw",
-    "ta",
-    "te",
-    "th",
-    "tl",
-    "tr",
-    "uk",
-    "ur",
-    "vi",
-    # dialects
-    "zh-CN",
-    "zh-cn",
-    "zh-tw",
-    "en-us",
-    "en-ca",
-    "en-uk",
-    "en-gb",
-    "en-au",
-    "en-gh",
-    "en-in",
-    "en-ie",
-    "en-nz",
-    "en-ng",
-    "en-ph",
-    "en-za",
-    "en-tz",
-    "fr-ca",
-    "fr-fr",
-    "pt-br",
-    "pt-pt",
-    "es-es",
-    "es-us",
-]
+SUPPORT_OPTIONS = ["tld"]
 
-DEFAULT_LANG = "en"
-
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
-    {vol.Optional(CONF_LANG, default=DEFAULT_LANG): vol.In(SUPPORT_LANGUAGES)}
+PLATFORM_SCHEMA = TTS_PLATFORM_SCHEMA.extend(
+    {
+        probatio.Optional(CONF_LANG, default=DEFAULT_LANG): probatio.In(
+            SUPPORT_LANGUAGES
+        ),
+        probatio.Optional(CONF_TLD, default=DEFAULT_TLD): probatio.In(SUPPORT_TLD),
+    }
 )
 
 
-async def async_get_engine(hass, config, discovery_info=None):
+async def async_get_engine(
+    hass: HomeAssistant,
+    config: ConfigType,
+    discovery_info: DiscoveryInfoType | None = None,
+) -> GoogleProvider:
     """Set up Google speech component."""
-    return GoogleProvider(hass, config[CONF_LANG])
+    return GoogleProvider(hass, config[CONF_LANG], config[CONF_TLD])
 
 
-class GoogleProvider(Provider):
-    """The Google speech API provider."""
+async def async_setup_entry(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up Google Translate speech platform via config entry."""
+    default_language = config_entry.data[CONF_LANG]
+    default_tld = config_entry.data[CONF_TLD]
+    async_add_entities([GoogleTTSEntity(config_entry, default_language, default_tld)])
 
-    def __init__(self, hass, lang):
+
+class GoogleTTSEntity(TextToSpeechEntity):
+    """The Google speech API entity."""
+
+    _attr_supported_languages = SUPPORT_LANGUAGES
+    _attr_supported_options = SUPPORT_OPTIONS
+
+    def __init__(self, config_entry: ConfigEntry, lang: str, tld: str) -> None:
         """Init Google TTS service."""
-        self.hass = hass
-        self._lang = lang
-        self.name = "Google"
+        if lang in MAP_LANG_TLD:
+            self._lang = MAP_LANG_TLD[lang].lang
+            self._tld = MAP_LANG_TLD[lang].tld
+        else:
+            self._lang = lang
+            self._tld = tld
+        self._attr_name = f"Google Translate {self._lang} {self._tld}"
+        self._attr_unique_id = config_entry.entry_id
 
-    @property
-    def default_language(self):
-        """Return the default language."""
-        return self._lang
+        self._attr_device_info = DeviceInfo(
+            entry_type=DeviceEntryType.SERVICE,
+            identifiers={(DOMAIN, config_entry.entry_id)},
+            manufacturer="Google",
+            model="Google Translate TTS",
+            translation_key="google_translate",
+            translation_placeholders={"lang": self._lang, "tld": self._tld},
+        )
+        self._attr_default_language = self._lang
 
-    @property
-    def supported_languages(self):
-        """Return list of supported languages."""
-        return SUPPORT_LANGUAGES
-
-    def get_tts_audio(self, message, language, options=None):
+    @override
+    def get_tts_audio(
+        self, message: str, language: str, options: dict[str, Any] | None = None
+    ) -> TtsAudioType:
         """Load TTS from google."""
-        tts = gTTS(text=message, lang=language)
+        tld = self._tld
+        if language in MAP_LANG_TLD:
+            tld_language = MAP_LANG_TLD[language]
+            tld = tld_language.tld
+            language = tld_language.lang
+        if options is not None and "tld" in options:
+            tld = options["tld"]
+
+        tts = gTTS(text=message, lang=language, tld=tld)
         mp3_data = BytesIO()
 
         try:
             tts.write_to_fp(mp3_data)
         except gTTSError as exc:
-            _LOGGER.exception("Error during processing of TTS request %s", exc)
+            _LOGGER.debug(
+                "Error during processing of TTS request %s", exc, exc_info=True
+            )
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="tts_error",
+            ) from exc
+
+        return "mp3", mp3_data.getvalue()
+
+
+class GoogleProvider(Provider):
+    """The Google speech API provider."""
+
+    def __init__(self, hass: HomeAssistant, lang: str, tld: str) -> None:
+        """Init Google TTS service."""
+        self.hass = hass
+        if lang in MAP_LANG_TLD:
+            self._lang = MAP_LANG_TLD[lang].lang
+            self._tld = MAP_LANG_TLD[lang].tld
+        else:
+            self._lang = lang
+            self._tld = tld
+        self.name = "Google Translate"
+
+    @property
+    @override
+    def default_language(self) -> str:
+        """Return the default language."""
+        return self._lang
+
+    @property
+    @override
+    def supported_languages(self) -> list[str]:
+        """Return list of supported languages."""
+        return SUPPORT_LANGUAGES
+
+    @property
+    @override
+    def supported_options(self) -> list[str]:
+        """Return a list of supported options."""
+        return SUPPORT_OPTIONS
+
+    @override
+    def get_tts_audio(
+        self, message: str, language: str, options: dict[str, Any]
+    ) -> TtsAudioType:
+        """Load TTS from google."""
+        tld = self._tld
+        if language in MAP_LANG_TLD:
+            tld = MAP_LANG_TLD[language].tld
+            language = MAP_LANG_TLD[language].lang
+        if "tld" in options:
+            tld = options["tld"]
+        tts = gTTS(text=message, lang=language, tld=tld)
+        mp3_data = BytesIO()
+
+        try:
+            tts.write_to_fp(mp3_data)
+        except gTTSError:
+            _LOGGER.exception("Error during processing of TTS request")
             return None, None
 
         return "mp3", mp3_data.getvalue()

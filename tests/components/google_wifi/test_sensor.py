@@ -1,208 +1,136 @@
-"""The tests for the Google Wifi platform."""
-from datetime import datetime, timedelta
-from http import HTTPStatus
-from unittest.mock import Mock, patch
+"""The tests for the Google Wifi sensor platform."""
 
-import homeassistant.components.google_wifi.sensor as google_wifi
-from homeassistant.const import STATE_UNKNOWN
+from datetime import timedelta
+from typing import Any
+
+import pytest
+from pytest_homeassistant.common import assert_setup_component, async_fire_time_changed
+from pytest_homeassistant.test_util.aiohttp import AiohttpClientMocker
+
+from homeassistant.components.google_wifi import const
+from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
+from homeassistant.core import HomeAssistant
 from homeassistant.setup import async_setup_component
 from homeassistant.util import dt as dt_util
 
-from tests.common import assert_setup_component, async_fire_time_changed
+from .const import RESOURCE_URL, UPDATED_RESPONSE
 
-NAME = "foo"
-
-MOCK_DATA = (
-    '{"software": {"softwareVersion":"initial",'
-    '"updateNewVersion":"initial"},'
-    '"system": {"uptime":86400},'
-    '"wan": {"localIpAddress":"initial", "online":true,'
-    '"ipAddress":true}}'
-)
-
-MOCK_DATA_NEXT = (
-    '{"software": {"softwareVersion":"next",'
-    '"updateNewVersion":"0.0.0.0"},'
-    '"system": {"uptime":172800},'
-    '"wan": {"localIpAddress":"next", "online":false,'
-    '"ipAddress":false}}'
-)
-
-MOCK_DATA_MISSING = '{"software": {},' '"system": {},' '"wan": {}}'
+MONITORED_CONDITIONS = [
+    const.ATTR_CURRENT_VERSION,
+    const.ATTR_NEW_VERSION,
+    const.ATTR_UPTIME,
+    const.ATTR_LAST_RESTART,
+    const.ATTR_LOCAL_IP,
+    const.ATTR_STATUS,
+]
 
 
-async def test_setup_minimum(hass, requests_mock):
-    """Test setup with minimum configuration."""
-    resource = f"http://{google_wifi.DEFAULT_HOST}{google_wifi.ENDPOINT}"
-    requests_mock.get(resource, status_code=HTTPStatus.OK)
-    assert await async_setup_component(
+async def setup_sensor_platform(
+    hass: HomeAssistant,
+    *,
+    name: str | None = None,
+    monitored_conditions: list[str] | None = None,
+) -> None:
+    """Set up the Google Wifi sensor platform with mocked data."""
+    sensor_config: dict[str, Any] = {
+        "platform": "google_wifi",
+        "monitored_conditions": monitored_conditions or MONITORED_CONDITIONS,
+    }
+    if name is not None:
+        sensor_config["name"] = name
+
+    assert await async_setup_component(hass, "sensor", {"sensor": sensor_config})
+    await hass.async_block_till_done()
+
+
+async def fire_polling_update(hass: HomeAssistant, seconds: int) -> None:
+    """Advance time far enough to trigger the coordinator update."""
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=seconds))
+    await hass.async_block_till_done()
+
+
+@pytest.mark.usefixtures("mock_success")
+async def test_setup_minimum(hass: HomeAssistant) -> None:
+    """Test setup with the minimum configuration."""
+    await setup_sensor_platform(
         hass,
-        "sensor",
-        {"sensor": {"platform": "google_wifi", "monitored_conditions": ["uptime"]}},
+        monitored_conditions=[const.ATTR_UPTIME],
     )
+
     assert_setup_component(1, "sensor")
+    state = hass.states.get("sensor.google_wifi_uptime")
+    assert state is not None
+    assert state.state == "1.0"
 
 
-async def test_setup_get(hass, requests_mock):
+@pytest.mark.usefixtures("mock_success")
+async def test_setup_get(hass: HomeAssistant) -> None:
     """Test setup with full configuration."""
-    resource = f"http://localhost{google_wifi.ENDPOINT}"
-    requests_mock.get(resource, status_code=HTTPStatus.OK)
+    await setup_sensor_platform(
+        hass,
+        name="Test Wifi",
+    )
+
+    assert_setup_component(6, "sensor")
+    assert hass.states.get("sensor.test_wifi_current_version") is not None
+
+
+@pytest.mark.usefixtures("mock_unreachable")
+async def test_setup_when_router_unreachable(hass: HomeAssistant) -> None:
+    """Test platform setup completes when the router does not respond."""
     assert await async_setup_component(
         hass,
         "sensor",
         {
             "sensor": {
                 "platform": "google_wifi",
-                "host": "localhost",
-                "name": "Test Wifi",
-                "monitored_conditions": [
-                    "current_version",
-                    "new_version",
-                    "uptime",
-                    "last_restart",
-                    "local_ip",
-                    "status",
-                ],
+                "monitored_conditions": [const.ATTR_UPTIME],
             }
         },
     )
-    assert_setup_component(6, "sensor")
+    await hass.async_block_till_done()
+    state = hass.states.get("sensor.google_wifi_uptime")
+    assert state is not None
+    assert state.state == STATE_UNAVAILABLE
 
 
-def setup_api(hass, data, requests_mock):
-    """Set up API with fake data."""
-    resource = f"http://localhost{google_wifi.ENDPOINT}"
-    now = datetime(1970, month=1, day=1)
-    sensor_dict = {}
-    with patch("homeassistant.util.dt.now", return_value=now):
-        requests_mock.get(resource, text=data, status_code=HTTPStatus.OK)
-        conditions = google_wifi.SENSOR_KEYS
-        api = google_wifi.GoogleWifiAPI("localhost", conditions)
-    for desc in google_wifi.SENSOR_TYPES:
-        sensor_dict[desc.key] = {
-            "sensor": google_wifi.GoogleWifiSensor(api, NAME, desc),
-            "name": f"{NAME}_{desc.key}",
-            "units": desc.native_unit_of_measurement,
-            "icon": desc.icon,
-        }
-    for name in sensor_dict:
-        sensor = sensor_dict[name]["sensor"]
-        sensor.hass = hass
-
-    return api, sensor_dict
-
-
-def fake_delay(hass, ha_delay):
-    """Fake delay to prevent update throttle."""
-    hass_now = dt_util.utcnow()
-    shifted_time = hass_now + timedelta(seconds=ha_delay)
-    async_fire_time_changed(hass, shifted_time)
-
-
-def test_name(requests_mock):
-    """Test the name."""
-    api, sensor_dict = setup_api(None, MOCK_DATA, requests_mock)
-    for name in sensor_dict:
-        sensor = sensor_dict[name]["sensor"]
-        test_name = sensor_dict[name]["name"]
-        assert test_name == sensor.name
-
-
-def test_unit_of_measurement(hass, requests_mock):
-    """Test the unit of measurement."""
-    api, sensor_dict = setup_api(hass, MOCK_DATA, requests_mock)
-    for name in sensor_dict:
-        sensor = sensor_dict[name]["sensor"]
-        assert sensor_dict[name]["units"] == sensor.unit_of_measurement
-
-
-def test_icon(requests_mock):
-    """Test the icon."""
-    api, sensor_dict = setup_api(None, MOCK_DATA, requests_mock)
-    for name in sensor_dict:
-        sensor = sensor_dict[name]["sensor"]
-        assert sensor_dict[name]["icon"] == sensor.icon
-
-
-def test_state(hass, requests_mock):
-    """Test the initial state."""
-    api, sensor_dict = setup_api(hass, MOCK_DATA, requests_mock)
-    now = datetime(1970, month=1, day=1)
-    with patch("homeassistant.util.dt.now", return_value=now):
-        for name in sensor_dict:
-            sensor = sensor_dict[name]["sensor"]
-            fake_delay(hass, 2)
-            sensor.update()
-            if name == google_wifi.ATTR_LAST_RESTART:
-                assert sensor.state == "1969-12-31 00:00:00"
-            elif name == google_wifi.ATTR_UPTIME:
-                assert sensor.state == 1
-            elif name == google_wifi.ATTR_STATUS:
-                assert sensor.state == "Online"
-            else:
-                assert sensor.state == "initial"
-
-
-def test_update_when_value_is_none(hass, requests_mock):
-    """Test state gets updated to unknown when sensor returns no data."""
-    api, sensor_dict = setup_api(hass, None, requests_mock)
-    for name in sensor_dict:
-        sensor = sensor_dict[name]["sensor"]
-        fake_delay(hass, 2)
-        sensor.update()
-        assert sensor.state is None
-
-
-def test_update_when_value_changed(hass, requests_mock):
-    """Test state gets updated when sensor returns a new status."""
-    api, sensor_dict = setup_api(hass, MOCK_DATA_NEXT, requests_mock)
-    now = datetime(1970, month=1, day=1)
-    with patch("homeassistant.util.dt.now", return_value=now):
-        for name in sensor_dict:
-            sensor = sensor_dict[name]["sensor"]
-            fake_delay(hass, 2)
-            sensor.update()
-            if name == google_wifi.ATTR_LAST_RESTART:
-                assert sensor.state == "1969-12-30 00:00:00"
-            elif name == google_wifi.ATTR_UPTIME:
-                assert sensor.state == 2
-            elif name == google_wifi.ATTR_STATUS:
-                assert sensor.state == "Offline"
-            elif name == google_wifi.ATTR_NEW_VERSION:
-                assert sensor.state == "Latest"
-            elif name == google_wifi.ATTR_LOCAL_IP:
-                assert sensor.state == STATE_UNKNOWN
-            else:
-                assert sensor.state == "next"
-
-
-def test_when_api_data_missing(hass, requests_mock):
-    """Test state logs an error when data is missing."""
-    api, sensor_dict = setup_api(hass, MOCK_DATA_MISSING, requests_mock)
-    now = datetime(1970, month=1, day=1)
-    with patch("homeassistant.util.dt.now", return_value=now):
-        for name in sensor_dict:
-            sensor = sensor_dict[name]["sensor"]
-            fake_delay(hass, 2)
-            sensor.update()
-            assert sensor.state == STATE_UNKNOWN
-
-
-def test_update_when_unavailable(hass, requests_mock):
-    """Test state updates when Google Wifi unavailable."""
-    api, sensor_dict = setup_api(hass, None, requests_mock)
-    api.update = Mock(
-        "google_wifi.GoogleWifiAPI.update",
-        side_effect=update_side_effect(hass, requests_mock),
+@pytest.mark.usefixtures("mock_success")
+async def test_sensor_states_update_from_router_data(hass: HomeAssistant) -> None:
+    """Test the entities expose the current router data through Home Assistant."""
+    await setup_sensor_platform(
+        hass,
+        name="Test Wifi",
     )
-    for name in sensor_dict:
-        sensor = sensor_dict[name]["sensor"]
-        sensor.update()
-        assert sensor.state is None
+
+    assert (
+        hass.states.get("sensor.test_wifi_current_version").state == "softwareVersion"
+    )
+    assert hass.states.get("sensor.test_wifi_new_version").state == "Latest"
+    assert hass.states.get("sensor.test_wifi_uptime").state == "1.0"
+    assert hass.states.get("sensor.test_wifi_local_ip").state == "10.0.0.10"
+    assert hass.states.get("sensor.test_wifi_status").state == "Online"
 
 
-def update_side_effect(hass, requests_mock):
-    """Mock representation of update function."""
-    api, sensor_dict = setup_api(hass, MOCK_DATA, requests_mock)
-    api.data = None
-    api.available = False
+@pytest.mark.usefixtures("mock_unreachable")
+async def test_sensor_updates_after_failure_and_recovery(
+    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker
+) -> None:
+    """Test the sensors become unavailable on failure and recover on the next poll."""
+    await setup_sensor_platform(
+        hass,
+        name="Test Wifi",
+    )
+
+    await fire_polling_update(hass, 31)
+    assert hass.states.get("sensor.test_wifi_uptime").state == STATE_UNAVAILABLE
+    assert hass.states.get("sensor.test_wifi_status").state == STATE_UNAVAILABLE
+
+    aioclient_mock.clear_requests()
+    aioclient_mock.get(RESOURCE_URL, json=UPDATED_RESPONSE)
+    await fire_polling_update(hass, 62)
+
+    assert hass.states.get("sensor.test_wifi_current_version").state == "newVersion"
+    assert hass.states.get("sensor.test_wifi_new_version").state == "1.2.3.4"
+    assert hass.states.get("sensor.test_wifi_uptime").state == "2.0"
+    assert hass.states.get("sensor.test_wifi_local_ip").state == STATE_UNKNOWN
+    assert hass.states.get("sensor.test_wifi_status").state == "Offline"

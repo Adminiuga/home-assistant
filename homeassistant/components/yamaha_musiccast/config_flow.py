@@ -1,19 +1,21 @@
 """Config flow for MusicCast."""
-from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, override
 from urllib.parse import urlparse
 
-from aiohttp import ClientConnectorError
+from aiohttp import ClientConnectorError, DummyCookieJar
 from aiomusiccast import MusicCastConnectionException, MusicCastDevice
-import voluptuous as vol
+import probatio
 
-from homeassistant import data_entry_flow
-from homeassistant.components import ssdp
-from homeassistant.config_entries import ConfigFlow
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_HOST
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.aiohttp_client import async_create_clientsession
+from homeassistant.helpers.service_info.ssdp import (
+    ATTR_UPNP_FRIENDLY_NAME,
+    ATTR_UPNP_SERIAL,
+    SsdpServiceInfo,
+)
 
 from . import get_upnp_desc
 from .const import CONF_SERIAL, CONF_UPNP_DESC, DOMAIN
@@ -30,32 +32,17 @@ class MusicCastFlowHandler(ConfigFlow, domain=DOMAIN):
     host: str
     upnp_description: str | None = None
 
+    @override
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
-    ) -> data_entry_flow.FlowResult:
+    ) -> ConfigFlowResult:
         """Handle a flow initiated by the user."""
         # Request user input, unless we are preparing discovery flow
         if user_input is None:
             return self._show_setup_form()
 
         host = user_input[CONF_HOST]
-        serial_number = None
-
-        errors = {}
-        # Check if device is a MusicCast device
-
-        try:
-            info = await MusicCastDevice.get_device_info(
-                host, async_get_clientsession(self.hass)
-            )
-        except (MusicCastConnectionException, ClientConnectorError):
-            errors["base"] = "cannot_connect"
-        except Exception:  # pylint: disable=broad-except
-            _LOGGER.exception("Unexpected exception")
-            errors["base"] = "unknown"
-        else:
-            if (serial_number := info.get("system_id")) is None:
-                errors["base"] = "no_musiccast_device"
+        serial_number, errors = await self._async_get_serial_number(host)
 
         if not errors:
             await self.async_set_unique_id(serial_number, raise_on_progress=False)
@@ -72,32 +59,83 @@ class MusicCastFlowHandler(ConfigFlow, domain=DOMAIN):
 
         return self._show_setup_form(errors)
 
-    def _show_setup_form(
-        self, errors: dict | None = None
-    ) -> data_entry_flow.FlowResult:
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle reconfiguration of the device host."""
+        errors: dict[str, str] = {}
+        entry = self._get_reconfigure_entry()
+        if user_input is not None:
+            host = user_input[CONF_HOST]
+            serial_number, errors = await self._async_get_serial_number(host)
+            if not errors:
+                await self.async_set_unique_id(serial_number)
+                self._abort_if_unique_id_mismatch()
+                data_updates = {
+                    CONF_HOST: host,
+                    CONF_UPNP_DESC: await get_upnp_desc(self.hass, host),
+                }
+                # The update listener is only registered after a successful setup
+                if entry.update_listeners:
+                    return self.async_update_and_abort(entry, data_updates=data_updates)
+                return self.async_update_reload_and_abort(
+                    entry, data_updates=data_updates
+                )
+
+        return self.async_show_form(
+            step_id="reconfigure",
+            data_schema=self.add_suggested_values_to_schema(
+                probatio.Schema({probatio.Required(CONF_HOST): str}),
+                user_input or entry.data,
+            ),
+            errors=errors,
+        )
+
+    async def _async_get_serial_number(
+        self, host: str
+    ) -> tuple[str | None, dict[str, str]]:
+        """Return the serial number of the MusicCast device at host and any errors."""
+        serial_number = None
+        errors: dict[str, str] = {}
+        try:
+            info = await MusicCastDevice.get_device_info(
+                host, async_create_clientsession(self.hass, cookie_jar=DummyCookieJar())
+            )
+        except MusicCastConnectionException, ClientConnectorError:
+            errors["base"] = "cannot_connect"
+        except Exception:
+            _LOGGER.exception("Unexpected exception")
+            errors["base"] = "unknown"
+        else:
+            if (serial_number := info.get("system_id")) is None:
+                errors["base"] = "no_musiccast_device"
+        return serial_number, errors
+
+    def _show_setup_form(self, errors: dict | None = None) -> ConfigFlowResult:
         """Show the setup form to the user."""
         return self.async_show_form(
             step_id="user",
-            data_schema=vol.Schema({vol.Required(CONF_HOST): str}),
+            data_schema=probatio.Schema({probatio.Required(CONF_HOST): str}),
             errors=errors or {},
         )
 
+    @override
     async def async_step_ssdp(
-        self, discovery_info: ssdp.SsdpServiceInfo
-    ) -> data_entry_flow.FlowResult:
+        self, discovery_info: SsdpServiceInfo
+    ) -> ConfigFlowResult:
         """Handle ssdp discoveries."""
         if not await MusicCastDevice.check_yamaha_ssdp(
-            discovery_info.ssdp_location, async_get_clientsession(self.hass)
+            discovery_info.ssdp_location,
+            async_create_clientsession(self.hass, cookie_jar=DummyCookieJar()),
         ):
             return self.async_abort(reason="yxc_control_url_missing")
 
-        self.serial_number = discovery_info.upnp[ssdp.ATTR_UPNP_SERIAL]
+        self.serial_number = discovery_info.upnp[ATTR_UPNP_SERIAL]
         self.upnp_description = discovery_info.ssdp_location
 
-        # ssdp_location and hostname have been checked in check_yamaha_ssdp so it is safe to ignore type assignment
-        self.host = urlparse(
-            discovery_info.ssdp_location
-        ).hostname  # type: ignore[assignment]
+        # ssdp_location and hostname have been checked in
+        # check_yamaha_ssdp so it is safe to ignore type
+        self.host = urlparse(discovery_info.ssdp_location).hostname  # type: ignore[assignment]
 
         await self.async_set_unique_id(self.serial_number)
         self._abort_if_unique_id_configured(
@@ -109,16 +147,14 @@ class MusicCastFlowHandler(ConfigFlow, domain=DOMAIN):
         self.context.update(
             {
                 "title_placeholders": {
-                    "name": discovery_info.upnp.get(
-                        ssdp.ATTR_UPNP_FRIENDLY_NAME, self.host
-                    )
+                    "name": discovery_info.upnp.get(ATTR_UPNP_FRIENDLY_NAME, self.host)
                 }
             }
         )
 
         return await self.async_step_confirm()
 
-    async def async_step_confirm(self, user_input=None) -> data_entry_flow.FlowResult:
+    async def async_step_confirm(self, user_input=None) -> ConfigFlowResult:
         """Allow the user to confirm adding the device."""
         if user_input is not None:
             return self.async_create_entry(

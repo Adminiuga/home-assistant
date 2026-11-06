@@ -1,9 +1,12 @@
 """Test UptimeRobot diagnostics."""
+
 import json
 from unittest.mock import patch
 
-from aiohttp import ClientSession
+from pytest_homeassistant.components.diagnostics import get_diagnostics_for_config_entry
+from pytest_homeassistant.typing import ClientSessionGenerator
 from pyuptimerobot import UptimeRobotException
+from pyuptimerobot.const import API_PATH_USER_ME
 
 from homeassistant.core import HomeAssistant
 
@@ -11,17 +14,14 @@ from .common import (
     MOCK_UPTIMEROBOT_ACCOUNT,
     MOCK_UPTIMEROBOT_API_KEY,
     MOCK_UPTIMEROBOT_EMAIL,
-    MockApiResponseKey,
     mock_uptimerobot_api_response,
     setup_uptimerobot_integration,
 )
 
-from tests.components.diagnostics import get_diagnostics_for_config_entry
-
 
 async def test_entry_diagnostics(
     hass: HomeAssistant,
-    hass_client: ClientSession,
+    hass_client: ClientSessionGenerator,
 ) -> None:
     """Test config entry diagnostics."""
     entry = await setup_uptimerobot_integration(hass)
@@ -29,11 +29,10 @@ async def test_entry_diagnostics(
     with patch(
         "pyuptimerobot.UptimeRobot.async_get_account_details",
         return_value=mock_uptimerobot_api_response(
-            key=MockApiResponseKey.ACCOUNT,
+            api_path=API_PATH_USER_ME,
             data=MOCK_UPTIMEROBOT_ACCOUNT,
         ),
     ):
-
         result = await get_diagnostics_for_config_entry(
             hass,
             hass_client,
@@ -41,13 +40,12 @@ async def test_entry_diagnostics(
         )
 
     assert result["account"] == {
-        "down_monitors": 0,
-        "paused_monitors": 0,
-        "up_monitors": 1,
+        "monitorsCount": 1,
+        "email": "**REDACTED**",
     }
 
     assert result["monitors"] == [
-        {"id": 1234, "interval": 0, "status": 2, "type": "MonitorType.HTTP"}
+        {"id": 1234, "interval": 300, "status": "UP", "type": "HTTP"}
     ]
 
     assert list(result.keys()) == ["account", "monitors"]
@@ -59,7 +57,7 @@ async def test_entry_diagnostics(
 
 async def test_entry_diagnostics_exception(
     hass: HomeAssistant,
-    hass_client: ClientSession,
+    hass_client: ClientSessionGenerator,
 ) -> None:
     """Test config entry diagnostics with exception."""
     entry = await setup_uptimerobot_integration(hass)
@@ -68,7 +66,6 @@ async def test_entry_diagnostics_exception(
         "pyuptimerobot.UptimeRobot.async_get_account_details",
         side_effect=UptimeRobotException("Test exception"),
     ):
-
         result = await get_diagnostics_for_config_entry(
             hass,
             hass_client,

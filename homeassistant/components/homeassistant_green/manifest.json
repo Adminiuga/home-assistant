@@ -1,0 +1,12 @@
+{
+  "domain": "homeassistant_green",
+  "name": "Home Assistant Green",
+  "after_dependencies": ["hassio"],
+  "categories": ["hubs_protocols.smart_home_hubs"],
+  "codeowners": ["@home-assistant/core"],
+  "config_flow": false,
+  "dependencies": ["hardware", "homeassistant_hardware"],
+  "documentation": "https://www.home-assistant.io/integrations/homeassistant_green",
+  "integration_type": "hardware",
+  "single_config_entry": true
+}

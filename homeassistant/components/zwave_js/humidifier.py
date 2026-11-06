@@ -1,10 +1,8 @@
 """Representation of Z-Wave humidifiers."""
-from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, override
 
-from zwave_js_server.client import Client as ZwaveClient
 from zwave_js_server.const import CommandClass
 from zwave_js_server.const.command_class.humidity_control import (
     HUMIDITY_CONTROL_SETPOINT_PROPERTY,
@@ -22,21 +20,20 @@ from homeassistant.components.humidifier import (
     HumidifierEntity,
     HumidifierEntityDescription,
 )
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .const import DATA_CLIENT, DOMAIN
-from .discovery import ZwaveDiscoveryInfo
+from .const import DOMAIN
 from .entity import ZWaveBaseEntity
+from .models import ZwaveDiscoveryInfo, ZwaveJSConfigEntry
 
 PARALLEL_UPDATES = 0
 
 
-@dataclass
-class ZwaveHumidifierEntityDescriptionRequiredKeys:
-    """A class for humidifier entity description required keys."""
+@dataclass(frozen=True, kw_only=True)
+class ZwaveHumidifierEntityDescription(HumidifierEntityDescription):
+    """A class that describes the humidifier or dehumidifier entity."""
 
     # The "on" control mode for this entity, e.g. HUMIDIFY for humidifier
     on_mode: HumidityControlMode
@@ -46,13 +43,6 @@ class ZwaveHumidifierEntityDescriptionRequiredKeys:
 
     # The setpoint type controlled by this entity
     setpoint_type: HumidityControlSetpointType
-
-
-@dataclass
-class ZwaveHumidifierEntityDescription(
-    HumidifierEntityDescription, ZwaveHumidifierEntityDescriptionRequiredKeys
-):
-    """A class that describes the humidifier or dehumidifier entity."""
 
 
 HUMIDIFIER_ENTITY_DESCRIPTION = ZwaveHumidifierEntityDescription(
@@ -75,11 +65,11 @@ DEHUMIDIFIER_ENTITY_DESCRIPTION = ZwaveHumidifierEntityDescription(
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    config_entry: ZwaveJSConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up Z-Wave humidifier from config entry."""
-    client: ZwaveClient = hass.data[DOMAIN][config_entry.entry_id][DATA_CLIENT]
+    client = config_entry.runtime_data.client
 
     @callback
     def async_add_humidifier(info: ZwaveDiscoveryInfo) -> None:
@@ -128,7 +118,7 @@ class ZWaveHumidifier(ZWaveBaseEntity, HumidifierEntity):
 
     def __init__(
         self,
-        config_entry: ConfigEntry,
+        config_entry: ZwaveJSConfigEntry,
         driver: Driver,
         info: ZwaveDiscoveryInfo,
         description: ZwaveHumidifierEntityDescription,
@@ -151,6 +141,7 @@ class ZWaveHumidifier(ZWaveBaseEntity, HumidifierEntity):
         )
 
     @property
+    @override
     def is_on(self) -> bool | None:
         """Return True if entity is on."""
         if (value := self._current_mode.value) is None:
@@ -163,6 +154,7 @@ class ZWaveHumidifier(ZWaveBaseEntity, HumidifierEntity):
             in self._current_mode.metadata.states
         )
 
+    @override
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn on device."""
         if (value := self._current_mode.value) is None:
@@ -175,8 +167,9 @@ class ZWaveHumidifier(ZWaveBaseEntity, HumidifierEntity):
         else:
             return
 
-        await self.info.node.async_set_value(self._current_mode, new_mode)
+        await self._async_set_value(self._current_mode, new_mode)
 
+    @override
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn off device."""
         if (value := self._current_mode.value) is None:
@@ -192,21 +185,24 @@ class ZWaveHumidifier(ZWaveBaseEntity, HumidifierEntity):
         else:
             return
 
-        await self.info.node.async_set_value(self._current_mode, new_mode)
+        await self._async_set_value(self._current_mode, new_mode)
 
     @property
+    @override
     def target_humidity(self) -> int | None:
         """Return the humidity we try to reach."""
         if not self._setpoint or self._setpoint.value is None:
             return None
         return int(self._setpoint.value)
 
+    @override
     async def async_set_humidity(self, humidity: int) -> None:
         """Set new target humidity."""
         if self._setpoint:
-            await self.info.node.async_set_value(self._setpoint, humidity)
+            await self._async_set_value(self._setpoint, humidity)
 
     @property
+    @override
     def min_humidity(self) -> int:
         """Return the minimum humidity."""
         min_value = DEFAULT_MIN_HUMIDITY
@@ -215,6 +211,7 @@ class ZWaveHumidifier(ZWaveBaseEntity, HumidifierEntity):
         return min_value
 
     @property
+    @override
     def max_humidity(self) -> int:
         """Return the maximum humidity."""
         max_value = DEFAULT_MAX_HUMIDITY

@@ -1,13 +1,12 @@
 """Reusable utilities for the Bond component."""
-from __future__ import annotations
 
 import logging
-from typing import Any, cast
+from typing import Any, cast, override
 
 from aiohttp import ClientResponseError
 from bond_async import Action, Bond, BondType
 
-from homeassistant.util.async_ import gather_with_concurrency
+from homeassistant.util.async_ import gather_with_limited_concurrency
 
 from .const import BRIDGE_MAKE
 
@@ -33,6 +32,7 @@ class BondDevice:
         self._attrs = attrs or {}
         self._supported_actions: set[str] = set(self._attrs.get("actions", []))
 
+    @override
     def __repr__(self) -> str:
         """Return readable representation of a bond device."""
         return {
@@ -70,7 +70,7 @@ class BondDevice:
     @property
     def trust_state(self) -> bool:
         """Check if Trust State is turned on."""
-        return self.props.get("trust_state", False)
+        return self.props.get("trust_state", False)  # type: ignore[no-any-return]
 
     def has_action(self, action: str) -> bool:
         """Check to see if the device supports an actions."""
@@ -130,6 +130,10 @@ class BondDevice:
         """Return True if this device supports setting a light brightness."""
         return self._has_any_action({Action.SET_BRIGHTNESS})
 
+    def supports_set_color_temp(self) -> bool:
+        """Return True if this device supports setting a light color temperature."""
+        return self._has_any_action({Action.SET_COLOR_TEMP})
+
 
 class BondHub:
     """Hub device representing Bond Bridge."""
@@ -163,7 +167,7 @@ class BondHub:
                 ]
             )
 
-        responses = await gather_with_concurrency(MAX_REQUESTS, *tasks)
+        responses = await gather_with_limited_concurrency(MAX_REQUESTS, *tasks)
         response_idx = 0
         for device_id in setup_device_ids:
             self._devices.append(
@@ -203,7 +207,7 @@ class BondHub:
     @property
     def make(self) -> str:
         """Return this hub make."""
-        return self._version.get("make", BRIDGE_MAKE)
+        return self._version.get("make", BRIDGE_MAKE)  # type: ignore[no-any-return]
 
     @property
     def name(self) -> str:

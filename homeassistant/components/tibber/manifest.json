@@ -1,12 +1,14 @@
 {
-  "dependencies": ["recorder"],
   "domain": "tibber",
   "name": "Tibber",
-  "documentation": "https://www.home-assistant.io/integrations/tibber",
-  "requirements": ["pyTibber==0.25.6"],
+  "categories": ["energy.energy_prices", "energy.meters_monitoring"],
   "codeowners": ["@danielhiversen"],
-  "quality_scale": "silver",
   "config_flow": true,
+  "connectivity": ["cloud"],
+  "dependencies": ["application_credentials", "recorder"],
+  "documentation": "https://www.home-assistant.io/integrations/tibber",
+  "integration_type": "hub",
   "iot_class": "cloud_polling",
-  "loggers": ["tibber"]
+  "loggers": ["tibber"],
+  "requirements": ["pyTibber==0.39.1"]
 }

@@ -1,8 +1,7 @@
 {
   "domain": "frontend",
-  "name": "Home Assistant Frontend",
-  "documentation": "https://www.home-assistant.io/integrations/frontend",
-  "requirements": ["home-assistant-frontend==20221108.0"],
+  "name": "Home Assistant frontend",
+  "codeowners": ["@home-assistant/frontend"],
   "dependencies": [
     "api",
     "auth",
@@ -12,13 +11,16 @@
     "file_upload",
     "http",
     "lovelace",
+    "map_tiles",
     "onboarding",
     "repairs",
     "search",
     "system_log",
     "websocket_api"
   ],
-  "codeowners": ["@home-assistant/frontend"],
+  "documentation": "https://www.home-assistant.io/integrations/frontend",
+  "integration_type": "system",
+  "preview_features": { "winter_mode": {} },
   "quality_scale": "internal",
-  "integration_type": "system"
+  "requirements": ["home-assistant-frontend==20261028.5"]
 }

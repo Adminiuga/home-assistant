@@ -1,0 +1,29 @@
+{
+  "domain": "reolink",
+  "name": "Reolink",
+  "categories": [
+    "security_safety.cameras",
+    "security_safety.doorbells_intercoms"
+  ],
+  "codeowners": ["@starkillerOG"],
+  "config_flow": true,
+  "connectivity": ["network"],
+  "dependencies": ["ffmpeg", "http", "webhook"],
+  "dhcp": [
+    {
+      "hostname": "reolink*"
+    },
+    {
+      "macaddress": "EC71DB*"
+    },
+    {
+      "registered_devices": true
+    }
+  ],
+  "documentation": "https://www.home-assistant.io/integrations/reolink",
+  "integration_type": "hub",
+  "iot_class": "local_push",
+  "loggers": ["reolink_aio"],
+  "quality_scale": "platinum",
+  "requirements": ["reolink-aio==0.22.0"]
+}

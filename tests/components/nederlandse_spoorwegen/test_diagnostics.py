@@ -1,0 +1,62 @@
+"""Tests for the diagnostics data provided by the Nederlandse Spoorwegen integration."""
+
+from unittest.mock import AsyncMock
+
+import pytest
+from pytest_homeassistant.common import MockConfigEntry
+from pytest_homeassistant.components.diagnostics import (
+    get_diagnostics_for_config_entry,
+    get_diagnostics_for_device,
+)
+from pytest_homeassistant.typing import ClientSessionGenerator
+from syrupy.assertion import SnapshotAssertion
+from syrupy.filters import props
+
+from homeassistant.components.nederlandse_spoorwegen.const import DOMAIN
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr
+
+from . import setup_integration
+from .const import SUBENTRY_ID_1
+
+
+@pytest.mark.freeze_time("2025-09-15 14:30:00+00:00")
+async def test_entry_diagnostics(
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    mock_config_entry: MockConfigEntry,
+    snapshot: SnapshotAssertion,
+    mock_nsapi: AsyncMock,
+) -> None:
+    """Test config entry diagnostics."""
+    mock_config_entry.add_to_hass(hass)
+    await setup_integration(hass, mock_config_entry)
+
+    result = await get_diagnostics_for_config_entry(
+        hass, hass_client, mock_config_entry
+    )
+    assert result == snapshot(exclude=props("created_at", "modified_at"))
+
+
+@pytest.mark.freeze_time("2025-09-15 14:30:00+00:00")
+async def test_device_diagnostics(
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    device_registry: dr.DeviceRegistry,
+    mock_config_entry: MockConfigEntry,
+    snapshot: SnapshotAssertion,
+    mock_nsapi: AsyncMock,
+) -> None:
+    """Test device diagnostics."""
+    # Ensure integration is set up so device exists
+    await setup_integration(hass, mock_config_entry)
+
+    device = device_registry.async_get_device_by_identifier(
+        (DOMAIN, SUBENTRY_ID_1), mock_config_entry.entry_id
+    )
+    assert device is not None
+
+    result = await get_diagnostics_for_device(
+        hass, hass_client, mock_config_entry, device
+    )
+    assert result == snapshot(exclude=props("created_at", "modified_at"))

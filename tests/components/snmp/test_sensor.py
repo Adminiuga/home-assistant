@@ -1,79 +1,55 @@
-"""SNMP sensor tests."""
+"""Tests for SNMP sensor platform setup behaviour."""
 
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import AsyncMock, patch
 
-import pytest
+from pysnmp.proto.rfc1902 import Integer32
+from pytest_homeassistant.common import async_fire_time_changed
 
 from homeassistant.components.sensor import DOMAIN as SENSOR_DOMAIN
+from homeassistant.components.snmp.sensor import SCAN_INTERVAL
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers import entity_registry as er
 from homeassistant.setup import async_setup_component
+from homeassistant.util import dt as dt_util
+
+CONFIG = {
+    SENSOR_DOMAIN: {
+        "platform": "snmp",
+        "host": "192.168.1.32",
+        "baseoid": "1.3.6.1.4.1.2021.10.1.3.1",
+    },
+}
 
 
-@pytest.fixture(autouse=True)
-def hlapi_mock():
-    """Mock out 3rd party API."""
-    mock_data = MagicMock()
-    mock_data.prettyPrint = Mock(return_value="hello")
-    with patch(
-        "homeassistant.components.snmp.sensor.getCmd",
-        return_value=(None, None, None, [[mock_data]]),
-    ):
-        yield
+async def test_setup_fetches_once(hass: HomeAssistant) -> None:
+    """Test setup performs only one SNMP fetch."""
+    get_cmd = AsyncMock(return_value=(None, None, None, [[Integer32(13)]]))
+
+    with patch("homeassistant.components.snmp.sensor.get_cmd", get_cmd):
+        assert await async_setup_component(hass, SENSOR_DOMAIN, CONFIG)
+        await hass.async_block_till_done()
+
+    assert hass.states.get("sensor.snmp").state == "13"
+    assert get_cmd.call_count == 1
 
 
-async def test_basic_config(hass: HomeAssistant) -> None:
-    """Test basic entity configuration."""
+async def test_entity_recovers_when_device_unreachable(hass: HomeAssistant) -> None:
+    """Test an entity unreachable at setup recovers on the next poll."""
+    get_cmd = AsyncMock(
+        side_effect=[
+            ("No SNMP response received before timeout", None, None, None),
+            (None, None, None, [[Integer32(13)]]),
+        ]
+    )
 
-    config = {
-        SENSOR_DOMAIN: {
-            "platform": "snmp",
-            "host": "192.168.1.32",
-            "baseoid": "1.3.6.1.4.1.2021.10.1.3.1",
-        },
-    }
+    with patch("homeassistant.components.snmp.sensor.get_cmd", get_cmd):
+        assert await async_setup_component(hass, SENSOR_DOMAIN, CONFIG)
+        await hass.async_block_till_done()
 
-    assert await async_setup_component(hass, SENSOR_DOMAIN, config)
-    await hass.async_block_till_done()
+        state = hass.states.get("sensor.snmp")
+        assert state is not None
+        assert state.state == "unknown"
 
-    state = hass.states.get("sensor.snmp")
-    assert state.state == "hello"
-    assert state.attributes == {"friendly_name": "SNMP"}
+        async_fire_time_changed(hass, dt_util.utcnow() + SCAN_INTERVAL)
+        await hass.async_block_till_done()
 
-
-async def test_entity_config(hass: HomeAssistant) -> None:
-    """Test entity configuration."""
-
-    config = {
-        SENSOR_DOMAIN: {
-            # SNMP configuration
-            "platform": "snmp",
-            "host": "192.168.1.32",
-            "baseoid": "1.3.6.1.4.1.2021.10.1.3.1",
-            # Entity configuration
-            "icon": "{{'mdi:one_two_three'}}",
-            "picture": "{{'blabla.png'}}",
-            "device_class": "temperature",
-            "name": "{{'SNMP' + ' ' + 'Sensor'}}",
-            "state_class": "measurement",
-            "unique_id": "very_unique",
-            "unit_of_measurement": "beardsecond",
-        },
-    }
-
-    assert await async_setup_component(hass, SENSOR_DOMAIN, config)
-    await hass.async_block_till_done()
-
-    entity_registry = er.async_get(hass)
-    assert entity_registry.async_get("sensor.snmp_sensor").unique_id == "very_unique"
-
-    state = hass.states.get("sensor.snmp_sensor")
-    assert state.state == "hello"
-    assert state.attributes == {
-        "device_class": "temperature",
-        "entity_picture": "blabla.png",
-        "friendly_name": "SNMP Sensor",
-        "icon": "mdi:one_two_three",
-        "state_class": "measurement",
-        "unit_of_measurement": "beardsecond",
-    }
+    assert hass.states.get("sensor.snmp").state == "13"

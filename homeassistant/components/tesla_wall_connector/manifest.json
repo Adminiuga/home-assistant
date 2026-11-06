@@ -1,9 +1,10 @@
 {
   "domain": "tesla_wall_connector",
   "name": "Tesla Wall Connector",
+  "categories": ["energy.ev_charging"],
+  "codeowners": ["@einarhauks", "@sarabveer"],
   "config_flow": true,
-  "documentation": "https://www.home-assistant.io/integrations/tesla_wall_connector",
-  "requirements": ["tesla-wall-connector==1.0.2"],
+  "connectivity": ["network"],
   "dhcp": [
     {
       "hostname": "teslawallconnector_*",
@@ -18,7 +19,9 @@
       "macaddress": "4CFCAA*"
     }
   ],
-  "codeowners": ["@einarhauks"],
+  "documentation": "https://www.home-assistant.io/integrations/tesla_wall_connector",
+  "integration_type": "device",
   "iot_class": "local_polling",
-  "loggers": ["tesla_wall_connector"]
+  "loggers": ["tesla_wall_connector"],
+  "requirements": ["tesla-wall-connector==1.2.0"]
 }

@@ -1,45 +1,41 @@
 """The Kostal Plenticore Solar Inverter integration."""
+
 import logging
 
-from kostal.plenticore import PlenticoreApiException
+from pykoplenti import ApiException
 
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed
 
 from .const import DOMAIN
-from .helper import Plenticore
+from .coordinator import Plenticore, PlenticoreConfigEntry
 
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS = [Platform.NUMBER, Platform.SELECT, Platform.SENSOR, Platform.SWITCH]
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_setup_entry(hass: HomeAssistant, entry: PlenticoreConfigEntry) -> None:
     """Set up Kostal Plenticore Solar Inverter from a config entry."""
-    hass.data.setdefault(DOMAIN, {})
-
     plenticore = Plenticore(hass, entry)
 
     if not await plenticore.async_setup():
-        return False
+        raise ConfigEntryAuthFailed(
+            translation_domain=DOMAIN,
+            translation_key="authentication_failed",
+            translation_placeholders={"host": plenticore.host},
+        )
 
-    hass.data[DOMAIN][entry.entry_id] = plenticore
+    entry.runtime_data = plenticore
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    return True
 
-
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_unload_entry(hass: HomeAssistant, entry: PlenticoreConfigEntry) -> None:
     """Unload a config entry."""
-    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-    if unload_ok:
-        # remove API object
-        plenticore = hass.data[DOMAIN].pop(entry.entry_id)
-        try:
-            await plenticore.async_unload()
-        except PlenticoreApiException as err:
-            _LOGGER.error("Error logging out from inverter: %s", err)
-
-    return unload_ok
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)
+    try:
+        await entry.runtime_data.async_unload()
+    except ApiException as err:
+        _LOGGER.error("Error logging out from inverter: %s", err)

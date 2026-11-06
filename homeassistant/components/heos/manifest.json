@@ -1,15 +1,20 @@
 {
   "domain": "heos",
   "name": "Denon HEOS",
+  "categories": ["media_entertainment.speakers_audio"],
+  "codeowners": ["@andrewsayre"],
   "config_flow": true,
+  "connectivity": ["network"],
   "documentation": "https://www.home-assistant.io/integrations/heos",
-  "requirements": ["pyheos==0.7.2"],
+  "integration_type": "hub",
+  "iot_class": "local_push",
+  "loggers": ["pyheos"],
+  "quality_scale": "platinum",
+  "requirements": ["pyheos==1.0.6"],
   "ssdp": [
     {
       "st": "urn:schemas-denon-com:device:ACT-Denon:1"
     }
   ],
-  "codeowners": ["@andrewsayre"],
-  "iot_class": "local_push",
-  "loggers": ["pyheos"]
+  "zeroconf": ["_heos-audio._tcp.local."]
 }

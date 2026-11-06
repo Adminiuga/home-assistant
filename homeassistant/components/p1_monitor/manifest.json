@@ -1,11 +1,13 @@
 {
   "domain": "p1_monitor",
   "name": "P1 Monitor",
-  "config_flow": true,
-  "documentation": "https://www.home-assistant.io/integrations/p1_monitor",
-  "requirements": ["p1monitor==2.1.1"],
+  "categories": ["energy.meters_monitoring", "water.meters_leak_detection"],
   "codeowners": ["@klaasnicolaas"],
-  "quality_scale": "platinum",
+  "config_flow": true,
+  "connectivity": ["network"],
+  "documentation": "https://www.home-assistant.io/integrations/p1_monitor",
+  "integration_type": "device",
   "iot_class": "local_polling",
-  "loggers": ["p1monitor"]
+  "loggers": ["p1monitor"],
+  "requirements": ["p1monitor==3.2.0"]
 }

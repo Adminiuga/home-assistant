@@ -1,17 +1,19 @@
 """Generic Plugwise Entity Class."""
-from __future__ import annotations
 
-from plugwise.constants import DeviceData
+from typing import override
 
-from homeassistant.const import ATTR_NAME, ATTR_VIA_DEVICE, CONF_HOST
+from plugwise import GwEntityData
+
+from homeassistant.const import ATTR_NAME, CONF_HOST
 from homeassistant.helpers.device_registry import (
     CONNECTION_NETWORK_MAC,
     CONNECTION_ZIGBEE,
+    DeviceInfo,
+    async_get_device_id_by_identifier,
 )
-from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN
+from .const import AVAILABLE, DOMAIN
 from .coordinator import PlugwiseDataUpdateCoordinator
 
 
@@ -29,54 +31,62 @@ class PlugwiseEntity(CoordinatorEntity[PlugwiseDataUpdateCoordinator]):
         super().__init__(coordinator)
         self._dev_id = device_id
 
-        configuration_url: str | None = None
-        if entry := self.coordinator.config_entry:
-            configuration_url = f"http://{entry.data[CONF_HOST]}"
+        api = coordinator.api
+        gateway_id = api.gateway_id
+        entry = coordinator.config_entry
 
-        data = coordinator.data.devices[device_id]
-        connections = set()
-        if mac := data.get("mac_address"):
-            connections.add((CONNECTION_NETWORK_MAC, mac))
-        if mac := data.get("zigbee_mac_address"):
-            connections.add((CONNECTION_ZIGBEE, mac))
+        # Link configuration-URL for the gateway device
+        configuration_url = (
+            f"http://{entry.data[CONF_HOST]}"
+            if device_id == gateway_id and entry
+            else None
+        )
 
+        # Build connections set
+        connections = {
+            (CONNECTION_NETWORK_MAC, mac_address)
+            for mac_address in (
+                self.device.get("mac_address"),
+                self.device.get("wifi_mac_address"),
+            )
+            if mac_address is not None
+        }
+        if zigbee_mac := self.device.get("zigbee_mac_address"):
+            connections.add((CONNECTION_ZIGBEE, zigbee_mac))
+
+        # Set base device info
         self._attr_device_info = DeviceInfo(
             configuration_url=configuration_url,
             identifiers={(DOMAIN, device_id)},
             connections=connections,
-            manufacturer=data.get("vendor"),
-            model=data.get("model"),
-            name=coordinator.data.gateway["smile_name"],
-            sw_version=data.get("firmware"),
-            hw_version=data.get("hardware"),
+            manufacturer=self.device.get("vendor"),
+            model=self.device.get("model"),
+            model_id=self.device.get("model_id"),
+            name=api.smile.name,
+            sw_version=self.device.get("firmware"),
+            hw_version=self.device.get("hardware"),
         )
 
-        if device_id != coordinator.data.gateway["gateway_id"]:
-            self._attr_device_info.update(
-                {
-                    ATTR_NAME: data.get("name"),
-                    ATTR_VIA_DEVICE: (
-                        DOMAIN,
-                        str(self.coordinator.data.gateway["gateway_id"]),
-                    ),
-                }
+        # Add extra info if not the gateway device
+        if device_id != gateway_id:
+            self._attr_device_info.name = self.device.get(ATTR_NAME)
+            self._attr_device_info.via_device_id = async_get_device_id_by_identifier(
+                coordinator.hass,
+                (DOMAIN, gateway_id),
+                config_entry_id=entry.entry_id,
             )
 
     @property
+    @override
     def available(self) -> bool:
         """Return if entity is available."""
         return (
-            self._dev_id in self.coordinator.data.devices
-            and ("available" not in self.device or self.device["available"])
+            self._dev_id in self.coordinator.data
+            and (AVAILABLE not in self.device or self.device[AVAILABLE] is True)
             and super().available
         )
 
     @property
-    def device(self) -> DeviceData:
+    def device(self) -> GwEntityData:
         """Return data for this device."""
-        return self.coordinator.data.devices[self._dev_id]
-
-    async def async_added_to_hass(self) -> None:
-        """Subscribe to updates."""
-        self._handle_coordinator_update()
-        await super().async_added_to_hass()
+        return self.coordinator.data[self._dev_id]

@@ -1,7 +1,6 @@
 """Media Player component to integrate TVs exposing the Joint Space API."""
-from __future__ import annotations
 
-from typing import Any
+from typing import Any, override
 
 from haphilipsjs import ConnectionFailure
 
@@ -15,14 +14,16 @@ from homeassistant.components.media_player import (
     MediaPlayerState,
     MediaType,
 )
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.entity import DeviceInfo
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.trigger import PluggableAction
 
-from . import LOGGER as _LOGGER, PhilipsTVDataUpdateCoordinator
-from .const import DOMAIN
+from . import LOGGER as _LOGGER
+from .const import TV_STATE_OFF
+from .coordinator import PhilipsTVConfigEntry, PhilipsTVDataUpdateCoordinator
+from .entity import PhilipsJsEntity
+from .helpers import async_get_turn_on_trigger
 
 SUPPORT_PHILIPS_JS = (
     MediaPlayerEntityFeature.TURN_OFF
@@ -39,8 +40,6 @@ SUPPORT_PHILIPS_JS = (
     | MediaPlayerEntityFeature.STOP
 )
 
-CONF_ON_ACTION = "turn_on_action"
-
 
 def _inverted(data):
     return {v: k for k, v in data.items()}
@@ -48,11 +47,11 @@ def _inverted(data):
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    config_entry: PhilipsTVConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up the configuration entry."""
-    coordinator = hass.data[DOMAIN][config_entry.entry_id]
+    coordinator = config_entry.runtime_data
     async_add_entities(
         [
             PhilipsTVMediaPlayer(
@@ -62,13 +61,11 @@ async def async_setup_entry(
     )
 
 
-class PhilipsTVMediaPlayer(
-    CoordinatorEntity[PhilipsTVDataUpdateCoordinator], MediaPlayerEntity
-):
+class PhilipsTVMediaPlayer(PhilipsJsEntity, MediaPlayerEntity):
     """Representation of a Philips TV exposing the JointSpace API."""
 
     _attr_device_class = MediaPlayerDeviceClass.TV
-    _attr_has_entity_name = True
+    _attr_name = None
 
     def __init__(
         self,
@@ -77,26 +74,24 @@ class PhilipsTVMediaPlayer(
         """Initialize the Philips TV."""
         self._tv = coordinator.api
         self._sources: dict[str, str] = {}
-        self._supports = SUPPORT_PHILIPS_JS
-        self._system = coordinator.system
         self._attr_unique_id = coordinator.unique_id
-        self._attr_device_info = DeviceInfo(
-            identifiers={
-                (DOMAIN, coordinator.unique_id),
-            },
-            manufacturer="Philips",
-            model=coordinator.system.get("model"),
-            sw_version=coordinator.system.get("softwareversion"),
-            name=coordinator.system["name"],
-        )
-        self._state = MediaPlayerState.OFF
-        self._media_content_type: str | None = None
-        self._media_content_id: str | None = None
-        self._media_title: str | None = None
-        self._media_channel: str | None = None
+        self._attr_state = MediaPlayerState.OFF
 
+        self._turn_on = PluggableAction(self.async_write_ha_state)
         super().__init__(coordinator)
         self._update_from_coordinator()
+
+    @override
+    async def async_added_to_hass(self) -> None:
+        """Handle being added to hass."""
+        await super().async_added_to_hass()
+
+        if (entry := self.registry_entry) and entry.device_id:
+            self.async_on_remove(
+                self._turn_on.async_register(
+                    self.hass, async_get_turn_on_trigger(entry.device_id)
+                )
+            )
 
     async def _async_update_soon(self):
         """Reschedule update task."""
@@ -104,76 +99,54 @@ class PhilipsTVMediaPlayer(
         await self.coordinator.async_request_refresh()
 
     @property
-    def supported_features(self):
+    @override
+    def supported_features(self) -> MediaPlayerEntityFeature:
         """Flag media player features that are supported."""
-        supports = self._supports
-        if self.coordinator.turn_on or (
-            self._tv.on and self._tv.powerstate is not None
-        ):
+        supports = SUPPORT_PHILIPS_JS
+        if self._turn_on or (self._tv.on and self._tv.powerstate is not None):
             supports |= MediaPlayerEntityFeature.TURN_ON
         return supports
 
-    @property
-    def state(self) -> MediaPlayerState:
-        """Get the device state. An exception means OFF state."""
-        if self._tv.on and (self._tv.powerstate == "On" or self._tv.powerstate is None):
-            return MediaPlayerState.ON
-        return MediaPlayerState.OFF
-
-    @property
-    def source(self):
-        """Return the current input source."""
-        return self._sources.get(self._tv.source_id)
-
-    @property
-    def source_list(self):
-        """List of available input sources."""
-        return list(self._sources.values())
-
+    @override
     async def async_select_source(self, source: str) -> None:
         """Set the input source."""
         if source_id := _inverted(self._sources).get(source):
             await self._tv.setSource(source_id)
         await self._async_update_soon()
 
-    @property
-    def volume_level(self):
-        """Volume level of the media player (0..1)."""
-        return self._tv.volume
-
-    @property
-    def is_volume_muted(self):
-        """Boolean if volume is currently muted."""
-        return self._tv.muted
-
+    @override
     async def async_turn_on(self) -> None:
         """Turn on the device."""
         if self._tv.on and self._tv.powerstate:
             await self._tv.setPowerState("On")
-            self._state = MediaPlayerState.ON
+            self._attr_state = MediaPlayerState.ON
         else:
-            await self.coordinator.turn_on.async_run(self.hass, self._context)
+            await self._turn_on.async_run(self.hass, self._context)
         await self._async_update_soon()
 
+    @override
     async def async_turn_off(self) -> None:
         """Turn off the device."""
-        if self._state == MediaPlayerState.ON:
+        if self._attr_state == MediaPlayerState.ON:
             await self._tv.sendKey("Standby")
-            self._state = MediaPlayerState.OFF
+            self._attr_state = MediaPlayerState.OFF
             await self._async_update_soon()
         else:
             _LOGGER.debug("Ignoring turn off when already in expected state")
 
+    @override
     async def async_volume_up(self) -> None:
         """Send volume up command."""
         await self._tv.sendKey("VolumeUp")
         await self._async_update_soon()
 
+    @override
     async def async_volume_down(self) -> None:
         """Send volume down command."""
         await self._tv.sendKey("VolumeDown")
         await self._async_update_soon()
 
+    @override
     async def async_mute_volume(self, mute: bool) -> None:
         """Send mute command."""
         if self._tv.muted != mute:
@@ -182,122 +155,123 @@ class PhilipsTVMediaPlayer(
         else:
             _LOGGER.debug("Ignoring request when already in expected state")
 
+    @override
     async def async_set_volume_level(self, volume: float) -> None:
         """Set volume level, range 0..1."""
         await self._tv.setVolume(volume, self._tv.muted)
         await self._async_update_soon()
 
+    @override
     async def async_media_previous_track(self) -> None:
         """Send rewind command."""
-        await self._tv.sendKey("Previous")
+        if self._tv.channel_active:
+            await self._tv.sendKey("ChannelStepDown")
+        else:
+            await self._tv.sendKey("Previous")
         await self._async_update_soon()
 
+    @override
     async def async_media_next_track(self) -> None:
         """Send fast forward command."""
-        await self._tv.sendKey("Next")
+        if self._tv.channel_active:
+            await self._tv.sendKey("ChannelStepUp")
+        else:
+            await self._tv.sendKey("Next")
         await self._async_update_soon()
 
+    @override
     async def async_media_play_pause(self) -> None:
         """Send pause command to media player."""
         if self._tv.quirk_playpause_spacebar:
-            await self._tv.sendUnicode(" ")
+            await self._tv.sendKey("Confirm")
         else:
             await self._tv.sendKey("PlayPause")
         await self._async_update_soon()
 
+    @override
     async def async_media_play(self) -> None:
         """Send pause command to media player."""
         await self._tv.sendKey("Play")
         await self._async_update_soon()
 
+    @override
     async def async_media_pause(self) -> None:
         """Send play command to media player."""
         await self._tv.sendKey("Pause")
         await self._async_update_soon()
 
+    @override
     async def async_media_stop(self) -> None:
         """Send play command to media player."""
         await self._tv.sendKey("Stop")
         await self._async_update_soon()
 
     @property
-    def media_channel(self):
-        """Get current channel if it's a channel."""
-        return self._media_channel
-
-    @property
-    def media_title(self):
-        """Title of current playing media."""
-        return self._media_title
-
-    @property
-    def media_content_type(self):
-        """Return content type of playing media."""
-        return self._media_content_type
-
-    @property
-    def media_content_id(self):
-        """Content type of current playing media."""
-        return self._media_content_id
-
-    @property
-    def media_image_url(self):
+    @override
+    def media_image_url(self) -> str | None:
         """Image url of current playing media."""
-        if self._media_content_id and self._media_content_type in (
+        if self._attr_media_content_id and self._attr_media_content_type in (
             MediaType.APP,
             MediaType.CHANNEL,
         ):
             return self.get_browse_image_url(
-                self._media_content_type, self._media_content_id, media_image_id=None
+                self._attr_media_content_type,
+                self._attr_media_content_id,
+                media_image_id=None,
             )
         return None
 
-    @property
-    def app_id(self):
-        """ID of the current running app."""
-        return self._tv.application_id
+    async def async_play_media_channel(self, media_id: str):
+        """Play a channel."""
+        list_id, _, channel_id = media_id.partition("/")
+        if channel_id:
+            await self._tv.setChannel(channel_id, list_id)
+            await self._async_update_soon()
+            return
 
-    @property
-    def app_name(self):
-        """Name of the current running app."""
-        if app := self._tv.applications.get(self._tv.application_id):
-            return app.get("label")
+        for channel in self._tv.channels_current:
+            if channel.get("preset") == media_id:
+                await self._tv.setChannel(channel["ccid"], self._tv.channel_list_id)
+                await self._async_update_soon()
+                return
 
+        raise HomeAssistantError(f"Unable to find channel {media_id}")
+
+    @override
     async def async_play_media(
-        self, media_type: str, media_id: str, **kwargs: Any
+        self, media_type: MediaType | str, media_id: str, **kwargs: Any
     ) -> None:
         """Play a piece of media."""
         _LOGGER.debug("Call play media type <%s>, Id <%s>", media_type, media_id)
 
         if media_type == MediaType.CHANNEL:
-            list_id, _, channel_id = media_id.partition("/")
-            if channel_id:
-                await self._tv.setChannel(channel_id, list_id)
-                await self._async_update_soon()
-            else:
-                _LOGGER.error("Unable to find channel <%s>", media_id)
+            await self.async_play_media_channel(media_id)
         elif media_type == MediaType.APP:
             if app := self._tv.applications.get(media_id):
                 await self._tv.setApplication(app["intent"])
                 await self._async_update_soon()
             else:
-                _LOGGER.error("Unable to find application <%s>", media_id)
+                raise HomeAssistantError(f"Unable to find application {media_id}")
         else:
-            _LOGGER.error("Unsupported media type <%s>", media_type)
+            raise HomeAssistantError(f"Unsupported media type {media_type}")
 
-    async def async_browse_media_channels(self, expanded):
+    async def async_browse_media_channels(self, expanded: bool) -> BrowseMedia:
         """Return channel media objects."""
         if expanded:
             children = [
                 BrowseMedia(
-                    title=channel.get("name", f"Channel: {channel_id}"),
+                    title=channel.get("name", f"Channel: {channel['ccid']}"),
                     media_class=MediaClass.CHANNEL,
-                    media_content_id=f"alltv/{channel_id}",
+                    media_content_id=f"{self._tv.channel_list_id}/{channel['ccid']}",
                     media_content_type=MediaType.CHANNEL,
                     can_play=True,
                     can_expand=False,
+                    thumbnail=self.get_browse_image_url(
+                        MediaType.CHANNEL,
+                        f"{self._tv.channel_list_id}/{channel['ccid']}",
+                    ),
                 )
-                for channel_id, channel in self._tv.channels.items()
+                for channel in self._tv.channels_current
             ]
         else:
             children = None
@@ -313,10 +287,12 @@ class PhilipsTVMediaPlayer(
             children=children,
         )
 
-    async def async_browse_media_favorites(self, list_id, expanded):
+    async def async_browse_media_favorites(
+        self, list_id: str, expanded: bool
+    ) -> BrowseMedia:
         """Return channel media objects."""
         if expanded:
-            favorites = await self._tv.getFavoriteList(list_id)
+            favorites = self._tv.favorite_lists.get(list_id)
             if favorites:
 
                 def get_name(channel):
@@ -333,8 +309,12 @@ class PhilipsTVMediaPlayer(
                         media_content_type=MediaType.CHANNEL,
                         can_play=True,
                         can_expand=False,
+                        thumbnail=self.get_browse_image_url(
+                            MediaType.CHANNEL,
+                            f"{list_id}/{channel['ccid']}",
+                        ),
                     )
-                    for channel in favorites
+                    for channel in favorites.get("channels", [])
                 ]
             else:
                 children = None
@@ -422,12 +402,17 @@ class PhilipsTVMediaPlayer(
             ],
         )
 
-    async def async_browse_media(self, media_content_type=None, media_content_id=None):
+    @override
+    async def async_browse_media(
+        self,
+        media_content_type: MediaType | str | None = None,
+        media_content_id: str | None = None,
+    ) -> BrowseMedia:
         """Implement the websocket media browsing helper."""
         if not self._tv.on:
             raise BrowseError("Can't browse when tv is turned off")
 
-        if media_content_id in (None, ""):
+        if media_content_id is None or media_content_id == "":
             return await self.async_browse_media_root()
         path = media_content_id.partition("/")
         if path[0] == "channels":
@@ -441,9 +426,10 @@ class PhilipsTVMediaPlayer(
 
         raise BrowseError(f"Media not found: {media_content_type} / {media_content_id}")
 
+    @override
     async def async_get_browse_image(
         self,
-        media_content_type: str,
+        media_content_type: MediaType | str,
         media_content_id: str,
         media_image_id: str | None = None,
     ) -> tuple[bytes | None, str | None]:
@@ -452,54 +438,90 @@ class PhilipsTVMediaPlayer(
             if media_content_type == MediaType.APP and media_content_id:
                 return await self._tv.getApplicationIcon(media_content_id)
             if media_content_type == MediaType.CHANNEL and media_content_id:
-                return await self._tv.getChannelLogo(media_content_id)
+                list_id, _, channel_id = media_content_id.partition("/")
+                if not channel_id:
+                    channel_id = list_id
+                    list_id = "all"
+                return await self._tv.getChannelLogo(channel_id, list_id)
         except ConnectionFailure:
             _LOGGER.warning("Failed to fetch image")
         return None, None
 
+    @override
     async def async_get_media_image(self) -> tuple[bytes | None, str | None]:
         """Serve album art. Returns (content, content_type)."""
+        if self.media_content_type is None or self.media_content_id is None:
+            return None, None
         return await self.async_get_browse_image(
             self.media_content_type, self.media_content_id, None
         )
 
+    @property
+    def _ambilight_idle(self) -> bool:
+        """Return True if ambilight reports no active configuration.
+
+        Some TVs without a powerstate endpoint always report the screen as off,
+        but only return an ambilight configuration while the TV is on.
+        """
+        if not self._tv.json_feature_supported("ambilight", "Ambilight"):
+            return True
+        return self._tv.ambilight_current_configuration is None
+
     @callback
     def _update_from_coordinator(self):
-
         if self._tv.on:
-            if self._tv.powerstate in ("Standby", "StandbyKeep"):
-                self._state = MediaPlayerState.OFF
+            if self._tv.powerstate in ("Standby", "StandbyKeep") or (
+                self._tv.powerstate is None
+                and self._tv.screenstate == TV_STATE_OFF
+                and self._ambilight_idle
+            ):
+                self._attr_state = MediaPlayerState.OFF
             else:
-                self._state = MediaPlayerState.ON
+                self._attr_state = MediaPlayerState.ON
         else:
-            self._state = MediaPlayerState.OFF
+            self._attr_state = MediaPlayerState.OFF
 
         self._sources = {
             srcid: source.get("name") or f"Source {srcid}"
             for srcid, source in (self._tv.sources or {}).items()
         }
 
+        self._attr_source = self._sources.get(self._tv.source_id)
+        self._attr_source_list = list(self._sources.values())
+
+        self._attr_app_id = self._tv.application_id
+        if app := self._tv.applications.get(self._tv.application_id):
+            self._attr_app_name = app.get("label")
+        else:
+            self._attr_app_name = None
+
+        self._attr_volume_level = self._tv.volume
+        self._attr_is_volume_muted = self._tv.muted
+
         if self._tv.channel_active:
-            self._media_content_type = MediaType.CHANNEL
-            self._media_content_id = f"all/{self._tv.channel_id}"
-            self._media_title = self._tv.channels.get(self._tv.channel_id, {}).get(
+            self._attr_media_content_type = MediaType.CHANNEL
+            self._attr_media_content_id = f"all/{self._tv.channel_id}"
+            self._attr_media_title = self._tv.channels.get(self._tv.channel_id, {}).get(
                 "name"
             )
-            self._media_channel = self._media_title
+            self._attr_media_channel = self._attr_media_title
         elif self._tv.application_id:
-            self._media_content_type = MediaType.APP
-            self._media_content_id = self._tv.application_id
-            self._media_title = self._tv.applications.get(
+            self._attr_media_content_type = MediaType.APP
+            self._attr_media_content_id = self._tv.application_id
+            self._attr_media_title = self._tv.applications.get(
                 self._tv.application_id, {}
             ).get("label")
-            self._media_channel = None
+            self._attr_media_channel = None
         else:
-            self._media_content_type = None
-            self._media_content_id = None
-            self._media_title = self._sources.get(self._tv.source_id)
-            self._media_channel = None
+            self._attr_media_content_type = None
+            self._attr_media_content_id = None
+            self._attr_media_title = self._sources.get(self._tv.source_id)
+            self._attr_media_channel = None
+
+        self._attr_assumed_state = True
 
     @callback
+    @override
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""
         self._update_from_coordinator()

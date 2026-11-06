@@ -1,44 +1,47 @@
 """Config flow for FireServiceRota."""
-from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, override
 
+import probatio
 from pyfireservicerota import FireServiceRota, InvalidAuthError
-import voluptuous as vol
 
-from homeassistant import config_entries
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_PASSWORD, CONF_TOKEN, CONF_URL, CONF_USERNAME
-from homeassistant.data_entry_flow import FlowResult
 
 from .const import DOMAIN, URL_LIST
 
-DATA_SCHEMA = vol.Schema(
+DATA_SCHEMA = probatio.Schema(
     {
-        vol.Required(CONF_URL, default="www.brandweerrooster.nl"): vol.In(URL_LIST),
-        vol.Required(CONF_USERNAME): str,
-        vol.Required(CONF_PASSWORD): str,
+        probatio.Required(CONF_URL, default="www.brandweerrooster.nl"): probatio.In(
+            URL_LIST
+        ),
+        probatio.Required(CONF_USERNAME): str,
+        probatio.Required(probatio.Secret(CONF_PASSWORD)): str,
     }
 )
 
 
-class FireServiceRotaFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
+class FireServiceRotaFlowHandler(ConfigFlow, domain=DOMAIN):
     """Handle a FireServiceRota config flow."""
 
     VERSION = 1
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize config flow."""
         self.api = None
         self._base_url = None
         self._username = None
         self._password = None
-        self._existing_entry = None
-        self._description_placeholders = None
+        self._existing_entry: dict[str, Any] | None = None
+        self._description_placeholders: dict[str, str] | None = None
 
-    async def async_step_user(self, user_input=None):
+    @override
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle a flow initiated by the user."""
-        errors = {}
+        errors: dict[str, str] = {}
 
         if user_input is None:
             return self._show_setup_form(user_input, errors)
@@ -100,32 +103,34 @@ class FireServiceRotaFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
 
         if step_id == "user":
             schema = {
-                vol.Required(CONF_URL, default="www.brandweerrooster.nl"): vol.In(
-                    URL_LIST
-                ),
-                vol.Required(CONF_USERNAME): str,
-                vol.Required(CONF_PASSWORD): str,
+                probatio.Required(
+                    CONF_URL, default="www.brandweerrooster.nl"
+                ): probatio.In(URL_LIST),
+                probatio.Required(CONF_USERNAME): str,
+                probatio.Required(probatio.Secret(CONF_PASSWORD)): str,
             }
         else:
-            schema = {vol.Required(CONF_PASSWORD): str}
+            schema = {probatio.Required(probatio.Secret(CONF_PASSWORD)): str}
 
         return self.async_show_form(
             step_id=step_id,
-            data_schema=vol.Schema(schema),
+            data_schema=probatio.Schema(schema),
             errors=errors or {},
             description_placeholders=self._description_placeholders,
         )
 
-    async def async_step_reauth(self, entry_data: Mapping[str, Any]) -> FlowResult:
+    async def async_step_reauth(
+        self, entry_data: Mapping[str, Any]
+    ) -> ConfigFlowResult:
         """Initialise re-authentication."""
         await self.async_set_unique_id(entry_data[CONF_USERNAME])
         self._existing_entry = {**entry_data}
-        self._description_placeholders = {CONF_USERNAME: entry_data[CONF_USERNAME]}
+        self._description_placeholders = {"username": entry_data[CONF_USERNAME]}
         return await self.async_step_reauth_confirm()
 
     async def async_step_reauth_confirm(
         self, user_input: dict[str, str] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Get new tokens for a config entry that can't authenticate."""
         if user_input is None:
             return self._show_setup_form(step_id="reauth_confirm")

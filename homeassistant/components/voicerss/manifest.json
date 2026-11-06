@@ -1,7 +1,10 @@
 {
   "domain": "voicerss",
   "name": "VoiceRSS",
-  "documentation": "https://www.home-assistant.io/integrations/voicerss",
+  "categories": ["ai_voice.speech"],
   "codeowners": [],
-  "iot_class": "cloud_push"
+  "connectivity": ["cloud"],
+  "documentation": "https://www.home-assistant.io/integrations/voicerss",
+  "iot_class": "cloud_push",
+  "quality_scale": "legacy"
 }

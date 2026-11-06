@@ -1,41 +1,695 @@
 """Tests for the telegram_bot component."""
+
+import base64
+import errno
+import io
+import os
+from pathlib import Path
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, mock_open, patch
+
 import pytest
-from telegram import Update
-from telegram.ext.dispatcher import Dispatcher
+from pytest_homeassistant.common import (
+    MockConfigEntry,
+    async_capture_events,
+    async_load_fixture,
+)
+from pytest_homeassistant.typing import ClientSessionGenerator
+from telegram import (
+    Chat,
+    File,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+    Update,
+)
+from telegram.constants import ChatType, InputMediaType
+from telegram.error import (
+    InvalidToken,
+    NetworkError,
+    RetryAfter,
+    TelegramError,
+    TimedOut,
+)
 
-from homeassistant.components.telegram_bot import DOMAIN, SERVICE_SEND_MESSAGE
+from homeassistant.components.telegram_bot.bot import (
+    ALLOWED_UPDATES,
+    _read_file_as_bytesio,
+)
+from homeassistant.components.telegram_bot.const import (
+    ATTR_CAPTION,
+    ATTR_CHAT_ID,
+    ATTR_MEDIA_TYPE,
+    ATTR_MESSAGE_ID,
+    ATTR_MESSAGE_THREAD_ID,
+    ATTR_PARSER,
+    ATTR_REPLY_TO_MSGID,
+    ATTR_URL,
+    CHAT_ACTION_TYPING,
+    DOMAIN,
+    PARSER_HTML,
+    PARSER_MD,
+    PARSER_MD2,
+    PARSER_PLAIN_TEXT,
+    PLATFORM_BROADCAST,
+    SECTION_ADDITIONAL_SETTINGS,
+    TelegramBotService,
+    TelegramBotServiceArgument,
+)
 from homeassistant.components.telegram_bot.webhooks import TELEGRAM_WEBHOOK_URL
+from homeassistant.config_entries import ConfigEntryState
+from homeassistant.const import (
+    ATTR_ENTITY_ID,
+    CONF_API_KEY,
+    CONF_PLATFORM,
+    HTTP_BASIC_AUTHENTICATION,
+    HTTP_BEARER_AUTHENTICATION,
+    HTTP_DIGEST_AUTHENTICATION,
+    CommonServiceArgument,
+)
+from homeassistant.core import (
+    DOMAIN as HOMEASSISTANT_DOMAIN,
+    Context,
+    HomeAssistant,
+    ServiceResponse,
+)
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
+from homeassistant.helpers import entity_registry as er
+from homeassistant.util import dt as dt_util, json as json_util
+from homeassistant.util.file import write_utf8_file
 
-from tests.common import async_capture_events
 
-
-@pytest.fixture(autouse=True)
-def clear_dispatcher():
-    """Clear the singleton that telegram.ext.dispatcher.Dispatcher sets on itself."""
-    yield
-    Dispatcher._set_singleton(None)
-    # This is how python-telegram-bot resets the dispatcher in their test suite
-    Dispatcher._Dispatcher__singleton_semaphore.release()
-
-
-async def test_webhook_platform_init(hass, webhook_platform):
+async def test_webhook_platform_init(hass: HomeAssistant, webhook_bot) -> None:
     """Test initialization of the webhooks platform."""
-    assert hass.services.has_service(DOMAIN, SERVICE_SEND_MESSAGE) is True
+    assert hass.services.has_service(DOMAIN, TelegramBotService.SEND_MESSAGE) is True
 
 
-async def test_polling_platform_init(hass, polling_platform):
+@pytest.mark.usefixtures("mock_external_calls", "mock_polling_calls")
+async def test_polling_platform_init(
+    hass: HomeAssistant,
+    mock_polling_config_entry: MockConfigEntry,
+) -> None:
     """Test initialization of the polling platform."""
-    assert hass.services.has_service(DOMAIN, SERVICE_SEND_MESSAGE) is True
+    mock_polling_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_polling_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert hass.services.has_service(DOMAIN, TelegramBotService.SEND_MESSAGE) is True
 
 
-async def test_webhook_endpoint_generates_telegram_text_event(
-    hass, webhook_platform, hass_client, update_message_text
+async def test_polling_platform_init_failed(
+    hass: HomeAssistant,
+    mock_polling_config_entry: MockConfigEntry,
+) -> None:
+    """Test failed initialization of the polling platform."""
+    with patch(
+        "homeassistant.components.telegram_bot.bot.Bot.get_me",
+        side_effect=NetworkError("mock network error"),
+    ) as mock_get_me:
+        mock_polling_config_entry.add_to_hass(hass)
+        await hass.config_entries.async_setup(mock_polling_config_entry.entry_id)
+        await hass.async_block_till_done()
+
+    mock_get_me.assert_called_once()
+    assert mock_polling_config_entry.state is ConfigEntryState.SETUP_RETRY
+
+
+@pytest.mark.usefixtures("mock_external_calls")
+async def test_polling_platform_setup_failed(
+    hass: HomeAssistant,
+    mock_polling_config_entry: MockConfigEntry,
+) -> None:
+    """Test setup fails when the bot platform cannot be set up."""
+    with patch(
+        "homeassistant.components.telegram_bot.polling.async_setup_bot_platform",
+        side_effect=RuntimeError("mock platform error"),
+    ):
+        mock_polling_config_entry.add_to_hass(hass)
+        await hass.config_entries.async_setup(mock_polling_config_entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert mock_polling_config_entry.state is ConfigEntryState.SETUP_ERROR
+    assert mock_polling_config_entry.reason == "Failed to set up the Telegram bot"
+
+
+async def test_polling_platform_init_failed_does_not_log_token(
+    hass: HomeAssistant,
+    mock_polling_config_entry: MockConfigEntry,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test that a connection failure does not put the bot token in the log."""
+    api_key = mock_polling_config_entry.data[CONF_API_KEY]
+    # The Telegram API URL embeds the bot token, and library errors quote it.
+    error = NetworkError(
+        "httpx2.HTTPStatusError: Client error '401 Unauthorized' for url "
+        f"'https://api.telegram.org/bot{api_key}/getMe'"
+    )
+
+    with patch(
+        "homeassistant.components.telegram_bot.bot.Bot.get_me", side_effect=error
+    ):
+        mock_polling_config_entry.add_to_hass(hass)
+        await hass.config_entries.async_setup(mock_polling_config_entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert mock_polling_config_entry.state is ConfigEntryState.SETUP_RETRY
+    # Home Assistant strips the trailing period from translated messages.
+    assert mock_polling_config_entry.reason == "Could not connect to Telegram"
+
+    # Nothing at any level may carry the token: not the info line, not the
+    # traceback config entry setup logs, not the library's own debug output.
+    assert api_key not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("service", "input"),
+    [
+        (
+            TelegramBotService.SEND_MESSAGE,
+            {
+                TelegramBotServiceArgument.MESSAGE: "test_message",
+                TelegramBotServiceArgument.MESSAGE_THREAD_ID: "123",
+            },
+        ),
+        (
+            TelegramBotService.SEND_MESSAGE,
+            {
+                TelegramBotServiceArgument.KEYBOARD: [
+                    "/command1, /command2",
+                    "/command3",
+                ],
+                TelegramBotServiceArgument.MESSAGE: "test_message",
+                TelegramBotServiceArgument.PARSE_MODE: PARSER_HTML,
+                TelegramBotServiceArgument.DISABLE_NOTIFICATION: True,
+                TelegramBotServiceArgument.DISABLE_WEB_PAGE_PREVIEW: True,
+                TelegramBotServiceArgument.MESSAGE_TAG: "mock_tag",
+                TelegramBotServiceArgument.REPLY_TO_MESSAGE_ID: 12345,
+            },
+        ),
+        (
+            TelegramBotService.SEND_MESSAGE,
+            {
+                TelegramBotServiceArgument.KEYBOARD: [],
+                TelegramBotServiceArgument.MESSAGE: "test_message",
+            },
+        ),
+        (
+            TelegramBotService.SEND_STICKER,
+            {
+                TelegramBotServiceArgument.STICKER_ID: "1",
+                TelegramBotServiceArgument.MESSAGE_THREAD_ID: "123",
+            },
+        ),
+        (
+            TelegramBotService.SEND_POLL,
+            {
+                TelegramBotServiceArgument.QUESTION: "Question",
+                TelegramBotServiceArgument.OPTIONS: ["Yes", "No"],
+            },
+        ),
+        (
+            TelegramBotService.SEND_LOCATION,
+            {
+                TelegramBotServiceArgument.MESSAGE_THREAD_ID: "123",
+                TelegramBotServiceArgument.LONGITUDE: "1.123",
+                TelegramBotServiceArgument.LATITUDE: "1.123",
+            },
+        ),
+    ],
+)
+async def test_send_message(
+    hass: HomeAssistant, webhook_bot, service: str, input: dict[str, Any]
+) -> None:
+    """Test services that do not require files to be sent."""
+    context = Context()
+    events = async_capture_events(hass, "telegram_sent")
+
+    response = await hass.services.async_call(
+        DOMAIN,
+        service,
+        input,
+        blocking=True,
+        context=context,
+        return_response=True,
+    )
+    await hass.async_block_till_done()
+
+    assert len(events) == 1
+    assert events[0].context == context
+
+    assert events[0].data["bot"]["id"] == 123456
+    assert events[0].data["bot"]["first_name"] == "Testbot"
+    assert events[0].data["bot"]["last_name"] == "mock last name"
+    assert events[0].data["bot"]["username"] == "mock_bot"
+
+    assert response == {
+        "chats": [
+            {
+                ATTR_CHAT_ID: 12345678,
+                ATTR_MESSAGE_ID: 12345,
+                ATTR_ENTITY_ID: "notify.mock_chat",
+            }
+        ]
+    }
+
+
+@pytest.mark.parametrize(
+    ("input", "expected"),
+    [
+        (
+            {
+                TelegramBotServiceArgument.MESSAGE: "test_message",
+                TelegramBotServiceArgument.PARSE_MODE: PARSER_PLAIN_TEXT,
+                TelegramBotServiceArgument.INLINE_KEYBOARD: "command1:/cmd1,/cmd2,mock_link:https://mock_link",
+            },
+            InlineKeyboardMarkup(
+                # 1 row with 3 buttons
+                [
+                    [
+                        InlineKeyboardButton(callback_data="/cmd1", text="command1"),
+                        InlineKeyboardButton(callback_data="/cmd2", text="CMD2"),
+                        InlineKeyboardButton(url="https://mock_link", text="mock_link"),
+                    ]
+                ]
+            ),
+        ),
+        (
+            {
+                TelegramBotServiceArgument.MESSAGE: "test_message",
+                TelegramBotServiceArgument.PARSE_MODE: PARSER_PLAIN_TEXT,
+                TelegramBotServiceArgument.INLINE_KEYBOARD: [
+                    [["command1", "/cmd1"]],
+                    [["mock_link", "https://mock_link"]],
+                ],
+            },
+            InlineKeyboardMarkup(
+                # 2 rows each with 1 button
+                [
+                    [InlineKeyboardButton(callback_data="/cmd1", text="command1")],
+                    [InlineKeyboardButton(url="https://mock_link", text="mock_link")],
+                ]
+            ),
+        ),
+    ],
+)
+async def test_send_message_with_inline_keyboard(
+    hass: HomeAssistant,
+    webhook_bot,
+    input: dict[str, Any],
+    expected: InlineKeyboardMarkup,
+) -> None:
+    """Test the send_message service.
+
+    Tests any service that does not require files to be sent.
+    """
+    context = Context()
+    events = async_capture_events(hass, "telegram_sent")
+
+    with patch(
+        "homeassistant.components.telegram_bot.bot.Bot.send_message",
+        AsyncMock(
+            return_value=Message(
+                message_id=12345,
+                date=dt_util.utcnow(),
+                chat=Chat(id=12345678, type=ChatType.PRIVATE),
+            )
+        ),
+    ) as mock_send_message:
+        response = await hass.services.async_call(
+            DOMAIN,
+            TelegramBotService.SEND_MESSAGE,
+            input,
+            blocking=True,
+            context=context,
+            return_response=True,
+        )
+        await hass.async_block_till_done()
+
+        mock_send_message.assert_called_once_with(
+            12345678,
+            "test_message",
+            parse_mode=None,
+            disable_web_page_preview=None,
+            disable_notification=False,
+            reply_to_message_id=None,
+            reply_markup=expected,
+            message_thread_id=None,
+        )
+
+    assert len(events) == 1
+    assert events[0].context == context
+
+    assert response == {
+        "chats": [
+            {
+                ATTR_CHAT_ID: 12345678,
+                ATTR_MESSAGE_ID: 12345,
+                ATTR_ENTITY_ID: "notify.mock_chat",
+            }
+        ]
+    }
+
+
+async def test_send_sticker_partial_error(
+    hass: HomeAssistant,
+    mock_broadcast_config_entry: MockConfigEntry,
+    mock_external_calls: None,
+) -> None:
+    """Test the send_sticker service with multiple targets."""
+
+    mock_broadcast_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_broadcast_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    with (
+        patch(
+            "homeassistant.components.telegram_bot.bot.load_data",
+        ) as mock_load_data,
+        patch(
+            "homeassistant.components.telegram_bot.bot.Bot.send_sticker"
+        ) as mock_send_sticker,
+    ):
+        mock_send_sticker.side_effect = NetworkError("mock network error")
+
+        with pytest.raises(HomeAssistantError) as err:
+            await hass.services.async_call(
+                DOMAIN,
+                TelegramBotService.SEND_STICKER,
+                {
+                    TelegramBotServiceArgument.URL: "https://mock_sticker_url",
+                    TelegramBotServiceArgument.CHAT_ID: [123456, 654321],
+                },
+                blocking=True,
+                return_response=True,
+            )
+
+    await hass.async_block_till_done()
+
+    assert mock_load_data.call_count == 2
+    assert mock_send_sticker.call_count == 2
+    assert err.value.translation_key == "multiple_errors"
+    assert err.value.translation_placeholders == {
+        "errors": (
+            "`entity_id` notify.mock_chat_1:"
+            " mock network error\n"
+            "`entity_id` notify.mock_chat_2:"
+            " mock network error"
+        )
+    }
+
+
+async def test_send_sticker_error(hass: HomeAssistant, webhook_bot) -> None:
+    """Test the send_message service with an error."""
+    with patch(
+        "homeassistant.components.telegram_bot.bot.Bot.send_sticker",
+    ) as mock_bot:
+        mock_bot.side_effect = NetworkError("mock network error")
+
+        with pytest.raises(HomeAssistantError) as err:
+            await hass.services.async_call(
+                DOMAIN,
+                TelegramBotService.SEND_STICKER,
+                {
+                    TelegramBotServiceArgument.STICKER_ID: "mock sticker id",
+                },
+                blocking=True,
+            )
+
+    await hass.async_block_till_done()
+
+    mock_bot.assert_called_once()
+    assert err.typename == "HomeAssistantError"
+    assert "mock network error" in str(err.value)
+    assert err.value.translation_domain == DOMAIN
+    assert err.value.translation_key == "action_failed"
+
+
+async def test_send_message_with_invalid_inline_keyboard(
+    hass: HomeAssistant,
+    webhook_bot,
+) -> None:
+    """Test the send_message service with invalid inline keyboard."""
+
+    with pytest.raises(ServiceValidationError) as err:
+        await hass.services.async_call(
+            DOMAIN,
+            TelegramBotService.SEND_MESSAGE,
+            {
+                TelegramBotServiceArgument.MESSAGE: "test_message",
+                TelegramBotServiceArgument.INLINE_KEYBOARD: 1,
+            },
+            blocking=True,
+            return_response=True,
+        )
+
+    await hass.async_block_till_done()
+    assert err.value.translation_key == "invalid_inline_keyboard"
+
+
+@patch(
+    "builtins.open",
+    mock_open(
+        read_data=base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAYAAADgdz34AAAABHNCSVQICAgIfAhkiAAAAAlwSFlzAAAApgAAAKYB3X3/OAAAABl0RVh0U29mdHdhcmUAd3d3Lmlua3NjYXBlLm9yZ5vuPBoAAANCSURBVEiJtZZPbBtFFMZ/M7ubXdtdb1xSFyeilBapySVU8h8OoFaooFSqiihIVIpQBKci6KEg9Q6H9kovIHoCIVQJJCKE1ENFjnAgcaSGC6rEnxBwA04Tx43t2FnvDAfjkNibxgHxnWb2e/u992bee7tCa00YFsffekFY+nUzFtjW0LrvjRXrCDIAaPLlW0nHL0SsZtVoaF98mLrx3pdhOqLtYPHChahZcYYO7KvPFxvRl5XPp1sN3adWiD1ZAqD6XYK1b/dvE5IWryTt2udLFedwc1+9kLp+vbbpoDh+6TklxBeAi9TL0taeWpdmZzQDry0AcO+jQ12RyohqqoYoo8RDwJrU+qXkjWtfi8Xxt58BdQuwQs9qC/afLwCw8tnQbqYAPsgxE1S6F3EAIXux2oQFKm0ihMsOF71dHYx+f3NND68ghCu1YIoePPQN1pGRABkJ6Bus96CutRZMydTl+TvuiRW1m3n0eDl0vRPcEysqdXn+jsQPsrHMquGeXEaY4Yk4wxWcY5V/9scqOMOVUFthatyTy8QyqwZ+kDURKoMWxNKr2EeqVKcTNOajqKoBgOE28U4tdQl5p5bwCw7BWquaZSzAPlwjlithJtp3pTImSqQRrb2Z8PHGigD4RZuNX6JYj6wj7O4TFLbCO/Mn/m8R+h6rYSUb3ekokRY6f/YukArN979jcW+V/S8g0eT/N3VN3kTqWbQ428m9/8k0P/1aIhF36PccEl6EhOcAUCrXKZXXWS3XKd2vc/TRBG9O5ELC17MmWubD2nKhUKZa26Ba2+D3P+4/MNCFwg59oWVeYhkzgN/JDR8deKBoD7Y+ljEjGZ0sosXVTvbc6RHirr2reNy1OXd6pJsQ+gqjk8VWFYmHrwBzW/n+uMPFiRwHB2I7ih8ciHFxIkd/3Omk5tCDV1t+2nNu5sxxpDFNx+huNhVT3/zMDz8usXC3ddaHBj1GHj/As08fwTS7Kt1HBTmyN29vdwAw+/wbwLVOJ3uAD1wi/dUH7Qei66PfyuRj4Ik9is+hglfbkbfR3cnZm7chlUWLdwmprtCohX4HUtlOcQjLYCu+fzGJH2QRKvP3UNz8bWk1qMxjGTOMThZ3kvgLI5AzFfo379UAAAAASUVORK5CYII="
+        )
+    ),
+    create=True,
+)
+def _read_file_as_bytesio_mock(file_path):
+    """Convert file to BytesIO for testing."""
+    _file = None
+
+    with open(file_path, encoding="utf8") as file_handler:
+        _file = io.BytesIO(file_handler.read())
+
+    _file.name = "dummy"
+    _file.seek(0)
+
+    return _file
+
+
+@pytest.fixture
+def allowlist_tmp_path(hass: HomeAssistant, tmp_path: Path) -> Path:
+    """Allow download_file to write into the temporary directory."""
+    hass.config.allowlist_external_dirs = {
+        *hass.config.allowlist_external_dirs,
+        tmp_path.resolve().as_posix(),
+    }
+    return tmp_path
+
+
+async def _run_download_file_service_with_mocks(
+    hass: HomeAssistant,
+    schema_request: dict[str, Any],
+    telegram_file: File,
+    download_bytes: Any,
+) -> tuple[AsyncMock, AsyncMock, dict[str, Any], ServiceResponse]:
+    """Run the download_file service with common mocks and return mocks/results.
+
+    Returns (get_file_mock, download_as_bytearray_mock, write_called)
+    """
+    write_called: dict[str, Any] = {}
+
+    def fake_write_bytes(self, data: bytes) -> None:
+        write_called["self"] = self
+        write_called["data"] = data
+
+    with (
+        patch(
+            "homeassistant.components.telegram_bot.bot.Bot.get_file",
+            AsyncMock(return_value=telegram_file),
+        ) as get_file_mock,
+        patch(
+            "telegram.File.download_as_bytearray",
+            AsyncMock(return_value=download_bytes),
+        ) as download_as_bytearray_mock,
+        patch("pathlib.Path.write_bytes", new=fake_write_bytes),
+    ):
+        response = await hass.services.async_call(
+            DOMAIN,
+            "download_file",
+            schema_request,
+            blocking=True,
+            return_response=True,
+        )
+        await hass.async_block_till_done()
+
+    return get_file_mock, download_as_bytearray_mock, write_called, response
+
+
+def _assert_download_file_mocks_calls(
+    file_content,
+    expected_path,
+    file_id,
+    get_file_mock,
+    download_as_bytearray_mock,
+    write_called,
 ):
-    """POST to the configured webhook endpoint and assert fired `telegram_text` event."""
+    """Common assert for mocks calls."""
+    get_file_mock.assert_called_once_with(file_id=file_id)
+    download_as_bytearray_mock.assert_called_once()
+    assert "self" in write_called
+    assert str(write_called["self"]) == expected_path
+    assert write_called["data"] == file_content
+
+
+def _assert_download_file_response(
+    response: ServiceResponse, expected_path: str
+) -> None:
+    """Assert download file response."""
+    assert response is not None
+    assert len(response.keys()) == 1
+    assert "file_path" in response
+    assert response["file_path"] == expected_path
+
+
+async def test_send_chat_action(
+    hass: HomeAssistant,
+    mock_broadcast_config_entry: MockConfigEntry,
+    mock_external_calls: None,
+) -> None:
+    """Test the send_chat_action service."""
+    mock_broadcast_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_broadcast_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    with patch(
+        "homeassistant.components.telegram_bot.bot.Bot.send_chat_action",
+        AsyncMock(return_value=True),
+    ) as mock:
+        await hass.services.async_call(
+            DOMAIN,
+            TelegramBotService.SEND_CHAT_ACTION,
+            {
+                CommonServiceArgument.CONFIG_ENTRY_ID: mock_broadcast_config_entry.entry_id,
+                TelegramBotServiceArgument.CHAT_ID: [123456],
+                TelegramBotServiceArgument.CHAT_ACTION: CHAT_ACTION_TYPING,
+                TelegramBotServiceArgument.MESSAGE_THREAD_ID: 123,
+            },
+            blocking=True,
+            return_response=True,
+        )
+
+    await hass.async_block_till_done()
+    mock.assert_called_once()
+    mock.assert_called_with(
+        chat_id=123456, action=CHAT_ACTION_TYPING, message_thread_id=123
+    )
+
+
+@pytest.mark.parametrize(
+    "service",
+    [
+        TelegramBotService.SEND_PHOTO,
+        TelegramBotService.SEND_ANIMATION,
+        TelegramBotService.SEND_VIDEO,
+        TelegramBotService.SEND_VOICE,
+        TelegramBotService.SEND_DOCUMENT,
+    ],
+)
+async def test_send_file(hass: HomeAssistant, webhook_bot, service: str) -> None:
+    """Test the send_file service (photo, animation, video, document...)."""
+    context = Context()
+    events = async_capture_events(hass, "telegram_sent")
+
+    hass.config.allowlist_external_dirs.add("/media/")
+
+    # Mock the file handler read with our base64 encoded dummy file
+    with patch(
+        "homeassistant.components.telegram_bot.bot._read_file_as_bytesio",
+        _read_file_as_bytesio_mock,
+    ):
+        response = await hass.services.async_call(
+            DOMAIN,
+            service,
+            {
+                TelegramBotServiceArgument.FILE: "/media/dummy",
+                TelegramBotServiceArgument.MESSAGE_THREAD_ID: "123",
+            },
+            blocking=True,
+            context=context,
+            return_response=True,
+        )
+        await hass.async_block_till_done()
+
+    assert len(events) == 1
+    assert events[0].context == context
+
+    assert response == {
+        "chats": [
+            {
+                ATTR_CHAT_ID: 12345678,
+                ATTR_MESSAGE_ID: 12345,
+                ATTR_ENTITY_ID: "notify.mock_chat",
+            }
+        ]
+    }
+
+
+async def test_send_message_thread(hass: HomeAssistant, webhook_bot) -> None:
+    """Test the send_message service for threads."""
+    context = Context()
+    events = async_capture_events(hass, "telegram_sent")
+
+    await hass.services.async_call(
+        DOMAIN,
+        TelegramBotService.SEND_MESSAGE,
+        {
+            TelegramBotServiceArgument.MESSAGE: "test_message",
+            TelegramBotServiceArgument.MESSAGE_THREAD_ID: "123",
+        },
+        blocking=True,
+        context=context,
+    )
+    await hass.async_block_till_done()
+
+    assert len(events) == 1
+    assert events[0].context == context
+    assert events[0].data[ATTR_MESSAGE_THREAD_ID] == 123
+
+
+@pytest.mark.parametrize(
+    "reply_content",
+    [
+        pytest.param({"text": "ORIGINAL MESSAGE"}, id="text"),
+        pytest.param(
+            {
+                "photo": [
+                    {
+                        "file_id": "photo-file-id",
+                        "file_unique_id": "photo-file-unique-id",
+                        "width": 640,
+                        "height": 480,
+                    }
+                ]
+            },
+            id="photo",
+        ),
+    ],
+)
+async def test_webhook_endpoint_generates_telegram_text_reply_event(
+    hass: HomeAssistant,
+    webhook_bot: None,
+    hass_client: ClientSessionGenerator,
+    update_message_text: dict[str, Any],
+    mock_generate_secret_token: str,
+    reply_content: dict[str, Any],
+) -> None:
+    """Test a reply includes the replied-to message ID in the text event."""
+    update_message_text["message"]["reply_to_message"] = {
+        "message_id": 42,
+        "date": 1441645500,
+        "chat": update_message_text["message"]["chat"],
+        **reply_content,
+    }
     client = await hass_client()
     events = async_capture_events(hass, "telegram_text")
 
-    response = await client.post(TELEGRAM_WEBHOOK_URL, json=update_message_text)
+    response = await client.post(
+        f"{TELEGRAM_WEBHOOK_URL}_123456",
+        json=update_message_text,
+        headers={"X-Telegram-Bot-Api-Secret-Token": mock_generate_secret_token},
+    )
     assert response.status == 200
     assert (await response.read()).decode("utf-8") == ""
 
@@ -44,16 +698,29 @@ async def test_webhook_endpoint_generates_telegram_text_event(
 
     assert len(events) == 1
     assert events[0].data["text"] == update_message_text["message"]["text"]
+    assert (
+        events[0].data[ATTR_REPLY_TO_MSGID]
+        == (update_message_text["message"]["reply_to_message"]["message_id"])
+    )
+    assert isinstance(events[0].context, Context)
 
 
 async def test_webhook_endpoint_generates_telegram_command_event(
-    hass, webhook_platform, hass_client, update_message_command
-):
-    """POST to the configured webhook endpoint and assert fired `telegram_command` event."""
+    hass: HomeAssistant,
+    webhook_bot,
+    hass_client: ClientSessionGenerator,
+    update_message_command,
+    mock_generate_secret_token,
+) -> None:
+    """POST to webhook endpoint and assert fired telegram_command event."""
     client = await hass_client()
     events = async_capture_events(hass, "telegram_command")
 
-    response = await client.post(TELEGRAM_WEBHOOK_URL, json=update_message_command)
+    response = await client.post(
+        f"{TELEGRAM_WEBHOOK_URL}_123456",
+        json=update_message_command,
+        headers={"X-Telegram-Bot-Api-Secret-Token": mock_generate_secret_token},
+    )
     assert response.status == 200
     assert (await response.read()).decode("utf-8") == ""
 
@@ -62,16 +729,25 @@ async def test_webhook_endpoint_generates_telegram_command_event(
 
     assert len(events) == 1
     assert events[0].data["command"] == update_message_command["message"]["text"]
+    assert isinstance(events[0].context, Context)
 
 
-async def test_webhook_endpoint_generates_telegram_callback_event(
-    hass, webhook_platform, hass_client, update_callback_query
-):
-    """POST to the configured webhook endpoint and assert fired `telegram_callback` event."""
+async def test_webhook_callback_inline_query(
+    hass: HomeAssistant,
+    webhook_bot,
+    hass_client: ClientSessionGenerator,
+    update_callback_query,
+    mock_generate_secret_token,
+) -> None:
+    """Test callback query triggered by inline query."""
     client = await hass_client()
     events = async_capture_events(hass, "telegram_callback")
 
-    response = await client.post(TELEGRAM_WEBHOOK_URL, json=update_callback_query)
+    response = await client.post(
+        f"{TELEGRAM_WEBHOOK_URL}_123456",
+        json=update_callback_query,
+        headers={"X-Telegram-Bot-Api-Secret-Token": mock_generate_secret_token},
+    )
     assert response.status == 200
     assert (await response.read()).decode("utf-8") == ""
 
@@ -80,38 +756,293 @@ async def test_webhook_endpoint_generates_telegram_callback_event(
 
     assert len(events) == 1
     assert events[0].data["data"] == update_callback_query["callback_query"]["data"]
+    assert isinstance(events[0].context, Context)
+
+
+async def test_webhook_callback_inline_keyboard(
+    hass: HomeAssistant,
+    webhook_bot: None,
+    hass_client: ClientSessionGenerator,
+    update_callback_inline_keyboard,
+    mock_generate_secret_token,
+) -> None:
+    """Test callback query triggered by inline keyboard button."""
+    client = await hass_client()
+    events = async_capture_events(hass, "telegram_callback")
+
+    response = await client.post(
+        f"{TELEGRAM_WEBHOOK_URL}_123456",
+        json=update_callback_inline_keyboard,
+        headers={"X-Telegram-Bot-Api-Secret-Token": mock_generate_secret_token},
+    )
+    assert response.status == 200
+    assert (await response.read()).decode("utf-8") == ""
+
+    # Make sure event has fired
+    await hass.async_block_till_done()
+
+    assert len(events) == 1
+    assert (
+        events[0].data["chat_id"]
+        == update_callback_inline_keyboard["callback_query"]["message"]["chat"]["id"]
+    )
+    expected_message = {
+        **update_callback_inline_keyboard["callback_query"]["message"],
+        "delete_chat_photo": False,
+        "group_chat_created": False,
+        "supergroup_chat_created": False,
+        "channel_chat_created": False,
+    }
+    assert events[0].data["message"] == expected_message
+    assert events[0].data["data"] == "/command arg1 arg2"
+    assert events[0].data["command"] == "/command"
+    assert events[0].data["args"] == ["arg1", "arg2"]
+    assert isinstance(events[0].context, Context)
+
+
+@pytest.mark.parametrize(
+    ("attachment_type"),
+    [
+        ("photo"),
+        ("document"),
+    ],
+)
+async def test_webhook_endpoint_generates_telegram_attachment_event(
+    hass: HomeAssistant,
+    webhook_bot: None,
+    hass_client: ClientSessionGenerator,
+    mock_generate_secret_token: str,
+    attachment_type: str,
+) -> None:
+    """POST to webhook and assert fired telegram_attachment event."""
+    client = await hass_client()
+    events = async_capture_events(hass, "telegram_attachment")
+    update_message_attachment = await async_load_fixture(
+        hass, f"update_message_attachment_{attachment_type}.json", DOMAIN
+    )
+
+    response = await client.post(
+        f"{TELEGRAM_WEBHOOK_URL}_123456",
+        data=update_message_attachment,
+        headers={
+            "X-Telegram-Bot-Api-Secret-Token": mock_generate_secret_token,
+            "Content-Type": "application/json",
+        },
+    )
+    assert response.status == 200
+    assert (await response.read()).decode("utf-8") == ""
+
+    # Make sure event has fired
+    await hass.async_block_till_done()
+
+    assert len(events) == 1
+    loaded = json_util.json_loads(update_message_attachment)
+    if attachment_type == "photo":
+        expected_file_id = loaded["message"]["photo"][-1]["file_id"]
+    else:
+        expected_file_id = loaded["message"][attachment_type]["file_id"]
+
+    assert events[0].data["file_id"] == expected_file_id
+    assert isinstance(events[0].context, Context)
+
+
+async def test_polling_platform_allowed_updates(
+    hass: HomeAssistant,
+    mock_polling_config_entry: MockConfigEntry,
+    mock_external_calls: None,
+) -> None:
+    """Test polling asks for the updates the integration handles.
+
+    Telegram keeps the setting per bot and reuses the last one it was given
+    when it is omitted, so it has to be sent on every start.
+    """
+    with patch(
+        "homeassistant.components.telegram_bot.polling.ApplicationBuilder"
+    ) as application_builder_class:
+        application = (
+            application_builder_class.return_value.bot.return_value.build.return_value
+        )
+        application.updater.start_polling = AsyncMock()
+        application.updater.stop = AsyncMock()
+        application.initialize = AsyncMock()
+        application.start = AsyncMock()
+        application.stop = AsyncMock()
+        application.shutdown = AsyncMock()
+
+        mock_polling_config_entry.add_to_hass(hass)
+        await hass.config_entries.async_setup(mock_polling_config_entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert (
+        application.updater.start_polling.call_args.kwargs["allowed_updates"]
+        == ALLOWED_UPDATES
+    )
 
 
 async def test_polling_platform_message_text_update(
-    hass, polling_platform, update_message_text
-):
-    """Provide the `PollBot`s `Dispatcher` with an `Update` and assert fired `telegram_text` event."""
+    hass: HomeAssistant,
+    mock_polling_config_entry: MockConfigEntry,
+    update_message_text,
+    mock_external_calls: None,
+) -> None:
+    """Test update_handler with an Update fires telegram_text event."""
     events = async_capture_events(hass, "telegram_text")
 
-    def telegram_dispatcher_callback():
-        dispatcher = Dispatcher.get_instance()
-        update = Update.de_json(update_message_text, dispatcher.bot)
-        dispatcher.process_update(update)
+    with patch(
+        "homeassistant.components.telegram_bot.polling.ApplicationBuilder"
+    ) as application_builder_class:
+        # Set up the integration with the polling platform inside
+        # the patch context manager.
+        application = (
+            application_builder_class.return_value.bot.return_value.build.return_value
+        )
+        application.updater.start_polling = AsyncMock()
+        application.updater.stop = AsyncMock()
+        application.initialize = AsyncMock()
+        application.start = AsyncMock()
+        application.stop = AsyncMock()
+        application.shutdown = AsyncMock()
 
-    # python-telegram-bots `Updater` uses threading, so we need to schedule its callback in a sync context.
-    await hass.async_add_executor_job(telegram_dispatcher_callback)
+        mock_polling_config_entry.add_to_hass(hass)
+        await hass.config_entries.async_setup(mock_polling_config_entry.entry_id)
+        await hass.async_block_till_done()
+
+        # Then call the callback and assert events fired.
+        handler = application.add_handler.call_args[0][0]
+        handle_update_callback = handler.callback
+
+        # Create Update object using library API.
+        application.bot.defaults.tzinfo = None
+        update = Update.de_json(update_message_text, application.bot)
+
+        # handle_update_callback == BaseTelegramBot.update_handler
+        await handle_update_callback(update, None)
 
     # Make sure event has fired
     await hass.async_block_till_done()
 
     assert len(events) == 1
     assert events[0].data["text"] == update_message_text["message"]["text"]
+    assert (
+        events[0].data["bot"]["config_entry_id"] == mock_polling_config_entry.entry_id
+    )
+    assert events[0].data["bot"]["id"] == 123456
+    assert events[0].data["bot"]["first_name"] == "Testbot"
+    assert events[0].data["bot"]["last_name"] == "mock last name"
+    assert events[0].data["bot"]["username"] == "mock_bot"
+
+    assert isinstance(events[0].context, Context)
+
+
+@pytest.mark.parametrize(
+    ("error", "log_message"),
+    [
+        (
+            TelegramError("Telegram error"),
+            'caused error: "Telegram error"',
+        ),
+        (NetworkError("Network error"), ""),
+        (RetryAfter(42), ""),
+        (TimedOut("TimedOut error"), ""),
+    ],
+)
+async def test_polling_platform_add_error_handler(
+    hass: HomeAssistant,
+    mock_polling_config_entry: MockConfigEntry,
+    update_message_text: dict[str, Any],
+    mock_external_calls: None,
+    caplog: pytest.LogCaptureFixture,
+    error: Exception,
+    log_message: str,
+) -> None:
+    """Test polling add error handler."""
+    with patch(
+        "homeassistant.components.telegram_bot.polling.ApplicationBuilder"
+    ) as application_builder_class:
+        application = (
+            application_builder_class.return_value.bot.return_value.build.return_value
+        )
+        application.updater.stop = AsyncMock()
+        application.initialize = AsyncMock()
+        application.updater.start_polling = AsyncMock()
+        application.start = AsyncMock()
+        application.stop = AsyncMock()
+        application.shutdown = AsyncMock()
+        application.bot.defaults.tzinfo = None
+
+        mock_polling_config_entry.add_to_hass(hass)
+        await hass.config_entries.async_setup(mock_polling_config_entry.entry_id)
+        await hass.async_block_till_done()
+
+        update = Update.de_json(update_message_text, application.bot)
+        process_error = application.add_error_handler.call_args[0][0]
+        await process_error(update, MagicMock(error=error))
+
+        assert log_message in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("error", "log_message"),
+    [
+        (
+            TelegramError("Telegram error"),
+            "TelegramError: Telegram error",
+        ),
+        (NetworkError("Network error"), ""),
+        (RetryAfter(42), ""),
+        (TimedOut("TimedOut error"), ""),
+    ],
+)
+async def test_polling_platform_start_polling_error_callback(
+    hass: HomeAssistant,
+    mock_polling_config_entry: MockConfigEntry,
+    caplog: pytest.LogCaptureFixture,
+    mock_external_calls: None,
+    error: Exception,
+    log_message: str,
+) -> None:
+    """Test polling add error handler."""
+    with patch(
+        "homeassistant.components.telegram_bot.polling.ApplicationBuilder"
+    ) as application_builder_class:
+        application = (
+            application_builder_class.return_value.bot.return_value.build.return_value
+        )
+        application.initialize = AsyncMock()
+        application.updater.start_polling = AsyncMock()
+        application.start = AsyncMock()
+        application.updater.stop = AsyncMock()
+        application.stop = AsyncMock()
+        application.shutdown = AsyncMock()
+
+        mock_polling_config_entry.add_to_hass(hass)
+        await hass.config_entries.async_setup(mock_polling_config_entry.entry_id)
+        await hass.async_block_till_done()
+
+        error_callback = application.updater.start_polling.call_args.kwargs[
+            "error_callback"
+        ]
+
+        error_callback(error)
+
+        assert log_message in caplog.text
 
 
 async def test_webhook_endpoint_unauthorized_update_doesnt_generate_telegram_text_event(
-    hass, webhook_platform, hass_client, unauthorized_update_message_text
-):
+    hass: HomeAssistant,
+    webhook_bot,
+    hass_client: ClientSessionGenerator,
+    unauthorized_update_message_text,
+    mock_generate_secret_token,
+) -> None:
     """Update with unauthorized user/chat should not trigger event."""
     client = await hass_client()
     events = async_capture_events(hass, "telegram_text")
 
     response = await client.post(
-        TELEGRAM_WEBHOOK_URL, json=unauthorized_update_message_text
+        f"{TELEGRAM_WEBHOOK_URL}_123456",
+        json=unauthorized_update_message_text,
+        headers={"X-Telegram-Bot-Api-Secret-Token": mock_generate_secret_token},
     )
     assert response.status == 200
     assert (await response.read()).decode("utf-8") == ""
@@ -120,3 +1051,1816 @@ async def test_webhook_endpoint_unauthorized_update_doesnt_generate_telegram_tex
     await hass.async_block_till_done()
 
     assert len(events) == 0
+
+
+async def test_webhook_endpoint_without_secret_token_is_denied(
+    hass: HomeAssistant,
+    webhook_bot,
+    hass_client: ClientSessionGenerator,
+    update_message_text,
+) -> None:
+    """Request without a secret token header should be denied."""
+    client = await hass_client()
+    async_capture_events(hass, "telegram_text")
+
+    response = await client.post(
+        f"{TELEGRAM_WEBHOOK_URL}_123456",
+        json=update_message_text,
+    )
+    assert response.status == 401
+
+
+async def test_webhook_endpoint_invalid_secret_token_is_denied(
+    hass: HomeAssistant,
+    webhook_bot,
+    hass_client: ClientSessionGenerator,
+    update_message_text,
+    incorrect_secret_token,
+) -> None:
+    """Request with an invalid secret token header should be denied."""
+    client = await hass_client()
+    async_capture_events(hass, "telegram_text")
+
+    response = await client.post(
+        f"{TELEGRAM_WEBHOOK_URL}_123456",
+        json=update_message_text,
+        headers={"X-Telegram-Bot-Api-Secret-Token": incorrect_secret_token},
+    )
+    assert response.status == 401
+
+
+async def test_multiple_config_entries_error(
+    hass: HomeAssistant,
+    mock_polling_config_entry: MockConfigEntry,
+    mock_broadcast_config_entry: MockConfigEntry,
+    mock_external_calls: None,
+    mock_polling_calls: None,
+) -> None:
+    """Test multiple config entries error."""
+
+    # setup the first entry
+    mock_polling_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_polling_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    # setup the second entry, a different bot with its own token
+    second_entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="mock api key 2",
+        data={**mock_broadcast_config_entry.data, CONF_API_KEY: "mock api key 2"},
+        options=mock_broadcast_config_entry.options,
+        minor_version=mock_broadcast_config_entry.minor_version,
+    )
+    second_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(second_entry.entry_id)
+    await hass.async_block_till_done()
+    assert second_entry.state is ConfigEntryState.LOADED
+
+    with pytest.raises(ServiceValidationError) as err:
+        await hass.services.async_call(
+            DOMAIN,
+            TelegramBotService.SEND_MESSAGE,
+            {
+                TelegramBotServiceArgument.MESSAGE: "mock message",
+            },
+            blocking=True,
+            return_response=True,
+        )
+
+    await hass.async_block_till_done()
+    assert err.value.translation_key == "missing_notify_entities"
+
+
+async def test_send_message_with_config_entry(
+    hass: HomeAssistant,
+    mock_broadcast_config_entry: MockConfigEntry,
+    mock_external_calls: None,
+) -> None:
+    """Test send message using config entry."""
+    mock_broadcast_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_broadcast_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    # test: send message to invalid chat id
+
+    with pytest.raises(HomeAssistantError) as err:
+        response = await hass.services.async_call(
+            DOMAIN,
+            TelegramBotService.SEND_MESSAGE,
+            {
+                CommonServiceArgument.CONFIG_ENTRY_ID: mock_broadcast_config_entry.entry_id,
+                TelegramBotServiceArgument.MESSAGE: "mock message",
+                TelegramBotServiceArgument.CHAT_ID: [123456, 1],
+            },
+            blocking=True,
+            return_response=True,
+        )
+    await hass.async_block_till_done()
+
+    assert err.value.translation_key == "invalid_chat_ids"
+    assert err.value.translation_placeholders == {
+        "chat_ids": "1",
+        "bot_name": "Mock Title",
+    }
+
+    # test: send message to valid chat id
+
+    response = await hass.services.async_call(
+        DOMAIN,
+        TelegramBotService.SEND_MESSAGE,
+        {
+            CommonServiceArgument.CONFIG_ENTRY_ID: mock_broadcast_config_entry.entry_id,
+            TelegramBotServiceArgument.MESSAGE: "mock message",
+            TelegramBotServiceArgument.CHAT_ID: 123456,
+        },
+        blocking=True,
+        return_response=True,
+    )
+
+    assert response == {
+        "chats": [
+            {
+                ATTR_CHAT_ID: 123456,
+                ATTR_MESSAGE_ID: 12345,
+                ATTR_ENTITY_ID: "notify.mock_chat_1",
+            }
+        ]
+    }
+
+
+async def test_send_message_no_chat_id_error(
+    hass: HomeAssistant,
+    mock_external_calls: None,
+) -> None:
+    """Test send message using config entry with no whitelisted chat id."""
+    mock_config_entry = MockConfigEntry(
+        unique_id="mock api key",
+        domain=DOMAIN,
+        data={
+            CONF_PLATFORM: PLATFORM_BROADCAST,
+            CONF_API_KEY: "mock api key",
+            SECTION_ADDITIONAL_SETTINGS: {},
+        },
+        options={ATTR_PARSER: PARSER_PLAIN_TEXT},
+    )
+    mock_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    with pytest.raises(ServiceValidationError) as err:
+        await hass.services.async_call(
+            DOMAIN,
+            TelegramBotService.SEND_MESSAGE,
+            {
+                TelegramBotServiceArgument.MESSAGE: "mock message",
+            },
+            blocking=True,
+            return_response=True,
+        )
+
+    assert err.value.translation_key == "missing_allowed_chat_ids"
+    assert err.value.translation_placeholders == {"bot_name": "Mock Title"}
+
+
+async def test_send_message_config_entry_error(
+    hass: HomeAssistant,
+    mock_broadcast_config_entry: MockConfigEntry,
+    mock_external_calls: None,
+) -> None:
+    """Test send message config entry error."""
+    mock_broadcast_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_broadcast_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    await hass.config_entries.async_unload(mock_broadcast_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    with pytest.raises(ServiceValidationError) as err:
+        await hass.services.async_call(
+            DOMAIN,
+            TelegramBotService.SEND_MESSAGE,
+            {
+                CommonServiceArgument.CONFIG_ENTRY_ID: mock_broadcast_config_entry.entry_id,
+                TelegramBotServiceArgument.MESSAGE: "mock message",
+            },
+            blocking=True,
+            return_response=True,
+        )
+
+    await hass.async_block_till_done()
+    assert err.value.translation_key == "entry_not_loaded"
+    assert err.value.translation_placeholders == {"telegram_bot": "Mock Title"}
+
+
+async def test_send_message_config_entry_wrong_domain(
+    hass: HomeAssistant,
+    mock_broadcast_config_entry: MockConfigEntry,
+    mock_external_calls: None,
+) -> None:
+    """Test send message with a config entry of another integration."""
+    mock_broadcast_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_broadcast_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    other_entry = MockConfigEntry(domain="other", title="Other entry")
+    other_entry.add_to_hass(hass)
+
+    with pytest.raises(ServiceValidationError) as err:
+        await hass.services.async_call(
+            DOMAIN,
+            TelegramBotService.SEND_MESSAGE,
+            {
+                CommonServiceArgument.CONFIG_ENTRY_ID: other_entry.entry_id,
+                TelegramBotServiceArgument.MESSAGE: "mock message",
+            },
+            blocking=True,
+            return_response=True,
+        )
+
+    assert err.value.translation_domain == HOMEASSISTANT_DOMAIN
+    assert err.value.translation_key == "service_config_entry_wrong_domain"
+    assert err.value.translation_placeholders == {
+        "domain": DOMAIN,
+        "entry_title": "Other entry",
+    }
+
+
+async def test_delete_message(
+    hass: HomeAssistant,
+    mock_broadcast_config_entry: MockConfigEntry,
+    mock_external_calls: None,
+) -> None:
+    """Test delete message."""
+    mock_broadcast_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_broadcast_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    # test: delete message with invalid chat id
+
+    with pytest.raises(ServiceValidationError) as err:
+        await hass.services.async_call(
+            DOMAIN,
+            TelegramBotService.DELETE_MESSAGE,
+            {
+                TelegramBotServiceArgument.CHAT_ID: 1,
+                TelegramBotServiceArgument.MESSAGE_ID: "last",
+            },
+            blocking=True,
+        )
+    await hass.async_block_till_done()
+
+    assert err.value.translation_key == "invalid_chat_ids"
+    assert err.value.translation_placeholders == {
+        "chat_ids": "1",
+        "bot_name": "Mock Title",
+    }
+
+    # test: delete message with valid chat id
+
+    response = await hass.services.async_call(
+        DOMAIN,
+        TelegramBotService.SEND_MESSAGE,
+        {TelegramBotServiceArgument.MESSAGE: "mock message"},
+        blocking=True,
+        return_response=True,
+    )
+    assert response == {
+        "chats": [
+            {
+                ATTR_CHAT_ID: 123456,
+                ATTR_MESSAGE_ID: 12345,
+                ATTR_ENTITY_ID: "notify.mock_chat_1",
+            }
+        ]
+    }
+
+    with patch(
+        "homeassistant.components.telegram_bot.bot.Bot.delete_message",
+        AsyncMock(return_value=True),
+    ) as mock:
+        await hass.services.async_call(
+            DOMAIN,
+            TelegramBotService.DELETE_MESSAGE,
+            {
+                TelegramBotServiceArgument.CHAT_ID: 123456,
+                TelegramBotServiceArgument.MESSAGE_ID: "last",
+            },
+            blocking=True,
+        )
+
+    await hass.async_block_till_done()
+    mock.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("media_type", "expected_media_class"),
+    [
+        (
+            InputMediaType.ANIMATION,
+            "InputMediaAnimation",
+        ),
+        (
+            InputMediaType.AUDIO,
+            "InputMediaAudio",
+        ),
+        (
+            InputMediaType.DOCUMENT,
+            "InputMediaDocument",
+        ),
+        (
+            InputMediaType.PHOTO,
+            "InputMediaPhoto",
+        ),
+        (
+            InputMediaType.VIDEO,
+            "InputMediaVideo",
+        ),
+    ],
+)
+async def test_edit_message_media(
+    hass: HomeAssistant,
+    mock_broadcast_config_entry: MockConfigEntry,
+    mock_external_calls: None,
+    media_type: str,
+    expected_media_class: str,
+) -> None:
+    """Test edit message media."""
+    mock_broadcast_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_broadcast_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    hass.config.allowlist_external_dirs.add("/tmp/")  # noqa: S108
+    write_utf8_file("/tmp/mock", "mock file contents")  # noqa: S108
+
+    with patch(
+        "homeassistant.components.telegram_bot.bot.Bot.edit_message_media",
+        AsyncMock(return_value=True),
+    ) as mock:
+        await hass.services.async_call(
+            DOMAIN,
+            TelegramBotService.EDIT_MESSAGE_MEDIA,
+            {
+                TelegramBotServiceArgument.CAPTION: "mock caption",
+                TelegramBotServiceArgument.FILE: "/tmp/mock",  # noqa: S108
+                TelegramBotServiceArgument.MEDIA_TYPE: media_type,
+                TelegramBotServiceArgument.MESSAGE_ID: 12345,
+                TelegramBotServiceArgument.CHAT_ID: 123456,
+                TelegramBotServiceArgument.INLINE_KEYBOARD: "/mock",
+                TelegramBotServiceArgument.PARSE_MODE: PARSER_MD,
+            },
+            blocking=True,
+        )
+
+    await hass.async_block_till_done()
+    mock.assert_called_once()
+    assert mock.call_args[1]["media"].__class__.__name__ == expected_media_class
+    assert mock.call_args[1]["media"].caption == "mock caption"
+    assert mock.call_args[1]["media"].parse_mode == PARSER_MD
+    assert mock.call_args[1]["chat_id"] == 123456
+    assert mock.call_args[1]["message_id"] == 12345
+    assert mock.call_args[1]["reply_markup"] == InlineKeyboardMarkup(
+        [[InlineKeyboardButton(callback_data="/mock", text="MOCK")]]
+    )
+
+
+async def test_edit_message(
+    hass: HomeAssistant,
+    mock_broadcast_config_entry: MockConfigEntry,
+    mock_external_calls: None,
+) -> None:
+    """Test edit message."""
+    mock_broadcast_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_broadcast_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    with patch(
+        "homeassistant.components.telegram_bot.bot.Bot.edit_message_text",
+        AsyncMock(return_value=True),
+    ) as mock:
+        await hass.services.async_call(
+            DOMAIN,
+            TelegramBotService.EDIT_MESSAGE,
+            {
+                TelegramBotServiceArgument.MESSAGE: "mock message",
+                TelegramBotServiceArgument.CHAT_ID: 123456,
+                TelegramBotServiceArgument.MESSAGE_ID: 12345,
+                TelegramBotServiceArgument.PARSE_MODE: PARSER_PLAIN_TEXT,
+            },
+            blocking=True,
+        )
+
+    await hass.async_block_till_done()
+    mock.assert_called_once_with(
+        "mock message",
+        chat_id=123456,
+        message_id=12345,
+        inline_message_id=None,
+        parse_mode=None,
+        disable_web_page_preview=None,
+        reply_markup=None,
+    )
+
+    with patch(
+        "homeassistant.components.telegram_bot.bot.Bot.edit_message_caption",
+        AsyncMock(return_value=True),
+    ) as mock:
+        await hass.services.async_call(
+            DOMAIN,
+            TelegramBotService.EDIT_CAPTION,
+            {
+                TelegramBotServiceArgument.CAPTION: "mock caption",
+                TelegramBotServiceArgument.CHAT_ID: 123456,
+                TelegramBotServiceArgument.MESSAGE_ID: 12345,
+                TelegramBotServiceArgument.PARSE_MODE: PARSER_MD2,
+            },
+            blocking=True,
+        )
+
+    await hass.async_block_till_done()
+    mock.assert_called_once_with(
+        chat_id=123456,
+        message_id=12345,
+        inline_message_id=None,
+        caption="mock caption",
+        reply_markup=None,
+        parse_mode=PARSER_MD2,
+    )
+
+    with patch(
+        "homeassistant.components.telegram_bot.bot.Bot.edit_message_reply_markup",
+        AsyncMock(return_value=True),
+    ) as mock:
+        await hass.services.async_call(
+            DOMAIN,
+            TelegramBotService.EDIT_REPLYMARKUP,
+            {
+                TelegramBotServiceArgument.INLINE_KEYBOARD: [],
+                TelegramBotServiceArgument.CHAT_ID: 123456,
+                TelegramBotServiceArgument.MESSAGE_ID: 12345,
+            },
+            blocking=True,
+        )
+
+    await hass.async_block_till_done()
+    mock.assert_called_once()
+
+
+async def test_async_setup_entry_failed(
+    hass: HomeAssistant, mock_broadcast_config_entry: MockConfigEntry
+) -> None:
+    """Test setup entry failed."""
+    mock_broadcast_config_entry.add_to_hass(hass)
+
+    with patch(
+        "homeassistant.components.telegram_bot.Bot.get_me",
+    ) as mock_bot:
+        mock_bot.side_effect = InvalidToken("mock invalid token error")
+
+        await hass.config_entries.async_setup(mock_broadcast_config_entry.entry_id)
+
+    await hass.async_block_till_done()
+    assert mock_broadcast_config_entry.state is ConfigEntryState.SETUP_ERROR
+    assert mock_broadcast_config_entry.error_reason_translation_key == "invalid_api_key"
+
+
+async def test_answer_callback_query(
+    hass: HomeAssistant,
+    mock_broadcast_config_entry: MockConfigEntry,
+    mock_external_calls: None,
+) -> None:
+    """Test answer callback query."""
+    mock_broadcast_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_broadcast_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    with patch(
+        "homeassistant.components.telegram_bot.bot.Bot.answer_callback_query"
+    ) as mock:
+        await hass.services.async_call(
+            DOMAIN,
+            TelegramBotService.ANSWER_CALLBACK_QUERY,
+            {
+                TelegramBotServiceArgument.MESSAGE: "mock message",
+                TelegramBotServiceArgument.CALLBACK_QUERY_ID: 123456,
+                TelegramBotServiceArgument.SHOW_ALERT: True,
+            },
+            blocking=True,
+        )
+
+    await hass.async_block_till_done()
+    mock.assert_called_once()
+    mock.assert_called_with(
+        123456,
+        text="mock message",
+        show_alert=True,
+    )
+
+
+async def test_leave_chat(
+    hass: HomeAssistant,
+    mock_broadcast_config_entry: MockConfigEntry,
+    mock_external_calls: None,
+) -> None:
+    """Test answer callback query."""
+    mock_broadcast_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_broadcast_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    with patch(
+        "homeassistant.components.telegram_bot.bot.Bot.leave_chat",
+        AsyncMock(return_value=True),
+    ) as mock:
+        await hass.services.async_call(
+            DOMAIN,
+            TelegramBotService.LEAVE_CHAT,
+            {
+                TelegramBotServiceArgument.CHAT_ID: 123456,
+            },
+            blocking=True,
+        )
+
+    await hass.async_block_till_done()
+    mock.assert_called_once()
+    mock.assert_called_with(
+        123456,
+    )
+
+
+async def test_send_video(
+    hass: HomeAssistant,
+    mock_broadcast_config_entry: MockConfigEntry,
+    mock_external_calls: None,
+) -> None:
+    """Test answer callback query."""
+    mock_broadcast_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_broadcast_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    # test: invalid file path
+
+    with pytest.raises(ServiceValidationError) as err:
+        await hass.services.async_call(
+            DOMAIN,
+            TelegramBotService.SEND_VIDEO,
+            {
+                TelegramBotServiceArgument.FILE: "/mock/file",
+            },
+            blocking=True,
+        )
+
+    await hass.async_block_till_done()
+
+    assert err.value.translation_domain == DOMAIN
+    assert err.value.translation_key == "allowlist_external_dirs_error"
+
+    # test: missing username input
+
+    with pytest.raises(ServiceValidationError) as err:
+        await hass.services.async_call(
+            DOMAIN,
+            TelegramBotService.SEND_VIDEO,
+            {
+                TelegramBotServiceArgument.URL: "https://mock",
+                TelegramBotServiceArgument.AUTHENTICATION: HTTP_DIGEST_AUTHENTICATION,
+                TelegramBotServiceArgument.PASSWORD: "mock password",
+            },
+            blocking=True,
+        )
+
+    await hass.async_block_till_done()
+
+    assert err.value.translation_domain == DOMAIN
+    assert err.value.translation_key == "missing_input"
+    assert err.value.translation_placeholders == {"field": "Username"}
+
+    # test: missing password input
+
+    with pytest.raises(ServiceValidationError) as err:
+        await hass.services.async_call(
+            DOMAIN,
+            TelegramBotService.SEND_VIDEO,
+            {
+                TelegramBotServiceArgument.URL: "https://mock",
+                TelegramBotServiceArgument.AUTHENTICATION: HTTP_BEARER_AUTHENTICATION,
+            },
+            blocking=True,
+        )
+
+    await hass.async_block_till_done()
+
+    assert err.value.translation_domain == DOMAIN
+    assert err.value.translation_key == "missing_input"
+    assert err.value.translation_placeholders == {"field": "Password"}
+
+    # test: 404 error
+
+    with (
+        patch(
+            "homeassistant.components.telegram_bot.bot.httpx2.AsyncClient.get"
+        ) as mock_get,
+        patch("homeassistant.components.telegram_bot.bot._RETRY_DELAY", 0),
+    ):
+        mock_get.return_value = AsyncMock(status_code=404, text="Success")
+
+        with pytest.raises(HomeAssistantError) as err:
+            await hass.services.async_call(
+                DOMAIN,
+                TelegramBotService.SEND_VIDEO,
+                {
+                    TelegramBotServiceArgument.URL: "https://mock",
+                    TelegramBotServiceArgument.AUTHENTICATION: HTTP_BASIC_AUTHENTICATION,
+                    TelegramBotServiceArgument.USERNAME: "mock_bot",
+                    TelegramBotServiceArgument.PASSWORD: "mock password",
+                },
+                blocking=True,
+            )
+
+    await hass.async_block_till_done()
+
+    assert mock_get.call_count > 0
+    assert err.value.translation_domain == DOMAIN
+    assert err.value.translation_key == "failed_to_load_url_status"
+    assert err.value.translation_placeholders == {"status_code": "404"}
+
+    # test: empty response
+
+    with (
+        patch(
+            "homeassistant.components.telegram_bot.bot.httpx2.AsyncClient.get"
+        ) as mock_get,
+        patch("homeassistant.components.telegram_bot.bot._RETRY_DELAY", 0),
+    ):
+        mock_get.return_value = AsyncMock(status_code=200, content=b"")
+
+        with pytest.raises(HomeAssistantError) as err:
+            await hass.services.async_call(
+                DOMAIN,
+                TelegramBotService.SEND_VIDEO,
+                {
+                    TelegramBotServiceArgument.URL: "https://mock",
+                    TelegramBotServiceArgument.AUTHENTICATION: HTTP_BASIC_AUTHENTICATION,
+                    TelegramBotServiceArgument.USERNAME: "mock_bot",
+                    TelegramBotServiceArgument.PASSWORD: "mock password",
+                },
+                blocking=True,
+            )
+
+    await hass.async_block_till_done()
+
+    assert mock_get.call_count == 5
+    assert err.value.translation_domain == DOMAIN
+    assert err.value.translation_key == "failed_to_load_url_empty"
+    assert err.value.translation_placeholders is None
+
+    # test: invalid url
+
+    with pytest.raises(HomeAssistantError) as err:
+        await hass.services.async_call(
+            DOMAIN,
+            TelegramBotService.SEND_VIDEO,
+            {
+                TelegramBotServiceArgument.URL: "invalid url",
+                TelegramBotServiceArgument.VERIFY_SSL: True,
+                TelegramBotServiceArgument.AUTHENTICATION: HTTP_BEARER_AUTHENTICATION,
+                TelegramBotServiceArgument.PASSWORD: "mock password",
+            },
+            blocking=True,
+        )
+
+    await hass.async_block_till_done()
+
+    assert mock_get.call_count > 0
+    assert err.value.translation_domain == DOMAIN
+    assert err.value.translation_key == "failed_to_load_url"
+    assert err.value.translation_placeholders == {
+        "error": "Request URL is missing an 'http://' or 'https://' protocol."
+    }
+
+    # test: no url/file input
+
+    with pytest.raises(ServiceValidationError) as err:
+        await hass.services.async_call(
+            DOMAIN,
+            TelegramBotService.SEND_VIDEO,
+            {},
+            blocking=True,
+        )
+
+    await hass.async_block_till_done()
+
+    assert err.value.translation_domain == DOMAIN
+    assert err.value.translation_key == "missing_input"
+    assert err.value.translation_placeholders == {"field": "URL or File"}
+
+    # test: load file error (e.g. not found, permissions error)
+
+    hass.config.allowlist_external_dirs.add("/tmp/")  # noqa: S108
+
+    with pytest.raises(HomeAssistantError) as err:
+        await hass.services.async_call(
+            DOMAIN,
+            TelegramBotService.SEND_VIDEO,
+            {
+                TelegramBotServiceArgument.FILE: "/tmp/not-exists",  # noqa: S108
+            },
+            blocking=True,
+        )
+
+    await hass.async_block_till_done()
+
+    assert err.value.translation_domain == DOMAIN
+    assert err.value.translation_key == "file_not_found"
+    assert err.value.translation_placeholders == {
+        "file_path": "/tmp/not-exists"  # noqa: S108
+    }
+
+    # test: success with file
+    write_utf8_file("/tmp/mock", "mock file contents")  # noqa: S108
+
+    response = await hass.services.async_call(
+        DOMAIN,
+        TelegramBotService.SEND_VIDEO,
+        {
+            TelegramBotServiceArgument.FILE: "/tmp/mock",  # noqa: S108
+        },
+        blocking=True,
+        return_response=True,
+    )
+
+    await hass.async_block_till_done()
+    assert response == {
+        "chats": [
+            {
+                ATTR_CHAT_ID: 123456,
+                ATTR_MESSAGE_ID: 12345,
+                ATTR_ENTITY_ID: "notify.mock_chat_1",
+            }
+        ]
+    }
+
+    # test: success with url
+
+    with patch(
+        "homeassistant.components.telegram_bot.bot.httpx2.AsyncClient.get"
+    ) as mock_get:
+        mock_get.return_value = AsyncMock(status_code=200, content=b"mock content")
+
+        response = await hass.services.async_call(
+            DOMAIN,
+            TelegramBotService.SEND_VIDEO,
+            {
+                TelegramBotServiceArgument.URL: "https://mock",
+                TelegramBotServiceArgument.AUTHENTICATION: HTTP_DIGEST_AUTHENTICATION,
+                TelegramBotServiceArgument.USERNAME: "mock_bot",
+                TelegramBotServiceArgument.PASSWORD: "mock password",
+            },
+            blocking=True,
+            return_response=True,
+        )
+
+    await hass.async_block_till_done()
+    assert mock_get.call_count > 0
+    assert response == {
+        "chats": [
+            {
+                ATTR_CHAT_ID: 123456,
+                ATTR_MESSAGE_ID: 12345,
+                ATTR_ENTITY_ID: "notify.mock_chat_1",
+            }
+        ]
+    }
+
+
+async def test_set_message_reaction(
+    hass: HomeAssistant,
+    mock_broadcast_config_entry: MockConfigEntry,
+    mock_external_calls: None,
+) -> None:
+    """Test set message reaction."""
+    mock_broadcast_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_broadcast_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    with patch(
+        "homeassistant.components.telegram_bot.bot.Bot.set_message_reaction",
+        AsyncMock(return_value=True),
+    ) as mock:
+        await hass.services.async_call(
+            DOMAIN,
+            "set_message_reaction",
+            {
+                TelegramBotServiceArgument.CHAT_ID: 123456,
+                TelegramBotServiceArgument.MESSAGE_ID: 54321,
+                "reaction": "👍",
+                "is_big": True,
+            },
+            blocking=True,
+        )
+
+    await hass.async_block_till_done()
+    mock.assert_called_once_with(
+        123456,
+        54321,
+        reaction="👍",
+        is_big=True,
+    )
+
+
+async def test_send_message_draft(
+    hass: HomeAssistant,
+    mock_broadcast_config_entry: MockConfigEntry,
+    mock_external_calls: None,
+) -> None:
+    """Test send message draft."""
+    mock_broadcast_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_broadcast_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    with patch(
+        "homeassistant.components.telegram_bot.bot.Bot.send_message_draft",
+        AsyncMock(return_value=True),
+    ) as mock:
+        await hass.services.async_call(
+            DOMAIN,
+            "send_message_draft",
+            {
+                TelegramBotServiceArgument.CHAT_ID: 123456,
+                TelegramBotServiceArgument.MESSAGE: "_Thinking..._",
+                TelegramBotServiceArgument.MESSAGE_THREAD_ID: "123",
+                TelegramBotServiceArgument.PARSE_MODE: PARSER_MD2,
+                "draft_id": "3456",
+            },
+            blocking=True,
+        )
+
+    await hass.async_block_till_done()
+    mock.assert_called_once_with(
+        chat_id=123456,
+        draft_id=3456,
+        text="_Thinking..._",
+        message_thread_id=123,
+        parse_mode=PARSER_MD2,
+    )
+
+
+@pytest.mark.parametrize(
+    ("service", "input"),
+    [
+        (
+            TelegramBotService.SEND_MESSAGE,
+            {
+                TelegramBotServiceArgument.CHAT_ID: 654321,
+                TelegramBotServiceArgument.MESSAGE: "test_message",
+                TelegramBotServiceArgument.MESSAGE_THREAD_ID: "123",
+            },
+        ),
+        (
+            TelegramBotService.SEND_PHOTO,
+            {
+                TelegramBotServiceArgument.CHAT_ID: 654321,
+                TelegramBotServiceArgument.FILE: "/media/dummy",
+            },
+        ),
+        (
+            TelegramBotService.SEND_VIDEO,
+            {
+                TelegramBotServiceArgument.CHAT_ID: 654321,
+                TelegramBotServiceArgument.FILE: "/media/dummy",
+            },
+        ),
+        (
+            TelegramBotService.SEND_ANIMATION,
+            {
+                TelegramBotServiceArgument.CHAT_ID: 654321,
+                TelegramBotServiceArgument.FILE: "/media/dummy",
+            },
+        ),
+        (
+            TelegramBotService.SEND_DOCUMENT,
+            {
+                TelegramBotServiceArgument.CHAT_ID: 654321,
+                TelegramBotServiceArgument.FILE: "/media/dummy",
+            },
+        ),
+        (
+            TelegramBotService.SEND_VOICE,
+            {
+                TelegramBotServiceArgument.CHAT_ID: 654321,
+                TelegramBotServiceArgument.FILE: "/media/dummy",
+            },
+        ),
+        (
+            TelegramBotService.SEND_STICKER,
+            {
+                TelegramBotServiceArgument.CHAT_ID: 654321,
+                TelegramBotServiceArgument.STICKER_ID: "1",
+                TelegramBotServiceArgument.MESSAGE_THREAD_ID: "123",
+            },
+        ),
+        (
+            TelegramBotService.SEND_POLL,
+            {
+                TelegramBotServiceArgument.CHAT_ID: 654321,
+                TelegramBotServiceArgument.QUESTION: "Question",
+                TelegramBotServiceArgument.OPTIONS: ["Yes", "No"],
+            },
+        ),
+        (
+            TelegramBotService.SEND_LOCATION,
+            {
+                TelegramBotServiceArgument.CHAT_ID: 654321,
+                TelegramBotServiceArgument.MESSAGE_THREAD_ID: "123",
+                TelegramBotServiceArgument.LONGITUDE: "1.123",
+                TelegramBotServiceArgument.LATITUDE: "1.123",
+            },
+        ),
+    ],
+)
+async def test_send_message_multi_target(
+    hass: HomeAssistant,
+    mock_broadcast_config_entry: MockConfigEntry,
+    mock_external_calls: None,
+    service: str,
+    input: dict[str, Any],
+) -> None:
+    """Test send message for entries with multiple chat_ids."""
+
+    mock_broadcast_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_broadcast_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    # we have 2 whitelisted chat ids in the config subentries: 123456 and 654321
+    # 123456 is the default target since it is the first in the list
+    # This test checks that the message is sent to the right target
+
+    hass.config.allowlist_external_dirs.add("/media/")
+    with patch(
+        "homeassistant.components.telegram_bot.bot._read_file_as_bytesio",
+        _read_file_as_bytesio_mock,
+    ):
+        response = await hass.services.async_call(
+            DOMAIN,
+            service,
+            input,
+            blocking=True,
+            return_response=True,
+        )
+
+    await hass.async_block_till_done()
+    assert response == {
+        "chats": [
+            {
+                ATTR_CHAT_ID: 654321,
+                ATTR_MESSAGE_ID: 12345,
+                ATTR_ENTITY_ID: "notify.mock_chat_2",
+            }
+        ]
+    }
+
+
+async def test_notify_entity_send_message(
+    hass: HomeAssistant,
+    mock_broadcast_config_entry: MockConfigEntry,
+    mock_external_calls: None,
+) -> None:
+    """Test send message using notify entity as target."""
+
+    mock_broadcast_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_broadcast_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    response = await hass.services.async_call(
+        DOMAIN,
+        TelegramBotService.SEND_MESSAGE,
+        {
+            CommonServiceArgument.ENTITY_ID: "notify.mock_chat_2",
+            TelegramBotServiceArgument.MESSAGE: "test_message",
+        },
+        blocking=True,
+        return_response=True,
+    )
+
+    assert response == {
+        "chats": [
+            {
+                ATTR_CHAT_ID: 654321,
+                ATTR_MESSAGE_ID: 12345,
+                ATTR_ENTITY_ID: "notify.mock_chat_2",
+            }
+        ]
+    }
+
+
+async def test_notify_entity_not_found(
+    hass: HomeAssistant,
+    mock_broadcast_config_entry: MockConfigEntry,
+    mock_external_calls: None,
+) -> None:
+    """Test send message using notify entity as target."""
+
+    mock_broadcast_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_broadcast_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    with pytest.raises(ServiceValidationError) as err:
+        await hass.services.async_call(
+            DOMAIN,
+            TelegramBotService.SEND_MESSAGE,
+            {
+                CommonServiceArgument.ENTITY_ID: "notify.non_existent_entity",
+                TelegramBotServiceArgument.MESSAGE: "test_message",
+            },
+            blocking=True,
+            return_response=True,
+        )
+
+    assert err.value.translation_key == "invalid_notify_entity"
+    assert err.value.translation_placeholders == {
+        ATTR_ENTITY_ID: "notify.non_existent_entity"
+    }
+
+
+async def test_notify_entity_other_integration(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    mock_broadcast_config_entry: MockConfigEntry,
+    mock_external_calls: None,
+) -> None:
+    """Test send message to a notify entity of another integration."""
+    mock_broadcast_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_broadcast_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    other_entry = MockConfigEntry(domain="other")
+    other_entry.add_to_hass(hass)
+    entity_registry.async_get_or_create(
+        "notify",
+        "other",
+        "unique_id",
+        config_entry=other_entry,
+        suggested_object_id="other",
+    )
+
+    with pytest.raises(ServiceValidationError) as err:
+        await hass.services.async_call(
+            DOMAIN,
+            TelegramBotService.SEND_MESSAGE,
+            {
+                CommonServiceArgument.ENTITY_ID: "notify.other",
+                TelegramBotServiceArgument.MESSAGE: "test_message",
+            },
+            blocking=True,
+            return_response=True,
+        )
+
+    assert err.value.translation_key == "invalid_notify_entity"
+    assert err.value.translation_placeholders == {ATTR_ENTITY_ID: "notify.other"}
+
+
+@pytest.mark.parametrize(
+    (
+        "telegram_file_name",
+        "schema_request",
+        "expected_download_path",
+    ),
+    [
+        pytest.param(
+            "file_name1.jpg",
+            {TelegramBotServiceArgument.FILE_ID: "some-file-id-1"},
+            lambda hass: f"{hass.config.path(DOMAIN)}/file_name1.jpg",
+            id="no_custom_name",
+        ),
+        pytest.param(
+            "file_name2.jpg",
+            {
+                TelegramBotServiceArgument.FILE_ID: "some-file-id-2",
+                TelegramBotServiceArgument.FILE_NAME: "custom_name2.jpg",
+            },
+            lambda hass: f"{hass.config.path(DOMAIN)}/custom_name2.jpg",
+            id="custom_name",
+        ),
+    ],
+)
+async def test_download_file_no_custom_dir(
+    hass: HomeAssistant,
+    mock_broadcast_config_entry: MockConfigEntry,
+    mock_external_calls: None,
+    telegram_file_name: str,
+    schema_request: dict[str, Any],
+    expected_download_path: Any,
+) -> None:
+    """Test download file."""
+    mock_broadcast_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_broadcast_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    download_dir = hass.config.path(DOMAIN)
+    expected_path = expected_download_path(hass)
+    # verify dir exists, if not create it
+    await hass.async_add_executor_job(os.makedirs, download_dir, 0o777, True)
+
+    file_id = schema_request[TelegramBotServiceArgument.FILE_ID]
+    telegram_file = File(
+        file_id=file_id,
+        file_unique_id="file_unique_id",
+        file_path=f"file/path/{telegram_file_name}",
+    )
+    file_content = f"This is the file content of {telegram_file_name}".encode()
+    (
+        get_file_mock,
+        download_as_bytearray_mock,
+        write_called,
+        response,
+    ) = await _run_download_file_service_with_mocks(
+        hass,
+        schema_request,
+        telegram_file,
+        file_content,
+    )
+
+    _assert_download_file_mocks_calls(
+        file_content,
+        expected_path,
+        file_id,
+        get_file_mock,
+        download_as_bytearray_mock,
+        write_called,
+    )
+    _assert_download_file_response(response, expected_path)
+
+
+@pytest.mark.parametrize(
+    (
+        "telegram_file_name",
+        "schema_request",
+        "expected_download_path",
+    ),
+    [
+        pytest.param(
+            "file_name3.jpg",
+            {
+                TelegramBotServiceArgument.FILE_ID: "some-file-id-3",
+            },
+            lambda path: f"{path}/file_name3.jpg",
+            id="no_custom_name_custom_dir",
+        ),
+        pytest.param(
+            "file_name4.jpg",
+            {
+                TelegramBotServiceArgument.FILE_ID: "some-file-id-4",
+                TelegramBotServiceArgument.FILE_NAME: "custom_name4.jpg",
+            },
+            lambda path: f"{path}/custom_name4.jpg",
+            id="custom_name_custom_dir",
+        ),
+    ],
+)
+@pytest.mark.usefixtures("allowlist_tmp_path")
+async def test_download_file_custom_dir(
+    tmp_path: Path,
+    hass: HomeAssistant,
+    mock_broadcast_config_entry: MockConfigEntry,
+    mock_external_calls: None,
+    telegram_file_name: str,
+    schema_request: dict[str, Any],
+    expected_download_path: Any,
+) -> None:
+    """Test download file."""
+    mock_broadcast_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_broadcast_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    schema_request[TelegramBotServiceArgument.DIRECTORY_PATH] = tmp_path.as_posix()
+    expected_path = expected_download_path(tmp_path.as_posix())
+
+    file_id = schema_request[TelegramBotServiceArgument.FILE_ID]
+    telegram_file = File(
+        file_id=file_id,
+        file_unique_id="file_unique_id",
+        file_path=f"file/path/{telegram_file_name}",
+    )
+    file_content = f"This is the file content of {telegram_file_name}".encode()
+    (
+        get_file_mock,
+        download_as_bytearray_mock,
+        write_called,
+        response,
+    ) = await _run_download_file_service_with_mocks(
+        hass,
+        schema_request,
+        telegram_file,
+        file_content,
+    )
+
+    _assert_download_file_mocks_calls(
+        file_content,
+        expected_path,
+        file_id,
+        get_file_mock,
+        download_as_bytearray_mock,
+        write_called,
+    )
+    _assert_download_file_response(response, expected_path)
+
+
+@pytest.mark.usefixtures("allowlist_tmp_path")
+async def test_download_file_directory_created_successfully(
+    tmp_path: Path,
+    hass: HomeAssistant,
+    mock_broadcast_config_entry: MockConfigEntry,
+    mock_external_calls: None,
+) -> None:
+    """Test on non exists temporary directory."""
+    mock_broadcast_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_broadcast_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    download_path = os.path.join(tmp_path.as_posix(), "download_dir")
+
+    schema_request = {
+        TelegramBotServiceArgument.FILE_ID: "file-id-for-new-dir",
+        TelegramBotServiceArgument.DIRECTORY_PATH: download_path,
+        TelegramBotServiceArgument.FILE_NAME: "dont_care.jpg",
+    }
+
+    expected_path = os.path.join(
+        download_path, schema_request[TelegramBotServiceArgument.FILE_NAME]
+    )
+
+    telegram_file = File(
+        file_id=schema_request[TelegramBotServiceArgument.FILE_ID],
+        file_unique_id="file_unique_id",
+        file_path=f"file/path/{schema_request[TelegramBotServiceArgument.FILE_NAME]}",
+    )
+    file_content = "file content for new dir"
+    (
+        get_file_mock,
+        download_as_bytearray_mock,
+        write_called,
+        response,
+    ) = await _run_download_file_service_with_mocks(
+        hass, schema_request, telegram_file, file_content
+    )
+
+    _assert_download_file_mocks_calls(
+        file_content,
+        expected_path,
+        schema_request[TelegramBotServiceArgument.FILE_ID],
+        get_file_mock,
+        download_as_bytearray_mock,
+        write_called,
+    )
+    _assert_download_file_response(response, expected_path)
+
+
+@pytest.mark.usefixtures("allowlist_tmp_path")
+async def test_download_file_when_bot_failed_to_get_file(
+    tmp_path: Path,
+    hass: HomeAssistant,
+    mock_broadcast_config_entry: MockConfigEntry,
+    mock_external_calls: None,
+) -> None:
+    """Test download file when bot failed to get file."""
+    mock_broadcast_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_broadcast_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    schema_request = {
+        TelegramBotServiceArgument.FILE_ID: "some-file-id",
+        TelegramBotServiceArgument.DIRECTORY_PATH: tmp_path.as_posix(),
+        TelegramBotServiceArgument.FILE_NAME: "custom_name.jpg",
+    }
+
+    with (
+        patch(
+            "homeassistant.components.telegram_bot.bot.Bot.get_file",
+            AsyncMock(side_effect=TelegramError("failed to get file")),
+        ),
+        pytest.raises(HomeAssistantError) as err,
+    ):
+        await hass.services.async_call(
+            DOMAIN,
+            "download_file",
+            schema_request,
+            blocking=True,
+        )
+    await hass.async_block_till_done()
+
+    assert err.typename == "HomeAssistantError"
+    assert err.value.translation_key == "action_failed"
+    assert "failed to get file" in str(err.value)
+
+
+@pytest.mark.usefixtures("allowlist_tmp_path")
+async def test_download_file_when_empty_file_path(
+    tmp_path: Path,
+    hass: HomeAssistant,
+    mock_broadcast_config_entry: MockConfigEntry,
+    mock_external_calls: None,
+) -> None:
+    """Test download file when bot failed to get file."""
+    mock_broadcast_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_broadcast_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    schema_request = {
+        TelegramBotServiceArgument.FILE_ID: "some-file-id",
+        TelegramBotServiceArgument.DIRECTORY_PATH: tmp_path.as_posix(),
+        TelegramBotServiceArgument.FILE_NAME: "custom_name.jpg",
+    }
+    telegram_file = File(
+        file_id=schema_request[TelegramBotServiceArgument.FILE_ID],
+        file_unique_id="file_unique_id",
+    )
+
+    with pytest.raises(HomeAssistantError) as err:
+        await _run_download_file_service_with_mocks(
+            hass, schema_request, telegram_file, "file_content"
+        )
+    await hass.async_block_till_done()
+    assert err.value.translation_key == "no_file_path"
+
+
+@pytest.mark.parametrize(
+    "exception_class",
+    [
+        RuntimeError,
+        OSError,
+        TelegramError,
+    ],
+)
+@pytest.mark.usefixtures("allowlist_tmp_path")
+async def test_download_file_when_error_when_downloading(
+    tmp_path: Path,
+    hass: HomeAssistant,
+    mock_broadcast_config_entry: MockConfigEntry,
+    mock_external_calls: None,
+    exception_class: type[Exception],
+) -> None:
+    """Test download file when bot failed to get file."""
+    mock_broadcast_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_broadcast_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    schema_request = {
+        TelegramBotServiceArgument.FILE_ID: "some-file-id",
+        TelegramBotServiceArgument.DIRECTORY_PATH: tmp_path.as_posix(),
+        TelegramBotServiceArgument.FILE_NAME: "custom_name.jpg",
+    }
+
+    telegram_file = File(
+        file_id=schema_request[TelegramBotServiceArgument.FILE_ID],
+        file_unique_id="file_unique_id",
+        file_path=f"file/path/{schema_request[TelegramBotServiceArgument.FILE_NAME]}",
+    )
+
+    with (
+        patch(
+            "homeassistant.components.telegram_bot.bot.Bot.get_file",
+            AsyncMock(return_value=telegram_file),
+        ),
+        patch(
+            "telegram.File.download_as_bytearray",
+            AsyncMock(side_effect=exception_class("failed to download file")),
+        ),
+        pytest.raises(HomeAssistantError) as err,
+    ):
+        await hass.services.async_call(
+            DOMAIN,
+            "download_file",
+            schema_request,
+            blocking=True,
+            return_response=True,
+        )
+    await hass.async_block_till_done()
+    assert err.value.translation_placeholders is not None
+    assert "error" in err.value.translation_placeholders
+    assert err.value.translation_placeholders["error"] == "failed to download file"
+
+
+@pytest.mark.parametrize(
+    ("error", "translation_key"),
+    [
+        pytest.param(
+            errno.EACCES, "os_write_permission_denied", id="permission_denied"
+        ),
+        pytest.param(errno.ENOSPC, "os_write_no_space", id="no_space"),
+        pytest.param(errno.EROFS, "os_write_read_only", id="read_only"),
+        pytest.param(errno.ENOENT, "os_write_dir_not_found", id="dir_not_found"),
+        pytest.param(errno.EIO, "os_write_error", id="other"),
+    ],
+)
+@pytest.mark.usefixtures("mock_external_calls")
+async def test_download_file_write_error(
+    hass: HomeAssistant,
+    mock_broadcast_config_entry: MockConfigEntry,
+    allowlist_tmp_path: Path,
+    error: int,
+    translation_key: str,
+) -> None:
+    """Test download file when the file can't be written."""
+    mock_broadcast_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_broadcast_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    directory_path = (allowlist_tmp_path / "downloads").as_posix()
+    telegram_file = File(
+        file_id="some-file-id",
+        file_unique_id="file_unique_id",
+        file_path="file/path/custom_name.jpg",
+    )
+
+    with (
+        patch(
+            "homeassistant.components.telegram_bot.bot.Bot.get_file",
+            AsyncMock(return_value=telegram_file),
+        ),
+        patch(
+            "telegram.File.download_as_bytearray",
+            AsyncMock(return_value=bytearray(b"file_content")),
+        ) as download_mock,
+        patch("pathlib.Path.write_bytes", side_effect=OSError(error, "Error")),
+        pytest.raises(HomeAssistantError) as err,
+    ):
+        await hass.services.async_call(
+            DOMAIN,
+            "download_file",
+            {
+                TelegramBotServiceArgument.FILE_ID: "some-file-id",
+                TelegramBotServiceArgument.DIRECTORY_PATH: directory_path,
+                TelegramBotServiceArgument.FILE_NAME: "custom_name.jpg",
+            },
+            blocking=True,
+            return_response=True,
+        )
+
+    download_mock.assert_awaited_once()
+    assert err.value.translation_domain == HOMEASSISTANT_DOMAIN
+    assert err.value.translation_key == translation_key
+    assert err.value.translation_placeholders == {
+        "path": f"{directory_path}/custom_name.jpg"
+    }
+
+
+@pytest.mark.usefixtures("mock_external_calls")
+async def test_download_file_create_directory_error(
+    hass: HomeAssistant,
+    mock_broadcast_config_entry: MockConfigEntry,
+    allowlist_tmp_path: Path,
+) -> None:
+    """Test download file when the download directory can't be created."""
+    mock_broadcast_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_broadcast_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    directory_path = (allowlist_tmp_path / "downloads").as_posix()
+    telegram_file = File(
+        file_id="some-file-id",
+        file_unique_id="file_unique_id",
+        file_path="file/path/custom_name.jpg",
+    )
+
+    with (
+        patch(
+            "homeassistant.components.telegram_bot.bot.Bot.get_file",
+            AsyncMock(return_value=telegram_file),
+        ),
+        patch("telegram.File.download_as_bytearray") as download_mock,
+        patch(
+            "homeassistant.components.telegram_bot.bot.os.makedirs",
+            side_effect=OSError(errno.EACCES, "Error"),
+        ),
+        pytest.raises(HomeAssistantError) as err,
+    ):
+        await hass.services.async_call(
+            DOMAIN,
+            "download_file",
+            {
+                TelegramBotServiceArgument.FILE_ID: "some-file-id",
+                TelegramBotServiceArgument.DIRECTORY_PATH: directory_path,
+                TelegramBotServiceArgument.FILE_NAME: "custom_name.jpg",
+            },
+            blocking=True,
+            return_response=True,
+        )
+
+    download_mock.assert_not_called()
+    assert err.value.translation_domain == HOMEASSISTANT_DOMAIN
+    assert err.value.translation_key == "os_write_permission_denied"
+    assert err.value.translation_placeholders == {"path": directory_path}
+
+
+@pytest.mark.parametrize(
+    "directory_path",
+    [
+        "../etc",
+        "/config/..",
+        "~/secrets",
+        "/home/~evil",
+    ],
+)
+async def test_download_file_rejects_invalid_directory_path(
+    hass: HomeAssistant,
+    mock_broadcast_config_entry: MockConfigEntry,
+    mock_external_calls: None,
+    directory_path: str,
+) -> None:
+    """Test download_file rejects directory_path containing `..` or `~`."""
+    mock_broadcast_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_broadcast_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    with (
+        patch(
+            "homeassistant.components.telegram_bot.bot.Bot.get_file",
+        ) as get_file_mock,
+        patch("pathlib.Path.write_bytes") as write_bytes_mock,
+        pytest.raises(ServiceValidationError) as err,
+    ):
+        await hass.services.async_call(
+            DOMAIN,
+            "download_file",
+            {
+                TelegramBotServiceArgument.FILE_ID: "some-file-id",
+                TelegramBotServiceArgument.DIRECTORY_PATH: directory_path,
+            },
+            blocking=True,
+            return_response=True,
+        )
+
+    assert err.value.translation_key == "invalid_directory_path"
+    assert err.value.translation_placeholders == {"directory_path": directory_path}
+    get_file_mock.assert_not_called()
+    write_bytes_mock.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "file_name",
+    [
+        "../etc/passwd",
+        "../../etc/cron.d/pwn",
+        "~/malicious",
+        "/root/.ssh/authorized_keys",
+        "subdir/inside.txt",
+        "windows\\style.txt",
+    ],
+)
+@pytest.mark.usefixtures("allowlist_tmp_path")
+async def test_download_file_rejects_invalid_file_name(
+    tmp_path: Path,
+    hass: HomeAssistant,
+    mock_broadcast_config_entry: MockConfigEntry,
+    mock_external_calls: None,
+    file_name: str,
+) -> None:
+    """Test download_file rejects file_name containing path separators or traversal."""
+    mock_broadcast_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_broadcast_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    with (
+        patch(
+            "homeassistant.components.telegram_bot.bot.Bot.get_file",
+        ) as get_file_mock,
+        patch("pathlib.Path.write_bytes") as write_bytes_mock,
+        pytest.raises(ServiceValidationError) as err,
+    ):
+        await hass.services.async_call(
+            DOMAIN,
+            "download_file",
+            {
+                TelegramBotServiceArgument.FILE_ID: "some-file-id",
+                TelegramBotServiceArgument.DIRECTORY_PATH: tmp_path.as_posix(),
+                TelegramBotServiceArgument.FILE_NAME: file_name,
+            },
+            blocking=True,
+            return_response=True,
+        )
+
+    assert err.value.translation_key == "invalid_file_name"
+    assert err.value.translation_placeholders == {"file_name": file_name}
+    get_file_mock.assert_not_called()
+    write_bytes_mock.assert_not_called()
+
+
+async def test_send_media_group(
+    hass: HomeAssistant,
+    mock_broadcast_config_entry: MockConfigEntry,
+    mock_external_calls: None,
+) -> None:
+    """Test the send_media_group service with multiple media types."""
+    mock_broadcast_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_broadcast_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    with patch(
+        "homeassistant.components.telegram_bot.bot.httpx2.AsyncClient.get"
+    ) as mock_get:
+        mock_get.return_value = AsyncMock(status_code=200, content=b"mock content")
+
+        response = await hass.services.async_call(
+            DOMAIN,
+            TelegramBotService.SEND_MEDIA_GROUP,
+            {
+                TelegramBotServiceArgument.MEDIA: [
+                    {
+                        ATTR_MEDIA_TYPE: InputMediaType.PHOTO,
+                        ATTR_URL: "https://mock/photo.jpg",
+                        ATTR_CAPTION: "mock photo",
+                    },
+                    {
+                        ATTR_MEDIA_TYPE: InputMediaType.VIDEO,
+                        ATTR_URL: "https://mock/video.mp4",
+                        ATTR_CAPTION: "mock video",
+                    },
+                    {
+                        ATTR_MEDIA_TYPE: InputMediaType.AUDIO,
+                        ATTR_URL: "https://mock/audio.mp3",
+                        ATTR_CAPTION: "mock url",
+                    },
+                    {
+                        ATTR_MEDIA_TYPE: InputMediaType.DOCUMENT,
+                        ATTR_URL: "https://mock/doc.pdf",
+                        ATTR_CAPTION: "mock document",
+                    },
+                ],
+            },
+            blocking=True,
+            return_response=True,
+        )
+
+    assert response == {
+        "chats": [
+            {
+                ATTR_CHAT_ID: 123456,
+                ATTR_ENTITY_ID: "notify.mock_chat_1",
+                ATTR_MESSAGE_ID: [12345, 12346, 12347, 12348],
+            }
+        ]
+    }
+
+
+async def test_send_media_group_caption_parse_mode(
+    hass: HomeAssistant,
+    mock_broadcast_config_entry: MockConfigEntry,
+    mock_external_calls: None,
+) -> None:
+    """Test the parse mode applies to the captions of the media items."""
+    mock_broadcast_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_broadcast_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    with (
+        patch(
+            "homeassistant.components.telegram_bot.bot.httpx2.AsyncClient.get"
+        ) as mock_get,
+        patch(
+            "homeassistant.components.telegram_bot.bot.Bot.send_media_group",
+            AsyncMock(
+                return_value=[
+                    Message(
+                        message_id=12345,
+                        date=dt_util.utcnow(),
+                        chat=Chat(id=123456, type=ChatType.PRIVATE),
+                    )
+                ]
+            ),
+        ) as mock_send_media_group,
+    ):
+        mock_get.return_value = AsyncMock(status_code=200, content=b"mock content")
+
+        await hass.services.async_call(
+            DOMAIN,
+            TelegramBotService.SEND_MEDIA_GROUP,
+            {
+                TelegramBotServiceArgument.PARSE_MODE: PARSER_MD,
+                TelegramBotServiceArgument.MEDIA: [
+                    {
+                        ATTR_MEDIA_TYPE: InputMediaType.PHOTO,
+                        ATTR_URL: "https://mock/photo.jpg",
+                        ATTR_CAPTION: "*bold*",
+                    },
+                    {
+                        ATTR_MEDIA_TYPE: InputMediaType.PHOTO,
+                        ATTR_URL: "https://mock/photo2.jpg",
+                    },
+                ],
+            },
+            blocking=True,
+            return_response=True,
+        )
+
+    media = mock_send_media_group.call_args.kwargs["media"]
+    assert media[0].caption == "*bold*"
+    assert media[0].parse_mode == PARSER_MD
+
+
+@pytest.mark.parametrize(
+    "subdirectory",
+    ["outside", "nested/deeper"],
+)
+async def test_download_file_rejects_directory_outside_allowlist(
+    tmp_path: Path,
+    hass: HomeAssistant,
+    mock_broadcast_config_entry: MockConfigEntry,
+    mock_external_calls: None,
+    subdirectory: str,
+) -> None:
+    """Test download_file rejects an absolute path outside the allowlist."""
+    mock_broadcast_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_broadcast_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    # tmp_path is deliberately not allowlisted here.
+    directory = tmp_path / subdirectory
+    target = directory / "payload.jpg"
+
+    with (
+        patch(
+            "homeassistant.components.telegram_bot.bot.Bot.get_file",
+        ) as get_file_mock,
+        pytest.raises(ServiceValidationError) as err,
+    ):
+        await hass.services.async_call(
+            DOMAIN,
+            "download_file",
+            {
+                TelegramBotServiceArgument.FILE_ID: "some-file-id",
+                TelegramBotServiceArgument.DIRECTORY_PATH: directory.as_posix(),
+                TelegramBotServiceArgument.FILE_NAME: "payload.jpg",
+            },
+            blocking=True,
+            return_response=True,
+        )
+
+    assert err.value.translation_key == "allowlist_external_dirs_error"
+    get_file_mock.assert_not_called()
+    # Nothing reached the disk and no directory was created on the way.
+    assert not target.exists()
+    assert not directory.exists()
+
+
+async def test_download_file_rejects_symlink_out_of_allowlist(
+    tmp_path: Path,
+    hass: HomeAssistant,
+    mock_broadcast_config_entry: MockConfigEntry,
+    mock_external_calls: None,
+) -> None:
+    """Test download_file rejects a symlink leaving the allowlist."""
+    mock_broadcast_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_broadcast_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    hass.config.allowlist_external_dirs = {allowed.resolve().as_posix()}
+
+    # A path that passes a plain string check but resolves out of the allowlist.
+    escape = allowed / "escape"
+    escape.symlink_to(outside, target_is_directory=True)
+    target = outside / "payload.jpg"
+
+    with (
+        patch(
+            "homeassistant.components.telegram_bot.bot.Bot.get_file",
+        ) as get_file_mock,
+        pytest.raises(ServiceValidationError) as err,
+    ):
+        await hass.services.async_call(
+            DOMAIN,
+            "download_file",
+            {
+                TelegramBotServiceArgument.FILE_ID: "some-file-id",
+                TelegramBotServiceArgument.DIRECTORY_PATH: escape.as_posix(),
+                TelegramBotServiceArgument.FILE_NAME: "payload.jpg",
+            },
+            blocking=True,
+            return_response=True,
+        )
+
+    assert err.value.translation_key == "allowlist_external_dirs_error"
+    get_file_mock.assert_not_called()
+    assert not target.exists()
+
+
+@pytest.mark.parametrize(
+    ("error", "translation_key"),
+    [
+        (OSError(errno.ENOENT, "No such file"), "file_not_found"),
+        (OSError(errno.EACCES, "Permission denied"), "file_permission_denied"),
+        (OSError(errno.EPERM, "Operation not permitted"), "file_permission_denied"),
+        (OSError(errno.EIO, "Input/output error"), "failed_to_load_file"),
+    ],
+)
+def test_read_file_errors(error: OSError, translation_key: str) -> None:
+    """Test reading a file maps OS errors to translated messages."""
+    with (
+        patch("builtins.open", side_effect=error),
+        pytest.raises(HomeAssistantError) as err,
+    ):
+        _read_file_as_bytesio("/some/file.jpg")
+
+    assert err.value.translation_key == translation_key
+    assert err.value.translation_placeholders == {"file_path": "/some/file.jpg"}

@@ -1,23 +1,29 @@
 """Test Flo by Moen sensor entities."""
-from homeassistant.components.flo.const import DOMAIN as FLO_DOMAIN
+
+import json
+
+import pytest
+from pytest_homeassistant.common import MockConfigEntry
+from pytest_homeassistant.test_util.aiohttp import AiohttpClientMocker
+
+from homeassistant.components.homeassistant import (
+    DOMAIN as HOMEASSISTANT_DOMAIN,
+    SERVICE_UPDATE_ENTITY,
+)
 from homeassistant.components.sensor import ATTR_STATE_CLASS, SensorStateClass
-from homeassistant.const import ATTR_ENTITY_ID, CONF_PASSWORD, CONF_USERNAME
+from homeassistant.const import ATTR_ENTITY_ID, STATE_UNKNOWN
+from homeassistant.core import HomeAssistant
 from homeassistant.setup import async_setup_component
 from homeassistant.util.unit_system import US_CUSTOMARY_SYSTEM
 
-from .common import TEST_PASSWORD, TEST_USER_ID
 
-
-async def test_sensors(hass, config_entry, aioclient_mock_fixture):
+@pytest.mark.usefixtures("aioclient_mock_fixture")
+async def test_sensors(hass: HomeAssistant, config_entry: MockConfigEntry) -> None:
     """Test Flo by Moen sensors."""
     hass.config.units = US_CUSTOMARY_SYSTEM
     config_entry.add_to_hass(hass)
-    assert await async_setup_component(
-        hass, FLO_DOMAIN, {CONF_USERNAME: TEST_USER_ID, CONF_PASSWORD: TEST_PASSWORD}
-    )
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
     await hass.async_block_till_done()
-
-    assert len(hass.data[FLO_DOMAIN][config_entry.entry_id]["devices"]) == 2
 
     # we should have 5 entities for the valve
     assert (
@@ -79,25 +85,61 @@ async def test_sensors(hass, config_entry, aioclient_mock_fixture):
     )
 
 
+@pytest.mark.usefixtures("aioclient_mock_fixture")
 async def test_manual_update_entity(
-    hass, config_entry, aioclient_mock_fixture, aioclient_mock
-):
+    hass: HomeAssistant,
+    config_entry: MockConfigEntry,
+    aioclient_mock: AiohttpClientMocker,
+) -> None:
     """Test manual update entity via service homeasasistant/update_entity."""
     config_entry.add_to_hass(hass)
-    assert await async_setup_component(
-        hass, FLO_DOMAIN, {CONF_USERNAME: TEST_USER_ID, CONF_PASSWORD: TEST_PASSWORD}
-    )
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
     await hass.async_block_till_done()
 
-    assert len(hass.data[FLO_DOMAIN][config_entry.entry_id]["devices"]) == 2
-
-    await async_setup_component(hass, "homeassistant", {})
+    await async_setup_component(hass, HOMEASSISTANT_DOMAIN, {})
 
     call_count = aioclient_mock.call_count
     await hass.services.async_call(
-        "homeassistant",
-        "update_entity",
+        HOMEASSISTANT_DOMAIN,
+        SERVICE_UPDATE_ENTITY,
         {ATTR_ENTITY_ID: ["sensor.smart_water_shutoff_current_system_mode"]},
         blocking=True,
     )
     assert aioclient_mock.call_count == call_count + 3
+
+
+@pytest.mark.parametrize("device_info_response", [225, 212, 220], indirect=True)
+@pytest.mark.usefixtures("aioclient_mock_fixture")
+async def test_water_temperature_placeholder_is_not_published(
+    hass: HomeAssistant, config_entry: MockConfigEntry
+) -> None:
+    """A valve with no temperature sensor reports a placeholder, not a reading."""
+    hass.config.units = US_CUSTOMARY_SYSTEM
+    config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert (
+        hass.states.get("sensor.smart_water_shutoff_water_temperature").state
+        == STATE_UNKNOWN
+    )
+
+    # The detector measures ambient air and is unaffected.
+    assert hass.states.get("sensor.kitchen_sink_temperature").state == "61"
+
+
+@pytest.mark.parametrize("device_info_response", [211.9, 70], indirect=True)
+@pytest.mark.usefixtures("aioclient_mock_fixture")
+async def test_water_temperature_below_threshold_is_published(
+    hass: HomeAssistant, config_entry: MockConfigEntry, device_info_response: str
+) -> None:
+    """Anything below boiling is a real reading and is published."""
+    hass.config.units = US_CUSTOMARY_SYSTEM
+    config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    expected = json.loads(device_info_response)["telemetry"]["current"]["tempF"]
+    assert hass.states.get("sensor.smart_water_shutoff_water_temperature").state == str(
+        round(expected, 1)
+    )

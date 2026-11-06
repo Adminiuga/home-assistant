@@ -1,9 +1,12 @@
 {
   "domain": "matrix",
   "name": "Matrix",
+  "categories": ["messaging_notifications.chat_apps"],
+  "codeowners": ["@PaarthShah"],
+  "connectivity": ["cloud", "network"],
   "documentation": "https://www.home-assistant.io/integrations/matrix",
-  "requirements": ["matrix-client==0.4.0"],
-  "codeowners": ["@tinloaf"],
   "iot_class": "cloud_push",
-  "loggers": ["matrix_client"]
+  "loggers": ["matrix_client"],
+  "quality_scale": "legacy",
+  "requirements": ["matrix-nio==0.26.0", "Pillow==13.0.0", "aiofiles==25.1.0"]
 }

@@ -1,0 +1,56 @@
+{
+  "entity": {
+    "binary_sensor": {
+      "heating": {
+        "default": "mdi:radiator-off",
+        "state": {
+          "on": "mdi:radiator"
+        }
+      }
+    },
+    "sensor": {
+      "tilt_state": {
+        "state": {
+          "neutral": "mdi:garage",
+          "non_neutral": "mdi:garage-open",
+          "tilted": "mdi:garage-alert"
+        }
+      }
+    }
+  },
+  "services": {
+    "activate_eco_mode_with_duration": {
+      "service": "mdi:leaf"
+    },
+    "activate_eco_mode_with_period": {
+      "service": "mdi:leaf"
+    },
+    "activate_vacation": {
+      "service": "mdi:compass"
+    },
+    "arm_anyway": {
+      "service": "mdi:shield-alert"
+    },
+    "deactivate_eco_mode": {
+      "service": "mdi:leaf-off"
+    },
+    "deactivate_vacation": {
+      "service": "mdi:compass-off"
+    },
+    "dump_hap_config": {
+      "service": "mdi:database-export"
+    },
+    "pull_latch": {
+      "service": "mdi:door-open"
+    },
+    "reset_energy_counter": {
+      "service": "mdi:reload"
+    },
+    "set_active_climate_profile": {
+      "service": "mdi:home-thermometer"
+    },
+    "set_home_cooling_mode": {
+      "service": "mdi:snowflake"
+    }
+  }
+}

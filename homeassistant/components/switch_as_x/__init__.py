@@ -1,120 +1,155 @@
 """Component to wrap switch entities in entities of other domains."""
-from __future__ import annotations
 
 import logging
 
-import voluptuous as vol
+import probatio
 
+from homeassistant.components.homeassistant import exposed_entities
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_ENTITY_ID
-from homeassistant.core import Event, HomeAssistant, callback
-from homeassistant.helpers import device_registry as dr, entity_registry as er
-from homeassistant.helpers.event import async_track_entity_registry_updated_event
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import ConfigEntryError
+from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.helper_integration import (
+    async_handle_source_entity_changes,
+    async_remove_helper_devices,
+)
 
-from .const import CONF_TARGET_DOMAIN
-from .light import LightSwitch
-
-__all__ = ["LightSwitch"]
+from .const import CONF_INVERT, CONF_TARGET_DOMAIN, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
+__all__ = [
+    "DOMAIN",
+]
+
 
 @callback
-def async_add_to_device(
-    hass: HomeAssistant, entry: ConfigEntry, entity_id: str
-) -> str | None:
-    """Add our config entry to the tracked entity's device."""
+def async_get_parent_device_id(hass: HomeAssistant, entity_id: str) -> str | None:
+    """Get the parent device id."""
     registry = er.async_get(hass)
-    device_registry = dr.async_get(hass)
-    device_id = None
 
-    if (
-        not (wrapped_switch := registry.async_get(entity_id))
-        or not (device_id := wrapped_switch.device_id)
-        or not (device_registry.async_get(device_id))
-    ):
-        return device_id
+    if not (wrapped_switch := registry.async_get(entity_id)):
+        return None
 
-    device_registry.async_update_device(device_id, add_config_entry_id=entry.entry_id)
-
-    return device_id
+    return wrapped_switch.device_id
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Set up a config entry."""
-    registry = er.async_get(hass)
-    device_registry = dr.async_get(hass)
+    entity_registry = er.async_get(hass)
     try:
-        entity_id = er.async_validate_entity_id(registry, entry.options[CONF_ENTITY_ID])
-    except vol.Invalid:
-        # The entity is identified by an unknown entity registry ID
-        _LOGGER.error(
-            "Failed to setup switch_as_x for unknown entity %s",
-            entry.options[CONF_ENTITY_ID],
+        entity_id = er.async_validate_entity_id(
+            entity_registry, entry.options[CONF_ENTITY_ID]
         )
-        return False
+    except probatio.Invalid as err:
+        # The entity is identified by an unknown entity registry ID
+        raise ConfigEntryError(
+            translation_domain=DOMAIN,
+            translation_key="unknown_entity",
+            translation_placeholders={"entity_id": entry.options[CONF_ENTITY_ID]},
+        ) from err
 
-    async def async_registry_updated(event: Event) -> None:
-        """Handle entity registry update."""
-        data = event.data
-        if data["action"] == "remove":
-            await hass.config_entries.async_remove(entry.entry_id)
+    def set_source_entity_id_or_uuid(source_entity_id: str) -> None:
+        hass.config_entries.async_update_entry(
+            entry,
+            options={**entry.options, CONF_ENTITY_ID: source_entity_id},
+        )
+        hass.config_entries.async_schedule_reload(entry.entry_id)
 
-        if data["action"] != "update":
-            return
-
-        if "entity_id" in data["changes"]:
-            # Entity_id changed, reload the config entry
-            await hass.config_entries.async_reload(entry.entry_id)
-
-        if device_id and "device_id" in data["changes"]:
-            # If the tracked switch is no longer in the device, remove our config entry
-            # from the device
-            if (
-                not (entity_entry := registry.async_get(data[CONF_ENTITY_ID]))
-                or not device_registry.async_get(device_id)
-                or entity_entry.device_id == device_id
-            ):
-                # No need to do any cleanup
-                return
-
-            device_registry.async_update_device(
-                device_id, remove_config_entry_id=entry.entry_id
-            )
+    async def source_entity_removed() -> None:
+        # The source entity has been removed, we remove the config entry because
+        # switch_as_x does not allow replacing the wrapped entity.
+        await hass.config_entries.async_remove(entry.entry_id)
 
     entry.async_on_unload(
-        async_track_entity_registry_updated_event(
-            hass, entity_id, async_registry_updated
+        async_handle_source_entity_changes(
+            hass,
+            helper_config_entry_id=entry.entry_id,
+            set_source_entity_id_or_uuid=set_source_entity_id_or_uuid,
+            source_device_id=async_get_parent_device_id(hass, entity_id),
+            source_entity_id_or_uuid=entry.options[CONF_ENTITY_ID],
+            source_entity_removed=source_entity_removed,
         )
     )
-
-    device_id = async_add_to_device(hass, entry, entity_id)
 
     await hass.config_entries.async_forward_entry_setups(
         entry, (entry.options[CONF_TARGET_DOMAIN],)
     )
-    return True
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> None:
+    """Migrate old entry."""
+    _LOGGER.debug(
+        "Migrating from version %s.%s", config_entry.version, config_entry.minor_version
+    )
+
+    if config_entry.version == 1:
+        options = {**config_entry.options}
+        if config_entry.minor_version < 2:
+            options.setdefault(CONF_INVERT, False)
+        if config_entry.version < 3:
+            # Remove the switch_as_x config entry from the source device
+            if source_device_id := async_get_parent_device_id(
+                hass, options[CONF_ENTITY_ID]
+            ):
+                async_remove_helper_devices(
+                    hass,
+                    helper_config_entry_id=config_entry.entry_id,
+                    source_device_id=source_device_id,
+                )
+        hass.config_entries.async_update_entry(
+            config_entry, options=options, minor_version=3
+        )
+
+    _LOGGER.debug(
+        "Migration to version %s.%s successful",
+        config_entry.version,
+        config_entry.minor_version,
+    )
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Unload a config entry."""
-    return await hass.config_entries.async_unload_platforms(
+    await hass.config_entries.async_unload_platforms_or_raise(
         entry, (entry.options[CONF_TARGET_DOMAIN],)
     )
 
 
 async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Unload a config entry."""
-    # Unhide the wrapped entry if registered
+    """Unload a config entry.
+
+    This will unhide the wrapped entity and restore assistant expose settings.
+    """
     registry = er.async_get(hass)
     try:
-        entity_id = er.async_validate_entity_id(registry, entry.options[CONF_ENTITY_ID])
-    except vol.Invalid:
+        switch_entity_id = er.async_validate_entity_id(
+            registry, entry.options[CONF_ENTITY_ID]
+        )
+    except probatio.Invalid:
         # The source entity has been removed from the entity registry
         return
 
-    if not (entity_entry := registry.async_get(entity_id)):
+    if not (switch_entity_entry := registry.async_get(switch_entity_id)):
         return
 
-    if entity_entry.hidden_by == er.RegistryEntryHider.INTEGRATION:
-        registry.async_update_entity(entity_id, hidden_by=None)
+    # Unhide the wrapped entity
+    if switch_entity_entry.hidden_by == er.RegistryEntryHider.INTEGRATION:
+        registry.async_update_entity(switch_entity_id, hidden_by=None)
+
+    switch_as_x_entries = er.async_entries_for_config_entry(registry, entry.entry_id)
+    if not switch_as_x_entries:
+        return
+
+    switch_as_x_entry = switch_as_x_entries[0]
+
+    # Restore assistant expose settings
+    expose_settings = exposed_entities.async_get_entity_settings(
+        hass, switch_as_x_entry.entity_id
+    )
+    for assistant, settings in expose_settings.items():
+        if (should_expose := settings.get("should_expose")) is None:
+            continue
+        exposed_entities.async_expose_entity(
+            hass, assistant, switch_entity_id, should_expose
+        )

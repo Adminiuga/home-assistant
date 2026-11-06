@@ -1,15 +1,25 @@
 """Test the SiteSage Emonitor config flow."""
+
+from collections.abc import Generator
+from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
 from aioemonitor.monitor import EmonitorNetwork, EmonitorStatus
 import aiohttp
+from pytest_homeassistant.common import MockConfigEntry
 
 from homeassistant import config_entries
-from homeassistant.components import dhcp
 from homeassistant.components.emonitor.const import DOMAIN
 from homeassistant.const import CONF_HOST
+from homeassistant.core import HomeAssistant
+from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.helpers.service_info.dhcp import DhcpServiceInfo
 
-from tests.common import MockConfigEntry
+DHCP_SERVICE_INFO = DhcpServiceInfo(
+    hostname="emonitor",
+    ip="1.2.3.4",
+    macaddress="aabbccddeeff",
+)
 
 
 def _mock_emonitor():
@@ -18,22 +28,38 @@ def _mock_emonitor():
     )
 
 
-async def test_form(hass):
+@contextmanager
+def _patch_success() -> Generator[None]:
+    """Patch the Emonitor status call and entry setup."""
+    with (
+        patch(
+            "homeassistant.components.emonitor.config_flow.Emonitor.async_get_status",
+            return_value=_mock_emonitor(),
+        ),
+        patch("homeassistant.components.emonitor.async_setup_entry", return_value=None),
+    ):
+        yield
+
+
+async def test_form(hass: HomeAssistant) -> None:
     """Test we get the form."""
 
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": config_entries.SOURCE_USER}
     )
-    assert result["type"] == "form"
+    assert result["type"] is FlowResultType.FORM
     assert result["errors"] == {}
 
-    with patch(
-        "homeassistant.components.emonitor.config_flow.Emonitor.async_get_status",
-        return_value=_mock_emonitor(),
-    ), patch(
-        "homeassistant.components.emonitor.async_setup_entry",
-        return_value=True,
-    ) as mock_setup_entry:
+    with (
+        patch(
+            "homeassistant.components.emonitor.config_flow.Emonitor.async_get_status",
+            return_value=_mock_emonitor(),
+        ),
+        patch(
+            "homeassistant.components.emonitor.async_setup_entry",
+            return_value=None,
+        ) as mock_setup_entry,
+    ):
         result2 = await hass.config_entries.flow.async_configure(
             result["flow_id"],
             {
@@ -42,15 +68,16 @@ async def test_form(hass):
         )
         await hass.async_block_till_done()
 
-    assert result2["type"] == "create_entry"
+    assert result2["type"] is FlowResultType.CREATE_ENTRY
     assert result2["title"] == "Emonitor DDEEFF"
     assert result2["data"] == {
         "host": "1.2.3.4",
     }
+    assert result2["result"].unique_id == "aa:bb:cc:dd:ee:ff"
     assert len(mock_setup_entry.mock_calls) == 1
 
 
-async def test_form_unknown_error(hass):
+async def test_form_unknown_error(hass: HomeAssistant) -> None:
     """Test we handle unknown error."""
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": config_entries.SOURCE_USER}
@@ -67,11 +94,19 @@ async def test_form_unknown_error(hass):
             },
         )
 
-    assert result2["type"] == "form"
+    assert result2["type"] is FlowResultType.FORM
     assert result2["errors"] == {"base": "unknown"}
 
+    with _patch_success():
+        result3 = await hass.config_entries.flow.async_configure(
+            result2["flow_id"], {CONF_HOST: "1.2.3.4"}
+        )
+        await hass.async_block_till_done()
 
-async def test_form_cannot_connect(hass):
+    assert result3["type"] is FlowResultType.CREATE_ENTRY
+
+
+async def test_form_cannot_connect(hass: HomeAssistant) -> None:
     """Test we handle cannot connect error."""
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": config_entries.SOURCE_USER}
@@ -88,11 +123,19 @@ async def test_form_cannot_connect(hass):
             },
         )
 
-    assert result2["type"] == "form"
+    assert result2["type"] is FlowResultType.FORM
     assert result2["errors"] == {CONF_HOST: "cannot_connect"}
 
+    with _patch_success():
+        result3 = await hass.config_entries.flow.async_configure(
+            result2["flow_id"], {CONF_HOST: "1.2.3.4"}
+        )
+        await hass.async_block_till_done()
 
-async def test_dhcp_can_confirm(hass):
+    assert result3["type"] is FlowResultType.CREATE_ENTRY
+
+
+async def test_dhcp_can_confirm(hass: HomeAssistant) -> None:
     """Test DHCP discovery flow can confirm right away."""
 
     with patch(
@@ -102,15 +145,11 @@ async def test_dhcp_can_confirm(hass):
         result = await hass.config_entries.flow.async_init(
             DOMAIN,
             context={"source": config_entries.SOURCE_DHCP},
-            data=dhcp.DhcpServiceInfo(
-                hostname="emonitor",
-                ip="1.2.3.4",
-                macaddress="aa:bb:cc:dd:ee:ff",
-            ),
+            data=DHCP_SERVICE_INFO,
         )
         await hass.async_block_till_done()
 
-    assert result["type"] == "form"
+    assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "confirm"
     assert result["description_placeholders"] == {
         "host": "1.2.3.4",
@@ -119,7 +158,7 @@ async def test_dhcp_can_confirm(hass):
 
     with patch(
         "homeassistant.components.emonitor.async_setup_entry",
-        return_value=True,
+        return_value=None,
     ) as mock_setup_entry:
         result2 = await hass.config_entries.flow.async_configure(
             result["flow_id"],
@@ -127,15 +166,16 @@ async def test_dhcp_can_confirm(hass):
         )
         await hass.async_block_till_done()
 
-    assert result2["type"] == "create_entry"
+    assert result2["type"] is FlowResultType.CREATE_ENTRY
     assert result2["title"] == "Emonitor DDEEFF"
     assert result2["data"] == {
         "host": "1.2.3.4",
     }
+    assert result2["result"].unique_id == "aa:bb:cc:dd:ee:ff"
     assert len(mock_setup_entry.mock_calls) == 1
 
 
-async def test_dhcp_fails_to_connect(hass):
+async def test_dhcp_fails_to_connect(hass: HomeAssistant) -> None:
     """Test DHCP discovery flow that fails to connect."""
 
     with patch(
@@ -145,19 +185,15 @@ async def test_dhcp_fails_to_connect(hass):
         result = await hass.config_entries.flow.async_init(
             DOMAIN,
             context={"source": config_entries.SOURCE_DHCP},
-            data=dhcp.DhcpServiceInfo(
-                hostname="emonitor",
-                ip="1.2.3.4",
-                macaddress="aa:bb:cc:dd:ee:ff",
-            ),
+            data=DHCP_SERVICE_INFO,
         )
         await hass.async_block_till_done()
 
-    assert result["type"] == "form"
+    assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "user"
 
 
-async def test_dhcp_already_exists(hass):
+async def test_dhcp_already_exists(hass: HomeAssistant) -> None:
     """Test DHCP discovery flow that fails to connect."""
 
     entry = MockConfigEntry(
@@ -174,19 +210,15 @@ async def test_dhcp_already_exists(hass):
         result = await hass.config_entries.flow.async_init(
             DOMAIN,
             context={"source": config_entries.SOURCE_DHCP},
-            data=dhcp.DhcpServiceInfo(
-                hostname="emonitor",
-                ip="1.2.3.4",
-                macaddress="aa:bb:cc:dd:ee:ff",
-            ),
+            data=DHCP_SERVICE_INFO,
         )
         await hass.async_block_till_done()
 
-    assert result["type"] == "abort"
+    assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "already_configured"
 
 
-async def test_user_unique_id_already_exists(hass):
+async def test_user_unique_id_already_exists(hass: HomeAssistant) -> None:
     """Test creating an entry where the unique_id already exists."""
 
     entry = MockConfigEntry(
@@ -199,15 +231,18 @@ async def test_user_unique_id_already_exists(hass):
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": config_entries.SOURCE_USER}
     )
-    assert result["type"] == "form"
+    assert result["type"] is FlowResultType.FORM
     assert result["errors"] == {}
 
-    with patch(
-        "homeassistant.components.emonitor.config_flow.Emonitor.async_get_status",
-        return_value=_mock_emonitor(),
-    ), patch(
-        "homeassistant.components.emonitor.async_setup_entry",
-        return_value=True,
+    with (
+        patch(
+            "homeassistant.components.emonitor.config_flow.Emonitor.async_get_status",
+            return_value=_mock_emonitor(),
+        ),
+        patch(
+            "homeassistant.components.emonitor.async_setup_entry",
+            return_value=None,
+        ),
     ):
         result2 = await hass.config_entries.flow.async_configure(
             result["flow_id"],
@@ -217,5 +252,5 @@ async def test_user_unique_id_already_exists(hass):
         )
         await hass.async_block_till_done()
 
-    assert result2["type"] == "abort"
+    assert result2["type"] is FlowResultType.ABORT
     assert result2["reason"] == "already_configured"

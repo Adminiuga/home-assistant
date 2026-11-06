@@ -1,7 +1,6 @@
 """Tests for the DLNA DMR data module."""
-from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Generator
 from unittest.mock import ANY, Mock, patch
 
 from async_upnp_client.aiohttp import AiohttpNotifyServer
@@ -15,7 +14,7 @@ from homeassistant.core import Event, HomeAssistant
 
 
 @pytest.fixture
-def aiohttp_notify_servers_mock() -> Iterable[Mock]:
+def aiohttp_notify_servers_mock() -> Generator[Mock]:
     """Construct mock AiohttpNotifyServer on demand, eliminating network use.
 
     This fixture provides a list of the constructed servers.
@@ -73,7 +72,7 @@ async def test_event_notifier(
 
     # Different address should give different notifier
     listen_addr_3 = EventListenAddr(
-        "192.88.99.4", 9999, "http://192.88.99.4:9999/notify"
+        "198.51.100.4", 9999, "http://198.51.100.4:9999/notify"
     )
     event_notifier_3 = await domain_data.async_get_event_notifier(listen_addr_3, hass)
     assert event_notifier_3 is not None
@@ -82,8 +81,8 @@ async def test_event_notifier(
     # Check that the parameters were passed through to the AiohttpNotifyServer
     aiohttp_notify_servers_mock.assert_called_with(
         requester=ANY,
-        source=("192.88.99.4", 9999),
-        callback_url="http://192.88.99.4:9999/notify",
+        source=("198.51.100.4", 9999),
+        callback_url="http://198.51.100.4:9999/notify",
         loop=ANY,
     )
 

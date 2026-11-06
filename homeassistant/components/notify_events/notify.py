@@ -1,6 +1,8 @@
 """Notify.Events platform for notify component."""
+
 import logging
 import os.path
+from typing import Any, override
 
 from notify_events import Message
 
@@ -10,6 +12,8 @@ from homeassistant.components.notify import (
     BaseNotificationService,
 )
 from homeassistant.const import CONF_TOKEN
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
 from .const import DOMAIN
 
@@ -33,7 +37,11 @@ ATTR_TOKEN = "token"
 _LOGGER = logging.getLogger(__name__)
 
 
-def get_service(hass, config, discovery_info=None):
+def get_service(
+    hass: HomeAssistant,
+    config: ConfigType,
+    discovery_info: DiscoveryInfoType | None = None,
+) -> NotifyEventsNotificationService:
     """Get the Notify.Events notification service."""
     return NotifyEventsNotificationService(hass.data[DOMAIN][CONF_TOKEN])
 
@@ -114,7 +122,8 @@ class NotifyEventsNotificationService(BaseNotificationService):
 
         return msg
 
-    def send_message(self, message, **kwargs):
+    @override
+    def send_message(self, message: str, **kwargs: Any) -> None:
         """Send a message."""
         data = kwargs.get(ATTR_DATA) or {}
         token = data.get(ATTR_TOKEN, self.token)

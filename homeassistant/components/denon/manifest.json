@@ -1,7 +1,10 @@
 {
   "domain": "denon",
   "name": "Denon Network Receivers",
-  "documentation": "https://www.home-assistant.io/integrations/denon",
+  "categories": ["media_entertainment.speakers_audio"],
   "codeowners": [],
-  "iot_class": "local_polling"
+  "connectivity": ["network"],
+  "documentation": "https://www.home-assistant.io/integrations/denon",
+  "iot_class": "local_polling",
+  "quality_scale": "legacy"
 }

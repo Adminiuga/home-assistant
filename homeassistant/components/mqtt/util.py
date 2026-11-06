@@ -1,20 +1,40 @@
 """Utility functions for the MQTT integration."""
 
-from __future__ import annotations
-
+import asyncio
+from collections.abc import Callable, Coroutine
+from functools import lru_cache
+import logging
 import os
 from pathlib import Path
 import tempfile
 from typing import Any
 
-import voluptuous as vol
+import probatio
 
-from homeassistant.const import CONF_PAYLOAD
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers import config_validation as cv, template
+from homeassistant import config as conf_util
+from homeassistant.config_entries import ConfigEntry, ConfigEntryState
+from homeassistant.const import (
+    MAX_LENGTH_STATE_STATE,
+    STATE_UNKNOWN,
+    EntityCategory,
+    Platform,
+)
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
+from homeassistant.helpers import (
+    config_validation as cv,
+    device_registry as dr,
+    entity_registry as er,
+    issue_registry as ir,
+    template,
+)
+from homeassistant.helpers.entity import ENTITY_CATEGORIES_SCHEMA
 from homeassistant.helpers.typing import ConfigType
+from homeassistant.loader import async_get_integration
+from homeassistant.util.async_ import create_eager_task
 
 from .const import (
+    ATTR_DISCOVERY_PAYLOAD,
     ATTR_PAYLOAD,
     ATTR_QOS,
     ATTR_RETAIN,
@@ -22,72 +42,276 @@ from .const import (
     CONF_CERTIFICATE,
     CONF_CLIENT_CERT,
     CONF_CLIENT_KEY,
-    DATA_MQTT,
     DEFAULT_ENCODING,
     DEFAULT_QOS,
     DEFAULT_RETAIN,
     DOMAIN,
+    INVALID_PLATFORM_CONFIG_ISSUE_PREFIX,
 )
-from .models import MqttData
+from .models import DATA_MQTT, DATA_MQTT_AVAILABLE, ReceiveMessage
+
+AVAILABILITY_TIMEOUT = 50.0
 
 TEMP_DIR_NAME = f"home-assistant-{DOMAIN}"
+
+_VALID_QOS_SCHEMA = probatio.All(probatio.Coerce(int), probatio.In([0, 1, 2]))
+
+_LOGGER = logging.getLogger(__name__)
+
+
+class EnsureJobAfterCooldown:
+    """Ensure a cool down period before executing a job.
+
+    When a new execute request arrives we cancel the current request
+    and start a new one.
+
+    We allow patching this util, as we generally have exceptions
+    for sleeps/waits/debouncers/timers causing long run times in tests.
+    """
+
+    def __init__(
+        self, timeout: float, callback_job: Callable[[], Coroutine[Any, None, None]]
+    ) -> None:
+        """Initialize the timer."""
+        self._loop = asyncio.get_running_loop()
+        self._timeout = timeout
+        self._callback = callback_job
+        self._task: asyncio.Task | None = None
+        self._timer: asyncio.TimerHandle | None = None
+        self._next_execute_time = 0.0
+
+    def set_timeout(self, timeout: float) -> None:
+        """Set a new timeout period."""
+        self._timeout = timeout
+
+    async def _async_job(self) -> None:
+        """Execute after a cooldown period."""
+        try:
+            await self._callback()
+        except HomeAssistantError as ha_error:
+            _LOGGER.error("%s", ha_error)
+
+    @callback
+    def _async_task_done(self, task: asyncio.Task) -> None:
+        """Handle task done."""
+        self._task = None
+
+    @callback
+    def async_execute(self) -> asyncio.Task:
+        """Execute the job."""
+        if self._task:
+            # Task already running,
+            # so we schedule another run
+            self.async_schedule()
+            return self._task
+
+        self._async_cancel_timer()
+        self._task = create_eager_task(self._async_job())
+        self._task.add_done_callback(self._async_task_done)
+        return self._task
+
+    @callback
+    def _async_cancel_timer(self) -> None:
+        """Cancel any pending task."""
+        if self._timer:
+            self._timer.cancel()
+            self._timer = None
+
+    @callback
+    def async_schedule(self) -> None:
+        """Ensure we execute after a cooldown period."""
+        # We want to reschedule the timer in the future
+        # every time this is called.
+        next_when = self._loop.time() + self._timeout
+        if not self._timer:
+            self._timer = self._loop.call_at(next_when, self._async_timer_reached)
+            return
+
+        if self._timer.when() < next_when:
+            # Timer already running, set the next execute time
+            # if it fires too early, it will get rescheduled
+            self._next_execute_time = next_when
+
+    @callback
+    def _async_timer_reached(self) -> None:
+        """Handle timer fire."""
+        self._timer = None
+        if self._loop.time() >= self._next_execute_time:
+            self.async_execute()
+            return
+        # Timer fired too early because there were multiple
+        # calls async_schedule. Reschedule the timer.
+        self._timer = self._loop.call_at(
+            self._next_execute_time, self._async_timer_reached
+        )
+
+    async def async_cleanup(self) -> None:
+        """Cleanup any pending task."""
+        self._async_cancel_timer()
+        if not self._task:
+            return
+        self._task.cancel()
+        try:
+            await self._task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            _LOGGER.exception("Error cleaning up task")
+
+
+def platforms_from_config(config: list[ConfigType]) -> set[Platform | str]:
+    """Return the platforms to be set up."""
+    return {key for platform in config for key in platform}
+
+
+async def async_forward_entry_setup_and_setup_discovery(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry,
+    platforms: set[Platform | str],
+    late: bool = False,
+) -> None:
+    """Forward the config entry setup to the platforms and set up discovery."""
+    mqtt_data = hass.data[DATA_MQTT]
+    platforms_loaded = mqtt_data.platforms_loaded
+    new_platforms: set[Platform | str] = platforms - platforms_loaded
+    tasks: list[asyncio.Task] = []
+    if "device_automation" in new_platforms:
+        # Local import to avoid circular dependencies
+        from . import device_automation  # noqa: PLC0415
+
+        tasks.append(
+            create_eager_task(
+                device_automation.async_setup_mqtt_device_automation_entry(
+                    hass, config_entry
+                )
+            )
+        )
+    if "tag" in new_platforms:
+        # Local import to avoid circular dependencies
+        from . import tag  # noqa: PLC0415
+
+        tasks.append(
+            create_eager_task(tag.async_setup_mqtt_tag_entry(hass, config_entry))
+        )
+    if new_entity_platforms := (new_platforms - {"tag", "device_automation"}):
+        tasks.append(
+            create_eager_task(
+                hass.config_entries.async_forward_entry_setups(
+                    config_entry, new_entity_platforms
+                )
+            )
+        )
+    if not tasks:
+        return
+    await asyncio.gather(*tasks)
+    platforms_loaded.update(new_platforms)
 
 
 def mqtt_config_entry_enabled(hass: HomeAssistant) -> bool | None:
     """Return true when the MQTT config entry is enabled."""
-    if not bool(hass.config_entries.async_entries(DOMAIN)):
-        return None
-    return not bool(hass.config_entries.async_entries(DOMAIN)[0].disabled_by)
+    # If the mqtt client is connected, skip the expensive config
+    # entry check as its roughly two orders of magnitude faster.
+    return (
+        DATA_MQTT in hass.data and hass.data[DATA_MQTT].client.connected
+    ) or hass.config_entries.async_has_entries(
+        DOMAIN, include_disabled=False, include_ignore=False
+    )
+
+
+async def async_wait_for_mqtt_client(hass: HomeAssistant) -> bool:
+    """Wait for the MQTT client to become available.
+
+    Waits when mqtt set up is in progress,
+    It is not needed that the client is connected.
+    Returns True if the mqtt client is available.
+    Returns False when the client is not available.
+    """
+    if not mqtt_config_entry_enabled(hass):
+        return False
+
+    entry = hass.config_entries.async_entries(DOMAIN)[0]
+    if entry.state is ConfigEntryState.LOADED:
+        return True
+
+    state_reached_future: asyncio.Future[bool]
+    if DATA_MQTT_AVAILABLE not in hass.data:
+        state_reached_future = hass.loop.create_future()
+        hass.data[DATA_MQTT_AVAILABLE] = state_reached_future
+    else:
+        state_reached_future = hass.data[DATA_MQTT_AVAILABLE]
+
+    try:
+        async with asyncio.timeout(AVAILABILITY_TIMEOUT):
+            # Await the client setup or an error state was received
+            return await state_reached_future
+    except TimeoutError:
+        return False
 
 
 def valid_topic(topic: Any) -> str:
-    """Validate that this is a valid topic name/filter."""
+    """Validate that this is a valid topic name/filter.
+
+    This function is not cached and is not expected to be called
+    directly outside of this module. It is not marked as protected
+    only because its tested directly in test_util.py.
+
+    If it gets used outside of valid_subscribe_topic and
+    valid_publish_topic, it may need an lru_cache decorator or
+    an lru_cache decorator on the function where its used.
+    """
     validated_topic = cv.string(topic)
     try:
         raw_validated_topic = validated_topic.encode("utf-8")
     except UnicodeError as err:
-        raise vol.Invalid("MQTT topic name/filter must be valid UTF-8 string.") from err
+        raise probatio.Invalid(
+            "MQTT topic name/filter must be valid UTF-8 string."
+        ) from err
     if not raw_validated_topic:
-        raise vol.Invalid("MQTT topic name/filter must not be empty.")
+        raise probatio.Invalid("MQTT topic name/filter must not be empty.")
     if len(raw_validated_topic) > 65535:
-        raise vol.Invalid(
+        raise probatio.Invalid(
             "MQTT topic name/filter must not be longer than 65535 encoded bytes."
         )
-    if "\0" in validated_topic:
-        raise vol.Invalid("MQTT topic name/filter must not contain null character.")
-    if any(char <= "\u001F" for char in validated_topic):
-        raise vol.Invalid("MQTT topic name/filter must not contain control characters.")
-    if any("\u007f" <= char <= "\u009F" for char in validated_topic):
-        raise vol.Invalid("MQTT topic name/filter must not contain control characters.")
-    if any("\ufdd0" <= char <= "\ufdef" for char in validated_topic):
-        raise vol.Invalid("MQTT topic name/filter must not contain non-characters.")
-    if any((ord(char) & 0xFFFF) in (0xFFFE, 0xFFFF) for char in validated_topic):
-        raise vol.Invalid("MQTT topic name/filter must not contain noncharacters.")
+
+    for char in validated_topic:
+        if char == "\0":
+            raise probatio.Invalid(
+                "MQTT topic name/filter must not contain null character."
+            )
+        if char <= "\u001f" or "\u007f" <= char <= "\u009f":
+            raise probatio.Invalid(
+                "MQTT topic name/filter must not contain control characters."
+            )
+        if "\ufdd0" <= char <= "\ufdef" or (ord(char) & 0xFFFF) in (0xFFFE, 0xFFFF):
+            raise probatio.Invalid(
+                "MQTT topic name/filter must not contain non-characters."
+            )
 
     return validated_topic
 
 
+@lru_cache
 def valid_subscribe_topic(topic: Any) -> str:
     """Validate that we can subscribe using this MQTT topic."""
     validated_topic = valid_topic(topic)
-    for i in (i for i, c in enumerate(validated_topic) if c == "+"):
-        if (i > 0 and validated_topic[i - 1] != "/") or (
-            i < len(validated_topic) - 1 and validated_topic[i + 1] != "/"
-        ):
-            raise vol.Invalid(
-                "Single-level wildcard must occupy an entire level of the filter"
-            )
+    if "+" in validated_topic:
+        for i in (i for i, c in enumerate(validated_topic) if c == "+"):
+            if (i > 0 and validated_topic[i - 1] != "/") or (
+                i < len(validated_topic) - 1 and validated_topic[i + 1] != "/"
+            ):
+                raise probatio.Invalid(
+                    "Single-level wildcard must occupy an entire level of the filter"
+                )
 
     index = validated_topic.find("#")
     if index != -1:
         if index != len(validated_topic) - 1:
             # If there are multiple wildcards, this will also trigger
-            raise vol.Invalid(
-                "Multi-level wildcard must be the last "
-                "character in the topic filter."
+            raise probatio.Invalid(
+                "Multi-level wildcard must be the last character in the topic filter."
             )
         if len(validated_topic) > 1 and validated_topic[index - 1] != "/":
-            raise vol.Invalid(
+            raise probatio.Invalid(
                 "Multi-level wildcard must be after a topic level separator."
             )
 
@@ -96,7 +320,7 @@ def valid_subscribe_topic(topic: Any) -> str:
 
 def valid_subscribe_topic_template(value: Any) -> template.Template:
     """Validate either a jinja2 template or a valid MQTT subscription topic."""
-    tpl = template.Template(value)
+    tpl = cv.template(value)
 
     if tpl.is_static:
         valid_subscribe_topic(value)
@@ -104,32 +328,65 @@ def valid_subscribe_topic_template(value: Any) -> template.Template:
     return tpl
 
 
+@lru_cache
 def valid_publish_topic(topic: Any) -> str:
     """Validate that we can publish using this MQTT topic."""
     validated_topic = valid_topic(topic)
     if "+" in validated_topic or "#" in validated_topic:
-        raise vol.Invalid("Wildcards can not be used in topic names")
+        raise probatio.Invalid("Wildcards cannot be used in topic names")
     return validated_topic
 
 
-_VALID_QOS_SCHEMA = vol.All(vol.Coerce(int), vol.In([0, 1, 2]))
+def valid_encoding(value: Any) -> str:
+    """Validate a payload encoding, an empty string passes the raw payload."""
+    encoding = cv.string(value)
+    if not encoding:
+        return encoding
+    # An empty string skips the codec lookup, so encode a character
+    try:
+        "a".encode(encoding)
+    except LookupError as err:
+        raise probatio.Invalid(f"Unknown payload encoding '{encoding}'") from err
+    return encoding
 
-MQTT_WILL_BIRTH_SCHEMA = vol.Schema(
+
+def entity_category_without_config(value: Any) -> EntityCategory:
+    """Validate the entity category of a platform not supporting `CONFIG`.
+
+    Entities of these platforms raise when they are added as config entities.
+    """
+    entity_category: EntityCategory = ENTITY_CATEGORIES_SCHEMA(value)
+    if entity_category is EntityCategory.CONFIG:
+        _options = ", ".join(sorted(set(EntityCategory) - {EntityCategory.CONFIG}))
+        raise probatio.Invalid(
+            f"Entity category '{entity_category}' is not supported by this platform."
+            f" Valid options are: {_options}"
+        )
+    return entity_category
+
+
+def valid_qos_schema(qos: Any) -> int:
+    """Validate that QOS value is valid."""
+    validated_qos: int = _VALID_QOS_SCHEMA(qos)
+    return validated_qos
+
+
+_MQTT_WILL_BIRTH_SCHEMA = probatio.Schema(
     {
-        vol.Required(ATTR_TOPIC): valid_publish_topic,
-        vol.Required(ATTR_PAYLOAD, CONF_PAYLOAD): cv.string,
-        vol.Optional(ATTR_QOS, default=DEFAULT_QOS): _VALID_QOS_SCHEMA,
-        vol.Optional(ATTR_RETAIN, default=DEFAULT_RETAIN): cv.boolean,
+        probatio.Required(ATTR_TOPIC): valid_publish_topic,
+        probatio.Required(ATTR_PAYLOAD): cv.string,
+        probatio.Optional(ATTR_QOS, default=DEFAULT_QOS): valid_qos_schema,
+        probatio.Optional(ATTR_RETAIN, default=DEFAULT_RETAIN): cv.boolean,
     },
     required=True,
 )
 
 
-def get_mqtt_data(hass: HomeAssistant, ensure_exists: bool = False) -> MqttData:
-    """Return typed MqttData from hass.data[DATA_MQTT]."""
-    if ensure_exists:
-        return hass.data.setdefault(DATA_MQTT, MqttData())
-    return hass.data[DATA_MQTT]
+def valid_birth_will(config: ConfigType) -> ConfigType:
+    """Validate a birth or will configuration and required topic/payload."""
+    if config:
+        config = _MQTT_WILL_BIRTH_SCHEMA(config)
+    return config
 
 
 async def async_create_certificate_temp_files(
@@ -162,7 +419,29 @@ async def async_create_certificate_temp_files(
     await hass.async_add_executor_job(_create_temp_dir_and_files)
 
 
-def get_file_path(option: str, default: str | None = None) -> Path | str | None:
+def check_state_too_long(
+    logger: logging.Logger, proposed_state: str, entity_id: str, msg: ReceiveMessage
+) -> bool:
+    """Check if the processed state is too long and log warning."""
+    if (state_length := len(proposed_state)) > MAX_LENGTH_STATE_STATE:
+        logger.warning(
+            "Cannot update state for entity %s after processing "
+            "payload on topic %s. The requested state (%s) exceeds "
+            "the maximum allowed length (%s). Fall back to "
+            "%s, failed state: %s",
+            entity_id,
+            msg.topic,
+            state_length,
+            MAX_LENGTH_STATE_STATE,
+            STATE_UNKNOWN,
+            proposed_state[:8192],
+        )
+        return True
+
+    return False
+
+
+def get_file_path(option: str, default: str | None = None) -> str | None:
     """Get file path of a certificate file."""
     temp_dir = Path(tempfile.gettempdir()) / TEMP_DIR_NAME
     if not temp_dir.exists():
@@ -172,7 +451,7 @@ def get_file_path(option: str, default: str | None = None) -> Path | str | None:
     if not file_path.exists():
         return default
 
-    return temp_dir / option
+    return str(temp_dir / option)
 
 
 def migrate_certificate_file_to_content(file_name_or_auto: str) -> str | None:
@@ -180,7 +459,117 @@ def migrate_certificate_file_to_content(file_name_or_auto: str) -> str | None:
     if file_name_or_auto == "auto":
         return "auto"
     try:
-        with open(file_name_or_auto, encoding=DEFAULT_ENCODING) as certiticate_file:
-            return certiticate_file.read()
+        with open(file_name_or_auto, encoding=DEFAULT_ENCODING) as certificate_file:
+            return certificate_file.read()
     except OSError:
         return None
+
+
+@callback
+def learn_more_url(platform: str) -> str:
+    """Return the URL for the platform specific MQTT documentation."""
+    return f"https://www.home-assistant.io/integrations/{platform}.mqtt/"
+
+
+@callback
+def _async_device_has_entities(
+    hass: HomeAssistant, device_id: str, *, include_disabled_entities: bool
+) -> bool:
+    """Return if entities that keep the device remain.
+
+    Disabled entities only keep the device if include_disabled_entities is set,
+    or if they were discovered through device discovery, as removing the device
+    would remove them while they are still part of the device discovery payload.
+    """
+    device_discovered_disabled_entities = {
+        disabled_entity.registry_key
+        for disabled_entity in hass.data[
+            DATA_MQTT
+        ].discovery_discovered_and_disabled.values()
+        if disabled_entity.discovery_data[ATTR_DISCOVERY_PAYLOAD].device_discovery
+    }
+    return any(
+        not entry.disabled
+        or include_disabled_entities
+        or (entry.domain, entry.platform, entry.unique_id)
+        in device_discovered_disabled_entities
+        for entry in er.async_entries_for_device(
+            er.async_get(hass), device_id, include_disabled_entities=True
+        )
+    )
+
+
+async def async_cleanup_device_registry(
+    hass: HomeAssistant,
+    device_id: str | None,
+    config_entry_id: str | None,
+    *,
+    include_disabled_entities: bool = False,
+) -> None:
+    """Clean up the device registry after MQTT removal.
+
+    Remove MQTT from the device registry entry if there are no remaining
+    entities, triggers, tags or child devices. With include_disabled_entities,
+    all disabled entities keep the device.
+    """
+    # Local import to avoid circular dependencies
+    from . import device_trigger, tag  # noqa: PLC0415
+
+    device_registry = dr.async_get(hass)
+    if (
+        device_id
+        and config_entry_id
+        and (device := device_registry.async_get(device_id)) is not None
+        # Only remove the device if it is owned by the MQTT config entry
+        and device.config_entry_id == config_entry_id
+        # Removing a parent device also removes its child devices
+        and not dr.async_entries_for_parent_device(device_registry, device_id)
+        and not _async_device_has_entities(
+            hass, device_id, include_disabled_entities=include_disabled_entities
+        )
+        and not await device_trigger.async_get_triggers(hass, device_id)
+        and not tag.async_has_tags(hass, device_id)
+    ):
+        device_registry.async_remove_device(device_id)
+        if isinstance(device, dr.ChildDeviceEntry):
+            await async_cleanup_device_registry(
+                hass,
+                device.parent_device_id,
+                config_entry_id,
+                include_disabled_entities=include_disabled_entities,
+            )
+
+
+@callback
+def async_refresh_mqtt_issues(hass: HomeAssistant) -> ir.IssuesRefresh:
+    """Begin a refresh of the issues for invalid manually configured items."""
+    return ir.async_refresh_issues(
+        hass, DOMAIN, issue_id_pattern=INVALID_PLATFORM_CONFIG_ISSUE_PREFIX
+    )
+
+
+async def async_check_config_schema(
+    hass: HomeAssistant, config_yaml: ConfigType
+) -> None:
+    """Validate manually configured MQTT items."""
+    mqtt_data = hass.data[DATA_MQTT]
+    mqtt_config: list[dict[str, list[ConfigType]]] = config_yaml.get(DOMAIN, {})
+    for mqtt_config_item in mqtt_config:
+        for domain, config_items in mqtt_config_item.items():
+            schema = mqtt_data.reload_schema[domain]
+            for config in config_items:
+                try:
+                    schema(config)
+                except probatio.Invalid as exc:
+                    integration = await async_get_integration(hass, DOMAIN)
+                    message = conf_util.format_schema_error(
+                        hass, exc, domain, config, integration.documentation
+                    )
+                    raise ServiceValidationError(
+                        translation_domain=DOMAIN,
+                        translation_key="invalid_platform_config_message",
+                        translation_placeholders={
+                            "domain": domain,
+                            "message": message,
+                        },
+                    ) from exc

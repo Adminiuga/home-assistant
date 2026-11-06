@@ -1,42 +1,42 @@
 {
   "domain": "flux_led",
   "name": "Magic Home",
+  "categories": ["lighting.led_strips_controllers", "lighting.bulbs_lamps"],
+  "codeowners": ["@icemanch"],
   "config_flow": true,
+  "connectivity": ["network"],
   "dependencies": ["network"],
-  "documentation": "https://www.home-assistant.io/integrations/flux_led",
-  "requirements": ["flux_led==0.28.32"],
-  "quality_scale": "platinum",
-  "codeowners": ["@icemanch", "@bdraco"],
-  "iot_class": "local_push",
   "dhcp": [
-    { "registered_devices": true },
     {
-      "macaddress": "18B905*",
-      "hostname": "[ba][lk]*"
+      "registered_devices": true
     },
     {
-      "macaddress": "249494*",
-      "hostname": "[ba][lk]*"
+      "hostname": "[ba][lk]*",
+      "macaddress": "18B905*"
     },
     {
-      "macaddress": "7CB94C*",
-      "hostname": "[ba][lk]*"
+      "hostname": "[ba][lk]*",
+      "macaddress": "249494*"
     },
     {
-      "macaddress": "ACCF23*",
-      "hostname": "[hba][flk]*"
+      "hostname": "[ba][lk]*",
+      "macaddress": "7CB94C*"
     },
     {
-      "macaddress": "B4E842*",
-      "hostname": "[ba][lk]*"
+      "hostname": "[hba][flk]*",
+      "macaddress": "ACCF23*"
     },
     {
-      "macaddress": "F0FE6B*",
-      "hostname": "[hba][flk]*"
+      "hostname": "[ba][lk]*",
+      "macaddress": "B4E842*"
     },
     {
-      "macaddress": "8CCE4E*",
-      "hostname": "lwip*"
+      "hostname": "[hba][flk]*",
+      "macaddress": "F0FE6B*"
+    },
+    {
+      "hostname": "lwip*",
+      "macaddress": "8CCE4E*"
     },
     {
       "hostname": "hf-lpb100-zj*"
@@ -45,9 +45,15 @@
       "hostname": "zengge_[0-9a-f][0-9a-f]_*"
     },
     {
-      "macaddress": "C82E47*",
-      "hostname": "sta*"
+      "hostname": "zengge"
+    },
+    {
+      "hostname": "sta*",
+      "macaddress": "C82E47*"
     }
   ],
-  "loggers": ["flux_led"]
+  "documentation": "https://www.home-assistant.io/integrations/flux_led",
+  "iot_class": "local_push",
+  "loggers": ["flux_led"],
+  "requirements": ["flux-led==1.2.0"]
 }

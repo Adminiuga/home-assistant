@@ -1,0 +1,69 @@
+"""Unit tests for the OurGroceries integration."""
+
+from unittest.mock import AsyncMock
+
+import pytest
+from pytest_homeassistant.common import MockConfigEntry
+
+from homeassistant.components.ourgroceries import ClientError, InvalidLoginException
+from homeassistant.components.ourgroceries.const import DOMAIN
+from homeassistant.config_entries import SOURCE_REAUTH, ConfigEntryState
+from homeassistant.core import HomeAssistant
+
+
+async def test_load_unload(
+    hass: HomeAssistant,
+    setup_integration: None,
+    ourgroceries_config_entry: MockConfigEntry | None,
+) -> None:
+    """Test loading and unloading of the config entry."""
+    entries = hass.config_entries.async_entries(DOMAIN)
+    assert len(entries) == 1
+
+    assert ourgroceries_config_entry.state is ConfigEntryState.LOADED
+
+    assert await hass.config_entries.async_unload(ourgroceries_config_entry.entry_id)
+    assert ourgroceries_config_entry.state is ConfigEntryState.NOT_LOADED
+
+
+@pytest.fixture
+def login_with_error(exception, ourgroceries: AsyncMock):
+    """Fixture to simulate error on login."""
+    ourgroceries.login.side_effect = (exception,)
+
+
+@pytest.mark.parametrize(
+    ("exception", "status"),
+    [
+        (InvalidLoginException, ConfigEntryState.SETUP_ERROR),
+        (ClientError, ConfigEntryState.SETUP_RETRY),
+        (TimeoutError, ConfigEntryState.SETUP_RETRY),
+    ],
+)
+async def test_init_failure(
+    hass: HomeAssistant,
+    login_with_error,
+    setup_integration: None,
+    status: ConfigEntryState,
+    ourgroceries_config_entry: MockConfigEntry | None,
+) -> None:
+    """Test an initialization error on integration load."""
+    assert ourgroceries_config_entry.state is status
+
+
+@pytest.mark.parametrize("exception", [InvalidLoginException])
+@pytest.mark.usefixtures("login_with_error", "setup_integration")
+async def test_init_invalid_login_starts_reauth(
+    hass: HomeAssistant,
+    ourgroceries_config_entry: MockConfigEntry,
+) -> None:
+    """Test an invalid login fails setup and starts a reauth flow."""
+    assert ourgroceries_config_entry.state is ConfigEntryState.SETUP_ERROR
+    assert (
+        ourgroceries_config_entry.reason
+        == "Login to OurGroceries failed because the username or password is incorrect"
+    )
+    flows = hass.config_entries.flow.async_progress()
+    assert len(flows) == 1
+    assert flows[0]["context"]["source"] == SOURCE_REAUTH
+    assert flows[0]["context"]["entry_id"] == ourgroceries_config_entry.entry_id

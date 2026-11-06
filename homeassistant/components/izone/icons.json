@@ -1,0 +1,25 @@
+{
+  "entity": {
+    "number": {
+      "damper_max": {
+        "default": "mdi:valve-open"
+      },
+      "damper_min": {
+        "default": "mdi:valve-closed"
+      }
+    },
+    "sensor": {
+      "damper_position": {
+        "default": "mdi:valve"
+      }
+    }
+  },
+  "services": {
+    "airflow_max": {
+      "service": "mdi:fan-plus"
+    },
+    "airflow_min": {
+      "service": "mdi:fan-minus"
+    }
+  }
+}

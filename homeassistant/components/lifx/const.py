@@ -1,53 +1,71 @@
 """Const for LIFX."""
 
 import logging
+from typing import TYPE_CHECKING
+
+from homeassistant.util.hass_dict import HassKey
+
+if TYPE_CHECKING:
+    from .manager import LIFXManager
 
 DOMAIN = "lifx"
+DATA_LIFX_MANAGER: HassKey[LIFXManager] = HassKey(DOMAIN)
 
-TARGET_ANY = "00:00:00:00:00:00"
-
-DISCOVERY_INTERVAL = 10
-MESSAGE_TIMEOUT = 1.65
-MESSAGE_RETRIES = 5
-OVERALL_TIMEOUT = 9
-UNAVAILABLE_GRACE = 90
-
+CONF_GROUP = "group"
 CONF_LABEL = "label"
+CONF_MAC_ADDRESS = "mac_address"
+CONF_NETWORK_NAME = "network_name"
 CONF_SERIAL = "serial"
+CONF_TITLE = "title"
 
-IDENTIFY_WAVEFORM = {
-    "transient": True,
-    "color": [0, 0, 1, 3500],
-    "skew_ratio": 0,
-    "period": 1000,
-    "cycles": 3,
-    "waveform": 1,
-    "set_hue": True,
-    "set_saturation": True,
-    "set_brightness": True,
-    "set_kelvin": True,
-}
 IDENTIFY = "identify"
 RESTART = "restart"
 
 ATTR_DURATION = "duration"
-ATTR_INDICATION = "indication"
 ATTR_INFRARED = "infrared"
 ATTR_POWER = "power"
-ATTR_REMAINING = "remaining"
 ATTR_RSSI = "rssi"
 ATTR_ZONES = "zones"
 
 ATTR_THEME = "theme"
 
-HEV_CYCLE_STATE = "hev_cycle_state"
-INFRARED_BRIGHTNESS = "infrared_brightness"
-INFRARED_BRIGHTNESS_VALUES_MAP = {
-    0: "Disabled",
-    16383: "25%",
-    32767: "50%",
-    65535: "100%",
-}
-DATA_LIFX_MANAGER = "lifx_manager"
+ATTR_CHANGE = "change"
+ATTR_CLOUD_SATURATION_MAX = "cloud_saturation_max"
+ATTR_CLOUD_SATURATION_MIN = "cloud_saturation_min"
+ATTR_CYCLES = "cycles"
+ATTR_DIRECTION = "direction"
+ATTR_PALETTE = "palette"
+ATTR_PERIOD = "period"
+ATTR_POWER_ON = "power_on"
+ATTR_SATURATION_MAX = "saturation_max"
+ATTR_SATURATION_MIN = "saturation_min"
+ATTR_SKY_TYPE = "sky_type"
+ATTR_SPEED = "speed"
+ATTR_SPREAD = "spread"
 
-_LOGGER = logging.getLogger(__package__)
+SERVICE_EFFECT_COLORSWEEP = "effect_colorsweep"
+SERVICE_EFFECT_COLORLOOP = "effect_colorloop"
+SERVICE_EFFECT_FLAME = "effect_flame"
+SERVICE_EFFECT_MORPH = "effect_morph"
+SERVICE_EFFECT_MOVE = "effect_move"
+SERVICE_EFFECT_PULSE = "effect_pulse"
+SERVICE_EFFECT_SKY = "effect_sky"
+SERVICE_EFFECT_STOP = "effect_stop"
+SERVICE_PAINT_THEME = "paint_theme"
+SERVICE_SET_HEV_CYCLE_STATE = "set_hev_cycle_state"
+SERVICE_SET_STATE = "set_state"
+
+HEV_CYCLE_STATE = "hev_cycle_state"
+LIFX_IDENTIFY_DELAY = 3.0
+# A bulb often misses one poll and answers the next, so it is only shown as
+# unavailable once it has missed this many in a row
+MAX_MISSED_POLLS = 3
+INFRARED_BRIGHTNESS = "infrared_brightness"
+INFRARED_LEVELS = {
+    "Disabled": 0.0,
+    "25%": 0.25,
+    "50%": 0.5,
+    "100%": 1.0,
+}
+
+LOGGER = logging.getLogger(__package__)

@@ -1,26 +1,22 @@
 """Diagnostics support for MQTT."""
-from __future__ import annotations
 
 from typing import Any
 
 from homeassistant.components import device_tracker
 from homeassistant.components.diagnostics import async_redact_data
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import (
-    ATTR_LATITUDE,
-    ATTR_LONGITUDE,
-    CONF_PASSWORD,
-    CONF_USERNAME,
-)
-from homeassistant.core import HomeAssistant, callback, split_entity_id
+from homeassistant.const import CONF_PASSWORD, CONF_USERNAME, EntityStateAttribute
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import device_registry as dr, entity_registry as er
-from homeassistant.helpers.device_registry import DeviceEntry
+from homeassistant.helpers.device_registry import AnyDeviceEntry
 
 from . import debug_info, is_connected
-from .util import get_mqtt_data
 
 REDACT_CONFIG = {CONF_PASSWORD, CONF_USERNAME}
-REDACT_STATE_DEVICE_TRACKER = {ATTR_LATITUDE, ATTR_LONGITUDE}
+REDACT_STATE_DEVICE_TRACKER = {
+    EntityStateAttribute.LATITUDE,
+    EntityStateAttribute.LONGITUDE,
+}
 
 
 async def async_get_config_entry_diagnostics(
@@ -31,7 +27,7 @@ async def async_get_config_entry_diagnostics(
 
 
 async def async_get_device_diagnostics(
-    hass: HomeAssistant, entry: ConfigEntry, device: DeviceEntry
+    hass: HomeAssistant, entry: ConfigEntry, device: AnyDeviceEntry
 ) -> dict[str, Any]:
     """Return diagnostics for a device entry."""
     return _async_get_diagnostics(hass, entry, device)
@@ -41,13 +37,13 @@ async def async_get_device_diagnostics(
 def _async_get_diagnostics(
     hass: HomeAssistant,
     entry: ConfigEntry,
-    device: DeviceEntry | None = None,
+    device: AnyDeviceEntry | None = None,
 ) -> dict[str, Any]:
     """Return diagnostics for a config entry."""
-    mqtt_instance = get_mqtt_data(hass).client
-    assert mqtt_instance is not None
-
-    redacted_config = async_redact_data(mqtt_instance.conf, REDACT_CONFIG)
+    redacted_config = {
+        "data": async_redact_data(dict(entry.data), REDACT_CONFIG),
+        "options": dict(entry.options),
+    }
 
     data = {
         "connected": is_connected(hass),
@@ -73,7 +69,9 @@ def _async_get_diagnostics(
 
 
 @callback
-def _async_device_as_dict(hass: HomeAssistant, device: DeviceEntry) -> dict[str, Any]:
+def _async_device_as_dict(
+    hass: HomeAssistant, device: AnyDeviceEntry
+) -> dict[str, Any]:
     """Represent an MQTT device as a dictionary."""
 
     # Gather information how this MQTT device is represented in Home Assistant
@@ -93,36 +91,38 @@ def _async_device_as_dict(hass: HomeAssistant, device: DeviceEntry) -> dict[str,
         include_disabled_entities=True,
     )
 
-    for entity_entry in entities:
+    def _state_dict(entity_entry: er.RegistryEntry) -> dict[str, Any] | None:
         state = hass.states.get(entity_entry.entity_id)
-        state_dict = None
-        if state:
-            state_dict = dict(state.as_dict())
+        if not state:
+            return None
 
-            # The context doesn't provide useful information in this case.
-            state_dict.pop("context", None)
+        state_dict = dict(state.as_dict())
 
-            entity_domain = split_entity_id(state.entity_id)[0]
+        # The context doesn't provide useful information in this case.
+        state_dict.pop("context", None)
 
-            # Retract some sensitive state attributes
-            if entity_domain == device_tracker.DOMAIN:
-                state_dict["attributes"] = async_redact_data(
-                    state_dict["attributes"], REDACT_STATE_DEVICE_TRACKER
-                )
+        # Retract some sensitive state attributes
+        if state.domain == device_tracker.DOMAIN:
+            state_dict["attributes"] = async_redact_data(
+                state_dict["attributes"], REDACT_STATE_DEVICE_TRACKER
+            )
+        return state_dict
 
-        data["entities"].append(
-            {
-                "device_class": entity_entry.device_class,
-                "disabled_by": entity_entry.disabled_by,
-                "disabled": entity_entry.disabled,
-                "entity_category": entity_entry.entity_category,
-                "entity_id": entity_entry.entity_id,
-                "icon": entity_entry.icon,
-                "original_device_class": entity_entry.original_device_class,
-                "original_icon": entity_entry.original_icon,
-                "state": state_dict,
-                "unit_of_measurement": entity_entry.unit_of_measurement,
-            }
-        )
+    data["entities"].extend(
+        {
+            "device_class": entity_entry.device_class,
+            "disabled_by": entity_entry.disabled_by,
+            "disabled": entity_entry.disabled,
+            "entity_category": entity_entry.entity_category,
+            "entity_id": entity_entry.entity_id,
+            "icon": entity_entry.icon,
+            "original_device_class": entity_entry.original_device_class,
+            "original_icon": entity_entry.original_icon,
+            "state": state_dict,
+            "unit_of_measurement": entity_entry.unit_of_measurement,
+        }
+        for entity_entry in entities
+        if (state_dict := _state_dict(entity_entry)) is not None
+    )
 
     return data

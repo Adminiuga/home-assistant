@@ -1,9 +1,12 @@
 {
   "domain": "sun",
   "name": "Sun",
+  "categories": ["weather_alerts.forecasts"],
+  "codeowners": ["@home-assistant/core"],
+  "config_flow": true,
   "documentation": "https://www.home-assistant.io/integrations/sun",
-  "codeowners": ["@Swamp-Ig"],
-  "quality_scale": "internal",
+  "integration_type": "service",
   "iot_class": "calculated",
-  "config_flow": true
+  "quality_scale": "internal",
+  "single_config_entry": true
 }

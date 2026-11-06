@@ -1,31 +1,28 @@
 """The melnor integration."""
 
-from __future__ import annotations
-
 from melnor_bluetooth.device import Device
 
 from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth.match import BluetoothCallbackMatcher
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_ADDRESS, Platform
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers.device_registry import CONNECTION_BLUETOOTH
 
 from .const import DOMAIN
-from .models import MelnorDataUpdateCoordinator
+from .coordinator import MelnorConfigEntry, MelnorDataUpdateCoordinator
 
 PLATFORMS: list[Platform] = [
     Platform.NUMBER,
     Platform.SENSOR,
     Platform.SWITCH,
+    Platform.TIME,
 ]
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_setup_entry(hass: HomeAssistant, entry: MelnorConfigEntry) -> None:
     """Set up melnor from a config entry."""
-
-    hass.data.setdefault(DOMAIN, {}).setdefault(entry.entry_id, {})
-
     ble_device = bluetooth.async_ble_device_from_address(hass, entry.data[CONF_ADDRESS])
 
     if not ble_device:
@@ -56,23 +53,27 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         bluetooth.BluetoothScanningMode.PASSIVE,
     )
 
-    coordinator = MelnorDataUpdateCoordinator(hass, device)
+    coordinator = MelnorDataUpdateCoordinator(hass, entry, device)
     await coordinator.async_config_entry_first_refresh()
 
-    hass.data[DOMAIN][entry.entry_id] = coordinator
-    hass.config_entries.async_setup_platforms(entry, PLATFORMS)
+    entry.runtime_data = coordinator
 
-    return True
+    # Register the parent device up front so zone entities can deterministically
+    # resolve its via_device_id, regardless of platform setup order.
+    dr.async_get(hass).async_get_or_create(
+        config_entry_id=entry.entry_id,
+        identifiers={(DOMAIN, device.mac)},
+        connections={(CONNECTION_BLUETOOTH, device.mac)},
+        manufacturer="Melnor",
+        model=device.model,
+        name=device.name,
+    )
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_unload_entry(hass: HomeAssistant, entry: MelnorConfigEntry) -> None:
     """Unload a config entry."""
+    await entry.runtime_data.data.disconnect()
 
-    device: Device = hass.data[DOMAIN][entry.entry_id].data
-
-    await device.disconnect()
-
-    if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
-        hass.data[DOMAIN].pop(entry.entry_id)
-
-    return unload_ok
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)

@@ -1,80 +1,122 @@
 """Provides functionality to notify people."""
-from __future__ import annotations
 
-import asyncio
+from datetime import timedelta
+import logging
 
-import voluptuous as vol
+import probatio
 
-import homeassistant.components.persistent_notification as pn
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_NAME, CONF_PLATFORM
-from homeassistant.core import HomeAssistant, ServiceCall
-import homeassistant.helpers.config_validation as cv
+from homeassistant.core import DOMAIN as HOMEASSISTANT_DOMAIN, HomeAssistant
+from homeassistant.exceptions import ConfigEntryError
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.entity_component import EntityComponent
 from homeassistant.helpers.typing import ConfigType
 
-from .const import (  # noqa: F401
+from .const import (
     ATTR_DATA,
     ATTR_MESSAGE,
+    ATTR_RECIPIENTS,
     ATTR_TARGET,
     ATTR_TITLE,
+    DATA_COMPONENT,
     DOMAIN,
     NOTIFY_SERVICE_SCHEMA,
-    PERSISTENT_NOTIFICATION_SERVICE_SCHEMA,
     SERVICE_NOTIFY,
     SERVICE_PERSISTENT_NOTIFICATION,
+    SERVICE_SEND_MESSAGE,
+    NotifyEntityFeature,
+    NotifyService,
+    NotifyServiceArgument,
 )
-from .legacy import (  # noqa: F401
+from .entity import NotifyEntity, NotifyEntityDescription
+from .legacy import (
     BaseNotificationService,
     async_reload,
     async_reset_platform,
     async_setup_legacy,
-    check_templates_warn,
 )
+from .repairs import migrate_notify_issue
+from .services import async_setup_services
+
+# mypy: disallow-any-generics
 
 # Platform specific data
 ATTR_TITLE_DEFAULT = "Home Assistant"
 
-PLATFORM_SCHEMA = vol.Schema(
-    {vol.Required(CONF_PLATFORM): cv.string, vol.Optional(CONF_NAME): cv.string},
-    extra=vol.ALLOW_EXTRA,
+ENTITY_ID_FORMAT = DOMAIN + ".{}"
+
+MIN_TIME_BETWEEN_SCANS = timedelta(seconds=10)
+
+_LOGGER = logging.getLogger(__name__)
+
+PLATFORM_SCHEMA = probatio.Schema(
+    {
+        probatio.Required(CONF_PLATFORM): cv.string,
+        probatio.Optional(CONF_NAME): cv.string,
+    },
+    extra=probatio.ALLOW_EXTRA,
 )
+
+__all__ = [
+    "ATTR_DATA",
+    "ATTR_MESSAGE",
+    "ATTR_RECIPIENTS",
+    "ATTR_TARGET",
+    "ATTR_TITLE",
+    "ATTR_TITLE_DEFAULT",
+    "DOMAIN",
+    "ENTITY_ID_FORMAT",
+    "NOTIFY_SERVICE_SCHEMA",
+    "PLATFORM_SCHEMA",
+    "SERVICE_NOTIFY",
+    "SERVICE_PERSISTENT_NOTIFICATION",
+    "SERVICE_SEND_MESSAGE",
+    "BaseNotificationService",
+    "NotifyEntity",
+    "NotifyEntityDescription",
+    "NotifyEntityFeature",
+    "NotifyService",
+    "NotifyServiceArgument",
+    "async_reload",
+    "async_reset_platform",
+    "migrate_notify_issue",
+]
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the notify services."""
 
-    platform_setups = async_setup_legacy(hass, config)
+    for setup in async_setup_legacy(hass, config):
+        # Tasks are created as tracked tasks to ensure startup
+        # waits for them to finish, but we explicitly do not
+        # want to wait for them to finish here because we want
+        # any config entries that use notify as a base platform
+        # to be able to start with out having to wait for the
+        # legacy platforms to finish setting up.
+        hass.async_create_task(setup, eager_start=True)
 
-    # We need to add the component here break the deadlock
-    # when setting up integrations from config entries as
-    # they would otherwise wait for notify to be
-    # setup and thus the config entries would not be able to
-    # setup their platforms, but we need to do it after
-    # the dispatcher is connected so we don't miss integrations
-    # that are registered before the dispatcher is connected
-    hass.config.components.add(DOMAIN)
+    # Reloading legacy platforms runs async_setup again; keep the existing
+    # component so config entry entities stay tracked.
+    if DATA_COMPONENT in hass.data:
+        return True
 
-    if platform_setups:
-        await asyncio.wait([asyncio.create_task(setup) for setup in platform_setups])
-
-    async def persistent_notification(service: ServiceCall) -> None:
-        """Send notification via the built-in persistent_notify integration."""
-        message = service.data[ATTR_MESSAGE]
-        message.hass = hass
-        check_templates_warn(hass, message)
-
-        title = None
-        if title_tpl := service.data.get(ATTR_TITLE):
-            check_templates_warn(hass, title_tpl)
-            title_tpl.hass = hass
-            title = title_tpl.async_render(parse_result=False)
-
-        pn.async_create(hass, message.async_render(parse_result=False), title)
-
-    hass.services.async_register(
-        DOMAIN,
-        SERVICE_PERSISTENT_NOTIFICATION,
-        persistent_notification,
-        schema=PERSISTENT_NOTIFICATION_SERVICE_SCHEMA,
-    )
+    hass.data[DATA_COMPONENT] = EntityComponent[NotifyEntity](_LOGGER, DOMAIN, hass)
+    async_setup_services(hass)
 
     return True
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Set up a config entry."""
+    if not await hass.data[DATA_COMPONENT].async_setup_entry(entry):
+        raise ConfigEntryError(
+            translation_domain=HOMEASSISTANT_DOMAIN,
+            translation_key="platform_setup_failed",
+            translation_placeholders={"platform": entry.domain, "domain": DOMAIN},
+        )
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Unload a config entry."""
+    await hass.data[DATA_COMPONENT].async_unload_entry(entry)

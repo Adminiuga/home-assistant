@@ -1,7 +1,10 @@
 """Test the Fully Kiosk Browser sensors."""
+
 from unittest.mock import MagicMock
 
+from freezegun.api import FrozenDateTimeFactory
 from fullykiosk import FullyKioskError
+from pytest_homeassistant.common import MockConfigEntry, async_fire_time_changed
 
 from homeassistant.components.fully_kiosk.const import DOMAIN, UPDATE_INTERVAL
 from homeassistant.components.sensor import (
@@ -14,24 +17,22 @@ from homeassistant.const import (
     ATTR_FRIENDLY_NAME,
     STATE_UNAVAILABLE,
     STATE_UNKNOWN,
+    EntityCategory,
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr, entity_registry as er
-from homeassistant.helpers.entity import EntityCategory
-from homeassistant.util import dt
-
-from tests.common import MockConfigEntry, async_fire_time_changed
+from homeassistant.util import dt as dt_util
 
 
 async def test_sensors_sensors(
     hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    device_registry: dr.DeviceRegistry,
+    freezer: FrozenDateTimeFactory,
     mock_fully_kiosk: MagicMock,
     init_integration: MockConfigEntry,
 ) -> None:
     """Test standard Fully Kiosk sensors."""
-    entity_registry = er.async_get(hass)
-    device_registry = dr.async_get(hass)
-
     state = hass.states.get("sensor.amazon_fire_battery")
     assert state
     assert state.state == "100"
@@ -52,6 +53,18 @@ async def test_sensors_sensors(
     assert entry
     assert entry.unique_id == "abcdef-123456-screenOrientation"
 
+    state = hass.states.get("sensor.amazon_fire_battery_temperature")
+    assert state
+    assert state.state == "27"
+    assert state.attributes.get(ATTR_DEVICE_CLASS) == SensorDeviceClass.TEMPERATURE
+    assert state.attributes.get(ATTR_FRIENDLY_NAME) == "Amazon Fire Battery temperature"
+    assert state.attributes.get(ATTR_STATE_CLASS) == SensorStateClass.MEASUREMENT
+
+    entry = entity_registry.async_get("sensor.amazon_fire_battery_temperature")
+    assert entry
+    assert entry.unique_id == "abcdef-123456-batteryTemperature"
+    assert entry.entity_category == EntityCategory.DIAGNOSTIC
+
     state = hass.states.get("sensor.amazon_fire_foreground_app")
     assert state
     assert state.state == "de.ozerov.fully"
@@ -66,6 +79,8 @@ async def test_sensors_sensors(
     assert state.state == "https://homeassistant.local"
     assert state.attributes.get(ATTR_DEVICE_CLASS) is None
     assert state.attributes.get(ATTR_FRIENDLY_NAME) == "Amazon Fire Current page"
+    assert state.attributes.get("full_url") == "https://homeassistant.local"
+    assert not state.attributes.get("truncated")
 
     entry = entity_registry.async_get("sensor.amazon_fire_current_page")
     assert entry
@@ -74,7 +89,7 @@ async def test_sensors_sensors(
     state = hass.states.get("sensor.amazon_fire_internal_storage_free_space")
     assert state
     assert state.state == "11675.5"
-    assert state.attributes.get(ATTR_DEVICE_CLASS) is None
+    assert state.attributes.get(ATTR_DEVICE_CLASS) == SensorDeviceClass.DATA_SIZE
     assert (
         state.attributes.get(ATTR_FRIENDLY_NAME)
         == "Amazon Fire Internal storage free space"
@@ -89,7 +104,7 @@ async def test_sensors_sensors(
     state = hass.states.get("sensor.amazon_fire_internal_storage_total_space")
     assert state
     assert state.state == "12938.5"
-    assert state.attributes.get(ATTR_DEVICE_CLASS) is None
+    assert state.attributes.get(ATTR_DEVICE_CLASS) == SensorDeviceClass.DATA_SIZE
     assert (
         state.attributes.get(ATTR_FRIENDLY_NAME)
         == "Amazon Fire Internal storage total space"
@@ -104,7 +119,7 @@ async def test_sensors_sensors(
     state = hass.states.get("sensor.amazon_fire_free_memory")
     assert state
     assert state.state == "362.4"
-    assert state.attributes.get(ATTR_DEVICE_CLASS) is None
+    assert state.attributes.get(ATTR_DEVICE_CLASS) == SensorDeviceClass.DATA_SIZE
     assert state.attributes.get(ATTR_FRIENDLY_NAME) == "Amazon Fire Free memory"
     assert state.attributes.get(ATTR_STATE_CLASS) == SensorStateClass.MEASUREMENT
 
@@ -116,7 +131,7 @@ async def test_sensors_sensors(
     state = hass.states.get("sensor.amazon_fire_total_memory")
     assert state
     assert state.state == "1440.1"
-    assert state.attributes.get(ATTR_DEVICE_CLASS) is None
+    assert state.attributes.get(ATTR_DEVICE_CLASS) == SensorDeviceClass.DATA_SIZE
     assert state.attributes.get(ATTR_FRIENDLY_NAME) == "Amazon Fire Total memory"
     assert state.attributes.get(ATTR_STATE_CLASS) == SensorStateClass.MEASUREMENT
 
@@ -139,8 +154,9 @@ async def test_sensors_sensors(
 
     # Test unknown/missing data
     mock_fully_kiosk.getDeviceInfo.return_value = {}
-    async_fire_time_changed(hass, dt.utcnow() + UPDATE_INTERVAL)
-    await hass.async_block_till_done()
+    freezer.tick(UPDATE_INTERVAL)
+    async_fire_time_changed(hass)
+    await hass.async_block_till_done(wait_background_tasks=True)
 
     state = hass.states.get("sensor.amazon_fire_internal_storage_free_space")
     assert state
@@ -148,9 +164,38 @@ async def test_sensors_sensors(
 
     # Test failed update
     mock_fully_kiosk.getDeviceInfo.side_effect = FullyKioskError("error", "status")
-    async_fire_time_changed(hass, dt.utcnow() + UPDATE_INTERVAL)
-    await hass.async_block_till_done()
+    freezer.tick(UPDATE_INTERVAL)
+    async_fire_time_changed(hass)
+    await hass.async_block_till_done(wait_background_tasks=True)
 
     state = hass.states.get("sensor.amazon_fire_internal_storage_free_space")
     assert state
     assert state.state == STATE_UNAVAILABLE
+
+
+async def test_url_sensor_truncating(
+    hass: HomeAssistant,
+    mock_fully_kiosk: MagicMock,
+    init_integration: MockConfigEntry,
+) -> None:
+    """Test that long URLs get truncated."""
+    state = hass.states.get("sensor.amazon_fire_current_page")
+    assert state
+    assert state.state == "https://homeassistant.local"
+    assert state.attributes.get("full_url") == "https://homeassistant.local"
+    assert not state.attributes.get("truncated")
+
+    long_url = "https://01234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789"
+    assert len(long_url) > 256
+
+    mock_fully_kiosk.getDeviceInfo.return_value = {
+        "currentPage": long_url,
+    }
+    async_fire_time_changed(hass, dt_util.utcnow() + UPDATE_INTERVAL)
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    state = hass.states.get("sensor.amazon_fire_current_page")
+    assert state
+    assert state.state == long_url[0:255]
+    assert state.attributes.get("full_url") == long_url
+    assert state.attributes.get("truncated")

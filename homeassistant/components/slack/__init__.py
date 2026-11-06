@@ -1,64 +1,89 @@
 """The slack integration."""
-import logging
+
+from dataclasses import dataclass
 
 from aiohttp.client_exceptions import ClientError
-from slack import WebClient
-from slack.errors import SlackApiError
+from slack_sdk.errors import SlackApiError
+from slack_sdk.web.async_client import AsyncWebClient
 
-from homeassistant.config_entries import SOURCE_IMPORT, ConfigEntry
-from homeassistant.const import CONF_API_KEY, CONF_PLATFORM, Platform
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import CONF_API_KEY, Platform
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryNotReady
-from homeassistant.helpers import aiohttp_client, discovery
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.helpers import aiohttp_client, config_validation as cv, discovery
 from homeassistant.helpers.typing import ConfigType
 
-from .const import DATA_CLIENT, DATA_HASS_CONFIG, DOMAIN
+from .const import (
+    ATTR_URL,
+    ATTR_USER_ID,
+    DATA_CLIENT,
+    DATA_HASS_CONFIG,
+    DOMAIN,
+    SLACK_DATA,
+)
 
-_LOGGER = logging.getLogger(__name__)
+PLATFORMS = [Platform.NOTIFY, Platform.SENSOR]
 
-PLATFORMS = [Platform.NOTIFY]
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+
+type SlackConfigEntry = ConfigEntry[SlackData]
+
+
+@dataclass
+class SlackData:
+    """Runtime data for the Slack integration."""
+
+    client: AsyncWebClient
+    url: str
+    user_id: str
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the Slack component."""
     hass.data[DATA_HASS_CONFIG] = config
-
-    # Iterate all entries for notify to only get Slack
-    if Platform.NOTIFY in config:
-        for entry in config[Platform.NOTIFY]:
-            if entry[CONF_PLATFORM] == DOMAIN:
-                hass.async_create_task(
-                    hass.config_entries.flow.async_init(
-                        DOMAIN, context={"source": SOURCE_IMPORT}, data=entry
-                    )
-                )
-
     return True
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_setup_entry(hass: HomeAssistant, entry: SlackConfigEntry) -> None:
     """Set up Slack from a config entry."""
     session = aiohttp_client.async_get_clientsession(hass)
-    slack = WebClient(token=entry.data[CONF_API_KEY], run_async=True, session=session)
+    slack = AsyncWebClient(
+        token=entry.data[CONF_API_KEY], session=session
+    )  # No run_async
 
     try:
-        await slack.auth_test()
+        res = await slack.auth_test()
     except (SlackApiError, ClientError) as ex:
         if isinstance(ex, SlackApiError) and ex.response["error"] == "invalid_auth":
-            _LOGGER.error("Invalid API key")
-            return False
+            raise ConfigEntryAuthFailed(
+                translation_domain=DOMAIN,
+                translation_key="invalid_api_key",
+            ) from ex
         raise ConfigEntryNotReady("Error while setting up integration") from ex
 
-    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = entry.data | {DATA_CLIENT: slack}
+    entry.runtime_data = SlackData(
+        client=slack,
+        url=res[ATTR_URL],
+        user_id=res[ATTR_USER_ID],
+    )
 
     hass.async_create_task(
         discovery.async_load_platform(
             hass,
             Platform.NOTIFY,
             DOMAIN,
-            hass.data[DOMAIN][entry.entry_id],
+            entry.data
+            | {
+                SLACK_DATA: {
+                    DATA_CLIENT: slack,
+                    ATTR_URL: res[ATTR_URL],
+                    ATTR_USER_ID: res[ATTR_USER_ID],
+                }
+            },
             hass.data[DATA_HASS_CONFIG],
         )
     )
 
-    return True
+    await hass.config_entries.async_forward_entry_setups(
+        entry, [platform for platform in PLATFORMS if platform != Platform.NOTIFY]
+    )

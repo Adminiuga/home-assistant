@@ -1,21 +1,15 @@
 set_hev_cycle_state:
-  name: Set HEV cycle state
-  description: Control the HEV LEDs on a LIFX Clean bulb.
   target:
     entity:
       integration: lifx
       domain: light
   fields:
     power:
-      name: enable
-      description: Start or stop a Clean cycle.
       required: true
       example: true
       selector:
         boolean:
     duration:
-      name: Duration
-      description: How long the HEV LEDs will remain on. Uses the configured default duration if not specified.
       required: false
       default: 7200
       example: 3600
@@ -25,51 +19,37 @@ set_hev_cycle_state:
           max: 86400
           unit_of_measurement: seconds
 set_state:
-  name: Set State
-  description: Set a color/brightness and possibly turn the light on/off.
   target:
     entity:
       integration: lifx
       domain: light
   fields:
     infrared:
-      name: infrared
-      description: Automatic infrared level when light brightness is low.
       selector:
         number:
           min: 0
           max: 255
     zones:
-      name: Zones
-      description: List of zone numbers to affect (8 per LIFX Z, starts at 0).
       example: "[0,5]"
       selector:
         object:
     transition:
-      name: Transition
-      description: Duration it takes to get to the final state.
       selector:
         number:
           min: 0
           max: 3600
           unit_of_measurement: seconds
     power:
-      name: Power
-      description: Turn the light on or off. Leave out to keep the power as it is.
       selector:
         boolean:
 
 effect_pulse:
-  name: Pulse effect
-  description: Run a flash effect by changing to a color and back.
   target:
     entity:
       integration: lifx
       domain: light
   fields:
     mode:
-      name: Mode
-      description: "Decides how colors are changed."
       selector:
         select:
           options:
@@ -79,27 +59,25 @@ effect_pulse:
             - "strobe"
             - "solid"
     brightness:
-      name: Brightness
-      description: Number indicating brightness of the temporary color.
       selector:
         number:
-          min: 0
+          min: 1
           max: 255
+    brightness_pct:
+      selector:
+        number:
+          min: 1
+          max: 100
+          unit_of_measurement: "%"
     color_name:
-      name: Color name
-      description: A human readable color name.
       example: "red"
       selector:
         text:
     rgb_color:
-      name: RGB color
-      description: The temporary color in RGB-format.
       example: "[255, 100, 100]"
       selector:
         object:
     period:
-      name: Period
-      description: Duration of the effect.
       default: 1.0
       selector:
         number:
@@ -108,38 +86,55 @@ effect_pulse:
           step: 0.05
           unit_of_measurement: seconds
     cycles:
-      name: Cycles
-      description: Number of times the effect should run.
       default: 1
       selector:
         number:
           min: 1
           max: 10000
     power_on:
-      name: Power on
-      description: Powered off lights are temporarily turned on during the effect.
       default: true
       selector:
         boolean:
 
 effect_colorloop:
-  name: Color loop effect
-  description: Run an effect with looping colors.
   target:
     entity:
       integration: lifx
       domain: light
   fields:
     brightness:
-      name: Brightness
-      description: Number indicating brightness of the effect. Leave this out to maintain the current brightness of each participating light.
       selector:
         number:
           min: 0
           max: 255
+    brightness_pct:
+      selector:
+        number:
+          min: 0
+          max: 100
+          unit_of_measurement: "%"
+    saturation_min:
+      default: 80
+      selector:
+        number:
+          min: 1
+          max: 100
+          unit_of_measurement: "%"
+    saturation_max:
+      default: 100
+      selector:
+        number:
+          min: 1
+          max: 100
+          unit_of_measurement: "%"
+    transition:
+      required: false
+      selector:
+        number:
+          min: 0
+          max: 3600
+          unit_of_measurement: seconds
     period:
-      name: Period
-      description: Duration between color changes.
       default: 60
       selector:
         number:
@@ -148,17 +143,13 @@ effect_colorloop:
           step: 0.05
           unit_of_measurement: seconds
     change:
-      name: Change
-      description: Hue movement per period, in degrees on a color wheel.
       default: 20
       selector:
         number:
-          min: 0
-          max: 360
+          min: 1
+          max: 179
           unit_of_measurement: "°"
     spread:
-      name: Spread
-      description: Maximum hue difference between participating lights, in degrees on a color wheel.
       default: 30
       selector:
         number:
@@ -166,22 +157,16 @@ effect_colorloop:
           max: 360
           unit_of_measurement: "°"
     power_on:
-      name: Power on
-      description: Powered off lights are temporarily turned on during the effect.
       default: true
       selector:
         boolean:
 effect_move:
-  name: Move effect
-  description: Start the firmware-based Move effect on a LIFX Z, Lightstrip or Beam.
   target:
     entity:
       integration: lifx
       domain: light
   fields:
     speed:
-      name: Speed
-      description: How long in seconds for the effect to move across the length of the light.
       default: 3.0
       example: 3.0
       selector:
@@ -191,8 +176,6 @@ effect_move:
           step: 0.1
           unit_of_measurement: seconds
     direction:
-      name: Direction
-      description: Direction the effect will move across the device.
       default: right
       example: right
       selector:
@@ -202,55 +185,434 @@ effect_move:
             - right
             - left
     theme:
-      name: Theme
-      description: (Optional) set one of the predefined themes onto the device before starting the effect.
       example: exciting
-      default: exciting
       selector:
         select:
           mode: dropdown
           options:
+            - "afghanistan"
+            - "albania"
+            - "algeria"
+            - "andorra"
+            - "angola"
+            - "antigua_and_barbuda"
+            - "arctic"
+            - "argentina"
+            - "arlington"
+            - "armenia"
+            - "aurora"
+            - "aurora_borealis"
+            - "australia"
+            - "austria"
             - "autumn"
+            - "autumn_table"
+            - "azerbaijan"
+            - "bahamas"
+            - "bahrain"
+            - "bangladesh"
+            - "barbados"
+            - "baubles"
+            - "be_my_valentine"
+            - "beach"
+            - "bedroom_glow_up"
+            - "belarus"
+            - "belgium"
+            - "belize"
+            - "benin"
+            - "bhutan"
+            - "bias_lighting"
+            - "bijutsukai"
             - "blissful"
+            - "blood_moon"
+            - "bloodlust"
+            - "bolivia"
+            - "book_of_the_dead"
+            - "bosnia_and_herzegovina"
+            - "botswana"
+            - "brazil"
+            - "brunei"
+            - "bulgaria"
+            - "burkina_faso"
+            - "burundi"
+            - "cabo_verde"
+            - "calaveras"
+            - "cambodia"
+            - "cameroon"
+            - "canada"
+            - "canada_day"
+            - "candy_cane"
+            - "candy_cane_twist"
+            - "central_african_republic"
+            - "chad"
             - "cheerful"
+            - "cherry_blossom"
+            - "chile"
+            - "china"
+            - "christmas"
+            - "classic_rock"
+            - "classical"
+            - "clouds"
+            - "colombia"
+            - "comoros"
+            - "coral_reef"
+            - "costa_rica"
+            - "cote_divoire"
+            - "cranberry_harvest"
+            - "croatia"
+            - "crystal_twist"
+            - "cuba"
+            - "curacao"
+            - "cyberpunk"
+            - "cyprus"
+            - "czechia"
+            - "dance_pop"
+            - "deck_the_halls"
+            - "deep_sea"
+            - "denmark"
+            - "desert"
+            - "dinner_for_two"
+            - "disco"
+            - "diwali"
+            - "djibouti"
+            - "dominica"
+            - "dominican_republic"
+            - "dr_congo"
             - "dream"
+            - "earth"
+            - "ecuador"
+            - "egypt"
+            - "el_salvador"
+            - "energising"
             - "energizing"
+            - "england"
             - "epic"
+            - "equatorial_guinea"
+            - "eritrea"
+            - "estonia"
+            - "eswatini"
+            - "eternal"
+            - "ethiopia"
+            - "european_union"
+            - "evening"
             - "exciting"
+            - "extraterrestrial"
+            - "fall"
+            - "fantasy"
+            - "festive"
+            - "fiji"
+            - "finland"
+            - "fire"
+            - "fireworks_finale"
+            - "focus"
             - "focusing"
+            - "forest"
+            - "forrest"
+            - "france"
+            - "fright_night"
+            - "funk"
+            - "gabon"
+            - "galaxy"
+            - "gambia"
+            - "garage_rock"
+            - "gauguin"
+            - "gentle"
+            - "georgia"
+            - "germany"
+            - "ghana"
+            - "ghostly"
+            - "gold_star"
+            - "graveyard_chill"
+            - "greece"
+            - "grenada"
+            - "guatemala"
+            - "guinea"
+            - "guinea_bissau"
+            - "guyana"
+            - "haiti"
             - "halloween"
             - "hanukkah"
+            - "haunted_fog"
+            - "hip_hop_rap"
+            - "hokusai"
             - "holly"
-            - "independence_day"
+            - "honduras"
+            - "hong_kong"
+            - "hungary"
+            - "hygge"
+            - "iceland"
+            - "independence"
+            - "india"
+            - "indie_pop"
+            - "indonesia"
             - "intense"
+            - "iran"
+            - "iraq"
+            - "israel"
+            - "italy"
+            - "jamaica"
+            - "japan"
+            - "jazz"
+            - "jordan"
+            - "jupiter"
+            - "kandinsky"
+            - "kazakhstan"
+            - "kenya"
+            - "kiribati"
+            - "klimt"
+            - "kosovo"
+            - "kuwait"
+            - "kwanzaa"
+            - "kyrgyzstan"
+            - "laos"
+            - "latvia"
+            - "lebanon"
+            - "leprechaun_treasure"
+            - "lesotho"
+            - "liberia"
+            - "libya"
+            - "liechtenstein"
+            - "lithuania"
+            - "lo_fi"
+            - "love"
+            - "lucky_shamrock"
+            - "luxembourg"
+            - "madagascar"
+            - "malawi"
+            - "malaysia"
+            - "maldives"
+            - "mali"
+            - "malta"
+            - "marc"
+            - "mars"
+            - "marshall_islands"
+            - "matisse"
+            - "mauritania"
+            - "mauritius"
             - "mellow"
+            - "memorial_day"
+            - "menorah"
+            - "mercury"
+            - "mexico"
+            - "micronesia"
+            - "midnight_shadows"
+            - "mistletoe"
+            - "moldova"
+            - "molly_malone"
+            - "monaco"
+            - "mondrian"
+            - "monet"
+            - "mongolia"
+            - "montenegro"
+            - "moon"
+            - "morocco"
+            - "movie_night_romance"
+            - "mozambique"
+            - "munch"
+            - "myanmar"
+            - "namibia"
+            - "nauru"
+            - "neon"
+            - "nepal"
+            - "neptune"
+            - "netherlands"
+            - "new_zealand"
+            - "nicaragua"
+            - "niger"
+            - "nigeria"
+            - "north_korea"
+            - "north_macedonia"
+            - "northern_ireland"
+            - "norway"
+            - "ocean"
+            - "oktoberfest"
+            - "old_glory"
+            - "oman"
+            - "outback"
+            - "pakistan"
+            - "palau"
+            - "palestine"
+            - "panama"
+            - "papua_new_guinea"
+            - "parade"
+            - "paraguay"
+            - "paranormal"
+            - "party"
             - "peaceful"
+            - "peru"
+            - "philippines"
+            - "pine_glow"
+            - "pluto"
+            - "poland"
+            - "pop"
+            - "poppy"
+            - "portugal"
             - "powerful"
+            - "pride"
+            - "proud"
+            - "psychedelic_rock"
+            - "puerto_rico"
+            - "pumpkin"
+            - "pumpkin_glow"
+            - "pumpkin_party"
+            - "pumpkin_spice"
+            - "punk"
+            - "qatar"
+            - "ramadan"
+            - "redrum"
             - "relaxing"
+            - "republic_of_ireland"
+            - "republic_of_the_congo"
+            - "romance"
+            - "romania"
+            - "rousseau"
+            - "russia"
+            - "rwanda"
+            - "sage_and_cedar"
+            - "saint_kitts_and_nevis"
+            - "saint_lucia"
+            - "saint_vincent_and_the_grenadines"
+            - "samoa"
+            - "san_marino"
             - "santa"
+            - "santas_candy"
+            - "santas_workshop"
+            - "sao_tome_and_principe"
+            - "saturn"
+            - "saudi_arabia"
+            - "sci_fi"
+            - "scotland"
+            - "scream_queen"
+            - "self_care_sanctuary"
+            - "senegal"
+            - "serbia"
             - "serene"
+            - "seychelles"
+            - "shamrock"
+            - "sierra_leone"
+            - "singapore"
+            - "slasher"
+            - "sleepy"
+            - "slovakia"
+            - "slovenia"
+            - "snake_banisher"
+            - "snowflake"
+            - "solomon_islands"
+            - "somalia"
             - "soothing"
+            - "south_africa"
+            - "south_korea"
+            - "south_sudan"
+            - "spacey"
+            - "spain"
+            - "spiders_lair"
             - "sports"
             - "spring"
+            - "sri_lanka"
+            - "st_patricks_day"
+            - "stardust"
+            - "storm_front"
+            - "sudan"
+            - "summer_dusk"
+            - "sun"
+            - "suriname"
+            - "sweden"
+            - "switzerland"
+            - "synthwave"
+            - "syria"
+            - "taiwan"
+            - "tajikistan"
+            - "tanzania"
+            - "taps"
+            - "thailand"
+            - "thanksgiving"
+            - "the_tricolour"
+            - "timor_leste"
+            - "togo"
+            - "tonga"
+            - "toxic_cauldron"
             - "tranquil"
+            - "trinidad_and_tobago"
+            - "tropical"
+            - "tunisia"
+            - "turkey_dinner"
+            - "turkiye"
+            - "turkmenistan"
+            - "tuvalu"
+            - "uganda"
+            - "ukraine"
+            - "united_arab_emirates"
+            - "united_kingdom"
+            - "uranus"
+            - "uruguay"
+            - "usa"
+            - "uzbekistan"
+            - "valentines"
+            - "vampires_den"
+            - "van_gogh"
+            - "vanuatu"
+            - "vaporwave"
+            - "vatican_city"
+            - "venezuela"
+            - "venus"
+            - "vermeer"
+            - "vietnam"
+            - "wales"
+            - "warm_ember"
             - "warming"
+            - "water"
+            - "whats_the_craic"
+            - "wheat_glow"
+            - "winter_night"
+            - "winter_wonderland"
+            - "witchs_ritual"
+            - "witchy"
+            - "yemen"
+            - "zambia"
+            - "zimbabwe"
+            - "zombie"
+            - "zombie_apocalypse"
     power_on:
-      name: Power on
-      description: Powered off lights will be turned on before starting the effect.
       default: true
       selector:
         boolean:
-effect_flame:
-  name: Flame effect
-  description: Start the firmware-based Flame effect on LIFX Tiles or Candle.
+effect_colorsweep:
   target:
     entity:
       integration: lifx
       domain: light
   fields:
     speed:
-      name: Speed
-      description: How fast the flames will move.
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 25
+          step: 1
+          unit_of_measurement: seconds
+    duration:
+      default: 30
+      selector:
+        number:
+          min: 0
+          max: 3600
+          step: 1
+          unit_of_measurement: seconds
+    palette:
+      example:
+        - "[[0, 0, 100, 1500], [0, 0, 100, 6500]]"
+      selector:
+        object:
+    power_on:
+      default: true
+      selector:
+        boolean:
+effect_flame:
+  target:
+    entity:
+      integration: lifx
+      domain: light
+  fields:
+    speed:
       default: 3
       selector:
         number:
@@ -259,22 +621,16 @@ effect_flame:
           step: 1
           unit_of_measurement: seconds
     power_on:
-      name: Power on
-      description: Powered off lights will be turned on before starting the effect.
       default: true
       selector:
         boolean:
 effect_morph:
-  name: Morph effect
-  description: Start the firmware-based Morph effect on LIFX Tiles on Candle.
   target:
     entity:
       integration: lifx
       domain: light
   fields:
     speed:
-      name: Speed
-      description: How fast the colors will move.
       default: 3
       selector:
         number:
@@ -283,52 +639,871 @@ effect_morph:
           step: 1
           unit_of_measurement: seconds
     palette:
-      name: Palette
-      description: List of at least 2 and at most 16 colors as hue (0-360), saturation (0-100), brightness (0-100) and kelvin (1500-900) values to use for this effect. Overrides the theme attribute.
       example:
         - "[[0, 100, 100, 3500], [60, 100, 100, 3500]]"
       selector:
         object:
     theme:
-      name: Theme
-      description: Predefined color theme to use for the effect. Overridden by the palette attribute.
       selector:
         select:
           options:
+            - "afghanistan"
+            - "albania"
+            - "algeria"
+            - "andorra"
+            - "angola"
+            - "antigua_and_barbuda"
+            - "arctic"
+            - "argentina"
+            - "arlington"
+            - "armenia"
+            - "aurora"
+            - "aurora_borealis"
+            - "australia"
+            - "austria"
             - "autumn"
+            - "autumn_table"
+            - "azerbaijan"
+            - "bahamas"
+            - "bahrain"
+            - "bangladesh"
+            - "barbados"
+            - "baubles"
+            - "be_my_valentine"
+            - "beach"
+            - "bedroom_glow_up"
+            - "belarus"
+            - "belgium"
+            - "belize"
+            - "benin"
+            - "bhutan"
+            - "bias_lighting"
+            - "bijutsukai"
             - "blissful"
+            - "blood_moon"
+            - "bloodlust"
+            - "bolivia"
+            - "book_of_the_dead"
+            - "bosnia_and_herzegovina"
+            - "botswana"
+            - "brazil"
+            - "brunei"
+            - "bulgaria"
+            - "burkina_faso"
+            - "burundi"
+            - "cabo_verde"
+            - "calaveras"
+            - "cambodia"
+            - "cameroon"
+            - "canada"
+            - "canada_day"
+            - "candy_cane"
+            - "candy_cane_twist"
+            - "central_african_republic"
+            - "chad"
             - "cheerful"
+            - "cherry_blossom"
+            - "chile"
+            - "china"
+            - "christmas"
+            - "classic_rock"
+            - "classical"
+            - "clouds"
+            - "colombia"
+            - "comoros"
+            - "coral_reef"
+            - "costa_rica"
+            - "cote_divoire"
+            - "cranberry_harvest"
+            - "croatia"
+            - "crystal_twist"
+            - "cuba"
+            - "curacao"
+            - "cyberpunk"
+            - "cyprus"
+            - "czechia"
+            - "dance_pop"
+            - "deck_the_halls"
+            - "deep_sea"
+            - "denmark"
+            - "desert"
+            - "dinner_for_two"
+            - "disco"
+            - "diwali"
+            - "djibouti"
+            - "dominica"
+            - "dominican_republic"
+            - "dr_congo"
             - "dream"
+            - "earth"
+            - "ecuador"
+            - "egypt"
+            - "el_salvador"
+            - "energising"
             - "energizing"
+            - "england"
             - "epic"
+            - "equatorial_guinea"
+            - "eritrea"
+            - "estonia"
+            - "eswatini"
+            - "eternal"
+            - "ethiopia"
+            - "european_union"
+            - "evening"
             - "exciting"
+            - "extraterrestrial"
+            - "fall"
+            - "fantasy"
+            - "festive"
+            - "fiji"
+            - "finland"
+            - "fire"
+            - "fireworks_finale"
+            - "focus"
             - "focusing"
+            - "forest"
+            - "forrest"
+            - "france"
+            - "fright_night"
+            - "funk"
+            - "gabon"
+            - "galaxy"
+            - "gambia"
+            - "garage_rock"
+            - "gauguin"
+            - "gentle"
+            - "georgia"
+            - "germany"
+            - "ghana"
+            - "ghostly"
+            - "gold_star"
+            - "graveyard_chill"
+            - "greece"
+            - "grenada"
+            - "guatemala"
+            - "guinea"
+            - "guinea_bissau"
+            - "guyana"
+            - "haiti"
             - "halloween"
             - "hanukkah"
+            - "haunted_fog"
+            - "hip_hop_rap"
+            - "hokusai"
             - "holly"
-            - "independence_day"
+            - "honduras"
+            - "hong_kong"
+            - "hungary"
+            - "hygge"
+            - "iceland"
+            - "independence"
+            - "india"
+            - "indie_pop"
+            - "indonesia"
             - "intense"
+            - "iran"
+            - "iraq"
+            - "israel"
+            - "italy"
+            - "jamaica"
+            - "japan"
+            - "jazz"
+            - "jordan"
+            - "jupiter"
+            - "kandinsky"
+            - "kazakhstan"
+            - "kenya"
+            - "kiribati"
+            - "klimt"
+            - "kosovo"
+            - "kuwait"
+            - "kwanzaa"
+            - "kyrgyzstan"
+            - "laos"
+            - "latvia"
+            - "lebanon"
+            - "leprechaun_treasure"
+            - "lesotho"
+            - "liberia"
+            - "libya"
+            - "liechtenstein"
+            - "lithuania"
+            - "lo_fi"
+            - "love"
+            - "lucky_shamrock"
+            - "luxembourg"
+            - "madagascar"
+            - "malawi"
+            - "malaysia"
+            - "maldives"
+            - "mali"
+            - "malta"
+            - "marc"
+            - "mars"
+            - "marshall_islands"
+            - "matisse"
+            - "mauritania"
+            - "mauritius"
             - "mellow"
+            - "memorial_day"
+            - "menorah"
+            - "mercury"
+            - "mexico"
+            - "micronesia"
+            - "midnight_shadows"
+            - "mistletoe"
+            - "moldova"
+            - "molly_malone"
+            - "monaco"
+            - "mondrian"
+            - "monet"
+            - "mongolia"
+            - "montenegro"
+            - "moon"
+            - "morocco"
+            - "movie_night_romance"
+            - "mozambique"
+            - "munch"
+            - "myanmar"
+            - "namibia"
+            - "nauru"
+            - "neon"
+            - "nepal"
+            - "neptune"
+            - "netherlands"
+            - "new_zealand"
+            - "nicaragua"
+            - "niger"
+            - "nigeria"
+            - "north_korea"
+            - "north_macedonia"
+            - "northern_ireland"
+            - "norway"
+            - "ocean"
+            - "oktoberfest"
+            - "old_glory"
+            - "oman"
+            - "outback"
+            - "pakistan"
+            - "palau"
+            - "palestine"
+            - "panama"
+            - "papua_new_guinea"
+            - "parade"
+            - "paraguay"
+            - "paranormal"
+            - "party"
             - "peaceful"
+            - "peru"
+            - "philippines"
+            - "pine_glow"
+            - "pluto"
+            - "poland"
+            - "pop"
+            - "poppy"
+            - "portugal"
             - "powerful"
+            - "pride"
+            - "proud"
+            - "psychedelic_rock"
+            - "puerto_rico"
+            - "pumpkin"
+            - "pumpkin_glow"
+            - "pumpkin_party"
+            - "pumpkin_spice"
+            - "punk"
+            - "qatar"
+            - "ramadan"
+            - "redrum"
             - "relaxing"
+            - "republic_of_ireland"
+            - "republic_of_the_congo"
+            - "romance"
+            - "romania"
+            - "rousseau"
+            - "russia"
+            - "rwanda"
+            - "sage_and_cedar"
+            - "saint_kitts_and_nevis"
+            - "saint_lucia"
+            - "saint_vincent_and_the_grenadines"
+            - "samoa"
+            - "san_marino"
             - "santa"
+            - "santas_candy"
+            - "santas_workshop"
+            - "sao_tome_and_principe"
+            - "saturn"
+            - "saudi_arabia"
+            - "sci_fi"
+            - "scotland"
+            - "scream_queen"
+            - "self_care_sanctuary"
+            - "senegal"
+            - "serbia"
             - "serene"
+            - "seychelles"
+            - "shamrock"
+            - "sierra_leone"
+            - "singapore"
+            - "slasher"
+            - "sleepy"
+            - "slovakia"
+            - "slovenia"
+            - "snake_banisher"
+            - "snowflake"
+            - "solomon_islands"
+            - "somalia"
             - "soothing"
+            - "south_africa"
+            - "south_korea"
+            - "south_sudan"
+            - "spacey"
+            - "spain"
+            - "spiders_lair"
             - "sports"
             - "spring"
+            - "sri_lanka"
+            - "st_patricks_day"
+            - "stardust"
+            - "storm_front"
+            - "sudan"
+            - "summer_dusk"
+            - "sun"
+            - "suriname"
+            - "sweden"
+            - "switzerland"
+            - "synthwave"
+            - "syria"
+            - "taiwan"
+            - "tajikistan"
+            - "tanzania"
+            - "taps"
+            - "thailand"
+            - "thanksgiving"
+            - "the_tricolour"
+            - "timor_leste"
+            - "togo"
+            - "tonga"
+            - "toxic_cauldron"
             - "tranquil"
+            - "trinidad_and_tobago"
+            - "tropical"
+            - "tunisia"
+            - "turkey_dinner"
+            - "turkiye"
+            - "turkmenistan"
+            - "tuvalu"
+            - "uganda"
+            - "ukraine"
+            - "united_arab_emirates"
+            - "united_kingdom"
+            - "uranus"
+            - "uruguay"
+            - "usa"
+            - "uzbekistan"
+            - "valentines"
+            - "vampires_den"
+            - "van_gogh"
+            - "vanuatu"
+            - "vaporwave"
+            - "vatican_city"
+            - "venezuela"
+            - "venus"
+            - "vermeer"
+            - "vietnam"
+            - "wales"
+            - "warm_ember"
             - "warming"
+            - "water"
+            - "whats_the_craic"
+            - "wheat_glow"
+            - "winter_night"
+            - "winter_wonderland"
+            - "witchs_ritual"
+            - "witchy"
+            - "yemen"
+            - "zambia"
+            - "zimbabwe"
+            - "zombie"
+            - "zombie_apocalypse"
     power_on:
-      name: Power on
-      description: Powered off lights will be turned on before starting the effect.
       default: true
       selector:
         boolean:
-effect_stop:
-  name: Stop effect
-  description: Stop a running effect.
+effect_sky:
   target:
     entity:
       integration: lifx
       domain: light
+  fields:
+    power_on:
+      default: true
+      selector:
+        boolean:
+    speed:
+      default: 50
+      example: 50
+      selector:
+        number:
+          min: 0
+          max: 86400
+          step: 1
+          unit_of_measurement: seconds
+    duration:
+      default: 0
+      example: 1800
+      selector:
+        number:
+          min: 0
+          max: 86400
+          step: 1
+          unit_of_measurement: seconds
+    sky_type:
+      default: "Clouds"
+      example: "Clouds"
+      selector:
+        select:
+          options:
+            - "Clouds"
+            - "Sunrise"
+            - "Sunset"
+    cloud_saturation_min:
+      default: 50
+      example: 50
+      selector:
+        number:
+          min: 0
+          max: 255
+    cloud_saturation_max:
+      default: 180
+      example: 180
+      selector:
+        number:
+          min: 0
+          max: 255
+    palette:
+      example:
+        - "[200, 1, 1, 3500]"
+        - "[241, 1, 0.01, 3500]"
+        - "[189, 1, 0.08, 3500]"
+        - "[40, 1, 1, 3500]"
+        - "[40, 0.5, 1, 3500]"
+        - "[40, 0, 1, 6500]"
+      selector:
+        object:
+effect_stop:
+  target:
+    entity:
+      integration: lifx
+      domain: light
+paint_theme:
+  target:
+    entity:
+      integration: lifx
+      domain: light
+  fields:
+    palette:
+      example:
+        - "[[0, 100, 100, 3500], [60, 100, 100, 3500]]"
+      selector:
+        object:
+    theme:
+      example: exciting
+      default: exciting
+      selector:
+        select:
+          mode: dropdown
+          options:
+            - "afghanistan"
+            - "albania"
+            - "algeria"
+            - "andorra"
+            - "angola"
+            - "antigua_and_barbuda"
+            - "arctic"
+            - "argentina"
+            - "arlington"
+            - "armenia"
+            - "aurora"
+            - "aurora_borealis"
+            - "australia"
+            - "austria"
+            - "autumn"
+            - "autumn_table"
+            - "azerbaijan"
+            - "bahamas"
+            - "bahrain"
+            - "bangladesh"
+            - "barbados"
+            - "baubles"
+            - "be_my_valentine"
+            - "beach"
+            - "bedroom_glow_up"
+            - "belarus"
+            - "belgium"
+            - "belize"
+            - "benin"
+            - "bhutan"
+            - "bias_lighting"
+            - "bijutsukai"
+            - "blissful"
+            - "blood_moon"
+            - "bloodlust"
+            - "bolivia"
+            - "book_of_the_dead"
+            - "bosnia_and_herzegovina"
+            - "botswana"
+            - "brazil"
+            - "brunei"
+            - "bulgaria"
+            - "burkina_faso"
+            - "burundi"
+            - "cabo_verde"
+            - "calaveras"
+            - "cambodia"
+            - "cameroon"
+            - "canada"
+            - "canada_day"
+            - "candy_cane"
+            - "candy_cane_twist"
+            - "central_african_republic"
+            - "chad"
+            - "cheerful"
+            - "cherry_blossom"
+            - "chile"
+            - "china"
+            - "christmas"
+            - "classic_rock"
+            - "classical"
+            - "clouds"
+            - "colombia"
+            - "comoros"
+            - "coral_reef"
+            - "costa_rica"
+            - "cote_divoire"
+            - "cranberry_harvest"
+            - "croatia"
+            - "crystal_twist"
+            - "cuba"
+            - "curacao"
+            - "cyberpunk"
+            - "cyprus"
+            - "czechia"
+            - "dance_pop"
+            - "deck_the_halls"
+            - "deep_sea"
+            - "denmark"
+            - "desert"
+            - "dinner_for_two"
+            - "disco"
+            - "diwali"
+            - "djibouti"
+            - "dominica"
+            - "dominican_republic"
+            - "dr_congo"
+            - "dream"
+            - "earth"
+            - "ecuador"
+            - "egypt"
+            - "el_salvador"
+            - "energising"
+            - "energizing"
+            - "england"
+            - "epic"
+            - "equatorial_guinea"
+            - "eritrea"
+            - "estonia"
+            - "eswatini"
+            - "eternal"
+            - "ethiopia"
+            - "european_union"
+            - "evening"
+            - "exciting"
+            - "extraterrestrial"
+            - "fall"
+            - "fantasy"
+            - "festive"
+            - "fiji"
+            - "finland"
+            - "fire"
+            - "fireworks_finale"
+            - "focus"
+            - "focusing"
+            - "forest"
+            - "forrest"
+            - "france"
+            - "fright_night"
+            - "funk"
+            - "gabon"
+            - "galaxy"
+            - "gambia"
+            - "garage_rock"
+            - "gauguin"
+            - "gentle"
+            - "georgia"
+            - "germany"
+            - "ghana"
+            - "ghostly"
+            - "gold_star"
+            - "graveyard_chill"
+            - "greece"
+            - "grenada"
+            - "guatemala"
+            - "guinea"
+            - "guinea_bissau"
+            - "guyana"
+            - "haiti"
+            - "halloween"
+            - "hanukkah"
+            - "haunted_fog"
+            - "hip_hop_rap"
+            - "hokusai"
+            - "holly"
+            - "honduras"
+            - "hong_kong"
+            - "hungary"
+            - "hygge"
+            - "iceland"
+            - "independence"
+            - "india"
+            - "indie_pop"
+            - "indonesia"
+            - "intense"
+            - "iran"
+            - "iraq"
+            - "israel"
+            - "italy"
+            - "jamaica"
+            - "japan"
+            - "jazz"
+            - "jordan"
+            - "jupiter"
+            - "kandinsky"
+            - "kazakhstan"
+            - "kenya"
+            - "kiribati"
+            - "klimt"
+            - "kosovo"
+            - "kuwait"
+            - "kwanzaa"
+            - "kyrgyzstan"
+            - "laos"
+            - "latvia"
+            - "lebanon"
+            - "leprechaun_treasure"
+            - "lesotho"
+            - "liberia"
+            - "libya"
+            - "liechtenstein"
+            - "lithuania"
+            - "lo_fi"
+            - "love"
+            - "lucky_shamrock"
+            - "luxembourg"
+            - "madagascar"
+            - "malawi"
+            - "malaysia"
+            - "maldives"
+            - "mali"
+            - "malta"
+            - "marc"
+            - "mars"
+            - "marshall_islands"
+            - "matisse"
+            - "mauritania"
+            - "mauritius"
+            - "mellow"
+            - "memorial_day"
+            - "menorah"
+            - "mercury"
+            - "mexico"
+            - "micronesia"
+            - "midnight_shadows"
+            - "mistletoe"
+            - "moldova"
+            - "molly_malone"
+            - "monaco"
+            - "mondrian"
+            - "monet"
+            - "mongolia"
+            - "montenegro"
+            - "moon"
+            - "morocco"
+            - "movie_night_romance"
+            - "mozambique"
+            - "munch"
+            - "myanmar"
+            - "namibia"
+            - "nauru"
+            - "neon"
+            - "nepal"
+            - "neptune"
+            - "netherlands"
+            - "new_zealand"
+            - "nicaragua"
+            - "niger"
+            - "nigeria"
+            - "north_korea"
+            - "north_macedonia"
+            - "northern_ireland"
+            - "norway"
+            - "ocean"
+            - "oktoberfest"
+            - "old_glory"
+            - "oman"
+            - "outback"
+            - "pakistan"
+            - "palau"
+            - "palestine"
+            - "panama"
+            - "papua_new_guinea"
+            - "parade"
+            - "paraguay"
+            - "paranormal"
+            - "party"
+            - "peaceful"
+            - "peru"
+            - "philippines"
+            - "pine_glow"
+            - "pluto"
+            - "poland"
+            - "pop"
+            - "poppy"
+            - "portugal"
+            - "powerful"
+            - "pride"
+            - "proud"
+            - "psychedelic_rock"
+            - "puerto_rico"
+            - "pumpkin"
+            - "pumpkin_glow"
+            - "pumpkin_party"
+            - "pumpkin_spice"
+            - "punk"
+            - "qatar"
+            - "ramadan"
+            - "redrum"
+            - "relaxing"
+            - "republic_of_ireland"
+            - "republic_of_the_congo"
+            - "romance"
+            - "romania"
+            - "rousseau"
+            - "russia"
+            - "rwanda"
+            - "sage_and_cedar"
+            - "saint_kitts_and_nevis"
+            - "saint_lucia"
+            - "saint_vincent_and_the_grenadines"
+            - "samoa"
+            - "san_marino"
+            - "santa"
+            - "santas_candy"
+            - "santas_workshop"
+            - "sao_tome_and_principe"
+            - "saturn"
+            - "saudi_arabia"
+            - "sci_fi"
+            - "scotland"
+            - "scream_queen"
+            - "self_care_sanctuary"
+            - "senegal"
+            - "serbia"
+            - "serene"
+            - "seychelles"
+            - "shamrock"
+            - "sierra_leone"
+            - "singapore"
+            - "slasher"
+            - "sleepy"
+            - "slovakia"
+            - "slovenia"
+            - "snake_banisher"
+            - "snowflake"
+            - "solomon_islands"
+            - "somalia"
+            - "soothing"
+            - "south_africa"
+            - "south_korea"
+            - "south_sudan"
+            - "spacey"
+            - "spain"
+            - "spiders_lair"
+            - "sports"
+            - "spring"
+            - "sri_lanka"
+            - "st_patricks_day"
+            - "stardust"
+            - "storm_front"
+            - "sudan"
+            - "summer_dusk"
+            - "sun"
+            - "suriname"
+            - "sweden"
+            - "switzerland"
+            - "synthwave"
+            - "syria"
+            - "taiwan"
+            - "tajikistan"
+            - "tanzania"
+            - "taps"
+            - "thailand"
+            - "thanksgiving"
+            - "the_tricolour"
+            - "timor_leste"
+            - "togo"
+            - "tonga"
+            - "toxic_cauldron"
+            - "tranquil"
+            - "trinidad_and_tobago"
+            - "tropical"
+            - "tunisia"
+            - "turkey_dinner"
+            - "turkiye"
+            - "turkmenistan"
+            - "tuvalu"
+            - "uganda"
+            - "ukraine"
+            - "united_arab_emirates"
+            - "united_kingdom"
+            - "uranus"
+            - "uruguay"
+            - "usa"
+            - "uzbekistan"
+            - "valentines"
+            - "vampires_den"
+            - "van_gogh"
+            - "vanuatu"
+            - "vaporwave"
+            - "vatican_city"
+            - "venezuela"
+            - "venus"
+            - "vermeer"
+            - "vietnam"
+            - "wales"
+            - "warm_ember"
+            - "warming"
+            - "water"
+            - "whats_the_craic"
+            - "wheat_glow"
+            - "winter_night"
+            - "winter_wonderland"
+            - "witchs_ritual"
+            - "witchy"
+            - "yemen"
+            - "zambia"
+            - "zimbabwe"
+            - "zombie"
+            - "zombie_apocalypse"
+    transition:
+      selector:
+        number:
+          min: 0
+          max: 3600
+          unit_of_measurement: seconds
+    power_on:
+      default: true
+      selector:
+        boolean:

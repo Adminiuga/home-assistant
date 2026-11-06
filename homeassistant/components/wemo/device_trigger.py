@@ -1,24 +1,24 @@
 """Triggers for WeMo devices."""
-from __future__ import annotations
 
+import probatio
 from pywemo.subscribe import EVENT_TYPE_LONG_PRESS
-import voluptuous as vol
 
 from homeassistant.components.device_automation import DEVICE_TRIGGER_BASE_SCHEMA
 from homeassistant.components.homeassistant.triggers import event as event_trigger
+from homeassistant.components.homeassistant.triggers.event import EventTriggerArgument
 from homeassistant.const import CONF_DEVICE_ID, CONF_DOMAIN, CONF_PLATFORM, CONF_TYPE
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant
 from homeassistant.helpers.trigger import TriggerActionType, TriggerInfo
 from homeassistant.helpers.typing import ConfigType
 
-from .const import DOMAIN as WEMO_DOMAIN, WEMO_SUBSCRIPTION_EVENT
-from .wemo_device import async_get_coordinator
+from .const import DOMAIN, WEMO_SUBSCRIPTION_EVENT
+from .coordinator import async_get_coordinator
 
 TRIGGER_TYPES = {EVENT_TYPE_LONG_PRESS}
 
 TRIGGER_SCHEMA = DEVICE_TRIGGER_BASE_SCHEMA.extend(
     {
-        vol.Required(CONF_TYPE): vol.In(TRIGGER_TYPES),
+        probatio.Required(CONF_TYPE): probatio.In(TRIGGER_TYPES),
     }
 )
 
@@ -31,7 +31,7 @@ async def async_get_triggers(
     wemo_trigger = {
         # Required fields of TRIGGER_BASE_SCHEMA
         CONF_PLATFORM: "device",
-        CONF_DOMAIN: WEMO_DOMAIN,
+        CONF_DOMAIN: DOMAIN,
         CONF_DEVICE_ID: device_id,
     }
 
@@ -60,9 +60,9 @@ async def async_attach_trigger(
     """Attach a trigger."""
     event_config = event_trigger.TRIGGER_SCHEMA(
         {
-            event_trigger.CONF_PLATFORM: "event",
-            event_trigger.CONF_EVENT_TYPE: WEMO_SUBSCRIPTION_EVENT,
-            event_trigger.CONF_EVENT_DATA: {
+            EventTriggerArgument.PLATFORM: "event",
+            EventTriggerArgument.EVENT_TYPE: WEMO_SUBSCRIPTION_EVENT,
+            EventTriggerArgument.EVENT_DATA: {
                 CONF_DEVICE_ID: config[CONF_DEVICE_ID],
                 CONF_TYPE: config[CONF_TYPE],
             },

@@ -1,66 +1,73 @@
 """The Steam integration."""
-from __future__ import annotations
 
-from homeassistant.config_entries import ConfigEntry
+from typing import TYPE_CHECKING
+
+from homeassistant.config_entries import ConfigSubentry
 from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers.device_registry import DeviceEntryType
-from homeassistant.helpers.entity import DeviceInfo
-from homeassistant.helpers.issue_registry import IssueSeverity, async_create_issue
-from homeassistant.helpers.typing import ConfigType
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import device_registry as dr, entity_registry as er
 
-from .const import DEFAULT_NAME, DOMAIN
-from .coordinator import SteamDataUpdateCoordinator
+from .const import CONF_ACCOUNTS, DOMAIN, SUBENTRY_TYPE_FRIEND
+from .coordinator import SteamConfigEntry, SteamDataUpdateCoordinator
 
-PLATFORMS = [Platform.SENSOR]
+PLATFORMS = [Platform.IMAGE, Platform.SENSOR]
 
 
-async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    """Set up the Steam integration."""
-    if DOMAIN in config:
-        async_create_issue(
-            hass,
-            DOMAIN,
-            "removed_yaml",
-            breaks_in_ha_version="2022.8.0",
-            is_fixable=False,
-            severity=IssueSeverity.WARNING,
-            translation_key="removed_yaml",
-        )
-
-    return True
-
-
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_setup_entry(hass: HomeAssistant, entry: SteamConfigEntry) -> None:
     """Set up Steam from a config entry."""
-    coordinator = SteamDataUpdateCoordinator(hass)
+    coordinator = SteamDataUpdateCoordinator(hass, entry)
     await coordinator.async_config_entry_first_refresh()
-    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
-    hass.config_entries.async_setup_platforms(entry, PLATFORMS)
+    entry.runtime_data = coordinator
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    return True
+    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def _async_update_listener(hass: HomeAssistant, entry: SteamConfigEntry) -> None:
+    """Handle update."""
+    await hass.config_entries.async_reload(entry.entry_id)
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: SteamConfigEntry) -> None:
     """Unload a config entry."""
-    if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
-        hass.data[DOMAIN].pop(entry.entry_id)
-    return unload_ok
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)
 
 
-class SteamEntity(CoordinatorEntity[SteamDataUpdateCoordinator]):
-    """Representation of a Steam entity."""
+async def async_migrate_entry(hass: HomeAssistant, entry: SteamConfigEntry) -> None:
+    """Migrate old entry."""
 
-    _attr_attribution = "Data provided by Steam"
+    if entry.version < 2:
+        # Migrate entity unique id
 
-    def __init__(self, coordinator: SteamDataUpdateCoordinator) -> None:
-        """Initialize a Steam entity."""
-        super().__init__(coordinator)
-        self._attr_device_info = DeviceInfo(
-            configuration_url="https://store.steampowered.com",
-            entry_type=DeviceEntryType.SERVICE,
-            identifiers={(DOMAIN, coordinator.config_entry.entry_id)},
-            manufacturer=DEFAULT_NAME,
-            name=DEFAULT_NAME,
-        )
+        @callback
+        def migrate_unique_id(entity_entry: er.RegistryEntry) -> dict[str, str] | None:
+            if entity_entry.unique_id.startswith("sensor.steam_"):
+                new = entity_entry.unique_id.removeprefix("sensor.steam_") + "_account"
+                return {"new_unique_id": new}
+            return None
+
+        await er.async_migrate_entries(hass, entry.entry_id, migrate_unique_id)
+        hass.config_entries.async_update_entry(entry, version=2)
+
+    if entry.version < 3:
+        for steamid, name in entry.options[CONF_ACCOUNTS].items():
+            if steamid == entry.unique_id:
+                continue
+            subentry = ConfigSubentry(
+                subentry_type=SUBENTRY_TYPE_FRIEND,
+                title=name,
+                unique_id=steamid,
+                data={},  # type: ignore[arg-type]
+            )
+            hass.config_entries.async_add_subentry(entry, subentry)
+
+        dev_reg = dr.async_get(hass)
+        if device := dev_reg.async_get_device_by_identifier(
+            (DOMAIN, entry.entry_id), entry.entry_id
+        ):
+            if TYPE_CHECKING:
+                assert entry.unique_id
+            dev_reg.async_update_device(
+                device.id, new_identifiers={(DOMAIN, entry.unique_id)}
+            )
+        hass.config_entries.async_update_entry(entry, version=3, options={})

@@ -1,5 +1,9 @@
 """Tests for the HDMI-CEC media player platform."""
+
+from typing import Any
+
 from pycec.const import (
+    CMD_STANDBY,
     DEVICE_TYPE_NAMES,
     KEY_BACKWARD,
     KEY_FORWARD,
@@ -49,42 +53,17 @@ from homeassistant.const import (
     STATE_UNAVAILABLE,
     STATE_UNKNOWN,
 )
+from homeassistant.core import HomeAssistant
 
-from . import MockHDMIDevice, assert_key_press_release
-
-
-@pytest.fixture(
-    name="assert_state",
-    params=[
-        False,
-        pytest.param(
-            True,
-            marks=pytest.mark.xfail(
-                reason="""State isn't updated because the function is missing the
-                `schedule_update_ha_state` for a correct push entity. Would still
-                update once the data comes back from the device."""
-            ),
-        ),
-    ],
-    ids=["skip_assert_state", "run_assert_state"],
-)
-def assert_state_fixture(hass, request):
-    """Allow for skipping the assert state changes.
-
-    This is broken in this entity, but we still want to test that
-    the rest of the code works as expected.
-    """
-
-    def test_state(state, expected):
-        if request.param:
-            assert state == expected
-        else:
-            assert True
-
-    return test_state
+from . import MockHDMIDevice, assert_cec_command, assert_key_press_release
+from .conftest import CecEntityCreator, HDMINetworkCreator
 
 
-async def test_load_platform(hass, create_hdmi_network, create_cec_entity):
+async def test_load_platform(
+    hass: HomeAssistant,
+    create_hdmi_network: HDMINetworkCreator,
+    create_cec_entity: CecEntityCreator,
+) -> None:
     """Test that media_player entity is loaded."""
     hdmi_network = await create_hdmi_network(config={"platform": "media_player"})
     mock_hdmi_device = MockHDMIDevice(logical_address=3)
@@ -98,7 +77,12 @@ async def test_load_platform(hass, create_hdmi_network, create_cec_entity):
 
 
 @pytest.mark.parametrize("platform", [{}, {"platform": "switch"}])
-async def test_load_types(hass, create_hdmi_network, create_cec_entity, platform):
+async def test_load_types(
+    hass: HomeAssistant,
+    create_hdmi_network: HDMINetworkCreator,
+    create_cec_entity: CecEntityCreator,
+    platform: dict[str, Any],
+) -> None:
     """Test that media_player entity is loaded when types is set."""
     config = platform | {"types": {"hdmi_cec.hdmi_4": "media_player"}}
     hdmi_network = await create_hdmi_network(config=config)
@@ -121,7 +105,11 @@ async def test_load_types(hass, create_hdmi_network, create_cec_entity, platform
     assert state is None
 
 
-async def test_service_on(hass, create_hdmi_network, create_cec_entity, assert_state):
+async def test_service_on(
+    hass: HomeAssistant,
+    create_hdmi_network: HDMINetworkCreator,
+    create_cec_entity: CecEntityCreator,
+) -> None:
     """Test that media_player triggers on `on` service."""
     hdmi_network = await create_hdmi_network({"platform": "media_player"})
     mock_hdmi_device = MockHDMIDevice(logical_address=3)
@@ -135,15 +123,18 @@ async def test_service_on(hass, create_hdmi_network, create_cec_entity, assert_s
         {ATTR_ENTITY_ID: "media_player.hdmi_3"},
         blocking=True,
     )
-    await hass.async_block_till_done()
 
     mock_hdmi_device.turn_on.assert_called_once_with()
 
     state = hass.states.get("media_player.hdmi_3")
-    assert_state(state.state, STATE_ON)
+    assert state.state == STATE_ON
 
 
-async def test_service_off(hass, create_hdmi_network, create_cec_entity, assert_state):
+async def test_service_off(
+    hass: HomeAssistant,
+    create_hdmi_network: HDMINetworkCreator,
+    create_cec_entity: CecEntityCreator,
+) -> None:
     """Test that media_player triggers on `off` service."""
     hdmi_network = await create_hdmi_network({"platform": "media_player"})
     mock_hdmi_device = MockHDMIDevice(logical_address=3)
@@ -158,14 +149,19 @@ async def test_service_off(hass, create_hdmi_network, create_cec_entity, assert_
         blocking=True,
     )
 
-    mock_hdmi_device.turn_off.assert_called_once_with()
+    mock_hdmi_device.turn_off.assert_not_called()
+    assert_cec_command(
+        mock_hdmi_device.send_command,
+        cmd=CMD_STANDBY,
+        dst=mock_hdmi_device.logical_address,
+    )
 
     state = hass.states.get("media_player.hdmi_3")
-    assert_state(state.state, STATE_OFF)
+    assert state.state == STATE_OFF
 
 
 @pytest.mark.parametrize(
-    "type_id,expected_features",
+    ("type_id", "expected_features"),
     [
         (TYPE_TV, (MPEF.TURN_ON, MPEF.TURN_OFF)),
         (
@@ -196,7 +192,10 @@ async def test_service_off(hass, create_hdmi_network, create_cec_entity, assert_
                 MPEF.STOP,
             ),
             marks=pytest.mark.xfail(
-                reason="Checking for the wrong attribute, should be checking `type_id`, is checking `type`."
+                reason=(
+                    "Checking for the wrong attribute, should be"
+                    " checking `type_id`, is checking `type`."
+                )
             ),
         ),
         pytest.param(
@@ -217,7 +216,10 @@ async def test_service_off(hass, create_hdmi_network, create_cec_entity, assert_
                 MPEF.NEXT_TRACK,
             ),
             marks=pytest.mark.xfail(
-                reason="Checking for the wrong attribute, should be checking `type_id`, is checking `type`."
+                reason=(
+                    "Checking for the wrong attribute, should be"
+                    " checking `type_id`, is checking `type`."
+                )
             ),
         ),
         pytest.param(
@@ -239,8 +241,12 @@ async def test_service_off(hass, create_hdmi_network, create_cec_entity, assert_
     ],
 )
 async def test_supported_features(
-    hass, create_hdmi_network, create_cec_entity, type_id, expected_features
-):
+    hass: HomeAssistant,
+    create_hdmi_network: HDMINetworkCreator,
+    create_cec_entity: CecEntityCreator,
+    type_id: int,
+    expected_features: MPEF,
+) -> None:
     """Test that features load as expected."""
     hdmi_network = await create_hdmi_network({"platform": "media_player"})
     mock_hdmi_device = MockHDMIDevice(
@@ -255,7 +261,7 @@ async def test_supported_features(
 
 
 @pytest.mark.parametrize(
-    "service,extra_data,key",
+    ("service", "extra_data", "key"),
     [
         (SERVICE_VOLUME_DOWN, None, KEY_VOLUME_DOWN),
         (SERVICE_VOLUME_UP, None, KEY_VOLUME_UP),
@@ -264,8 +270,13 @@ async def test_supported_features(
     ],
 )
 async def test_volume_services(
-    hass, create_hdmi_network, create_cec_entity, service, extra_data, key
-):
+    hass: HomeAssistant,
+    create_hdmi_network: HDMINetworkCreator,
+    create_cec_entity: CecEntityCreator,
+    service: str,
+    extra_data: dict[str, Any] | None,
+    key: int,
+) -> None:
     """Test volume related commands."""
     hdmi_network = await create_hdmi_network({"platform": "media_player"})
     mock_hdmi_device = MockHDMIDevice(logical_address=3, type=TYPE_AUDIO)
@@ -281,22 +292,25 @@ async def test_volume_services(
         data,
         blocking=True,
     )
-    await hass.async_block_till_done()
 
     assert mock_hdmi_device.send_command.call_count == 2
     assert_key_press_release(mock_hdmi_device.send_command, dst=3, key=key)
 
 
 @pytest.mark.parametrize(
-    "service,key",
+    ("service", "key"),
     [
         (SERVICE_MEDIA_NEXT_TRACK, KEY_FORWARD),
         (SERVICE_MEDIA_PREVIOUS_TRACK, KEY_BACKWARD),
     ],
 )
 async def test_track_change_services(
-    hass, create_hdmi_network, create_cec_entity, service, key
-):
+    hass: HomeAssistant,
+    create_hdmi_network: HDMINetworkCreator,
+    create_cec_entity: CecEntityCreator,
+    service: str,
+    key: int,
+) -> None:
     """Test track change related commands."""
     hdmi_network = await create_hdmi_network({"platform": "media_player"})
     mock_hdmi_device = MockHDMIDevice(logical_address=3, type=TYPE_RECORDER)
@@ -308,14 +322,13 @@ async def test_track_change_services(
         {ATTR_ENTITY_ID: "media_player.hdmi_3"},
         blocking=True,
     )
-    await hass.async_block_till_done()
 
     assert mock_hdmi_device.send_command.call_count == 2
     assert_key_press_release(mock_hdmi_device.send_command, dst=3, key=key)
 
 
 @pytest.mark.parametrize(
-    "service,key,expected_state",
+    ("service", "key", "expected_state"),
     [
         pytest.param(
             SERVICE_MEDIA_PLAY,
@@ -330,14 +343,13 @@ async def test_track_change_services(
     ],
 )
 async def test_playback_services(
-    hass,
-    create_hdmi_network,
-    create_cec_entity,
-    assert_state,
-    service,
-    key,
-    expected_state,
-):
+    hass: HomeAssistant,
+    create_hdmi_network: HDMINetworkCreator,
+    create_cec_entity: CecEntityCreator,
+    service: str,
+    key: int,
+    expected_state: str,
+) -> None:
     """Test playback related commands."""
     hdmi_network = await create_hdmi_network({"platform": "media_player"})
     mock_hdmi_device = MockHDMIDevice(logical_address=3, type=TYPE_RECORDER)
@@ -349,22 +361,20 @@ async def test_playback_services(
         {ATTR_ENTITY_ID: "media_player.hdmi_3"},
         blocking=True,
     )
-    await hass.async_block_till_done()
 
     assert mock_hdmi_device.send_command.call_count == 2
     assert_key_press_release(mock_hdmi_device.send_command, dst=3, key=key)
 
     state = hass.states.get("media_player.hdmi_3")
-    assert_state(state.state, expected_state)
+    assert state.state == expected_state
 
 
 @pytest.mark.xfail(reason="PLAY feature isn't enabled")
 async def test_play_pause_service(
-    hass,
-    create_hdmi_network,
-    create_cec_entity,
-    assert_state,
-):
+    hass: HomeAssistant,
+    create_hdmi_network: HDMINetworkCreator,
+    create_cec_entity: CecEntityCreator,
+) -> None:
     """Test play pause service."""
     hdmi_network = await create_hdmi_network({"platform": "media_player"})
     mock_hdmi_device = MockHDMIDevice(
@@ -378,13 +388,12 @@ async def test_play_pause_service(
         {ATTR_ENTITY_ID: "media_player.hdmi_3"},
         blocking=True,
     )
-    await hass.async_block_till_done()
 
     assert mock_hdmi_device.send_command.call_count == 2
     assert_key_press_release(mock_hdmi_device.send_command, dst=3, key=KEY_PAUSE)
 
     state = hass.states.get("media_player.hdmi_3")
-    assert_state(state.state, STATE_PAUSED)
+    assert state.state == STATE_PAUSED
 
     await hass.services.async_call(
         MEDIA_PLAYER_DOMAIN,
@@ -392,14 +401,13 @@ async def test_play_pause_service(
         {ATTR_ENTITY_ID: "media_player.hdmi_3"},
         blocking=True,
     )
-    await hass.async_block_till_done()
 
     assert mock_hdmi_device.send_command.call_count == 4
     assert_key_press_release(mock_hdmi_device.send_command, 1, dst=3, key=KEY_PLAY)
 
 
 @pytest.mark.parametrize(
-    "type_id,update_data,expected_state",
+    ("type_id", "update_data", "expected_state"),
     [
         (TYPE_TV, {"power_status": POWER_OFF}, STATE_OFF),
         (TYPE_TV, {"power_status": 3}, STATE_OFF),
@@ -422,8 +430,13 @@ async def test_play_pause_service(
     ],
 )
 async def test_update_state(
-    hass, create_hdmi_network, create_cec_entity, type_id, update_data, expected_state
-):
+    hass: HomeAssistant,
+    create_hdmi_network: HDMINetworkCreator,
+    create_cec_entity: CecEntityCreator,
+    type_id: int,
+    update_data: dict[str, Any],
+    expected_state: str,
+) -> None:
     """Test state updates work as expected."""
     hdmi_network = await create_hdmi_network({"platform": "media_player"})
     mock_hdmi_device = MockHDMIDevice(logical_address=3, type=type_id)
@@ -438,7 +451,7 @@ async def test_update_state(
 
 
 @pytest.mark.parametrize(
-    "data,expected_state",
+    ("data", "expected_state"),
     [
         ({"power_status": POWER_OFF}, STATE_OFF),
         ({"power_status": 3}, STATE_OFF),
@@ -468,8 +481,12 @@ async def test_update_state(
     ],
 )
 async def test_starting_state(
-    hass, create_hdmi_network, create_cec_entity, data, expected_state
-):
+    hass: HomeAssistant,
+    create_hdmi_network: HDMINetworkCreator,
+    create_cec_entity: CecEntityCreator,
+    data: dict[str, Any],
+    expected_state: str,
+) -> None:
     """Test starting states are set as expected."""
     hdmi_network = await create_hdmi_network({"platform": "media_player"})
     mock_hdmi_device = MockHDMIDevice(logical_address=3, **data)
@@ -478,16 +495,18 @@ async def test_starting_state(
     assert state.state == expected_state
 
 
-@pytest.mark.xfail(
-    reason="The code only sets the state to unavailable, doesn't set the `_attr_available` to false."
-)
-async def test_unavailable_status(hass, create_hdmi_network, create_cec_entity):
+async def test_unavailable_status(
+    hass: HomeAssistant,
+    create_hdmi_network: HDMINetworkCreator,
+    create_cec_entity: CecEntityCreator,
+) -> None:
     """Test entity goes into unavailable status when expected."""
     hdmi_network = await create_hdmi_network({"platform": "media_player"})
     mock_hdmi_device = MockHDMIDevice(logical_address=3)
     await create_cec_entity(hdmi_network, mock_hdmi_device)
 
     hass.bus.async_fire(EVENT_HDMI_CEC_UNAVAILABLE)
+    await hass.async_block_till_done()
 
     state = hass.states.get("media_player.hdmi_3")
     assert state.state == STATE_UNAVAILABLE

@@ -1,9 +1,14 @@
 """The tests for the Light Switch platform."""
+
+import pytest
+
 from homeassistant.components.light import (
     ATTR_COLOR_MODE,
     ATTR_SUPPORTED_COLOR_MODES,
     ColorMode,
 )
+from homeassistant.components.switch import DOMAIN
+from homeassistant.core import HomeAssistant
 from homeassistant.setup import async_setup_component
 
 from . import common as switch_common
@@ -11,7 +16,13 @@ from . import common as switch_common
 from tests.components.light import common
 
 
-async def test_default_state(hass):
+@pytest.fixture(autouse=True)
+async def setup_homeassistant(hass: HomeAssistant):
+    """Set up the homeassistant integration."""
+    await async_setup_component(hass, "homeassistant", {})
+
+
+async def test_default_state(hass: HomeAssistant) -> None:
     """Test light switch default state."""
     await async_setup_component(
         hass,
@@ -39,9 +50,9 @@ async def test_default_state(hass):
     assert state.attributes.get(ATTR_COLOR_MODE) is None
 
 
-async def test_light_service_calls(hass):
+async def test_light_service_calls(hass: HomeAssistant) -> None:
     """Test service calls to light."""
-    await async_setup_component(hass, "switch", {"switch": [{"platform": "demo"}]})
+    await async_setup_component(hass, DOMAIN, {"switch": [{"platform": "demo"}]})
     await async_setup_component(
         hass,
         "light",
@@ -52,11 +63,13 @@ async def test_light_service_calls(hass):
     assert hass.states.get("light.light_switch").state == "on"
 
     await common.async_toggle(hass, "light.light_switch")
+    await hass.async_block_till_done()
 
     assert hass.states.get("switch.decorative_lights").state == "off"
     assert hass.states.get("light.light_switch").state == "off"
 
     await common.async_turn_on(hass, "light.light_switch")
+    await hass.async_block_till_done()
 
     assert hass.states.get("switch.decorative_lights").state == "on"
     assert hass.states.get("light.light_switch").state == "on"
@@ -72,9 +85,9 @@ async def test_light_service_calls(hass):
     assert hass.states.get("light.light_switch").state == "off"
 
 
-async def test_switch_service_calls(hass):
+async def test_switch_service_calls(hass: HomeAssistant) -> None:
     """Test service calls to switch."""
-    await async_setup_component(hass, "switch", {"switch": [{"platform": "demo"}]})
+    await async_setup_component(hass, DOMAIN, {"switch": [{"platform": "demo"}]})
     await async_setup_component(
         hass,
         "light",

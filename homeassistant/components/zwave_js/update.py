@@ -1,14 +1,13 @@
 """Representation of Z-Wave updates."""
-from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections import Counter
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Final, cast, override
 
 from awesomeversion import AwesomeVersion
-from zwave_js_server.client import Client as ZwaveClient
-from zwave_js_server.const import NodeStatus
 from zwave_js_server.exceptions import BaseZwaveJSServerError, FailedZWaveCommand
 from zwave_js_server.model.driver import Driver
 from zwave_js_server.model.firmware import (
@@ -17,43 +16,148 @@ from zwave_js_server.model.firmware import (
     FirmwareUpdateResult,
 )
 from zwave_js_server.model.node import Node as ZwaveNode
+from zwave_js_server.model.node.firmware import NodeFirmwareUpdateInfo
 
 from homeassistant.components.update import (
     UpdateDeviceClass,
     UpdateEntity,
+    UpdateEntityDescription,
     UpdateEntityFeature,
+    UpdateEntityStateAttribute,
 )
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.const import EntityCategory
+from homeassistant.core import CoreState, HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
-from homeassistant.helpers.entity import EntityCategory
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.event import async_call_later
-from homeassistant.helpers.start import async_at_start
+from homeassistant.helpers.restore_state import ExtraStoredData
 
-from .const import API_KEY_FIRMWARE_UPDATE_SERVICE, DATA_CLIENT, DOMAIN, LOGGER
-from .helpers import get_device_info, get_valueless_base_unique_id
+from .const import API_KEY_FIRMWARE_UPDATE_SERVICE, DOMAIN, LOGGER
+from .entity import ZWaveNodeBaseEntity
+from .models import ZwaveJSConfigEntry
 
 PARALLEL_UPDATES = 1
+
+UPDATE_DELAY_STRING = "delay"
+UPDATE_DELAY_INTERVAL = 15  # In seconds
+ATTR_LATEST_VERSION_FIRMWARE = "latest_version_firmware"
+
+OTA_MESSAGE_SLEEPING_DEVICE = (
+    "This is a battery powered sleeping device. You may need to wake it up"
+    " manually for the update to begin."
+)
+
+
+@dataclass(frozen=True, kw_only=True)
+class ZWaveUpdateEntityDescription(UpdateEntityDescription):
+    """Class describing Z-Wave update entity."""
+
+    install_method: Callable[
+        [ZWaveFirmwareUpdateEntity, FirmwareUpdateInfo],
+        Awaitable[FirmwareUpdateResult],
+    ]
+    progress_method: Callable[[ZWaveFirmwareUpdateEntity], Callable[[], None]]
+    finished_method: Callable[[ZWaveFirmwareUpdateEntity], Callable[[], None]]
+
+
+CONTROLLER_UPDATE_ENTITY_DESCRIPTION = ZWaveUpdateEntityDescription(
+    key="controller_firmware_update",
+    install_method=(
+        lambda entity, firmware_update_info: entity.driver.async_firmware_update_otw(
+            update_info=firmware_update_info
+        )
+    ),
+    progress_method=lambda entity: entity.driver.on(
+        "firmware update progress", entity.update_progress
+    ),
+    finished_method=lambda entity: entity.driver.on(
+        "firmware update finished", entity.update_finished
+    ),
+)
+NODE_UPDATE_ENTITY_DESCRIPTION = ZWaveUpdateEntityDescription(
+    key="node_firmware_update",
+    install_method=(
+        lambda entity, firmware_update_info: (
+            entity.driver.controller.async_firmware_update_ota(
+                entity.node, cast(NodeFirmwareUpdateInfo, firmware_update_info)
+            )
+        )
+    ),
+    progress_method=lambda entity: entity.node.on(
+        "firmware update progress", entity.update_progress
+    ),
+    finished_method=lambda entity: entity.node.on(
+        "firmware update finished", entity.update_finished
+    ),
+)
+
+
+@dataclass
+class ZWaveFirmwareUpdateExtraStoredData(ExtraStoredData):
+    """Extra stored data for Z-Wave node firmware update entity."""
+
+    latest_version_firmware: FirmwareUpdateInfo | None
+
+    @override
+    def as_dict(self) -> dict[str, Any]:
+        """Return a dict representation of the extra data."""
+        return {
+            ATTR_LATEST_VERSION_FIRMWARE: self.latest_version_firmware.to_dict()
+            if self.latest_version_firmware
+            else None
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ZWaveFirmwareUpdateExtraStoredData:
+        """Initialize the extra data from a dict."""
+        # If there was no firmware info stored, or if it's stale info, we don't restore
+        # anything.
+        if (
+            not (firmware_dict := data[ATTR_LATEST_VERSION_FIRMWARE])
+            or "normalizedVersion" not in firmware_dict
+        ):
+            return cls(None)
+
+        return cls(FirmwareUpdateInfo.from_dict(firmware_dict))
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    config_entry: ZwaveJSConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    """Set up Z-Wave button from config entry."""
-    client: ZwaveClient = hass.data[DOMAIN][config_entry.entry_id][DATA_CLIENT]
-
-    semaphore = asyncio.Semaphore(3)
+    """Set up Z-Wave update entity from config entry."""
+    client = config_entry.runtime_data.client
+    cnt: Counter = Counter()
 
     @callback
     def async_add_firmware_update_entity(node: ZwaveNode) -> None:
         """Add firmware update entity."""
+        # Delay the first update of each entity to avoid spamming the firmware server.
+        # Maintain a counter to schedule first update in UPDATE_DELAY_INTERVAL
+        # second increments.
+        cnt[UPDATE_DELAY_STRING] += 1
+        delay = timedelta(seconds=(cnt[UPDATE_DELAY_STRING] * UPDATE_DELAY_INTERVAL))
         driver = client.driver
         assert driver is not None  # Driver is ready before platforms are loaded.
-        async_add_entities([ZWaveNodeFirmwareUpdate(driver, node, semaphore)])
+        if node.is_controller_node:
+            # If the node is a controller, we create a controller firmware update entity
+            entity = ZWaveFirmwareUpdateEntity(
+                driver,
+                node,
+                delay=delay,
+                entity_description=CONTROLLER_UPDATE_ENTITY_DESCRIPTION,
+            )
+        else:
+            # If the node is not a controller, we create a node firmware update entity
+            entity = ZWaveFirmwareUpdateEntity(
+                driver,
+                node,
+                delay=delay,
+                entity_description=NODE_UPDATE_ENTITY_DESCRIPTION,
+            )
+        async_add_entities([entity])
 
     config_entry.async_on_unload(
         async_dispatcher_connect(
@@ -64,9 +168,10 @@ async def async_setup_entry(
     )
 
 
-class ZWaveNodeFirmwareUpdate(UpdateEntity):
+class ZWaveFirmwareUpdateEntity(ZWaveNodeBaseEntity, UpdateEntity):
     """Representation of a firmware update entity."""
 
+    entity_description: ZWaveUpdateEntityDescription
     _attr_entity_category = EntityCategory.CONFIG
     _attr_device_class = UpdateDeviceClass.FIRMWARE
     _attr_supported_features = (
@@ -74,49 +179,50 @@ class ZWaveNodeFirmwareUpdate(UpdateEntity):
         | UpdateEntityFeature.RELEASE_NOTES
         | UpdateEntityFeature.PROGRESS
     )
-    _attr_has_entity_name = True
-    _attr_should_poll = False
+    _remove_on_reinterview = True
 
     def __init__(
-        self, driver: Driver, node: ZwaveNode, semaphore: asyncio.Semaphore
+        self,
+        driver: Driver,
+        node: ZwaveNode,
+        delay: timedelta,
+        entity_description: ZWaveUpdateEntityDescription,
     ) -> None:
         """Initialize a Z-Wave device firmware update entity."""
-        self.driver = driver
-        self.node = node
-        self.semaphore = semaphore
+        super().__init__(driver, node)
+        self.entity_description = entity_description
         self._latest_version_firmware: FirmwareUpdateInfo | None = None
-        self._status_unsub: Callable[[], None] | None = None
         self._poll_unsub: Callable[[], None] | None = None
         self._progress_unsub: Callable[[], None] | None = None
         self._finished_unsub: Callable[[], None] | None = None
         self._finished_event = asyncio.Event()
         self._result: FirmwareUpdateResult | None = None
+        self._delay: Final[timedelta] = delay
 
         # Entity class attributes
         self._attr_name = "Firmware"
-        self._base_unique_id = get_valueless_base_unique_id(driver, node)
-        self._attr_unique_id = f"{self._base_unique_id}.firmware_update"
+        # Legacy format, kept as migrating existing unique IDs is not worth the risk
+        self._attr_unique_id = f"{self._base_unique_id}.firmware_update"  # pylint: disable=home-assistant-entity-unique-id-redundant-platform
         self._attr_installed_version = node.firmware_version
-        # device may not be precreated in main handler yet
-        self._attr_device_info = get_device_info(driver, node)
+
+    @property
+    @override
+    def extra_restore_state_data(self) -> ZWaveFirmwareUpdateExtraStoredData:
+        """Return ZWave Node Firmware Update specific state data to be restored."""
+        return ZWaveFirmwareUpdateExtraStoredData(self._latest_version_firmware)
 
     @callback
-    def _update_on_status_change(self, _: dict[str, Any]) -> None:
-        """Update the entity when node is awake."""
-        self._status_unsub = None
-        self.hass.async_create_task(self._async_update())
-
-    @callback
-    def _update_progress(self, event: dict[str, Any]) -> None:
+    def update_progress(self, event: dict[str, Any]) -> None:
         """Update install progress on event."""
         progress: FirmwareUpdateProgress = event["firmware_update_progress"]
         if not self._latest_version_firmware:
             return
-        self._attr_in_progress = int(progress.progress)
+        self._attr_in_progress = True
+        self._attr_update_percentage = int(progress.progress)
         self.async_write_ha_state()
 
     @callback
-    def _update_finished(self, event: dict[str, Any]) -> None:
+    def update_finished(self, event: dict[str, Any]) -> None:
         """Update install progress on event."""
         result: FirmwareUpdateResult = event["firmware_update_finished"]
         self._result = result
@@ -138,33 +244,35 @@ class ZWaveNodeFirmwareUpdate(UpdateEntity):
         self._result = None
         self._finished_event.clear()
         self._attr_in_progress = False
+        self._attr_update_percentage = None
         if write_state:
             self.async_write_ha_state()
 
     async def _async_update(self, _: HomeAssistant | datetime | None = None) -> None:
         """Update the entity."""
-        self._poll_unsub = None
+        if self._poll_unsub:
+            self._poll_unsub()
+            self._poll_unsub = None
 
-        # If device is asleep/dead, wait for it to wake up/become alive before
-        # attempting an update
-        for status, event_name in (
-            (NodeStatus.ASLEEP, "wake up"),
-            (NodeStatus.DEAD, "alive"),
-        ):
-            if self.node.status == status:
-                if not self._status_unsub:
-                    self._status_unsub = self.node.once(
-                        event_name, self._update_on_status_change
-                    )
-                return
+        # If hass hasn't started yet, push the next update to the next day so that we
+        # can preserve the offsets we've created between each node
+        if self.hass.state is not CoreState.running:
+            self._poll_unsub = async_call_later(
+                self.hass, timedelta(days=1), self._async_update
+            )
+            return
 
         try:
-            async with self.semaphore:
-                available_firmware_updates = (
-                    await self.driver.controller.async_get_available_firmware_updates(
-                        self.node, API_KEY_FIRMWARE_UPDATE_SERVICE
-                    )
+            # Retrieve all firmware updates including non-stable ones but filter
+            # non-stable channels out
+            all_updates = (
+                await self.driver.controller.async_get_available_firmware_updates(
+                    self.node, API_KEY_FIRMWARE_UPDATE_SERVICE, True
                 )
+            )
+            available_firmware_updates = [
+                update for update in all_updates if update.channel == "stable"
+            ]
         except FailedZWaveCommand as err:
             LOGGER.debug(
                 "Failed to get firmware updates for node %s: %s",
@@ -197,12 +305,23 @@ class ZWaveNodeFirmwareUpdate(UpdateEntity):
                 self.hass, timedelta(days=1), self._async_update
             )
 
+    @override
     async def async_release_notes(self) -> str | None:
         """Get release notes."""
         if self._latest_version_firmware is None:
             return None
-        return self._latest_version_firmware.changelog
+        changelog = self._latest_version_firmware.changelog
+        if not self.node.can_sleep:
+            return changelog
 
+        message = OTA_MESSAGE_SLEEPING_DEVICE
+        if wakeup := (self.node.device_config.metadata.wakeup or "").strip():
+            message += f" To wake up this device:\n\n{wakeup}"
+        # Surround the content with blank lines so markdown inside the alert is rendered
+        header = f"<ha-alert alert-type='info'>\n\n{message}\n\n</ha-alert>"
+        return f"{header}\n\n{changelog}"
+
+    @override
     async def async_install(
         self, version: str | None, backup: bool, **kwargs: Any
     ) -> None:
@@ -211,19 +330,14 @@ class ZWaveNodeFirmwareUpdate(UpdateEntity):
         assert firmware
         self._unsub_firmware_events_and_reset_progress(False)
         self._attr_in_progress = True
+        self._attr_update_percentage = None
         self.async_write_ha_state()
 
-        self._progress_unsub = self.node.on(
-            "firmware update progress", self._update_progress
-        )
-        self._finished_unsub = self.node.on(
-            "firmware update finished", self._update_finished
-        )
+        self._progress_unsub = self.entity_description.progress_method(self)
+        self._finished_unsub = self.entity_description.finished_method(self)
 
         try:
-            await self.driver.controller.async_firmware_update_ota(
-                self.node, firmware.files
-            )
+            await self.entity_description.install_method(self, firmware)
         except BaseZwaveJSServerError as err:
             self._unsub_firmware_events_and_reset_progress()
             raise HomeAssistantError(err) from err
@@ -232,7 +346,8 @@ class ZWaveNodeFirmwareUpdate(UpdateEntity):
         await self._finished_event.wait()
         assert self._result is not None
 
-        # If the update was not successful, we should throw an error to let the user know
+        # If the update was not successful, we should throw an error
+        # to let the user know
         if not self._result.success:
             error_msg = self._result.status.name.replace("_", " ").title()
             self._unsub_firmware_events_and_reset_progress()
@@ -243,47 +358,55 @@ class ZWaveNodeFirmwareUpdate(UpdateEntity):
         self._latest_version_firmware = None
         self._unsub_firmware_events_and_reset_progress()
 
-    async def async_poll_value(self, _: bool) -> None:
-        """Poll a value."""
-        LOGGER.error(
-            "There is no value to refresh for this entity so the zwave_js.refresh_value "
-            "service won't work for it"
-        )
-
+    @override
     async def async_added_to_hass(self) -> None:
         """Call when entity is added."""
-        self.async_on_remove(
-            async_dispatcher_connect(
-                self.hass,
-                f"{DOMAIN}_{self.unique_id}_poll_value",
-                self.async_poll_value,
+        await super().async_added_to_hass()
+
+        # Make sure these variables are set for the elif evaluation
+        state = None
+        latest_version = None
+
+        # If we have a complete previous state, use that to set the latest version
+        if (
+            (state := await self.async_get_last_state())
+            and (
+                latest_version := state.attributes.get(
+                    UpdateEntityStateAttribute.LATEST_VERSION
+                )
             )
+            is not None
+            and (extra_data := await self.async_get_last_extra_data())
+            and (
+                latest_version_firmware := ZWaveFirmwareUpdateExtraStoredData.from_dict(
+                    extra_data.as_dict()
+                ).latest_version_firmware
+            )
+        ):
+            self._attr_latest_version = latest_version
+            self._latest_version_firmware = latest_version_firmware
+        # If we have no state or latest version to restore, or the latest version is
+        # the same as the installed version, we can set the latest
+        # version to installed so that the entity starts as off. If we have partial
+        # restore data due to an upgrade to an HA version where this feature is released
+        # from one that is not the entity will start in an unknown state until we can
+        # correct on next update
+        elif (
+            not state
+            or not latest_version
+            or latest_version == self._attr_installed_version
+        ):
+            self._attr_latest_version = self._attr_installed_version
+
+        # Spread updates out in 15 second increments
+        # to avoid spamming the firmware server
+        self.async_on_remove(
+            async_call_later(self.hass, self._delay, self._async_update)
         )
 
-        self.async_on_remove(
-            async_dispatcher_connect(
-                self.hass,
-                f"{DOMAIN}_{self._base_unique_id}_remove_entity",
-                self.async_remove,
-            )
-        )
-
-        self.async_on_remove(
-            async_dispatcher_connect(
-                self.hass,
-                f"{DOMAIN}_{self._base_unique_id}_remove_entity_on_ready_node",
-                self.async_remove,
-            )
-        )
-
-        self.async_on_remove(async_at_start(self.hass, self._async_update))
-
+    @override
     async def async_will_remove_from_hass(self) -> None:
         """Call when entity will be removed."""
-        if self._status_unsub:
-            self._status_unsub()
-            self._status_unsub = None
-
         if self._poll_unsub:
             self._poll_unsub()
             self._poll_unsub = None

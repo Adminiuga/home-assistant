@@ -1,9 +1,11 @@
 """Provides device actions for ZHA devices."""
-from __future__ import annotations
 
 from typing import Any
 
-import voluptuous as vol
+import probatio
+from zha.zigbee.device import ZigbeeDevice
+from zhaquirks.inovelli.types import AllLEDEffectType, SingleLEDEffectType
+from zigpy.zcl.clusters.security import IasWd
 
 from homeassistant.components.device_automation import InvalidDeviceAutomationConfig
 from homeassistant.const import CONF_DEVICE_ID, CONF_DOMAIN, CONF_TYPE
@@ -11,95 +13,114 @@ from homeassistant.core import Context, HomeAssistant
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.typing import ConfigType, TemplateVarsType
 
-from . import DOMAIN
-from .api import SERVICE_WARNING_DEVICE_SQUAWK, SERVICE_WARNING_DEVICE_WARN
-from .core.channels.manufacturerspecific import AllLEDEffectType, SingleLEDEffectType
-from .core.const import CHANNEL_IAS_WD, CHANNEL_INOVELLI
-from .core.helpers import async_get_zha_device
+from .const import DOMAIN
+from .helpers import async_get_zha_device_proxy, convert_zha_error_to_ha_error
+from .services import SERVICE_WARNING_DEVICE_SQUAWK, SERVICE_WARNING_DEVICE_WARN
 
 # mypy: disallow-any-generics
 
+INOVELLI_CLUSTER_ID = 0xFC31
+
 ACTION_SQUAWK = "squawk"
 ACTION_WARN = "warn"
-ATTR_DATA = "data"
 ATTR_IEEE = "ieee"
-CONF_ZHA_ACTION_TYPE = "zha_action_type"
-ZHA_ACTION_TYPE_SERVICE_CALL = "service_call"
-ZHA_ACTION_TYPE_CHANNEL_COMMAND = "channel_command"
 INOVELLI_ALL_LED_EFFECT = "issue_all_led_effect"
 INOVELLI_INDIVIDUAL_LED_EFFECT = "issue_individual_led_effect"
 
 DEFAULT_ACTION_SCHEMA = cv.DEVICE_ACTION_BASE_SCHEMA.extend(
     {
-        vol.Required(CONF_DOMAIN): DOMAIN,
-        vol.Required(CONF_TYPE): vol.In({ACTION_SQUAWK, ACTION_WARN}),
+        probatio.Required(CONF_DOMAIN): DOMAIN,
+        probatio.Required(CONF_TYPE): probatio.In({ACTION_SQUAWK, ACTION_WARN}),
     }
 )
 
 INOVELLI_ALL_LED_EFFECT_SCHEMA = cv.DEVICE_ACTION_BASE_SCHEMA.extend(
     {
-        vol.Required(CONF_TYPE): INOVELLI_ALL_LED_EFFECT,
-        vol.Required(CONF_DOMAIN): DOMAIN,
-        vol.Required("effect_type"): AllLEDEffectType.__getitem__,
-        vol.Required("color"): vol.All(vol.Coerce(int), vol.Range(0, 255)),
-        vol.Required("level"): vol.All(vol.Coerce(int), vol.Range(0, 100)),
-        vol.Required("duration"): vol.All(vol.Coerce(int), vol.Range(1, 255)),
+        probatio.Required(CONF_TYPE): INOVELLI_ALL_LED_EFFECT,
+        probatio.Required(CONF_DOMAIN): DOMAIN,
+        probatio.Required("effect_type"): probatio.In(
+            AllLEDEffectType.__members__.keys()
+        ),
+        probatio.Required("color"): probatio.All(
+            probatio.Coerce(int), probatio.Range(0, 255)
+        ),
+        probatio.Required("level"): probatio.All(
+            probatio.Coerce(int), probatio.Range(0, 100)
+        ),
+        probatio.Required("duration"): probatio.All(
+            probatio.Coerce(int), probatio.Range(1, 255)
+        ),
     }
 )
 
 INOVELLI_INDIVIDUAL_LED_EFFECT_SCHEMA = INOVELLI_ALL_LED_EFFECT_SCHEMA.extend(
     {
-        vol.Required(CONF_TYPE): INOVELLI_INDIVIDUAL_LED_EFFECT,
-        vol.Required("effect_type"): SingleLEDEffectType.__getitem__,
-        vol.Required("led_number"): vol.All(vol.Coerce(int), vol.Range(0, 6)),
+        probatio.Required(CONF_TYPE): INOVELLI_INDIVIDUAL_LED_EFFECT,
+        probatio.Required("effect_type"): probatio.In(
+            SingleLEDEffectType.__members__.keys()
+        ),
+        probatio.Required("led_number"): probatio.All(
+            probatio.Coerce(int), probatio.Range(0, 6)
+        ),
     }
 )
 
-ACTION_SCHEMA_MAP = {
-    INOVELLI_ALL_LED_EFFECT: INOVELLI_ALL_LED_EFFECT_SCHEMA,
-    INOVELLI_INDIVIDUAL_LED_EFFECT: INOVELLI_INDIVIDUAL_LED_EFFECT_SCHEMA,
-}
-
-ACTION_SCHEMA = vol.Any(
-    INOVELLI_ALL_LED_EFFECT_SCHEMA,
-    INOVELLI_INDIVIDUAL_LED_EFFECT_SCHEMA,
-    DEFAULT_ACTION_SCHEMA,
+ACTION_SCHEMA = probatio.TaggedUnion(
+    CONF_TYPE,
+    {
+        ACTION_SQUAWK: DEFAULT_ACTION_SCHEMA,
+        ACTION_WARN: DEFAULT_ACTION_SCHEMA,
+        INOVELLI_ALL_LED_EFFECT: INOVELLI_ALL_LED_EFFECT_SCHEMA,
+        INOVELLI_INDIVIDUAL_LED_EFFECT: INOVELLI_INDIVIDUAL_LED_EFFECT_SCHEMA,
+    },
 )
 
-DEVICE_ACTIONS = {
-    CHANNEL_IAS_WD: [
+# Maps a cluster_id the device must expose to the available actions.
+DEVICE_ACTIONS_BY_CLUSTER_ID: dict[int, list[dict[str, str]]] = {
+    IasWd.cluster_id: [
         {CONF_TYPE: ACTION_SQUAWK, CONF_DOMAIN: DOMAIN},
         {CONF_TYPE: ACTION_WARN, CONF_DOMAIN: DOMAIN},
     ],
-    CHANNEL_INOVELLI: [
+    INOVELLI_CLUSTER_ID: [
         {CONF_TYPE: INOVELLI_ALL_LED_EFFECT, CONF_DOMAIN: DOMAIN},
         {CONF_TYPE: INOVELLI_INDIVIDUAL_LED_EFFECT, CONF_DOMAIN: DOMAIN},
     ],
 }
 
-DEVICE_ACTION_TYPES = {
-    ACTION_SQUAWK: ZHA_ACTION_TYPE_SERVICE_CALL,
-    ACTION_WARN: ZHA_ACTION_TYPE_SERVICE_CALL,
-    INOVELLI_ALL_LED_EFFECT: ZHA_ACTION_TYPE_CHANNEL_COMMAND,
-    INOVELLI_INDIVIDUAL_LED_EFFECT: ZHA_ACTION_TYPE_CHANNEL_COMMAND,
-}
-
 DEVICE_ACTION_SCHEMAS = {
-    INOVELLI_ALL_LED_EFFECT: vol.Schema(
+    INOVELLI_ALL_LED_EFFECT: probatio.Schema(
         {
-            vol.Required("effect_type"): vol.In(AllLEDEffectType.__members__.keys()),
-            vol.Required("color"): vol.All(vol.Coerce(int), vol.Range(0, 255)),
-            vol.Required("level"): vol.All(vol.Coerce(int), vol.Range(0, 100)),
-            vol.Required("duration"): vol.All(vol.Coerce(int), vol.Range(1, 255)),
+            probatio.Required("effect_type"): probatio.In(
+                AllLEDEffectType.__members__.keys()
+            ),
+            probatio.Required("color"): probatio.All(
+                probatio.Coerce(int), probatio.Range(0, 255)
+            ),
+            probatio.Required("level"): probatio.All(
+                probatio.Coerce(int), probatio.Range(0, 100)
+            ),
+            probatio.Required("duration"): probatio.All(
+                probatio.Coerce(int), probatio.Range(1, 255)
+            ),
         }
     ),
-    INOVELLI_INDIVIDUAL_LED_EFFECT: vol.Schema(
+    INOVELLI_INDIVIDUAL_LED_EFFECT: probatio.Schema(
         {
-            vol.Required("led_number"): vol.All(vol.Coerce(int), vol.Range(0, 6)),
-            vol.Required("effect_type"): vol.In(SingleLEDEffectType.__members__.keys()),
-            vol.Required("color"): vol.All(vol.Coerce(int), vol.Range(0, 255)),
-            vol.Required("level"): vol.All(vol.Coerce(int), vol.Range(0, 100)),
-            vol.Required("duration"): vol.All(vol.Coerce(int), vol.Range(1, 255)),
+            probatio.Required("led_number"): probatio.All(
+                probatio.Coerce(int), probatio.Range(0, 6)
+            ),
+            probatio.Required("effect_type"): probatio.In(
+                SingleLEDEffectType.__members__.keys()
+            ),
+            probatio.Required("color"): probatio.All(
+                probatio.Coerce(int), probatio.Range(0, 255)
+            ),
+            probatio.Required("level"): probatio.All(
+                probatio.Coerce(int), probatio.Range(0, 100)
+            ),
+            probatio.Required("duration"): probatio.All(
+                probatio.Coerce(int), probatio.Range(1, 255)
+            ),
         }
     ),
 }
@@ -107,11 +128,6 @@ DEVICE_ACTION_SCHEMAS = {
 SERVICE_NAMES = {
     ACTION_SQUAWK: SERVICE_WARNING_DEVICE_SQUAWK,
     ACTION_WARN: SERVICE_WARNING_DEVICE_WARN,
-}
-
-CHANNEL_MAPPINGS = {
-    INOVELLI_ALL_LED_EFFECT: CHANNEL_INOVELLI,
-    INOVELLI_INDIVIDUAL_LED_EFFECT: CHANNEL_INOVELLI,
 }
 
 
@@ -122,18 +138,16 @@ async def async_call_action_from_config(
     context: Context | None,
 ) -> None:
     """Perform an action based on configuration."""
-    await ZHA_ACTION_TYPES[DEVICE_ACTION_TYPES[config[CONF_TYPE]]](
-        hass, config, variables, context
-    )
+    action_type = config[CONF_TYPE]
+    handler = ACTION_HANDLERS[action_type]
+    await handler(hass, config, context)
 
 
 async def async_validate_action_config(
     hass: HomeAssistant, config: ConfigType
 ) -> ConfigType:
     """Validate config."""
-    schema = ACTION_SCHEMA_MAP.get(config[CONF_TYPE], DEFAULT_ACTION_SCHEMA)
-    config = schema(config)
-    return config
+    return ACTION_SCHEMA(config)
 
 
 async def async_get_actions(
@@ -141,87 +155,107 @@ async def async_get_actions(
 ) -> list[dict[str, str]]:
     """List device actions."""
     try:
-        zha_device = async_get_zha_device(hass, device_id)
-    except (KeyError, AttributeError):
+        zha_device = async_get_zha_device_proxy(hass, device_id).device
+    except KeyError, AttributeError:
         return []
-    cluster_channels = [
-        ch.name
-        for pool in zha_device.channels.pools
-        for ch in pool.claimed_channels.values()
-    ]
-    actions = [
-        action
-        for channel, channel_actions in DEVICE_ACTIONS.items()
-        for action in channel_actions
-        if channel in cluster_channels
-    ]
-    for action in actions:
-        action[CONF_DEVICE_ID] = device_id
+    # Green Power devices have no clusters
+    if not isinstance(zha_device, ZigbeeDevice):
+        return []
+    cluster_ids = {
+        cluster_id
+        for ep_id, endpoint in zha_device.device.endpoints.items()
+        if ep_id != 0
+        for cluster_id in endpoint.in_clusters
+    }
+    actions: list[dict[str, str]] = []
+    for required_cluster_id, cluster_actions in DEVICE_ACTIONS_BY_CLUSTER_ID.items():
+        if required_cluster_id in cluster_ids:
+            actions.extend(
+                {**action, CONF_DEVICE_ID: device_id} for action in cluster_actions
+            )
     return actions
 
 
 async def async_get_action_capabilities(
     hass: HomeAssistant, config: ConfigType
-) -> dict[str, vol.Schema]:
+) -> dict[str, probatio.Schema]:
     """List action capabilities."""
+    if (fields := DEVICE_ACTION_SCHEMAS.get(config[CONF_TYPE])) is None:
+        return {}
+    return {"extra_fields": fields}
 
-    return {"extra_fields": DEVICE_ACTION_SCHEMAS.get(config[CONF_TYPE], {})}
 
-
-async def _execute_service_based_action(
+async def _execute_siren_service(
     hass: HomeAssistant,
     config: dict[str, Any],
-    variables: TemplateVarsType,
     context: Context | None,
 ) -> None:
-    action_type = config[CONF_TYPE]
-    service_name = SERVICE_NAMES[action_type]
     try:
-        zha_device = async_get_zha_device(hass, config[CONF_DEVICE_ID])
-    except (KeyError, AttributeError):
+        zha_device = async_get_zha_device_proxy(hass, config[CONF_DEVICE_ID]).device
+    except KeyError, AttributeError:
         return
-
-    service_data = {ATTR_IEEE: str(zha_device.ieee)}
-
     await hass.services.async_call(
-        DOMAIN, service_name, service_data, blocking=True, context=context
+        DOMAIN,
+        SERVICE_NAMES[config[CONF_TYPE]],
+        {ATTR_IEEE: str(zha_device.ieee)},
+        blocking=True,
+        context=context,
     )
 
 
-async def _execute_channel_command_based_action(
+def _find_inovelli_cluster(hass: HomeAssistant, config: dict[str, Any]) -> Any:
+    try:
+        zha_device = async_get_zha_device_proxy(hass, config[CONF_DEVICE_ID]).device
+    except (KeyError, AttributeError) as err:
+        raise InvalidDeviceAutomationConfig(
+            f"ZHA device {config[CONF_DEVICE_ID]} not found"
+        ) from err
+    try:
+        return zha_device.device.find_cluster(cluster_id=INOVELLI_CLUSTER_ID)
+    except ValueError as err:
+        raise InvalidDeviceAutomationConfig(
+            f"Device does not expose Inovelli cluster 0x{INOVELLI_CLUSTER_ID:04x}"
+        ) from err
+
+
+async def _execute_inovelli_all_led_effect(
     hass: HomeAssistant,
     config: dict[str, Any],
-    variables: TemplateVarsType,
     context: Context | None,
 ) -> None:
-    action_type = config[CONF_TYPE]
-    channel_name = CHANNEL_MAPPINGS[action_type]
-    try:
-        zha_device = async_get_zha_device(hass, config[CONF_DEVICE_ID])
-    except (KeyError, AttributeError):
-        return
+    cluster = _find_inovelli_cluster(hass, config)
 
-    action_channel = None
-    for pool in zha_device.channels.pools:
-        for channel in pool.all_channels.values():
-            if channel.name == channel_name:
-                action_channel = channel
-                break
-
-    if action_channel is None:
-        raise InvalidDeviceAutomationConfig(
-            f"Unable to execute channel action - channel: {channel_name} action: {action_type}"
+    async with convert_zha_error_to_ha_error():
+        await cluster.led_effect(
+            # The action isn't validated when ZHA wasn't loaded yet, so the
+            # effect type is converted here instead of in the schema
+            led_effect=AllLEDEffectType[config["effect_type"]],
+            led_color=config["color"],
+            led_level=config["level"],
+            led_duration=config["duration"],
         )
 
-    if not hasattr(action_channel, action_type):
-        raise InvalidDeviceAutomationConfig(
-            f"Unable to execute channel action - channel: {channel_name} action: {action_type}"
+
+async def _execute_inovelli_individual_led_effect(
+    hass: HomeAssistant,
+    config: dict[str, Any],
+    context: Context | None,
+) -> None:
+    cluster = _find_inovelli_cluster(hass, config)
+
+    async with convert_zha_error_to_ha_error():
+        await cluster.individual_led_effect(
+            led_effect=SingleLEDEffectType[config["effect_type"]],
+            led_color=config["color"],
+            led_level=config["level"],
+            led_duration=config["duration"],
+            led_number=config["led_number"],
         )
 
-    await getattr(action_channel, action_type)(**config)
 
-
-ZHA_ACTION_TYPES = {
-    ZHA_ACTION_TYPE_SERVICE_CALL: _execute_service_based_action,
-    ZHA_ACTION_TYPE_CHANNEL_COMMAND: _execute_channel_command_based_action,
+ACTION_HANDLERS = {
+    ACTION_SQUAWK: _execute_siren_service,
+    ACTION_WARN: _execute_siren_service,
+    INOVELLI_ALL_LED_EFFECT: _execute_inovelli_all_led_effect,
+    INOVELLI_INDIVIDUAL_LED_EFFECT: _execute_inovelli_individual_led_effect,
 }

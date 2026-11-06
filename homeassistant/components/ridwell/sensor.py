@@ -1,25 +1,22 @@
 """Support for Ridwell sensors."""
-from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import date, datetime
-from typing import Any
+from datetime import date
+from typing import Any, override
 
-from aioridwell.model import RidwellAccount, RidwellPickupEvent
+from aioridwell.model import RidwellAccount
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
     SensorEntity,
     SensorEntityDescription,
 )
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.typing import StateType
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from . import RidwellData, RidwellEntity
-from .const import DOMAIN, SENSOR_TYPE_NEXT_PICKUP
+from .const import SENSOR_TYPE_NEXT_PICKUP
+from .coordinator import RidwellConfigEntry, RidwellDataUpdateCoordinator
+from .entity import RidwellEntity
 
 ATTR_CATEGORY = "category"
 ATTR_PICKUP_STATE = "pickup_state"
@@ -28,22 +25,22 @@ ATTR_QUANTITY = "quantity"
 
 SENSOR_DESCRIPTION = SensorEntityDescription(
     key=SENSOR_TYPE_NEXT_PICKUP,
-    name="Ridwell pickup",
+    translation_key="next_pickup",
     device_class=SensorDeviceClass.DATE,
 )
 
 
 async def async_setup_entry(
-    hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
+    hass: HomeAssistant,
+    entry: RidwellConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up Ridwell sensors based on a config entry."""
-    data: RidwellData = hass.data[DOMAIN][entry.entry_id]
+    coordinator = entry.runtime_data
 
     async_add_entities(
-        [
-            RidwellSensor(data.coordinator, account, SENSOR_DESCRIPTION)
-            for account in data.accounts.values()
-        ]
+        RidwellSensor(coordinator, account, SENSOR_DESCRIPTION)
+        for account in coordinator.accounts.values()
     )
 
 
@@ -52,26 +49,26 @@ class RidwellSensor(RidwellEntity, SensorEntity):
 
     def __init__(
         self,
-        coordinator: DataUpdateCoordinator,
+        coordinator: RidwellDataUpdateCoordinator,
         account: RidwellAccount,
         description: SensorEntityDescription,
     ) -> None:
         """Initialize."""
-        super().__init__(coordinator, account, description)
+        super().__init__(coordinator, account)
 
-        self._attr_name = f"{description.name} ({account.address['street1']})"
+        self._attr_unique_id = f"{account.account_id}_{description.key}"
+        self.entity_description = description
 
     @property
+    @override
     def extra_state_attributes(self) -> Mapping[str, Any]:
         """Return entity specific state attributes."""
-        event = self.coordinator.data[self._account.account_id]
-
         attrs: dict[str, Any] = {
             ATTR_PICKUP_TYPES: {},
-            ATTR_PICKUP_STATE: event.state.value,
+            ATTR_PICKUP_STATE: self.next_pickup_event.state.value,
         }
 
-        for pickup in event.pickups:
+        for pickup in self.next_pickup_event.pickups:
             if pickup.name not in attrs[ATTR_PICKUP_TYPES]:
                 attrs[ATTR_PICKUP_TYPES][pickup.name] = {
                     ATTR_CATEGORY: pickup.category.value,
@@ -80,13 +77,13 @@ class RidwellSensor(RidwellEntity, SensorEntity):
             else:
                 # Ridwell's API will return distinct objects, even if they have the
                 # same name (e.g. two pickups of Latex Paint will show up as two
-                # objects) – so, we sum the quantities:
+                # objects) - so, we sum the quantities:
                 attrs[ATTR_PICKUP_TYPES][pickup.name][ATTR_QUANTITY] += pickup.quantity
 
         return attrs
 
     @property
-    def native_value(self) -> StateType | date | datetime:
+    @override
+    def native_value(self) -> date:
         """Return the value reported by the sensor."""
-        event: RidwellPickupEvent = self.coordinator.data[self._account.account_id]
-        return event.pickup_date
+        return self.next_pickup_event.pickup_date

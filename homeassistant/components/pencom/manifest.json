@@ -1,9 +1,12 @@
 {
   "domain": "pencom",
   "name": "Pencom",
-  "documentation": "https://www.home-assistant.io/integrations/pencom",
-  "requirements": ["pencompy==0.0.3"],
+  "categories": ["diy_makers.boards_hardware", "plugs_switches"],
   "codeowners": [],
+  "connectivity": ["network"],
+  "documentation": "https://www.home-assistant.io/integrations/pencom",
   "iot_class": "local_polling",
-  "loggers": ["pencompy"]
+  "loggers": ["pencompy"],
+  "quality_scale": "legacy",
+  "requirements": ["pencompy==0.0.4"]
 }

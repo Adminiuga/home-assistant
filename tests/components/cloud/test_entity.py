@@ -1,0 +1,484 @@
+"""Tests for helpers in the Home Assistant Cloud conversation entity."""
+
+import base64
+from collections.abc import Callable
+import datetime as dt
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from PIL import Image
+import probatio
+import pytest
+from pytest_homeassistant.common import MockConfigEntry
+from syrupy.assertion import SnapshotAssertion
+
+from homeassistant.components import conversation
+from homeassistant.components.cloud.const import AI_TASK_ENTITY_UNIQUE_ID, DOMAIN
+from homeassistant.components.cloud.entity import (
+    BaseCloudLLMEntity,
+    _convert_content_to_param,
+    _format_structured_output,
+    _format_tool,
+)
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import entity_registry as er, llm, selector
+from homeassistant.setup import async_setup_component
+
+
+@pytest.fixture
+def cloud_entity(hass: HomeAssistant) -> BaseCloudLLMEntity:
+    """Return a CloudLLMTaskEntity attached to hass."""
+    cloud = MagicMock()
+    cloud.llm = MagicMock()
+    cloud.is_logged_in = True
+    cloud.valid_subscription = True
+    entry = MockConfigEntry(domain=DOMAIN)
+    entry.add_to_hass(hass)
+    entity = BaseCloudLLMEntity(cloud, entry)
+    entity.entity_id = "ai_task.cloud_ai_task"
+    entity.hass = hass
+    return entity
+
+
+@pytest.fixture
+def mock_prepare_files_for_prompt(
+    cloud_entity: BaseCloudLLMEntity,
+) -> AsyncMock:
+    """Patch file preparation helper on the entity."""
+    with patch.object(
+        cloud_entity,
+        "_async_prepare_files_for_prompt",
+        AsyncMock(),
+    ) as mock:
+        yield mock
+
+
+class DummyTool(llm.Tool):
+    """Simple tool used for schema conversion tests."""
+
+    name = "do_something"
+    description = "Test tool"
+    parameters = probatio.Schema({probatio.Required("value"): str})
+
+    async def async_call(self, hass: HomeAssistant, tool_input, llm_context):
+        """No-op implementation."""
+        return {"value": "done"}
+
+
+def test_format_tool_openapi_31(snapshot: SnapshotAssertion) -> None:
+    """Test that tool parameters use OpenAPI 3.1 nullable types."""
+    tool = DummyTool()
+    tool.parameters = probatio.Schema(
+        {probatio.Required("value"): probatio.In(["on", "off", None])}
+    )
+
+    assert _format_tool(tool, None) == snapshot
+
+
+async def test_format_structured_output() -> None:
+    """Test that structured output schemas are normalized."""
+    schema = probatio.Schema(
+        {
+            probatio.Required("name"): selector.TextSelector(),
+            probatio.Optional("age"): selector.NumberSelector(
+                config=selector.NumberSelectorConfig(min=0, max=120),
+            ),
+            probatio.Required("stuff"): selector.ObjectSelector(
+                {
+                    "multiple": True,
+                    "fields": {
+                        "item_name": {"selector": {"text": None}},
+                        "item_value": {"selector": {"text": None}},
+                    },
+                }
+            ),
+        }
+    )
+
+    assert _format_structured_output(schema, None) == {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "age": {"type": "number", "minimum": 0.0, "maximum": 120.0},
+            "stuff": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "item_name": {"type": "string"},
+                        "item_value": {"type": "string"},
+                    },
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": ["name", "stuff"],
+        "additionalProperties": False,
+    }
+
+
+@pytest.mark.parametrize(
+    ("object_type", "array_type"),
+    [
+        pytest.param("object", "array", id="single-types"),
+        pytest.param(["object", "null"], ["array", "null"], id="nullable-types"),
+        pytest.param(["null", "object"], ["null", "array"], id="null-first"),
+        pytest.param(["object"], ["array"], id="single-type-arrays"),
+        pytest.param("object", ["object", "array"], id="object-array-union"),
+    ],
+)
+def test_format_structured_output_type_arrays(
+    object_type: str | list[str],
+    array_type: str | list[str],
+    snapshot: SnapshotAssertion,
+) -> None:
+    """Test constraints on object and array types from a custom serializer."""
+    schema = {
+        "type": object_type,
+        "properties": {
+            "objects": {
+                "type": array_type,
+                "items": {"type": object_type},
+            },
+            "mapping": {"type": object_type, "additionalProperties": True},
+            "value": {"type": ["string", "null"]},
+            "untyped": {},
+        },
+    }
+    llm_api = MagicMock(
+        spec=llm.APIInstance,
+        custom_serializer=MagicMock(return_value=schema),
+    )
+
+    assert _format_structured_output(probatio.Schema(dict), llm_api) == snapshot
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        pytest.param(probatio.Schema(None), id="null"),
+        pytest.param(probatio.Schema(probatio.Maybe(str)), id="nullable-string"),
+        pytest.param(
+            probatio.Schema(probatio.In(["on", "off", None])), id="nullable-enum"
+        ),
+        pytest.param(
+            probatio.Schema(
+                probatio.All(
+                    float,
+                    probatio.Range(
+                        min=0, max=10, min_included=False, max_included=False
+                    ),
+                )
+            ),
+            id="exclusive-bounds",
+        ),
+        pytest.param(
+            probatio.Schema(probatio.ExactSequence([str, int])), id="prefix-items"
+        ),
+    ],
+)
+def test_format_structured_output_openapi_31(
+    schema: probatio.Schema, snapshot: SnapshotAssertion
+) -> None:
+    """Test version-specific schema conversion using OpenAPI 3.1."""
+    assert _format_structured_output(schema, None) == snapshot
+
+
+@pytest.mark.parametrize(
+    "schema_factory",
+    [
+        pytest.param(probatio.Maybe, id="any-of"),
+        pytest.param(
+            lambda schema: probatio.SomeOf([schema, str], min_valid=1, max_valid=1),
+            id="one-of",
+        ),
+        pytest.param(
+            lambda schema: probatio.SomeOf([schema, dict], min_valid=2, max_valid=2),
+            id="all-of",
+        ),
+        pytest.param(
+            lambda schema: probatio.ExactSequence([schema]), id="prefix-items"
+        ),
+        pytest.param(
+            lambda schema: probatio.Maybe(probatio.ExactSequence([schema])),
+            id="nullable-prefix-items",
+        ),
+    ],
+)
+def test_format_structured_output_nested_objects(
+    schema_factory: Callable[[selector.ObjectSelector], object],
+    snapshot: SnapshotAssertion,
+) -> None:
+    """Test constraints on objects nested in composition branches and tuples."""
+    schema = probatio.Schema(
+        {
+            probatio.Required("value"): schema_factory(
+                selector.ObjectSelector(
+                    {"fields": {"name": {"selector": {"text": None}}}}
+                )
+            )
+        }
+    )
+
+    assert _format_structured_output(schema, None) == snapshot
+
+
+async def test_prepare_files_for_prompt(
+    cloud_entity: BaseCloudLLMEntity, tmp_path: Path
+) -> None:
+    """Test that media attachments are converted to the expected payload."""
+    image_path = tmp_path / "doorbell.jpg"
+    Image.new("RGB", (2, 2), "blue").save(image_path, "JPEG")
+    pdf_path = tmp_path / "context.pdf"
+    pdf_path.write_bytes(b"%PDF-1.3\nmock\n")
+
+    attachments = [
+        conversation.Attachment(
+            media_content_id="media-source://media/doorbell.jpg",
+            mime_type="image/jpeg",
+            path=image_path,
+        ),
+        conversation.Attachment(
+            media_content_id="media-source://media/context.pdf",
+            mime_type="application/pdf",
+            path=pdf_path,
+        ),
+    ]
+
+    files = await cloud_entity._async_prepare_files_for_prompt(attachments)
+
+    assert files[0] == {
+        "type": "input_image",
+        "image_url": "data:image/jpeg;base64,"
+        + base64.b64encode(image_path.read_bytes()).decode(),
+        "detail": "auto",
+    }
+    assert files[1] == {
+        "type": "input_file",
+        "filename": "context.pdf",
+        "file_data": "data:application/pdf;base64,"
+        + base64.b64encode(pdf_path.read_bytes()).decode(),
+    }
+
+
+async def test_prepare_files_for_prompt_invalid_type(
+    cloud_entity: BaseCloudLLMEntity, tmp_path: Path
+) -> None:
+    """Test that unsupported attachments raise an error."""
+    text_path = tmp_path / "notes.txt"
+    text_path.write_text("notes")
+
+    attachments = [
+        conversation.Attachment(
+            media_content_id="media-source://media/notes.txt",
+            mime_type="text/plain",
+            path=text_path,
+        )
+    ]
+
+    with pytest.raises(
+        HomeAssistantError,
+        match="Only images and PDF are currently supported as attachments",
+    ):
+        await cloud_entity._async_prepare_files_for_prompt(attachments)
+
+
+async def test_prepare_chat_for_generation_appends_attachments(
+    hass: HomeAssistant,
+    cloud_entity: BaseCloudLLMEntity,
+    mock_prepare_files_for_prompt: AsyncMock,
+) -> None:
+    """Test chat preparation adds LLM tools, attachments, and metadata."""
+    chat_log = conversation.ChatLog(hass, "conversation-id")
+    attachment = conversation.Attachment(
+        media_content_id="media-source://media/doorbell.jpg",
+        mime_type="image/jpeg",
+        path=Path(hass.config.path("doorbell.jpg")),
+    )
+    chat_log.async_add_user_content(
+        conversation.UserContent(content="Describe the door", attachments=[attachment])
+    )
+    chat_log.llm_api = MagicMock(
+        tools=[DummyTool()],
+        custom_serializer=None,
+    )
+
+    files = [{"type": "input_image", "image_url": "data://img", "detail": "auto"}]
+
+    mock_prepare_files_for_prompt.return_value = files
+    messages = _convert_content_to_param(chat_log.content)
+    response = await cloud_entity._prepare_chat_for_generation(
+        chat_log,
+        messages,
+        response_format={"type": "json"},
+    )
+
+    assert response["conversation_id"] == "conversation-id"
+    assert response["response_format"] == {"type": "json"}
+    assert response["tool_choice"] == "auto"
+    assert len(response["tools"]) == 2
+    assert response["tools"][0]["name"] == "do_something"
+    assert response["tools"][1]["type"] == "web_search"
+    assert response["messages"] is messages
+    mock_prepare_files_for_prompt.assert_awaited_once_with([attachment])
+
+    # Verify that files are actually added to the last user message
+    last_message = messages[-1]
+    assert last_message["type"] == "message"
+    assert last_message["role"] == "user"
+    assert isinstance(last_message["content"], list)
+    assert last_message["content"][0] == {
+        "type": "input_text",
+        "text": "Describe the door",
+    }
+    assert last_message["content"][1] == files[0]
+
+
+async def test_prepare_chat_for_generation_passes_messages_through(
+    hass: HomeAssistant, cloud_entity: BaseCloudLLMEntity
+) -> None:
+    """Test that prepared messages are forwarded unchanged."""
+    chat_log = conversation.ChatLog(hass, "conversation-id")
+
+    chat_log.async_add_user_content(
+        conversation.UserContent(content="What time is it?")
+    )
+    chat_log.async_add_assistant_content_without_tools(
+        conversation.AssistantContent(
+            agent_id="agent",
+            tool_calls=[
+                llm.ToolInput(
+                    tool_name="HassGetCurrentTime",
+                    tool_args={},
+                    id="mock-tool-call-id",
+                    external=True,
+                )
+            ],
+        )
+    )
+    chat_log.async_add_assistant_content_without_tools(
+        conversation.ToolResultContent(
+            agent_id="agent",
+            tool_call_id="mock-tool-call-id",
+            tool_name="HassGetCurrentTime",
+            result=llm.ToolResult(
+                data={
+                    "speech": {"plain": {"speech": "12:00 PM", "extra_data": None}},
+                    "response_type": "action_done",
+                    "speech_slots": {"time": dt.time(12, 0)},
+                    "data": {"success": [], "failed": []},
+                }
+            ),
+        )
+    )
+    chat_log.async_add_assistant_content_without_tools(
+        conversation.AssistantContent(agent_id="agent", content="12:00 PM")
+    )
+
+    messages = _convert_content_to_param(chat_log.content)
+
+    response = await cloud_entity._prepare_chat_for_generation(chat_log, messages)
+
+    assert response["messages"] == messages
+    assert response["conversation_id"] == "conversation-id"
+
+
+async def test_async_handle_chat_log_service_sets_structured_output_non_strict(
+    hass: HomeAssistant,
+    cloud: MagicMock,
+    entity_registry: er.EntityRegistry,
+    mock_cloud_login: None,
+) -> None:
+    """Ensure structured output disables strict validation."""
+    assert await async_setup_component(hass, DOMAIN, {})
+    await hass.async_block_till_done()
+
+    on_start_callback = cloud.register_on_start.call_args[0][0]
+    await on_start_callback()
+    await hass.async_block_till_done()
+
+    entity_id = entity_registry.async_get_entity_id(
+        "ai_task", DOMAIN, AI_TASK_ENTITY_UNIQUE_ID
+    )
+    assert entity_id is not None
+
+    async def _empty_stream():
+        return
+
+    async def _fake_delta_stream(
+        self: conversation.ChatLog,
+        agent_id: str,
+        stream,
+    ):
+        content = conversation.AssistantContent(
+            agent_id=agent_id, content='{"value": "ok"}'
+        )
+        self.async_add_assistant_content_without_tools(content)
+        yield content
+
+    cloud.llm.async_generate_data = AsyncMock(return_value=_empty_stream())
+
+    with patch(
+        "homeassistant.components.conversation.chat_log.ChatLog.async_add_delta_content_stream",
+        _fake_delta_stream,
+    ):
+        await hass.services.async_call(
+            "ai_task",
+            "generate_data",
+            {
+                "entity_id": entity_id,
+                "task_name": "Device Report",
+                "instructions": "Provide value.",
+                "structure": {
+                    "value": {
+                        "selector": {"text": None},
+                        "required": True,
+                    }
+                },
+            },
+            blocking=True,
+            return_response=True,
+        )
+
+    cloud.llm.async_generate_data.assert_awaited_once()
+    _, kwargs = cloud.llm.async_generate_data.call_args
+
+    assert kwargs["response_format"]["json_schema"]["strict"] is False
+
+
+@pytest.mark.parametrize(
+    ("result", "expected_output"),
+    [
+        pytest.param(
+            llm.ToolResult(data={"temperature": 21}),
+            '{"data":{"temperature":21},"error":false}',
+            id="success",
+        ),
+        pytest.param(
+            llm.ToolResult(data={"error": "Not found"}, error=True),
+            '{"data":{"error":"Not found"},"error":true}',
+            id="error",
+        ),
+    ],
+)
+def test_convert_tool_result_to_param(
+    result: llm.ToolResult, expected_output: str
+) -> None:
+    """Test the tool result is sent with its error flag."""
+    content = [
+        conversation.ToolResultContent(
+            agent_id="agent",
+            tool_call_id="mock-tool-call-id",
+            tool_name="HassGetState",
+            result=result,
+        )
+    ]
+
+    assert _convert_content_to_param(content) == [
+        {
+            "type": "function_call_output",
+            "call_id": "mock-tool-call-id",
+            "output": expected_output,
+        }
+    ]

@@ -1,9 +1,12 @@
 {
   "domain": "slide",
   "name": "Slide",
-  "documentation": "https://www.home-assistant.io/integrations/slide",
-  "requirements": ["goslide-api==0.5.1"],
+  "categories": ["blinds_curtains"],
   "codeowners": ["@ualex73"],
+  "connectivity": ["cloud"],
+  "documentation": "https://www.home-assistant.io/integrations/slide",
   "iot_class": "cloud_polling",
-  "loggers": ["goslideapi"]
+  "loggers": ["goslideapi"],
+  "quality_scale": "legacy",
+  "requirements": ["goslide-api==0.7.4"]
 }

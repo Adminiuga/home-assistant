@@ -1,18 +1,15 @@
 """Config flow for Evil Genius Labs integration."""
-from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any
+from typing import Any, override
 
 import aiohttp
-import async_timeout
+import probatio
 import pyevilgenius
-import voluptuous as vol
 
-from homeassistant import config_entries
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.core import HomeAssistant
-from homeassistant.data_entry_flow import FlowResult
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import aiohttp_client
 
@@ -31,7 +28,7 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
     )
 
     try:
-        async with async_timeout.timeout(10):
+        async with asyncio.timeout(10):
             data = await hub.get_all()
             info = await hub.get_info()
     except aiohttp.ClientError as err:
@@ -41,21 +38,22 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
     return {"title": data["name"]["value"], "unique_id": info["wiFiChipId"]}
 
 
-class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
+class EvilGeniusLabsConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Evil Genius Labs."""
 
     VERSION = 1
 
+    @override
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle the initial step."""
         if user_input is None:
             return self.async_show_form(
                 step_id="user",
-                data_schema=vol.Schema(
+                data_schema=probatio.Schema(
                     {
-                        vol.Required("host"): str,
+                        probatio.Required("host"): str,
                     }
                 ),
             )
@@ -64,11 +62,11 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         try:
             info = await validate_input(self.hass, user_input)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             errors["base"] = "timeout"
         except CannotConnect:
             errors["base"] = "cannot_connect"
-        except Exception:  # pylint: disable=broad-except
+        except Exception:
             _LOGGER.exception("Unexpected exception")
             errors["base"] = "unknown"
         else:
@@ -77,9 +75,9 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="user",
-            data_schema=vol.Schema(
+            data_schema=probatio.Schema(
                 {
-                    vol.Required("host", default=user_input["host"]): str,
+                    probatio.Required("host", default=user_input["host"]): str,
                 }
             ),
             errors=errors,

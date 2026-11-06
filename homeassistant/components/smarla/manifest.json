@@ -1,0 +1,14 @@
+{
+  "domain": "smarla",
+  "name": "Swing2Sleep Smarla",
+  "categories": ["health_wellbeing"],
+  "codeowners": ["@explicatis", "@johannes-exp"],
+  "config_flow": true,
+  "connectivity": ["cloud"],
+  "documentation": "https://www.home-assistant.io/integrations/smarla",
+  "integration_type": "device",
+  "iot_class": "cloud_push",
+  "loggers": ["pysmarlaapi", "pysignalr"],
+  "quality_scale": "silver",
+  "requirements": ["pysmarlaapi==1.0.2"]
+}

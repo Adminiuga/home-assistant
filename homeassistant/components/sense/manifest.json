@@ -1,10 +1,10 @@
 {
   "domain": "sense",
   "name": "Sense",
-  "documentation": "https://www.home-assistant.io/integrations/sense",
-  "requirements": ["sense_energy==0.10.4"],
+  "categories": ["energy.meters_monitoring"],
   "codeowners": ["@kbickar"],
   "config_flow": true,
+  "connectivity": ["cloud"],
   "dhcp": [
     {
       "hostname": "sense-*",
@@ -19,6 +19,9 @@
       "macaddress": "A4D578*"
     }
   ],
+  "documentation": "https://www.home-assistant.io/integrations/sense",
+  "integration_type": "hub",
   "iot_class": "cloud_polling",
-  "loggers": ["sense_energy"]
+  "loggers": ["sense_energy"],
+  "requirements": ["sense-energy==0.15.0"]
 }

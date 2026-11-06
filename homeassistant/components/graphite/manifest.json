@@ -1,7 +1,10 @@
 {
   "domain": "graphite",
   "name": "Graphite",
-  "documentation": "https://www.home-assistant.io/integrations/graphite",
+  "categories": ["diy_makers.web_data_connectors"],
   "codeowners": [],
-  "iot_class": "local_push"
+  "connectivity": ["network"],
+  "documentation": "https://www.home-assistant.io/integrations/graphite",
+  "iot_class": "local_push",
+  "quality_scale": "legacy"
 }

@@ -1,8 +1,10 @@
 """The Logitech Harmony Hub integration utils."""
+
 import aioharmony.exceptions as harmony_exceptions
 from aioharmony.harmonyapi import HarmonyAPI
 
 from homeassistant.const import CONF_NAME
+from homeassistant.core import HomeAssistant
 
 
 def find_unique_id_for_remote(harmony: HarmonyAPI):
@@ -12,6 +14,11 @@ def find_unique_id_for_remote(harmony: HarmonyAPI):
 
     # fallback timeStampHash if Hub ID is not available
     return harmony.config["global"]["timeStampHash"].split(";")[-1]
+
+
+def config_file_path(hass: HomeAssistant, unique_id: str | None) -> str:
+    """Return the path the hub configuration is written to."""
+    return hass.config.path(f"harmony_{unique_id}.conf")
 
 
 def find_best_name_for_remote(data: dict, harmony: HarmonyAPI):
@@ -25,7 +32,7 @@ def find_best_name_for_remote(data: dict, harmony: HarmonyAPI):
     return data[CONF_NAME]
 
 
-async def get_harmony_client_if_available(ip_address: str):
+async def get_harmony_client_if_available(ip_address: str) -> HarmonyAPI | None:
     """Connect to a harmony hub and fetch info."""
     harmony = HarmonyAPI(ip_address=ip_address)
 

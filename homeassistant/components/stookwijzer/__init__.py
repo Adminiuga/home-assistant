@@ -1,0 +1,102 @@
+"""The Stookwijzer integration."""
+
+from typing import Any
+
+from stookwijzer import Stookwijzer
+
+from homeassistant.const import CONF_LATITUDE, CONF_LOCATION, CONF_LONGITUDE, Platform
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import ConfigEntryError
+from homeassistant.helpers import (
+    config_validation as cv,
+    entity_registry as er,
+    issue_registry as ir,
+)
+from homeassistant.helpers.typing import ConfigType
+
+from .const import DOMAIN, LOGGER
+from .coordinator import StookwijzerConfigEntry, StookwijzerCoordinator
+from .services import async_setup_services
+
+PLATFORMS = [Platform.SENSOR]
+
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Set up the Stookwijzer component."""
+    async_setup_services(hass)
+    return True
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: StookwijzerConfigEntry) -> None:
+    """Set up Stookwijzer from a config entry."""
+    await er.async_migrate_entries(hass, entry.entry_id, async_migrate_entity_entry)
+
+    coordinator = StookwijzerCoordinator(hass, entry)
+    await coordinator.async_config_entry_first_refresh()
+
+    entry.runtime_data = coordinator
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+
+async def async_unload_entry(
+    hass: HomeAssistant, entry: StookwijzerConfigEntry
+) -> None:
+    """Unload Stookwijzer config entry."""
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)
+
+
+async def async_migrate_entry(
+    hass: HomeAssistant, entry: StookwijzerConfigEntry
+) -> None:
+    """Migrate old entry."""
+    LOGGER.debug("Migrating from version %s", entry.version)
+
+    if entry.version == 1:
+        xy = await Stookwijzer.async_transform_coordinates(
+            entry.data[CONF_LOCATION][CONF_LATITUDE],
+            entry.data[CONF_LOCATION][CONF_LONGITUDE],
+        )
+
+        if not xy:
+            ir.async_create_issue(
+                hass,
+                DOMAIN,
+                f"location_migration_failed_{entry.entry_id}",
+                config_entry_id=entry.entry_id,
+                is_fixable=False,
+                severity=ir.IssueSeverity.ERROR,
+                translation_key="location_migration_failed",
+                translation_placeholders={
+                    "entry_title": entry.title,
+                },
+            )
+            raise ConfigEntryError(
+                translation_domain=DOMAIN,
+                translation_key="location_migration_failed",
+            )
+
+        hass.config_entries.async_update_entry(
+            entry,
+            version=2,
+            data={
+                CONF_LATITUDE: xy["x"],
+                CONF_LONGITUDE: xy["y"],
+            },
+        )
+
+        LOGGER.debug("Migration to version %s successful", entry.version)
+
+
+@callback
+def async_migrate_entity_entry(entity_entry: er.RegistryEntry) -> dict[str, Any] | None:
+    """Migrate Stookwijzer entity entries.
+
+    - Migrates unique ID for the old Stookwijzer sensors to the new unique ID.
+    """
+    if entity_entry.unique_id == entity_entry.config_entry_id:
+        return {"new_unique_id": f"{entity_entry.config_entry_id}_advice"}
+
+    # No migration needed
+    return None

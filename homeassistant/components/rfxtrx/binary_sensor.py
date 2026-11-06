@@ -1,8 +1,7 @@
 """Support for RFXtrx binary sensors."""
-from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, override
 
 import RFXtrx as rfxtrxmod
 
@@ -11,14 +10,20 @@ from homeassistant.components.binary_sensor import (
     BinarySensorEntity,
     BinarySensorEntityDescription,
 )
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.config_entries import ConfigSubentry
 from homeassistant.const import CONF_COMMAND_OFF, CONF_COMMAND_ON, STATE_ON
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.helpers import event as evt
 from homeassistant.helpers.entity import Entity
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from . import DeviceTuple, RfxtrxEntity, async_setup_platform_entry, get_pt2262_cmd
+from . import (
+    DeviceTuple,
+    RfxtrxConfigEntry,
+    async_setup_platform_entry,
+    get_device_tuple_from_device,
+    get_pt2262_cmd,
+)
 from .const import (
     COMMAND_OFF_LIST,
     COMMAND_ON_LIST,
@@ -26,6 +31,7 @@ from .const import (
     CONF_OFF_DELAY,
     DEVICE_PACKET_TYPE_LIGHTING4,
 )
+from .entity import RfxtrxEntity
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -88,8 +94,8 @@ def supported(event: rfxtrxmod.RFXtrxEvent) -> bool:
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    config_entry: RfxtrxConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up config entry."""
 
@@ -101,14 +107,17 @@ async def async_setup_entry(
     def _constructor(
         event: rfxtrxmod.RFXtrxEvent,
         auto: rfxtrxmod.RFXtrxEvent | None,
-        device_id: DeviceTuple,
-        entity_info: dict[str, Any],
+        subentry: ConfigSubentry,
     ) -> list[Entity]:
-
+        entity_info = subentry.data
+        device_id = get_device_tuple_from_device(
+            event.device, data_bits=entity_info.get(CONF_DATA_BITS)
+        )
         return [
             RfxtrxBinarySensor(
                 event.device,
                 device_id,
+                subentry.subentry_id,
                 get_sensor_description(event.device.type_string),
                 entity_info.get(CONF_OFF_DELAY),
                 entity_info.get(CONF_DATA_BITS),
@@ -131,11 +140,13 @@ class RfxtrxBinarySensor(RfxtrxEntity, BinarySensorEntity):
     """
 
     _attr_force_update = True
+    _attr_name = None
 
     def __init__(
         self,
         device: rfxtrxmod.RFXtrxDevice,
         device_id: DeviceTuple,
+        subentry_id: str,
         entity_description: BinarySensorEntityDescription,
         off_delay: float | None = None,
         data_bits: int | None = None,
@@ -144,7 +155,7 @@ class RfxtrxBinarySensor(RfxtrxEntity, BinarySensorEntity):
         event: rfxtrxmod.RFXtrxEvent | None = None,
     ) -> None:
         """Initialize the RFXtrx sensor."""
-        super().__init__(device, device_id, event=event)
+        super().__init__(device, device_id, subentry_id, event=event)
         self.entity_description = entity_description
         self._data_bits = data_bits
         self._off_delay = off_delay
@@ -152,6 +163,7 @@ class RfxtrxBinarySensor(RfxtrxEntity, BinarySensorEntity):
         self._cmd_on = cmd_on
         self._cmd_off = cmd_off
 
+    @override
     async def async_added_to_hass(self) -> None:
         """Restore device state."""
         await super().async_added_to_hass()
@@ -188,6 +200,7 @@ class RfxtrxBinarySensor(RfxtrxEntity, BinarySensorEntity):
         elif event.values.get("Sensor Status") in SENSOR_STATUS_OFF:
             self._attr_is_on = False
 
+    @override
     def _apply_event(self, event: rfxtrxmod.RFXtrxEvent) -> None:
         """Apply command from rfxtrx."""
         super()._apply_event(event)
@@ -197,6 +210,7 @@ class RfxtrxBinarySensor(RfxtrxEntity, BinarySensorEntity):
             self._apply_event_standard(event)
 
     @callback
+    @override
     def _handle_event(
         self, event: rfxtrxmod.RFXtrxEvent, device_id: DeviceTuple
     ) -> None:

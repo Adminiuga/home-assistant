@@ -1,9 +1,16 @@
 {
   "domain": "pilight",
   "name": "Pilight",
+  "categories": [
+    "hubs_protocols.wireless_protocols",
+    "diy_makers.boards_hardware"
+  ],
+  "codeowners": [],
+  "connectivity": ["rf"],
+  "disabled": "Pilight relies on setuptools.pkg_resources, which is no longer available in setuptools 82.0.0 and later.",
   "documentation": "https://www.home-assistant.io/integrations/pilight",
-  "requirements": ["pilight==0.1.1"],
-  "codeowners": ["@trekky12"],
   "iot_class": "local_push",
-  "loggers": ["pilight"]
+  "loggers": ["pilight"],
+  "quality_scale": "legacy",
+  "requirements": ["pilight==0.1.1"]
 }

@@ -1,9 +1,26 @@
 {
   "domain": "velux",
   "name": "Velux",
+  "categories": ["blinds_curtains"],
+  "codeowners": ["@Julius2342", "@pawlizio", "@wollew"],
+  "config_flow": true,
+  "connectivity": ["network"],
+  "dhcp": [
+    {
+      "hostname": "velux_klf*",
+      "macaddress": "646184*"
+    }
+  ],
   "documentation": "https://www.home-assistant.io/integrations/velux",
-  "requirements": ["pyvlx==0.2.20"],
-  "codeowners": ["@Julius2342"],
+  "integration_type": "hub",
   "iot_class": "local_polling",
-  "loggers": ["pyvlx"]
+  "loggers": ["pyvlx"],
+  "quality_scale": "silver",
+  "requirements": ["pyvlx==0.2.36"],
+  "zeroconf": [
+    {
+      "name": "velux_klf_lan_*",
+      "type": "_http._tcp.local."
+    }
+  ]
 }

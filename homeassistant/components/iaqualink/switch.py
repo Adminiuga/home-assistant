@@ -1,15 +1,16 @@
 """Support for Aqualink pool feature switches."""
-from __future__ import annotations
 
-from typing import Any
+from typing import Any, override
 
-from homeassistant.components.switch import DOMAIN, SwitchEntity
-from homeassistant.config_entries import ConfigEntry
+from iaqualink.device import AqualinkSwitch
+
+from homeassistant.components.switch import SwitchEntity
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from . import AqualinkEntity, refresh_system
-from .const import DOMAIN as AQUALINK_DOMAIN
+from . import AqualinkConfigEntry, refresh_system
+from .coordinator import AqualinkDataUpdateCoordinator
+from .entity import AqualinkEntity
 from .utils import await_or_reraise
 
 PARALLEL_UPDATES = 0
@@ -17,48 +18,54 @@ PARALLEL_UPDATES = 0
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    config_entry: AqualinkConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up discovered switches."""
-    devs = []
-    for dev in hass.data[AQUALINK_DOMAIN][DOMAIN]:
-        devs.append(HassAqualinkSwitch(dev))
-    async_add_entities(devs, True)
+    async_add_entities(
+        HassAqualinkSwitch(
+            config_entry.runtime_data.coordinators[dev.system.serial], dev
+        )
+        for dev in config_entry.runtime_data.switches
+    )
 
 
-class HassAqualinkSwitch(AqualinkEntity, SwitchEntity):
+class HassAqualinkSwitch(AqualinkEntity[AqualinkSwitch], SwitchEntity):
     """Representation of a switch."""
 
-    @property
-    def name(self) -> str:
-        """Return the name of the switch."""
-        return self.dev.label
+    def __init__(
+        self, coordinator: AqualinkDataUpdateCoordinator, dev: AqualinkSwitch
+    ) -> None:
+        """Initialize AquaLink switch."""
+        super().__init__(coordinator, dev)
+        name = dev.label
+        if name == "Cleaner":
+            self._attr_icon = "mdi:robot-vacuum"
+        elif name == "Waterfall" or name.endswith("Dscnt"):
+            self._attr_icon = "mdi:fountain"
+        elif name.endswith(("Pump", "Blower")):
+            self._attr_icon = "mdi:fan"
+        if name.endswith("Heater"):
+            self._attr_icon = "mdi:radiator"
 
     @property
-    def icon(self) -> str | None:
-        """Return an icon based on the switch type."""
-        if self.name == "Cleaner":
-            return "mdi:robot-vacuum"
-        if self.name == "Waterfall" or self.name.endswith("Dscnt"):
-            return "mdi:fountain"
-        if self.name.endswith("Pump") or self.name.endswith("Blower"):
-            return "mdi:fan"
-        if self.name.endswith("Heater"):
-            return "mdi:radiator"
-        return None
-
-    @property
+    @override
     def is_on(self) -> bool:
         """Return whether the switch is on or not."""
         return self.dev.is_on
 
     @refresh_system
+    @override
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn on the switch."""
-        await await_or_reraise(self.dev.turn_on())
+        await await_or_reraise(
+            self.hass, self.coordinator.config_entry, self.dev.turn_on()
+        )
 
     @refresh_system
+    @override
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn off the switch."""
-        await await_or_reraise(self.dev.turn_off())
+        await await_or_reraise(
+            self.hass, self.coordinator.config_entry, self.dev.turn_off()
+        )

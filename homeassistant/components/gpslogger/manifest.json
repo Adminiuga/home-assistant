@@ -1,9 +1,11 @@
 {
   "domain": "gpslogger",
   "name": "GPSLogger",
-  "config_flow": true,
-  "documentation": "https://www.home-assistant.io/integrations/gpslogger",
-  "dependencies": ["webhook"],
+  "categories": ["presence_location.phones_companion_apps"],
   "codeowners": [],
+  "config_flow": true,
+  "connectivity": ["cloud", "network"],
+  "dependencies": ["webhook"],
+  "documentation": "https://www.home-assistant.io/integrations/gpslogger",
   "iot_class": "cloud_push"
 }

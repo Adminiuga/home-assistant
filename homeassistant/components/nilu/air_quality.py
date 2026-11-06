@@ -1,8 +1,8 @@
 """Sensor for checking the air quality around Norway."""
-from __future__ import annotations
 
 from datetime import timedelta
 import logging
+from typing import override
 
 from niluclient import (
     CO,
@@ -20,9 +20,12 @@ from niluclient import (
     create_station_client,
     lookup_stations_in_area,
 )
-import voluptuous as vol
+import probatio
 
-from homeassistant.components.air_quality import PLATFORM_SCHEMA, AirQualityEntity
+from homeassistant.components.air_quality import (
+    PLATFORM_SCHEMA as AIR_QUALITY_PLATFORM_SCHEMA,
+    AirQualityEntity,
+)
 from homeassistant.const import (
     CONF_LATITUDE,
     CONF_LONGITUDE,
@@ -30,7 +33,7 @@ from homeassistant.const import (
     CONF_SHOW_ON_MAP,
 )
 from homeassistant.core import HomeAssistant
-import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 from homeassistant.util import Throttle
@@ -39,7 +42,6 @@ _LOGGER = logging.getLogger(__name__)
 
 ATTR_AREA = "area"
 ATTR_POLLUTION_INDEX = "nilu_pollution_index"
-ATTRIBUTION = "Data provided by luftkvalitet.info and nilu.no"
 
 CONF_AREA = "area"
 CONF_STATION = "stations"
@@ -86,30 +88,34 @@ CONF_ALLOWED_AREAS = [
     "Ålesund",
 ]
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
+PLATFORM_SCHEMA = AIR_QUALITY_PLATFORM_SCHEMA.extend(
     {
-        vol.Inclusive(
+        probatio.Inclusive(
             CONF_LATITUDE, "coordinates", "Latitude and longitude must exist together"
         ): cv.latitude,
-        vol.Inclusive(
+        probatio.Inclusive(
             CONF_LONGITUDE, "coordinates", "Latitude and longitude must exist together"
         ): cv.longitude,
-        vol.Exclusive(
+        probatio.Exclusive(
             CONF_AREA,
             "station_collection",
-            "Can only configure one specific station or "
-            "stations in a specific area pr sensor. "
-            "Please only configure station or area.",
-        ): vol.All(cv.string, vol.In(CONF_ALLOWED_AREAS)),
-        vol.Exclusive(
+            (
+                "Can only configure one specific station or "
+                "stations in a specific area pr sensor. "
+                "Please only configure station or area."
+            ),
+        ): probatio.All(cv.string, probatio.In(CONF_ALLOWED_AREAS)),
+        probatio.Exclusive(
             CONF_STATION,
             "station_collection",
-            "Can only configure one specific station or "
-            "stations in a specific area pr sensor. "
-            "Please only configure station or area.",
-        ): vol.All(cv.ensure_list, [cv.string]),
-        vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
-        vol.Optional(CONF_SHOW_ON_MAP, default=False): cv.boolean,
+            (
+                "Can only configure one specific station or "
+                "stations in a specific area pr sensor. "
+                "Please only configure station or area."
+            ),
+        ): probatio.All(probatio.EnsureList(), [cv.string]),
+        probatio.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
+        probatio.Optional(CONF_SHOW_ON_MAP, default=False): cv.boolean,
     }
 )
 
@@ -169,6 +175,8 @@ class NiluData:
 class NiluSensor(AirQualityEntity):
     """Single nilu station air sensor."""
 
+    _attr_attribution = "Data provided by luftkvalitet.info and nilu.no"
+
     def __init__(self, api_data: NiluData, name: str, show_on_map: bool) -> None:
         """Initialize the sensor."""
         self._api = api_data
@@ -181,71 +189,79 @@ class NiluSensor(AirQualityEntity):
             self._attrs[CONF_LONGITUDE] = api_data.data.longitude
 
     @property
-    def attribution(self) -> str:
-        """Return the attribution."""
-        return ATTRIBUTION
-
-    @property
+    @override
     def extra_state_attributes(self) -> dict:
         """Return other details about the sensor state."""
         return self._attrs
 
     @property
+    @override
     def name(self) -> str:
         """Return the name of the sensor."""
         return self._name
 
     @property
+    @override
     def air_quality_index(self) -> str | None:
         """Return the Air Quality Index (AQI)."""
         return self._max_aqi
 
     @property
+    @override
     def carbon_monoxide(self) -> str | None:
         """Return the CO (carbon monoxide) level."""
         return self.get_component_state(CO)
 
     @property
+    @override
     def carbon_dioxide(self) -> str | None:
         """Return the CO2 (carbon dioxide) level."""
         return self.get_component_state(CO2)
 
     @property
+    @override
     def nitrogen_oxide(self) -> str | None:
         """Return the N2O (nitrogen oxide) level."""
         return self.get_component_state(NOX)
 
     @property
+    @override
     def nitrogen_monoxide(self) -> str | None:
         """Return the NO (nitrogen monoxide) level."""
         return self.get_component_state(NO)
 
     @property
+    @override
     def nitrogen_dioxide(self) -> str | None:
         """Return the NO2 (nitrogen dioxide) level."""
         return self.get_component_state(NO2)
 
     @property
+    @override
     def ozone(self) -> str | None:
         """Return the O3 (ozone) level."""
         return self.get_component_state(OZONE)
 
     @property
+    @override
     def particulate_matter_2_5(self) -> str | None:
         """Return the particulate matter 2.5 level."""
         return self.get_component_state(PM25)
 
     @property
+    @override
     def particulate_matter_10(self) -> str | None:
         """Return the particulate matter 10 level."""
         return self.get_component_state(PM10)
 
     @property
+    @override
     def particulate_matter_0_1(self) -> str | None:
         """Return the particulate matter 0.1 level."""
         return self.get_component_state(PM1)
 
     @property
+    @override
     def sulphur_dioxide(self) -> str | None:
         """Return the SO2 (sulphur dioxide) level."""
         return self.get_component_state(SO2)

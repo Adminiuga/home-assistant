@@ -1,16 +1,21 @@
 """The notify_events component."""
-import voluptuous as vol
+
+import probatio
 
 from homeassistant.const import CONF_TOKEN, Platform
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers import discovery
-import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers import config_validation as cv, discovery
 from homeassistant.helpers.typing import ConfigType
 
 from .const import DOMAIN
 
-CONFIG_SCHEMA = vol.Schema(
-    {DOMAIN: vol.Schema({vol.Required(CONF_TOKEN): cv.string})}, extra=vol.ALLOW_EXTRA
+CONFIG_SCHEMA = probatio.Schema(
+    {
+        DOMAIN: probatio.Schema(
+            {probatio.Required(probatio.Secret(CONF_TOKEN)): cv.string}
+        )
+    },
+    extra=probatio.ALLOW_EXTRA,
 )
 
 

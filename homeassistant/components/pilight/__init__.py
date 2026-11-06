@@ -1,17 +1,14 @@
 """Component to create an interface to a Pilight daemon."""
-from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import timedelta
 import functools
 import logging
-import socket
 import threading
 from typing import Any
 
 from pilight import pilight
-from typing_extensions import ParamSpec
-import voluptuous as vol
+import probatio
 
 from homeassistant.const import (
     CONF_HOST,
@@ -21,13 +18,12 @@ from homeassistant.const import (
     EVENT_HOMEASSISTANT_START,
     EVENT_HOMEASSISTANT_STOP,
 )
-from homeassistant.core import HomeAssistant, ServiceCall
-import homeassistant.helpers.config_validation as cv
+from homeassistant.core import Event, HomeAssistant, ServiceCall
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.event import track_point_in_utc_time
 from homeassistant.helpers.typing import ConfigType
 from homeassistant.util import dt as dt_util
-
-_P = ParamSpec("_P")
+from homeassistant.util.async_ import run_callback_threadsafe
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -39,31 +35,36 @@ DEFAULT_SEND_DELAY = 0.0
 DOMAIN = "pilight"
 
 EVENT = "pilight_received"
+type EVENT_TYPE = Event[dict[str, Any]]
 
 # The Pilight code schema depends on the protocol. Thus only require to have
 # the protocol information. Ensure that protocol is in a list otherwise
 # segfault in pilight-daemon, https://github.com/pilight/pilight/issues/296
-RF_CODE_SCHEMA = vol.Schema(
-    {vol.Required(CONF_PROTOCOL): vol.All(cv.ensure_list, [cv.string])},
-    extra=vol.ALLOW_EXTRA,
+RF_CODE_SCHEMA = probatio.Schema(
+    {
+        probatio.Required(CONF_PROTOCOL): probatio.All(
+            probatio.EnsureList(), [cv.string]
+        )
+    },
+    extra=probatio.ALLOW_EXTRA,
 )
 
 SERVICE_NAME = "send"
 
-CONFIG_SCHEMA = vol.Schema(
+CONFIG_SCHEMA = probatio.Schema(
     {
-        DOMAIN: vol.Schema(
+        DOMAIN: probatio.Schema(
             {
-                vol.Optional(CONF_HOST, default=DEFAULT_HOST): cv.string,
-                vol.Optional(CONF_PORT, default=DEFAULT_PORT): cv.port,
-                vol.Optional(CONF_WHITELIST, default={}): {cv.string: [cv.string]},
-                vol.Optional(CONF_SEND_DELAY, default=DEFAULT_SEND_DELAY): vol.Coerce(
-                    float
-                ),
+                probatio.Optional(CONF_HOST, default=DEFAULT_HOST): cv.string,
+                probatio.Optional(CONF_PORT, default=DEFAULT_PORT): probatio.Port(),
+                probatio.Optional(CONF_WHITELIST, default={}): {cv.string: [cv.string]},
+                probatio.Optional(
+                    CONF_SEND_DELAY, default=DEFAULT_SEND_DELAY
+                ): probatio.Coerce(float),
             }
         )
     },
-    extra=vol.ALLOW_EXTRA,
+    extra=probatio.ALLOW_EXTRA,
 )
 
 
@@ -76,7 +77,7 @@ def setup(hass: HomeAssistant, config: ConfigType) -> bool:
 
     try:
         pilight_client = pilight.Client(host=host, port=port)
-    except (OSError, socket.timeout) as err:
+    except (OSError, TimeoutError) as err:
         _LOGGER.error("Unable to connect to %s on port %s: %s", host, port, err)
         return False
 
@@ -101,10 +102,24 @@ def setup(hass: HomeAssistant, config: ConfigType) -> bool:
 
         try:
             pilight_client.send_code(message_data)
+        # pylint: disable-next=home-assistant-action-swallowed-exception
         except OSError:
             _LOGGER.error("Pilight send failed for %s", str(message_data))
 
-    hass.services.register(DOMAIN, SERVICE_NAME, send_code, schema=RF_CODE_SCHEMA)
+    def _register_service() -> None:
+        # Cannot be moved: the integration is disabled
+        # pylint: disable-next=home-assistant-action-registered-outside-services-module
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_NAME,
+            send_code,
+            schema=RF_CODE_SCHEMA,
+            description_placeholders={
+                "pilight_protocols_docs_url": "https://manual.pilight.org/protocols/index.html"
+            },
+        )
+
+    run_callback_threadsafe(hass.loop, _register_service).result()
 
     # Publish received codes on the HA event bus
     # A whitelist of codes to be published in the event bus
@@ -118,11 +133,8 @@ def setup(hass: HomeAssistant, config: ConfigType) -> bool:
             {"protocol": data["protocol"], "uuid": data["uuid"]}, **data["message"]
         )
 
-        # No whitelist defined, put data on event bus
-        if not whitelist:
-            hass.bus.fire(EVENT, data)
-        # Check if data matches the defined whitelist
-        elif all(str(data[key]) in whitelist[key] for key in whitelist):
+        # No whitelist defined or data matches whitelist, put data on event bus
+        if not whitelist or all(str(data[key]) in whitelist[key] for key in whitelist):
             hass.bus.fire(EVENT, data)
 
     pilight_client.set_callback(handle_received_code)
@@ -142,7 +154,7 @@ class CallRateDelayThrottle:
     it should not block the mainloop.
     """
 
-    def __init__(self, hass, delay_seconds: float) -> None:
+    def __init__(self, hass: HomeAssistant, delay_seconds: float) -> None:
         """Initialize the delay handler."""
         self._delay = timedelta(seconds=max(0.0, delay_seconds))
         self._queue: list[Callable[[Any], None]] = []
@@ -151,7 +163,7 @@ class CallRateDelayThrottle:
         self._next_ts = dt_util.utcnow()
         self._schedule = functools.partial(track_point_in_utc_time, hass)
 
-    def limited(self, method: Callable[_P, Any]) -> Callable[_P, None]:
+    def limited[**_P](self, method: Callable[_P, Any]) -> Callable[_P, None]:
         """Decorate to delay calls on a certain method."""
 
         @functools.wraps(method)

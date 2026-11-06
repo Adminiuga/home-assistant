@@ -1,25 +1,32 @@
 """Support for azure service bus notification."""
+
 import json
 import logging
+from typing import Any, override
 
 from azure.servicebus import ServiceBusMessage
-from azure.servicebus.aio import ServiceBusClient
+from azure.servicebus.aio import ServiceBusClient, ServiceBusSender
 from azure.servicebus.exceptions import (
     MessagingEntityNotFoundError,
     ServiceBusConnectionError,
     ServiceBusError,
 )
-import voluptuous as vol
+import probatio
 
 from homeassistant.components.notify import (
     ATTR_DATA,
     ATTR_TARGET,
     ATTR_TITLE,
-    PLATFORM_SCHEMA,
+    PLATFORM_SCHEMA as NOTIFY_PLATFORM_SCHEMA,
     BaseNotificationService,
 )
 from homeassistant.const import CONTENT_TYPE_JSON
-import homeassistant.helpers.config_validation as cv
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
+
+DOMAIN = "azure_service_bus"
 
 CONF_CONNECTION_STRING = "connection_string"
 CONF_QUEUE_NAME = "queue"
@@ -29,15 +36,15 @@ ATTR_ASB_MESSAGE = "message"
 ATTR_ASB_TITLE = "title"
 ATTR_ASB_TARGET = "target"
 
-PLATFORM_SCHEMA = vol.All(
-    cv.has_at_least_one_key(CONF_QUEUE_NAME, CONF_TOPIC_NAME),
-    PLATFORM_SCHEMA.extend(
+PLATFORM_SCHEMA = probatio.All(
+    probatio.AtLeastOne(CONF_QUEUE_NAME, CONF_TOPIC_NAME),
+    NOTIFY_PLATFORM_SCHEMA.extend(
         {
-            vol.Required(CONF_CONNECTION_STRING): cv.string,
-            vol.Exclusive(
+            probatio.Required(CONF_CONNECTION_STRING): cv.string,
+            probatio.Exclusive(
                 CONF_QUEUE_NAME, "output", "Can only send to a queue or a topic."
             ): cv.string,
-            vol.Exclusive(
+            probatio.Exclusive(
                 CONF_TOPIC_NAME, "output", "Can only send to a queue or a topic."
             ): cv.string,
         }
@@ -47,11 +54,15 @@ PLATFORM_SCHEMA = vol.All(
 _LOGGER = logging.getLogger(__name__)
 
 
-def get_service(hass, config, discovery_info=None):
+def get_service(
+    hass: HomeAssistant,
+    config: ConfigType,
+    discovery_info: DiscoveryInfoType | None = None,
+) -> ServiceBusNotificationService | None:
     """Get the notification service."""
-    connection_string = config[CONF_CONNECTION_STRING]
-    queue_name = config.get(CONF_QUEUE_NAME)
-    topic_name = config.get(CONF_TOPIC_NAME)
+    connection_string: str = config[CONF_CONNECTION_STRING]
+    queue_name: str | None = config.get(CONF_QUEUE_NAME)
+    topic_name: str | None = config.get(CONF_TOPIC_NAME)
 
     # Library can do synchronous IO when creating the clients.
     # Passes in loop here, but can't run setup on the event loop.
@@ -59,10 +70,11 @@ def get_service(hass, config, discovery_info=None):
         connection_string, loop=hass.loop
     )
 
+    client: ServiceBusSender | None = None
     try:
         if queue_name:
             client = servicebus.get_queue_sender(queue_name)
-        else:
+        elif topic_name:
             client = servicebus.get_topic_sender(topic_name)
     except (ServiceBusConnectionError, MessagingEntityNotFoundError) as err:
         _LOGGER.error(
@@ -72,7 +84,7 @@ def get_service(hass, config, discovery_info=None):
         )
         return None
 
-    return ServiceBusNotificationService(client)
+    return ServiceBusNotificationService(client) if client else None
 
 
 class ServiceBusNotificationService(BaseNotificationService):
@@ -82,7 +94,8 @@ class ServiceBusNotificationService(BaseNotificationService):
         """Initialize the service."""
         self._client = client
 
-    async def async_send_message(self, message, **kwargs):
+    @override
+    async def async_send_message(self, message: str, **kwargs: Any) -> None:
         """Send a message."""
         dto = {ATTR_ASB_MESSAGE: message}
 
@@ -100,8 +113,8 @@ class ServiceBusNotificationService(BaseNotificationService):
         try:
             await self._client.send_messages(queue_message)
         except ServiceBusError as err:
-            _LOGGER.error(
-                "Could not send service bus notification to %s. %s",
-                self._client.name,
-                err,
-            )
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="send_message_failed",
+                translation_placeholders={"target": self._client.name},
+            ) from err

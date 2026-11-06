@@ -1,7 +1,9 @@
 """The Nibe Heat Pump sensors."""
-from __future__ import annotations
 
-from nibe.coil import Coil
+from math import ceil, log10
+from typing import override
+
+from nibe.coil import Coil, CoilData
 
 from homeassistant.components.sensor import (
     ENTITY_ID_FORMAT,
@@ -10,25 +12,24 @@ from homeassistant.components.sensor import (
     SensorEntityDescription,
     SensorStateClass,
 )
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
-    ELECTRIC_CURRENT_AMPERE,
-    ELECTRIC_CURRENT_MILLIAMPERE,
-    ELECTRIC_POTENTIAL_MILLIVOLT,
-    ELECTRIC_POTENTIAL_VOLT,
-    ENERGY_KILO_WATT_HOUR,
-    ENERGY_MEGA_WATT_HOUR,
-    ENERGY_WATT_HOUR,
-    POWER_WATT,
-    TEMP_CELSIUS,
-    TEMP_FAHRENHEIT,
-    TIME_HOURS,
+    PERCENTAGE,
+    EntityCategory,
+    UnitOfElectricCurrent,
+    UnitOfElectricPotential,
+    UnitOfEnergy,
+    UnitOfFrequency,
+    UnitOfPower,
+    UnitOfPressure,
+    UnitOfTemperature,
+    UnitOfTime,
+    UnitOfVolumeFlowRate,
 )
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity import EntityCategory
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from . import DOMAIN, CoilEntity, Coordinator
+from .coordinator import CoilCoordinator, NibeHeatpumpConfigEntry
+from .entity import CoilEntity
 
 UNIT_DESCRIPTIONS = {
     "°C": SensorEntityDescription(
@@ -36,94 +37,201 @@ UNIT_DESCRIPTIONS = {
         entity_category=EntityCategory.DIAGNOSTIC,
         device_class=SensorDeviceClass.TEMPERATURE,
         state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=TEMP_CELSIUS,
+        native_unit_of_measurement=UnitOfTemperature.CELSIUS,
     ),
     "°F": SensorEntityDescription(
         key="°F",
         entity_category=EntityCategory.DIAGNOSTIC,
         device_class=SensorDeviceClass.TEMPERATURE,
         state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=TEMP_FAHRENHEIT,
+        native_unit_of_measurement=UnitOfTemperature.FAHRENHEIT,
     ),
     "A": SensorEntityDescription(
         key="A",
         entity_category=EntityCategory.DIAGNOSTIC,
         device_class=SensorDeviceClass.CURRENT,
         state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=ELECTRIC_CURRENT_AMPERE,
+        native_unit_of_measurement=UnitOfElectricCurrent.AMPERE,
     ),
     "mA": SensorEntityDescription(
         key="mA",
         entity_category=EntityCategory.DIAGNOSTIC,
         device_class=SensorDeviceClass.CURRENT,
         state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=ELECTRIC_CURRENT_MILLIAMPERE,
+        native_unit_of_measurement=UnitOfElectricCurrent.MILLIAMPERE,
     ),
     "V": SensorEntityDescription(
         key="V",
         entity_category=EntityCategory.DIAGNOSTIC,
-        device_class=SensorDeviceClass.CURRENT,
+        device_class=SensorDeviceClass.VOLTAGE,
         state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=ELECTRIC_POTENTIAL_VOLT,
+        native_unit_of_measurement=UnitOfElectricPotential.VOLT,
     ),
     "mV": SensorEntityDescription(
         key="mV",
         entity_category=EntityCategory.DIAGNOSTIC,
-        device_class=SensorDeviceClass.CURRENT,
+        device_class=SensorDeviceClass.VOLTAGE,
         state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=ELECTRIC_POTENTIAL_MILLIVOLT,
+        native_unit_of_measurement=UnitOfElectricPotential.MILLIVOLT,
     ),
     "W": SensorEntityDescription(
         key="W",
         entity_category=EntityCategory.DIAGNOSTIC,
         device_class=SensorDeviceClass.POWER,
         state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=POWER_WATT,
+        native_unit_of_measurement=UnitOfPower.WATT,
+    ),
+    "kW": SensorEntityDescription(
+        key="kW",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        device_class=SensorDeviceClass.POWER,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=UnitOfPower.KILO_WATT,
     ),
     "Wh": SensorEntityDescription(
         key="Wh",
         entity_category=EntityCategory.DIAGNOSTIC,
         device_class=SensorDeviceClass.ENERGY,
         state_class=SensorStateClass.TOTAL_INCREASING,
-        native_unit_of_measurement=ENERGY_WATT_HOUR,
+        native_unit_of_measurement=UnitOfEnergy.WATT_HOUR,
     ),
     "kWh": SensorEntityDescription(
         key="kWh",
         entity_category=EntityCategory.DIAGNOSTIC,
         device_class=SensorDeviceClass.ENERGY,
         state_class=SensorStateClass.TOTAL_INCREASING,
-        native_unit_of_measurement=ENERGY_KILO_WATT_HOUR,
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
     ),
     "MWh": SensorEntityDescription(
         key="MWh",
         entity_category=EntityCategory.DIAGNOSTIC,
         device_class=SensorDeviceClass.ENERGY,
         state_class=SensorStateClass.TOTAL_INCREASING,
-        native_unit_of_measurement=ENERGY_MEGA_WATT_HOUR,
+        native_unit_of_measurement=UnitOfEnergy.MEGA_WATT_HOUR,
+    ),
+    "hrs": SensorEntityDescription(
+        key="hrs",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        device_class=SensorDeviceClass.DURATION,
+        native_unit_of_measurement=UnitOfTime.HOURS,
     ),
     "h": SensorEntityDescription(
         key="h",
         entity_category=EntityCategory.DIAGNOSTIC,
         device_class=SensorDeviceClass.DURATION,
         state_class=SensorStateClass.TOTAL_INCREASING,
-        native_unit_of_measurement=TIME_HOURS,
+        native_unit_of_measurement=UnitOfTime.HOURS,
+    ),
+    "min": SensorEntityDescription(
+        key="min",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        device_class=SensorDeviceClass.DURATION,
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        native_unit_of_measurement=UnitOfTime.MINUTES,
+    ),
+    "s": SensorEntityDescription(
+        key="s",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        device_class=SensorDeviceClass.DURATION,
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        native_unit_of_measurement=UnitOfTime.SECONDS,
+    ),
+    "Hz": SensorEntityDescription(
+        key="Hz",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        device_class=SensorDeviceClass.FREQUENCY,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=UnitOfFrequency.HERTZ,
+    ),
+    "Pa": SensorEntityDescription(
+        key="Pa",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        device_class=SensorDeviceClass.PRESSURE,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=UnitOfPressure.PA,
+    ),
+    "kPa": SensorEntityDescription(
+        key="kPa",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        device_class=SensorDeviceClass.PRESSURE,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=UnitOfPressure.KPA,
+    ),
+    "bar": SensorEntityDescription(
+        key="bar",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        device_class=SensorDeviceClass.PRESSURE,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=UnitOfPressure.BAR,
+    ),
+    "l/m": SensorEntityDescription(
+        key="l/m",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        device_class=SensorDeviceClass.VOLUME_FLOW_RATE,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=UnitOfVolumeFlowRate.LITERS_PER_MINUTE,
+    ),
+    "l/min": SensorEntityDescription(
+        key="l/min",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        device_class=SensorDeviceClass.VOLUME_FLOW_RATE,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=UnitOfVolumeFlowRate.LITERS_PER_MINUTE,
+    ),
+    "m³/h": SensorEntityDescription(
+        key="m³/h",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        device_class=SensorDeviceClass.VOLUME_FLOW_RATE,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=UnitOfVolumeFlowRate.CUBIC_METERS_PER_HOUR,
+    ),
+    "%RH": SensorEntityDescription(
+        key="%RH",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        device_class=SensorDeviceClass.HUMIDITY,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=PERCENTAGE,
+    ),
+    "DM": SensorEntityDescription(
+        key="DM",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        native_unit_of_measurement="DM",
+        icon="mdi:thermometer-lines",
     ),
 }
+
+NATURE_TO_STATE_CLASS = {
+    "total": SensorStateClass.TOTAL,
+    "total_increasing": SensorStateClass.TOTAL_INCREASING,
+    "measurement": SensorStateClass.MEASUREMENT,
+    "measurement_angle": SensorStateClass.MEASUREMENT_ANGLE,
+}
+
+
+def _is_supported(coil: Coil) -> bool:
+    """Check if coil is supported by platform."""
+    if coil.is_boolean:
+        return False
+
+    if coil.is_writable and coil.nature is None:
+        return False
+
+    return True
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    config_entry: NibeHeatpumpConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up platform."""
 
-    coordinator: Coordinator = hass.data[DOMAIN][config_entry.entry_id]
+    coordinator = config_entry.runtime_data
 
     async_add_entities(
         Sensor(coordinator, coil, UNIT_DESCRIPTIONS.get(coil.unit))
         for coil in coordinator.coils
-        if not coil.is_writable and not coil.is_boolean
+        if _is_supported(coil)
     )
 
 
@@ -132,7 +240,7 @@ class Sensor(CoilEntity, SensorEntity):
 
     def __init__(
         self,
-        coordinator: Coordinator,
+        coordinator: CoilCoordinator,
         coil: Coil,
         entity_description: SensorEntityDescription | None,
     ) -> None:
@@ -144,5 +252,15 @@ class Sensor(CoilEntity, SensorEntity):
             self._attr_native_unit_of_measurement = coil.unit
             self._attr_entity_category = EntityCategory.DIAGNOSTIC
 
-    def _async_read_coil(self, coil: Coil):
-        self._attr_native_value = coil.value
+        if state_class := NATURE_TO_STATE_CLASS.get(coil.nature):
+            self._attr_state_class = state_class
+
+        if coil.mappings:
+            self._attr_device_class = SensorDeviceClass.ENUM
+            self._attr_options = list(coil.mappings.values())
+        else:
+            self._attr_suggested_display_precision = ceil(log10(abs(coil.factor)))
+
+    @override
+    def _async_read_coil(self, data: CoilData):
+        self._attr_native_value = data.value

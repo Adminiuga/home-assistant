@@ -1,19 +1,149 @@
 {
   "config": {
-    "step": {
-      "user": {
-        "title": "Connect to Heos",
-        "description": "Please enter the host name or IP address of a Heos device (preferably one connected via wire to the network).",
-        "data": {
-          "host": "[%key:common::config_flow::data::host%]"
-        }
-      }
+    "abort": {
+      "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]",
+      "single_instance_allowed": "[%key:common::config_flow::abort::single_instance_allowed%]"
     },
     "error": {
-      "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]"
+      "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]",
+      "invalid_auth": "[%key:common::config_flow::error::invalid_auth%]",
+      "password_missing": "[%key:component::heos::options::error::password_missing%]",
+      "unknown": "[%key:common::config_flow::error::unknown%]",
+      "username_missing": "[%key:component::heos::options::error::username_missing%]"
     },
-    "abort": {
-      "single_instance_allowed": "[%key:common::config_flow::abort::single_instance_allowed%]"
+    "step": {
+      "confirm_discovery": {
+        "description": "Do you want to add your HEOS devices to Home Assistant?",
+        "title": "Discovered HEOS System"
+      },
+      "reauth_confirm": {
+        "data": {
+          "password": "[%key:common::config_flow::data::password%]",
+          "username": "[%key:common::config_flow::data::username%]"
+        },
+        "data_description": {
+          "password": "[%key:component::heos::options::step::init::data_description::password%]",
+          "username": "[%key:component::heos::options::step::init::data_description::username%]"
+        },
+        "description": "Please update your HEOS Account credentials. Alternatively, you can clear the credentials if you do not want the integration to access favorites, playlists, and streaming services.",
+        "title": "Reauthenticate HEOS"
+      },
+      "reconfigure": {
+        "data": {
+          "host": "[%key:common::config_flow::data::host%]"
+        },
+        "data_description": {
+          "host": "[%key:component::heos::config::step::user::data_description::host%]"
+        },
+        "description": "Change the host name or IP address of the HEOS-capable product used to access your HEOS System.",
+        "title": "Reconfigure HEOS"
+      },
+      "user": {
+        "data": {
+          "host": "[%key:common::config_flow::data::host%]"
+        },
+        "data_description": {
+          "host": "Host name or IP address of a HEOS-capable product (preferably one connected via wire to the network)."
+        },
+        "description": "Please enter the host name or IP address of a HEOS-capable product to access your HEOS System.",
+        "title": "Connect to HEOS"
+      }
+    }
+  },
+  "exceptions": {
+    "action_error": {
+      "message": "Unable to {action}: {error}"
+    },
+    "entity_not_found": {
+      "message": "Entity {entity_id} was not found"
+    },
+    "entity_not_grouped": {
+      "message": "Entity {entity_id} is not joined to a group"
+    },
+    "not_heos_media_player": {
+      "message": "Entity {entity_id} is not a HEOS media player entity"
+    },
+    "unable_to_connect": {
+      "message": "Unable to connect to {host}"
+    },
+    "unable_to_get_players": {
+      "message": "Unexpected error retrieving players"
+    },
+    "unknown_source": {
+      "message": "Unknown source: {source}"
+    },
+    "unsupported_media_content_id": {
+      "message": "Unsupported media_content_id: {media_content_id}"
+    }
+  },
+  "options": {
+    "error": {
+      "invalid_auth": "[%key:common::config_flow::error::invalid_auth%]",
+      "password_missing": "Password is missing",
+      "unknown": "[%key:common::config_flow::error::unknown%]",
+      "username_missing": "Username is missing"
+    },
+    "step": {
+      "init": {
+        "data": {
+          "password": "[%key:common::config_flow::data::password%]",
+          "username": "[%key:common::config_flow::data::username%]"
+        },
+        "data_description": {
+          "password": "The password to your HEOS Account.",
+          "username": "The username or email address of your HEOS Account."
+        },
+        "description": "You can sign in to your HEOS Account to access favorites, streaming services, and other features. Clearing the credentials will sign out of your account.",
+        "title": "HEOS options"
+      }
+    }
+  },
+  "services": {
+    "get_queue": {
+      "description": "Retrieves the queue of the media player.",
+      "name": "Get queue"
+    },
+    "group_volume_down": {
+      "description": "Turns down the group volume.",
+      "name": "Turn down group volume"
+    },
+    "group_volume_set": {
+      "description": "Sets the group's volume while preserving member volume ratios.",
+      "fields": {
+        "volume_level": {
+          "description": "The volume. 0 is inaudible, 1 is the maximum volume.",
+          "name": "Level"
+        }
+      },
+      "name": "Set group volume"
+    },
+    "group_volume_up": {
+      "description": "Turns up the group volume.",
+      "name": "Turn up group volume"
+    },
+    "move_queue_item": {
+      "description": "Moves one or more items within the play queue.",
+      "fields": {
+        "destination_position": {
+          "description": "The position index in the queue to move the items to.",
+          "name": "Destination position"
+        },
+        "queue_ids": {
+          "description": "The IDs (indexes) of the items in the queue to move.",
+          "name": "Queue IDs"
+        }
+      },
+      "name": "Move queue item"
+    },
+    "remove_from_queue": {
+      "description": "Removes items from the play queue.",
+      "fields": {
+        "queue_ids": {
+          "description": "The IDs (indexes) of the items in the queue to remove.",
+          "name": "Queue IDs"
+        }
+      },
+      "name": "Remove from queue"
     }
   }
 }

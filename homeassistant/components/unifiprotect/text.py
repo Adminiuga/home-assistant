@@ -1,0 +1,107 @@
+"""Text entities for UniFi Protect."""
+
+from collections.abc import Sequence
+from dataclasses import dataclass
+from typing import cast, override
+
+from uiprotect.data import DoorbellMessageType, ModelType, ProtectAdoptableDeviceModel
+from uiprotect.data.public_devices import PublicCamera, PublicDeviceModel
+
+from homeassistant.components.text import TextEntity, TextEntityDescription
+from homeassistant.const import EntityCategory
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+
+from .data import ProtectDeviceType, UFPConfigEntry
+from .entity import (
+    ProtectDeviceEntity,
+    ProtectEntityDescription,
+    ProtectSettableKeysMixin,
+    T,
+    async_all_device_entities,
+)
+from .utils import async_get_doorbell_settings_public, async_ufp_instance_command
+
+PARALLEL_UPDATES = 0
+
+
+@dataclass(frozen=True, kw_only=True)
+class ProtectTextEntityDescription(ProtectSettableKeysMixin[T], TextEntityDescription):
+    """Describes UniFi Protect Text entity."""
+
+
+def _get_doorbell_current(obj: PublicDeviceModel) -> str | None:
+    if (text := cast(PublicCamera, obj).lcd_message_text) is None:
+        return async_get_doorbell_settings_public(obj.api).default_message_text
+    return text
+
+
+async def _set_doorbell_message(obj: PublicCamera, message: str) -> None:
+    # reset_at=None keeps the message up until it is changed
+    await obj.set_lcd_message(
+        DoorbellMessageType.CUSTOM_MESSAGE, text=message, reset_at=None
+    )
+
+
+CAMERA: tuple[ProtectTextEntityDescription, ...] = (
+    ProtectTextEntityDescription(
+        key="doorbell",
+        translation_key="doorbell",
+        entity_category=EntityCategory.CONFIG,
+        ufp_public_value_fn=_get_doorbell_current,
+        ufp_set_method_fn=_set_doorbell_message,
+        ufp_required_field="feature_flags.has_lcd_screen",
+    ),
+)
+
+_MODEL_DESCRIPTIONS: dict[ModelType, Sequence[ProtectEntityDescription]] = {
+    ModelType.CAMERA: CAMERA,
+}
+
+
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: UFPConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up sensors for UniFi Protect integration."""
+    data = entry.runtime_data
+
+    @callback
+    def _add_new_device(device: ProtectAdoptableDeviceModel) -> None:
+        async_add_entities(
+            async_all_device_entities(
+                data,
+                ProtectDeviceText,
+                model_descriptions=_MODEL_DESCRIPTIONS,
+                ufp_device=device,
+            )
+        )
+
+    data.async_subscribe_adopt(_add_new_device)
+    async_add_entities(
+        async_all_device_entities(
+            data, ProtectDeviceText, model_descriptions=_MODEL_DESCRIPTIONS
+        )
+    )
+
+
+class ProtectDeviceText(ProtectDeviceEntity, TextEntity):
+    """A Ubiquiti UniFi Protect Sensor."""
+
+    entity_description: ProtectTextEntityDescription
+    _state_attrs = ("_attr_available", "_attr_native_value")
+
+    @callback
+    @override
+    def _async_update_device_from_protect(self, device: ProtectDeviceType) -> None:
+        super()._async_update_device_from_protect(device)
+        self._attr_native_value = self.entity_description.get_value(
+            self.device, self._ufp_public_obj
+        )
+
+    @async_ufp_instance_command
+    @override
+    async def async_set_value(self, value: str) -> None:
+        """Change the value."""
+        await self.entity_description.ufp_set(self._ufp_set_target(), value)

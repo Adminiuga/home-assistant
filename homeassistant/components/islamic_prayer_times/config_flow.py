@@ -1,57 +1,148 @@
 """Config flow for Islamic Prayer Times integration."""
-from __future__ import annotations
 
-import voluptuous as vol
+from typing import Any, override
 
-from homeassistant import config_entries
+import probatio
+
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult, OptionsFlow
+from homeassistant.const import CONF_LATITUDE, CONF_LOCATION, CONF_LONGITUDE
 from homeassistant.core import callback
+from homeassistant.helpers.selector import (
+    LocationSelector,
+    SelectSelector,
+    SelectSelectorConfig,
+    SelectSelectorMode,
+)
 
-from .const import CALC_METHODS, CONF_CALC_METHOD, DEFAULT_CALC_METHOD, DOMAIN, NAME
+from .const import (
+    CALC_METHODS,
+    CONF_CALC_METHOD,
+    CONF_LAT_ADJ_METHOD,
+    CONF_MIDNIGHT_MODE,
+    CONF_SCHOOL,
+    DEFAULT_CALC_METHOD,
+    DEFAULT_LAT_ADJ_METHOD,
+    DEFAULT_MIDNIGHT_MODE,
+    DEFAULT_SCHOOL,
+    DOMAIN,
+    LAT_ADJ_METHODS,
+    MIDNIGHT_MODES,
+    NAME,
+    SCHOOLS,
+)
+from .coordinator import IslamicPrayerTimesConfigEntry
 
 
-class IslamicPrayerFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
+class IslamicPrayerFlowHandler(ConfigFlow, domain=DOMAIN):
     """Handle the Islamic Prayer config flow."""
 
     VERSION = 1
+    MINOR_VERSION = 2
 
     @staticmethod
     @callback
+    @override
     def async_get_options_flow(
-        config_entry: config_entries.ConfigEntry,
+        config_entry: IslamicPrayerTimesConfigEntry,
     ) -> IslamicPrayerOptionsFlowHandler:
         """Get the options flow for this handler."""
-        return IslamicPrayerOptionsFlowHandler(config_entry)
+        return IslamicPrayerOptionsFlowHandler()
 
-    async def async_step_user(self, user_input=None):
+    @override
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle a flow initialized by the user."""
-        if self._async_current_entries():
-            return self.async_abort(reason="single_instance_allowed")
 
-        if user_input is None:
-            return self.async_show_form(step_id="user")
+        if user_input is not None:
+            lat: float = user_input[CONF_LOCATION][CONF_LATITUDE]
+            lon: float = user_input[CONF_LOCATION][CONF_LONGITUDE]
+            await self.async_set_unique_id(f"{lat}-{lon}")
+            self._abort_if_unique_id_configured()
 
-        return self.async_create_entry(title=NAME, data=user_input)
+            return self.async_create_entry(
+                title=NAME,
+                data={
+                    CONF_LATITUDE: lat,
+                    CONF_LONGITUDE: lon,
+                },
+            )
+
+        home_location = {
+            CONF_LATITUDE: self.hass.config.latitude,
+            CONF_LONGITUDE: self.hass.config.longitude,
+        }
+        return self.async_show_form(
+            step_id="user",
+            data_schema=probatio.Schema(
+                {
+                    probatio.Required(
+                        CONF_LOCATION, default=home_location
+                    ): LocationSelector(),
+                }
+            ),
+        )
 
 
-class IslamicPrayerOptionsFlowHandler(config_entries.OptionsFlow):
+class IslamicPrayerOptionsFlowHandler(OptionsFlow):
     """Handle Islamic Prayer client options."""
 
-    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
-        """Initialize options flow."""
-        self.config_entry = config_entry
-
-    async def async_step_init(self, user_input=None):
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Manage options."""
         if user_input is not None:
             return self.async_create_entry(title="", data=user_input)
 
         options = {
-            vol.Optional(
+            probatio.Optional(
                 CONF_CALC_METHOD,
                 default=self.config_entry.options.get(
                     CONF_CALC_METHOD, DEFAULT_CALC_METHOD
                 ),
-            ): vol.In(CALC_METHODS)
+            ): SelectSelector(
+                SelectSelectorConfig(
+                    options=CALC_METHODS,
+                    mode=SelectSelectorMode.DROPDOWN,
+                    translation_key=CONF_CALC_METHOD,
+                )
+            ),
+            probatio.Optional(
+                CONF_LAT_ADJ_METHOD,
+                default=self.config_entry.options.get(
+                    CONF_LAT_ADJ_METHOD, DEFAULT_LAT_ADJ_METHOD
+                ),
+            ): SelectSelector(
+                SelectSelectorConfig(
+                    options=LAT_ADJ_METHODS,
+                    mode=SelectSelectorMode.DROPDOWN,
+                    translation_key=CONF_LAT_ADJ_METHOD,
+                )
+            ),
+            probatio.Optional(
+                CONF_MIDNIGHT_MODE,
+                default=self.config_entry.options.get(
+                    CONF_MIDNIGHT_MODE, DEFAULT_MIDNIGHT_MODE
+                ),
+            ): SelectSelector(
+                SelectSelectorConfig(
+                    options=MIDNIGHT_MODES,
+                    mode=SelectSelectorMode.DROPDOWN,
+                    translation_key=CONF_MIDNIGHT_MODE,
+                )
+            ),
+            probatio.Optional(
+                CONF_SCHOOL,
+                default=self.config_entry.options.get(CONF_SCHOOL, DEFAULT_SCHOOL),
+            ): SelectSelector(
+                SelectSelectorConfig(
+                    options=SCHOOLS,
+                    mode=SelectSelectorMode.DROPDOWN,
+                    translation_key=CONF_SCHOOL,
+                )
+            ),
         }
 
-        return self.async_show_form(step_id="init", data_schema=vol.Schema(options))
+        return self.async_show_form(
+            step_id="init", data_schema=probatio.Schema(options)
+        )

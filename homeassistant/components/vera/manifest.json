@@ -1,10 +1,13 @@
 {
   "domain": "vera",
   "name": "Vera",
-  "config_flow": true,
-  "documentation": "https://www.home-assistant.io/integrations/vera",
-  "requirements": ["pyvera==0.3.13"],
+  "categories": ["hubs_protocols.smart_home_hubs"],
   "codeowners": [],
+  "config_flow": true,
+  "connectivity": ["zwave"],
+  "documentation": "https://www.home-assistant.io/integrations/vera",
+  "integration_type": "hub",
   "iot_class": "local_polling",
-  "loggers": ["pyvera"]
+  "loggers": ["pyvera"],
+  "requirements": ["pyvera==0.3.16"]
 }

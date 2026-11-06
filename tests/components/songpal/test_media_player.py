@@ -1,8 +1,12 @@
 """Test songpal media_player."""
+
 from datetime import timedelta
 import logging
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
+import pytest
+from pytest_homeassistant.common import MockConfigEntry, async_fire_time_changed
 from songpal import (
     ConnectChange,
     ContentChange,
@@ -10,11 +14,19 @@ from songpal import (
     SongpalException,
     VolumeChange,
 )
+from songpal.notification import SettingChange
 
 from homeassistant.components import media_player, songpal
 from homeassistant.components.media_player import MediaPlayerEntityFeature
-from homeassistant.components.songpal.const import SET_SOUND_SETTING
-from homeassistant.const import STATE_OFF, STATE_ON, STATE_UNAVAILABLE
+from homeassistant.components.songpal.const import ERROR_REQUEST_RETRY
+from homeassistant.components.songpal.services import SET_SOUND_SETTING
+from homeassistant.const import (
+    EVENT_HOMEASSISTANT_STOP,
+    STATE_OFF,
+    STATE_ON,
+    STATE_UNAVAILABLE,
+)
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.setup import async_setup_component
 from homeassistant.util import dt as dt_util
@@ -34,24 +46,32 @@ from . import (
     _patch_media_player_device,
 )
 
-from tests.common import MockConfigEntry, async_fire_time_changed
-
 SUPPORT_SONGPAL = (
     MediaPlayerEntityFeature.VOLUME_SET
     | MediaPlayerEntityFeature.VOLUME_STEP
     | MediaPlayerEntityFeature.VOLUME_MUTE
     | MediaPlayerEntityFeature.SELECT_SOURCE
+    | MediaPlayerEntityFeature.SELECT_SOUND_MODE
     | MediaPlayerEntityFeature.TURN_ON
     | MediaPlayerEntityFeature.TURN_OFF
 )
 
 
-def _get_attributes(hass):
+def _get_attributes(hass: HomeAssistant) -> dict[str, Any]:
     state = hass.states.get(ENTITY_ID)
     return state.as_dict()["attributes"]
 
 
-async def test_setup_platform(hass):
+async def _call(hass: HomeAssistant, service: str, **argv: Any) -> None:
+    await hass.services.async_call(
+        media_player.DOMAIN,
+        service,
+        {"entity_id": ENTITY_ID, **argv},
+        blocking=True,
+    )
+
+
+async def test_setup_platform(hass: HomeAssistant) -> None:
     """Test the legacy setup platform."""
     mocked_device = _create_mocked_device(throw_exception=True)
     with _patch_media_player_device(mocked_device):
@@ -76,7 +96,9 @@ async def test_setup_platform(hass):
     assert len(all_states) == 0
 
 
-async def test_setup_failed(hass, caplog):
+async def test_setup_failed(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
     """Test failed to set up the entity."""
     mocked_device = _create_mocked_device(throw_exception=True)
     entry = MockConfigEntry(domain=songpal.DOMAIN, data=CONF_DATA)
@@ -87,8 +109,8 @@ async def test_setup_failed(hass, caplog):
         await hass.async_block_till_done()
     all_states = hass.states.async_all()
     assert len(all_states) == 0
-    warning_records = [x for x in caplog.records if x.levelno == logging.WARNING]
-    assert len(warning_records) == 2
+    assert "[name(http://0.0.0.0:10000/sony)] Unable to connect" in caplog.text
+    assert "Platform songpal not ready yet: Unable to do POST request" in caplog.text
     assert not any(x.levelno == logging.ERROR for x in caplog.records)
     caplog.clear()
 
@@ -103,7 +125,11 @@ async def test_setup_failed(hass, caplog):
     assert not any(x.levelno == logging.ERROR for x in caplog.records)
 
 
-async def test_state(hass):
+async def test_state(
+    hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
+    entity_registry: er.EntityRegistry,
+) -> None:
     """Test state of the entity."""
     mocked_device = _create_mocked_device()
     entry = MockConfigEntry(domain=songpal.DOMAIN, data=CONF_DATA)
@@ -121,22 +147,67 @@ async def test_state(hass):
     assert attributes["is_volume_muted"] is False
     assert attributes["source_list"] == ["title1", "title2"]
     assert attributes["source"] == "title2"
+    assert attributes["sound_mode_list"] == ["Sound Mode 1", "Sound Mode 2"]
+    assert attributes["sound_mode"] == "Sound Mode 2"
     assert attributes["supported_features"] == SUPPORT_SONGPAL
 
-    device_registry = dr.async_get(hass)
-    device = device_registry.async_get_device(identifiers={(songpal.DOMAIN, MAC)})
+    device = device_registry.async_get_device_by_identifier(
+        (songpal.DOMAIN, MAC), entry.entry_id
+    )
     assert device.connections == {(dr.CONNECTION_NETWORK_MAC, MAC)}
     assert device.manufacturer == "Sony Corporation"
     assert device.name == FRIENDLY_NAME
     assert device.sw_version == SW_VERSION
     assert device.model == MODEL
 
-    entity_registry = er.async_get(hass)
     entity = entity_registry.async_get(ENTITY_ID)
     assert entity.unique_id == MAC
 
 
-async def test_state_wireless(hass):
+async def test_state_nosoundmode(
+    hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
+    entity_registry: er.EntityRegistry,
+) -> None:
+    """Test state of the entity with no soundField in sound settings."""
+    mocked_device = _create_mocked_device(no_soundfield=True)
+    entry = MockConfigEntry(domain=songpal.DOMAIN, data=CONF_DATA)
+    entry.add_to_hass(hass)
+
+    with _patch_media_player_device(mocked_device):
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    state = hass.states.get(ENTITY_ID)
+    assert state.name == FRIENDLY_NAME
+    assert state.state == STATE_ON
+    attributes = state.as_dict()["attributes"]
+    assert attributes["volume_level"] == 0.5
+    assert attributes["is_volume_muted"] is False
+    assert attributes["source_list"] == ["title1", "title2"]
+    assert attributes["source"] == "title2"
+    assert "sound_mode_list" not in attributes
+    assert "sound_mode" not in attributes
+    assert attributes["supported_features"] == SUPPORT_SONGPAL
+
+    device = device_registry.async_get_device_by_identifier(
+        (songpal.DOMAIN, MAC), entry.entry_id
+    )
+    assert device.connections == {(dr.CONNECTION_NETWORK_MAC, MAC)}
+    assert device.manufacturer == "Sony Corporation"
+    assert device.name == FRIENDLY_NAME
+    assert device.sw_version == SW_VERSION
+    assert device.model == MODEL
+
+    entity = entity_registry.async_get(ENTITY_ID)
+    assert entity.unique_id == MAC
+
+
+async def test_state_wireless(
+    hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
+    entity_registry: er.EntityRegistry,
+) -> None:
     """Test state of the entity with only Wireless MAC."""
     mocked_device = _create_mocked_device(wired_mac=None, wireless_mac=WIRELESS_MAC)
     entry = MockConfigEntry(domain=songpal.DOMAIN, data=CONF_DATA)
@@ -154,11 +225,12 @@ async def test_state_wireless(hass):
     assert attributes["is_volume_muted"] is False
     assert attributes["source_list"] == ["title1", "title2"]
     assert attributes["source"] == "title2"
+    assert attributes["sound_mode_list"] == ["Sound Mode 1", "Sound Mode 2"]
+    assert attributes["sound_mode"] == "Sound Mode 2"
     assert attributes["supported_features"] == SUPPORT_SONGPAL
 
-    device_registry = dr.async_get(hass)
-    device = device_registry.async_get_device(
-        identifiers={(songpal.DOMAIN, WIRELESS_MAC)}
+    device = device_registry.async_get_device_by_identifier(
+        (songpal.DOMAIN, WIRELESS_MAC), entry.entry_id
     )
     assert device.connections == {(dr.CONNECTION_NETWORK_MAC, WIRELESS_MAC)}
     assert device.manufacturer == "Sony Corporation"
@@ -166,12 +238,15 @@ async def test_state_wireless(hass):
     assert device.sw_version == SW_VERSION
     assert device.model == MODEL
 
-    entity_registry = er.async_get(hass)
     entity = entity_registry.async_get(ENTITY_ID)
     assert entity.unique_id == WIRELESS_MAC
 
 
-async def test_state_both(hass):
+async def test_state_both(
+    hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
+    entity_registry: er.EntityRegistry,
+) -> None:
     """Test state of the entity with both Wired and Wireless MAC."""
     mocked_device = _create_mocked_device(wired_mac=MAC, wireless_mac=WIRELESS_MAC)
     entry = MockConfigEntry(domain=songpal.DOMAIN, data=CONF_DATA)
@@ -189,10 +264,13 @@ async def test_state_both(hass):
     assert attributes["is_volume_muted"] is False
     assert attributes["source_list"] == ["title1", "title2"]
     assert attributes["source"] == "title2"
+    assert attributes["sound_mode_list"] == ["Sound Mode 1", "Sound Mode 2"]
+    assert attributes["sound_mode"] == "Sound Mode 2"
     assert attributes["supported_features"] == SUPPORT_SONGPAL
 
-    device_registry = dr.async_get(hass)
-    device = device_registry.async_get_device(identifiers={(songpal.DOMAIN, MAC)})
+    device = device_registry.async_get_device_by_identifier(
+        (songpal.DOMAIN, MAC), entry.entry_id
+    )
     assert device.connections == {
         (dr.CONNECTION_NETWORK_MAC, MAC),
         (dr.CONNECTION_NETWORK_MAC, WIRELESS_MAC),
@@ -202,13 +280,12 @@ async def test_state_both(hass):
     assert device.sw_version == SW_VERSION
     assert device.model == MODEL
 
-    entity_registry = er.async_get(hass)
     entity = entity_registry.async_get(ENTITY_ID)
     # We prefer the wired mac if present.
     assert entity.unique_id == MAC
 
 
-async def test_services(hass):
+async def test_services(hass: HomeAssistant) -> None:
     """Test services."""
     mocked_device = _create_mocked_device()
     entry = MockConfigEntry(domain=songpal.DOMAIN, data=CONF_DATA)
@@ -218,32 +295,24 @@ async def test_services(hass):
         await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
-    async def _call(service, **argv):
-        await hass.services.async_call(
-            media_player.DOMAIN,
-            service,
-            {"entity_id": ENTITY_ID, **argv},
-            blocking=True,
-        )
-
-    await _call(media_player.SERVICE_TURN_ON)
-    await _call(media_player.SERVICE_TURN_OFF)
-    await _call(media_player.SERVICE_TOGGLE)
+    await _call(hass, media_player.SERVICE_TURN_ON)
+    await _call(hass, media_player.SERVICE_TURN_OFF)
+    await _call(hass, media_player.SERVICE_TOGGLE)
     assert mocked_device.set_power.call_count == 3
     mocked_device.set_power.assert_has_calls([call(True), call(False), call(False)])
 
-    await _call(media_player.SERVICE_VOLUME_SET, volume_level=0.6)
-    await _call(media_player.SERVICE_VOLUME_UP)
-    await _call(media_player.SERVICE_VOLUME_DOWN)
+    await _call(hass, media_player.SERVICE_VOLUME_SET, volume_level=0.6)
+    await _call(hass, media_player.SERVICE_VOLUME_UP)
+    await _call(hass, media_player.SERVICE_VOLUME_DOWN)
     assert mocked_device.volume1.set_volume.call_count == 3
     mocked_device.volume1.set_volume.assert_has_calls([call(60), call(51), call(49)])
 
-    await _call(media_player.SERVICE_VOLUME_MUTE, is_volume_muted=True)
+    await _call(hass, media_player.SERVICE_VOLUME_MUTE, is_volume_muted=True)
     mocked_device.volume1.set_mute.assert_called_once_with(True)
 
-    await _call(media_player.SERVICE_SELECT_SOURCE, source="none")
+    await _call(hass, media_player.SERVICE_SELECT_SOURCE, source="none")
     mocked_device.input1.activate.assert_not_called()
-    await _call(media_player.SERVICE_SELECT_SOURCE, source="title1")
+    await _call(hass, media_player.SERVICE_SELECT_SOURCE, source="title1")
     mocked_device.input1.activate.assert_called_once()
 
     await hass.services.async_call(
@@ -294,8 +363,11 @@ async def test_services(hass):
     mocked_device2.set_sound_settings.assert_called_once_with("name", "value")
     mocked_device3.set_sound_settings.assert_called_once_with("name", "value")
 
+    await _call(hass, media_player.SERVICE_SELECT_SOUND_MODE, sound_mode="Sound Mode 1")
+    mocked_device.set_sound_settings.assert_called_with("soundField", "sound_mode1")
 
-async def test_websocket_events(hass):
+
+async def test_websocket_events(hass: HomeAssistant) -> None:
     """Test websocket events."""
     mocked_device = _create_mocked_device()
     entry = MockConfigEntry(domain=songpal.DOMAIN, data=CONF_DATA)
@@ -306,7 +378,7 @@ async def test_websocket_events(hass):
         await hass.async_block_till_done()
 
     mocked_device.listen_notifications.assert_called_once()
-    assert mocked_device.on_notification.call_count == 4
+    assert mocked_device.on_notification.call_count == 5
 
     notification_callbacks = mocked_device.notification_callbacks
 
@@ -327,13 +399,41 @@ async def test_websocket_events(hass):
     await notification_callbacks[ContentChange](content_change)
     assert _get_attributes(hass)["source"] == "title1"
 
+    sound_mode_change = MagicMock()
+    sound_mode_change.target = "soundField"
+    sound_mode_change.currentValue = "sound_mode1"
+    await notification_callbacks[SettingChange](sound_mode_change)
+    assert _get_attributes(hass)["sound_mode"] == "Sound Mode 1"
+    sound_mode_change.currentValue = "sound_mode2"
+    await notification_callbacks[SettingChange](sound_mode_change)
+    assert _get_attributes(hass)["sound_mode"] == "Sound Mode 2"
+
     power_change = MagicMock()
     power_change.status = False
     await notification_callbacks[PowerChange](power_change)
     assert hass.states.get(ENTITY_ID).state == STATE_OFF
 
 
-async def test_disconnected(hass, caplog):
+async def test_stop_listener_removed_on_unload(hass: HomeAssistant) -> None:
+    """Test the stop listener is removed when the entity is removed."""
+    mocked_device = _create_mocked_device()
+    entry = MockConfigEntry(domain=songpal.DOMAIN, data=CONF_DATA)
+    entry.add_to_hass(hass)
+
+    with _patch_media_player_device(mocked_device):
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+    stop_listeners = hass.bus.async_listeners()[EVENT_HOMEASSISTANT_STOP]
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert hass.bus.async_listeners()[EVENT_HOMEASSISTANT_STOP] == stop_listeners - 1
+
+
+async def test_disconnected(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
     """Test disconnected behavior."""
     mocked_device = _create_mocked_device()
     entry = MockConfigEntry(domain=songpal.DOMAIN, data=CONF_DATA)
@@ -360,3 +460,65 @@ async def test_disconnected(hass, caplog):
     assert warning_records[0].message.endswith("Got disconnected, trying to reconnect")
     assert warning_records[1].message.endswith("Connection reestablished")
     assert not any(x.levelno == logging.ERROR for x in caplog.records)
+
+
+@pytest.mark.parametrize(
+    "service", [media_player.SERVICE_TURN_ON, media_player.SERVICE_TURN_OFF]
+)
+@pytest.mark.parametrize(
+    ("error_code", "swallow"), [(ERROR_REQUEST_RETRY, True), (1234, False)]
+)
+async def test_error_swallowing(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture, service, error_code, swallow
+) -> None:
+    """Test swallowing specific errors on turn_on and turn_off."""
+    mocked_device = _create_mocked_device()
+    entry = MockConfigEntry(domain=songpal.DOMAIN, data=CONF_DATA)
+    entry.add_to_hass(hass)
+
+    with _patch_media_player_device(mocked_device):
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    type(mocked_device).set_power = AsyncMock(
+        side_effect=[
+            SongpalException("Error to swallow", error=(error_code, "Error to swallow"))
+        ]
+    )
+
+    if swallow:
+        await _call(hass, service)
+        assert "Swallowing" in caplog.text
+    else:
+        with pytest.raises(SongpalException):
+            await _call(hass, service)
+
+
+@pytest.mark.parametrize(
+    ("max_volume", "volume", "service", "expected_volume"),
+    [
+        pytest.param(95, 28, media_player.SERVICE_VOLUME_UP, 29, id="up_max_95"),
+        pytest.param(14, 4, media_player.SERVICE_VOLUME_UP, 5, id="up_max_14"),
+        pytest.param(95, 30, media_player.SERVICE_VOLUME_DOWN, 29, id="down_max_95"),
+    ],
+)
+async def test_volume_step(
+    hass: HomeAssistant,
+    max_volume: int,
+    volume: int,
+    service: str,
+    expected_volume: int,
+) -> None:
+    """Test a volume step moves exactly one device volume step."""
+    mocked_device = _create_mocked_device()
+    mocked_device.volume1.maxVolume = max_volume
+    mocked_device.volume1.volume = volume
+    entry = MockConfigEntry(domain=songpal.DOMAIN, data=CONF_DATA)
+    entry.add_to_hass(hass)
+
+    with _patch_media_player_device(mocked_device):
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    await _call(hass, service)
+    mocked_device.volume1.set_volume.assert_called_once_with(expected_volume)

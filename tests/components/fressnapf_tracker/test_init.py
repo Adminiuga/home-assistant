@@ -1,0 +1,189 @@
+"""Test the Fressnapf Tracker integration init."""
+
+from collections.abc import Generator
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from fressnapftracker import (
+    FressnapfTrackerError,
+    FressnapfTrackerInvalidTrackerResponseError,
+)
+import pytest
+from pytest_homeassistant.common import MockConfigEntry
+from syrupy.assertion import SnapshotAssertion
+
+from homeassistant.components.fressnapf_tracker.const import DOMAIN
+from homeassistant.config_entries import ConfigEntryState
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr, issue_registry as ir
+
+from .conftest import MOCK_SERIAL_NUMBER
+
+
+@pytest.fixture
+def mock_api_client_malformed_tracker() -> Generator[MagicMock]:
+    """Mock the ApiClient for a malformed tracker response in _tracker_is_valid."""
+    with patch(
+        "homeassistant.components.fressnapf_tracker.ApiClient",
+        autospec=True,
+    ) as mock_api_client:
+        client = mock_api_client.return_value
+        client.get_tracker = AsyncMock(
+            side_effect=FressnapfTrackerInvalidTrackerResponseError("Invalid tracker")
+        )
+        yield client
+
+
+@pytest.mark.usefixtures("mock_auth_client", "mock_api_client_init")
+async def test_setup_entry(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test successful setup of config entry."""
+    mock_config_entry.add_to_hass(hass)
+
+    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert mock_config_entry.state is ConfigEntryState.LOADED
+
+
+@pytest.mark.usefixtures("mock_auth_client", "mock_api_client_init")
+async def test_unload_entry(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test successful unload of config entry."""
+    mock_config_entry.add_to_hass(hass)
+
+    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert mock_config_entry.state is ConfigEntryState.LOADED
+
+    await hass.config_entries.async_unload(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert mock_config_entry.state is ConfigEntryState.NOT_LOADED
+
+
+@pytest.mark.usefixtures("mock_auth_client")
+async def test_setup_entry_tracker_is_valid_api_error(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_api_client_init: MagicMock,
+) -> None:
+    """Test setup retries when API returns error during _tracker_is_valid."""
+    mock_config_entry.add_to_hass(hass)
+
+    mock_api_client_init.get_tracker = AsyncMock(
+        side_effect=FressnapfTrackerError("API Error")
+    )
+
+    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert mock_config_entry.state is ConfigEntryState.SETUP_RETRY
+
+
+@pytest.mark.usefixtures("init_integration")
+async def test_state_entity_device_snapshots(
+    device_registry: dr.DeviceRegistry,
+    mock_config_entry: MockConfigEntry,
+    snapshot: SnapshotAssertion,
+) -> None:
+    """Test sensor entity is created correctly."""
+    device_entries = dr.async_entries_for_config_entry(
+        device_registry, mock_config_entry.entry_id
+    )
+    assert device_entries
+    for device_entry in device_entries:
+        assert device_entry == snapshot(name=f"{device_entry.name}-entry"), (
+            f"device entry snapshot failed for {device_entry.name}"
+        )
+
+
+@pytest.mark.usefixtures("mock_auth_client", "mock_api_client_malformed_tracker")
+async def test_invalid_tracker(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    issue_registry: ir.IssueRegistry,
+) -> None:
+    """Test that an issue is created when an invalid tracker is detected."""
+    mock_config_entry.add_to_hass(hass)
+
+    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert mock_config_entry.state is ConfigEntryState.LOADED
+    assert len(issue_registry.issues) == 1
+
+    issue_id = (
+        f"invalid_fressnapf_tracker_{mock_config_entry.entry_id}_{MOCK_SERIAL_NUMBER}"
+    )
+    issue = issue_registry.async_get_issue(DOMAIN, issue_id)
+    assert issue is not None
+    assert issue.config_entry_id == mock_config_entry.entry_id
+
+    await hass.config_entries.async_remove(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+    assert issue_registry.async_get_issue(DOMAIN, issue_id) is None
+
+
+@pytest.mark.usefixtures("mock_auth_client", "mock_api_client_malformed_tracker")
+async def test_invalid_tracker_already_exists(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    issue_registry: ir.IssueRegistry,
+) -> None:
+    """Test that an existing issue is not duplicated."""
+    mock_config_entry.add_to_hass(hass)
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        f"invalid_fressnapf_tracker_{mock_config_entry.entry_id}_{MOCK_SERIAL_NUMBER}",
+        config_entry_id=mock_config_entry.entry_id,
+        is_fixable=False,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key="invalid_fressnapf_tracker",
+        translation_placeholders={"tracker_id": MOCK_SERIAL_NUMBER},
+    )
+
+    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert mock_config_entry.state is ConfigEntryState.LOADED
+    assert len(issue_registry.issues) == 1
+
+
+@pytest.mark.usefixtures("mock_auth_client", "mock_api_client_malformed_tracker")
+async def test_invalid_tracker_shared_between_entries(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_email_config_entry: MockConfigEntry,
+    issue_registry: ir.IssueRegistry,
+) -> None:
+    """Test each account sharing an invalid tracker gets its own issue."""
+    mock_email_config_entry.add_to_hass(hass)
+    hass.config_entries.async_update_entry(mock_email_config_entry, unique_id="other")
+    mock_config_entry.add_to_hass(hass)
+    entries = (mock_config_entry, mock_email_config_entry)
+    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+    for entry in entries:
+        assert entry.state is ConfigEntryState.LOADED
+
+    assert len(issue_registry.issues) == 2
+    for entry in entries:
+        issue = issue_registry.async_get_issue(
+            DOMAIN, f"invalid_fressnapf_tracker_{entry.entry_id}_{MOCK_SERIAL_NUMBER}"
+        )
+        assert issue is not None
+        assert issue.config_entry_id == entry.entry_id
+
+    await hass.config_entries.async_remove(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+    assert len(issue_registry.issues) == 1
+    assert issue_registry.async_get_issue(
+        DOMAIN,
+        f"invalid_fressnapf_tracker_{mock_email_config_entry.entry_id}_{MOCK_SERIAL_NUMBER}",
+    )

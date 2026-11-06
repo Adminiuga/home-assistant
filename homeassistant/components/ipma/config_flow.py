@@ -1,55 +1,70 @@
 """Config flow to configure IPMA component."""
-import voluptuous as vol
 
-from homeassistant import config_entries
-from homeassistant.const import CONF_LATITUDE, CONF_LONGITUDE, CONF_MODE, CONF_NAME
-import homeassistant.helpers.config_validation as cv
+import logging
+from typing import Any, override
 
-from .const import DOMAIN, HOME_LOCATION_NAME
-from .weather import FORECAST_MODE
+import probatio
+from pyipma import IPMAException
+from pyipma.api import IPMA_API
+from pyipma.location import Location
+
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.const import CONF_LATITUDE, CONF_LOCATION, CONF_LONGITUDE
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.selector import LocationSelector, LocationSelectorConfig
+
+from .const import DOMAIN
+
+_LOGGER = logging.getLogger(__name__)
 
 
-class IpmaFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
+class IpmaFlowHandler(ConfigFlow, domain=DOMAIN):
     """Config flow for IPMA component."""
 
     VERSION = 1
 
-    def __init__(self):
-        """Init IpmaFlowHandler."""
-        self._errors = {}
-
-    async def async_step_user(self, user_input=None):
+    @override
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle a flow initialized by the user."""
-        self._errors = {}
+        errors = {}
 
         if user_input is not None:
-            if user_input[CONF_NAME] not in self.hass.config_entries.async_entries(
-                DOMAIN
-            ):
+            self._async_abort_entries_match(user_input[CONF_LOCATION])
+
+            api = IPMA_API(async_get_clientsession(self.hass))
+
+            try:
+                location = await Location.get(
+                    api,
+                    user_input[CONF_LOCATION][CONF_LATITUDE],
+                    user_input[CONF_LOCATION][CONF_LONGITUDE],
+                )
+            except IPMAException:
+                _LOGGER.exception("Unexpected exception")
+                errors["base"] = "unknown"
+            else:
                 return self.async_create_entry(
-                    title=user_input[CONF_NAME], data=user_input
+                    title=location.name, data=user_input[CONF_LOCATION]
                 )
 
-            self._errors[CONF_NAME] = "name_exists"
-
-        # default location is set hass configuration
-        return await self._show_config_form(
-            name=HOME_LOCATION_NAME,
-            latitude=self.hass.config.latitude,
-            longitude=self.hass.config.longitude,
-        )
-
-    async def _show_config_form(self, name=None, latitude=None, longitude=None):
-        """Show the configuration form to edit location data."""
         return self.async_show_form(
             step_id="user",
-            data_schema=vol.Schema(
+            data_schema=self.add_suggested_values_to_schema(
+                probatio.Schema(
+                    {
+                        probatio.Required(CONF_LOCATION): LocationSelector(
+                            LocationSelectorConfig(radius=False)
+                        ),
+                    }
+                ),
                 {
-                    vol.Required(CONF_NAME, default=name): str,
-                    vol.Required(CONF_LATITUDE, default=latitude): cv.latitude,
-                    vol.Required(CONF_LONGITUDE, default=longitude): cv.longitude,
-                    vol.Required(CONF_MODE, default="daily"): vol.In(FORECAST_MODE),
-                }
+                    CONF_LOCATION: {
+                        CONF_LATITUDE: self.hass.config.latitude,
+                        CONF_LONGITUDE: self.hass.config.longitude,
+                    }
+                },
             ),
-            errors=self._errors,
+            errors=errors,
         )

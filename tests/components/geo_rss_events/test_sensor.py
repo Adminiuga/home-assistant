@@ -1,20 +1,22 @@
 """The test for the geo rss events sensor platform."""
+
 from unittest.mock import MagicMock, patch
 
+from freezegun.api import FrozenDateTimeFactory
 import pytest
+from pytest_homeassistant.common import assert_setup_component, async_fire_time_changed
 
 from homeassistant.components import sensor
-import homeassistant.components.geo_rss_events.sensor as geo_rss_events
+from homeassistant.components.geo_rss_events import sensor as geo_rss_events
 from homeassistant.const import (
     ATTR_FRIENDLY_NAME,
     ATTR_ICON,
     ATTR_UNIT_OF_MEASUREMENT,
     EVENT_HOMEASSISTANT_START,
 )
+from homeassistant.core import HomeAssistant
 from homeassistant.setup import async_setup_component
-import homeassistant.util.dt as dt_util
-
-from tests.common import assert_setup_component, async_fire_time_changed
+from homeassistant.util import dt as dt_util
 
 URL = "http://geo.rss.local/geo_rss_events.xml"
 VALID_CONFIG_WITH_CATEGORIES = {
@@ -55,7 +57,9 @@ def _generate_mock_feed_entry(
     return feed_entry
 
 
-async def test_setup(hass, mock_feed):
+async def test_setup(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory, mock_feed
+) -> None:
     """Test the general setup of the platform."""
     # Set up some mock feed entries for this test.
     mock_entry_1 = _generate_mock_feed_entry(
@@ -67,10 +71,8 @@ async def test_setup(hass, mock_feed):
     mock_feed.return_value.update.return_value = "OK", [mock_entry_1, mock_entry_2]
 
     utcnow = dt_util.utcnow()
-    # Patching 'utcnow' to gain more control over the timed update.
-    with patch(
-        "homeassistant.util.dt.utcnow", return_value=utcnow
-    ), assert_setup_component(1, sensor.DOMAIN):
+    freezer.move_to(utcnow)
+    with assert_setup_component(1, sensor.DOMAIN):
         assert await async_setup_component(hass, sensor.DOMAIN, VALID_CONFIG)
         # Artificially trigger update.
         hass.bus.fire(EVENT_HOMEASSISTANT_START)
@@ -96,7 +98,7 @@ async def test_setup(hass, mock_feed):
         # so no changes to entities.
         mock_feed.return_value.update.return_value = "OK_NO_DATA", None
         async_fire_time_changed(hass, utcnow + geo_rss_events.SCAN_INTERVAL)
-        await hass.async_block_till_done()
+        await hass.async_block_till_done(wait_background_tasks=True)
 
         all_states = hass.states.async_all()
         assert len(all_states) == 1
@@ -106,7 +108,7 @@ async def test_setup(hass, mock_feed):
         # Simulate an update - empty data, removes all entities
         mock_feed.return_value.update.return_value = "ERROR", None
         async_fire_time_changed(hass, utcnow + 2 * geo_rss_events.SCAN_INTERVAL)
-        await hass.async_block_till_done()
+        await hass.async_block_till_done(wait_background_tasks=True)
 
         all_states = hass.states.async_all()
         assert len(all_states) == 1
@@ -119,7 +121,7 @@ async def test_setup(hass, mock_feed):
         }
 
 
-async def test_setup_with_categories(hass, mock_feed):
+async def test_setup_with_categories(hass: HomeAssistant, mock_feed) -> None:
     """Test the general setup of the platform."""
     # Set up some mock feed entries for this test.
     mock_entry_1 = _generate_mock_feed_entry(

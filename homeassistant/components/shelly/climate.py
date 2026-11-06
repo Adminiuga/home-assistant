@@ -1,61 +1,320 @@
 """Climate support for Shelly."""
-from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, cast
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Self, cast, override
 
 from aioshelly.block_device import Block
+from aioshelly.const import BLU_TRV_IDENTIFIER, RPC_GENERATIONS
 from aioshelly.exceptions import DeviceConnectionError, InvalidAuthError
 
 from homeassistant.components.climate import (
     DOMAIN as CLIMATE_DOMAIN,
     PRESET_NONE,
     ClimateEntity,
+    ClimateEntityDescription,
     ClimateEntityFeature,
+    ClimateExtraStoredData,
     HVACAction,
     HVACMode,
+    RestoreClimate,
 )
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import ATTR_TEMPERATURE, TEMP_CELSIUS
+from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
 from homeassistant.core import HomeAssistant, State, callback
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers import device_registry, entity_registry
-from homeassistant.helpers.entity import DeviceInfo
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.restore_state import RestoreEntity
+from homeassistant.helpers import entity_registry as er, issue_registry as ir
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.entity_registry import RegistryEntry
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.util.unit_conversion import TemperatureConverter
 
-from .const import LOGGER, SHTRV_01_TEMPERATURE_SETTINGS
-from .coordinator import ShellyBlockCoordinator, get_entry_data
-from .utils import get_device_entry_gen
+from .const import (
+    BLU_TRV_TEMPERATURE_SETTINGS,
+    DOMAIN,
+    LOGGER,
+    MODEL_LINKEDGO_ST802_THERMOSTAT,
+    MODEL_LINKEDGO_ST1820_THERMOSTAT,
+    NOT_CALIBRATED_ISSUE_ID,
+    RPC_THERMOSTAT_SETTINGS,
+    SHTRV_01_TEMPERATURE_SETTINGS,
+)
+from .coordinator import ShellyBlockCoordinator, ShellyConfigEntry, ShellyRpcCoordinator
+from .entity import (
+    RpcEntityDescription,
+    ShellyRpcAttributeEntity,
+    ShellyRpcEntity,
+    async_setup_entry_rpc,
+    get_entity_block_device_info,
+    get_entity_blu_trv_device_info,
+    rpc_call,
+)
+from .utils import (
+    async_remove_shelly_entity,
+    get_device_entry_gen,
+    get_rpc_key_by_role,
+    get_rpc_key_id,
+    get_rpc_key_ids,
+    is_rpc_thermostat_internal_actuator,
+)
+
+PARALLEL_UPDATES = 0
+
+THERMOSTAT_TO_HA_MODE = {
+    "cool": HVACMode.COOL,
+    "dry": HVACMode.DRY,
+    "heat": HVACMode.HEAT,
+    "floor_heating": HVACMode.HEAT,
+    "ventilation": HVACMode.FAN_ONLY,
+}
+
+PRESET_FROST_PROTECTION = "frost_protection"
+
+
+@dataclass(kw_only=True, frozen=True)
+class RpcClimateDescription(RpcEntityDescription, ClimateEntityDescription):
+    """Class to describe a RPC climate."""
+
+
+class RpcLinkedgoThermostatClimate(ShellyRpcAttributeEntity, ClimateEntity):
+    """Entity that controls a LINKEDGO Thermostat on RPC based Shelly devices."""
+
+    entity_description: RpcClimateDescription
+    _attr_native_temperature_unit = UnitOfTemperature.CELSIUS
+    _attr_translation_key = "thermostat"
+    _id: int
+
+    def __init__(
+        self,
+        coordinator: ShellyRpcCoordinator,
+        key: str,
+        attribute: str,
+        description: RpcEntityDescription,
+    ) -> None:
+        """Initialize RPC LINKEDGO Thermostat."""
+        super().__init__(coordinator, key, attribute, description)
+        self._attr_name = None  # Main device entity
+
+        self._attr_supported_features = (
+            ClimateEntityFeature.TARGET_TEMPERATURE
+            | ClimateEntityFeature.TURN_OFF
+            | ClimateEntityFeature.TURN_ON
+        )
+
+        config = coordinator.device.config
+
+        self._attr_min_temp = config[key]["min"]
+        self._attr_max_temp = config[key]["max"]
+        self._attr_target_temperature_step = config[key]["meta"]["ui"]["step"]
+
+        self._current_humidity_key = get_rpc_key_by_role(config, "current_humidity")
+        self._current_temperature_key = get_rpc_key_by_role(
+            config, "current_temperature"
+        )
+        self._thermostat_enable_key = get_rpc_key_by_role(config, "enable")
+
+        self._target_humidity_key = get_rpc_key_by_role(config, "target_humidity")
+        if self._target_humidity_key:
+            self._attr_supported_features |= ClimateEntityFeature.TARGET_HUMIDITY
+            self._attr_min_humidity = config[self._target_humidity_key]["min"]
+            self._attr_max_humidity = config[self._target_humidity_key]["max"]
+
+        self._anti_freeze_key = get_rpc_key_by_role(config, "anti_freeze")
+        if self._anti_freeze_key:
+            self._attr_supported_features |= ClimateEntityFeature.PRESET_MODE
+            self._attr_preset_modes = [PRESET_NONE, PRESET_FROST_PROTECTION]
+
+        self._fan_speed_key = get_rpc_key_by_role(config, "fan_speed")
+        if self._fan_speed_key:
+            self._attr_supported_features |= ClimateEntityFeature.FAN_MODE
+            self._attr_fan_modes = config[self._fan_speed_key]["options"]
+
+        # ST1820 only supports HEAT and OFF
+        self._attr_hvac_modes = [HVACMode.OFF, HVACMode.HEAT]
+        # ST802 supports multiple working modes
+        self._working_mode_key = get_rpc_key_by_role(config, "working_mode")
+        if self._working_mode_key:
+            modes = config[self._working_mode_key]["options"]
+            self._attr_hvac_modes = [HVACMode.OFF] + [
+                THERMOSTAT_TO_HA_MODE[mode] for mode in modes
+            ]
+            self._ha_to_thermostat_mode = {
+                THERMOSTAT_TO_HA_MODE[mode]: mode for mode in modes
+            }
+
+    @property
+    def _status(self) -> dict[str, Any]:
+        """Return the full device status."""
+        return self.coordinator.device.status
+
+    @property
+    @override
+    def current_humidity(self) -> float | None:
+        """Return the current humidity."""
+        if TYPE_CHECKING:
+            assert self._current_humidity_key is not None
+
+        return cast(float, self._status[self._current_humidity_key]["value"])
+
+    @property
+    @override
+    def target_humidity(self) -> float | None:
+        """Return the humidity we try to reach."""
+        if TYPE_CHECKING:
+            assert self._target_humidity_key is not None
+
+        return cast(float, self._status[self._target_humidity_key]["value"])
+
+    @property
+    @override
+    def hvac_mode(self) -> HVACMode | None:
+        """Return hvac operation ie. heat, cool mode."""
+        if TYPE_CHECKING:
+            assert self._thermostat_enable_key is not None
+
+        if not self._status[self._thermostat_enable_key]["value"]:
+            return HVACMode.OFF
+
+        if self._working_mode_key is not None:
+            working_mode = self._status[self._working_mode_key]["value"]
+            return THERMOSTAT_TO_HA_MODE[working_mode]
+
+        return HVACMode.HEAT  # ST1820
+
+    @property
+    @override
+    def native_current_temperature(self) -> float | None:
+        """Return the current temperature."""
+        if TYPE_CHECKING:
+            assert self._current_temperature_key is not None
+
+        return cast(float, self._status[self._current_temperature_key]["value"])
+
+    @property
+    @override
+    def native_target_temperature(self) -> float | None:
+        """Return the temperature we try to reach."""
+        return cast(float, self.attribute_value)
+
+    @property
+    @override
+    def preset_mode(self) -> str | None:
+        """Return the current preset mode."""
+        if TYPE_CHECKING:
+            assert self._anti_freeze_key is not None
+
+        if self._status[self._anti_freeze_key]["value"]:
+            return PRESET_FROST_PROTECTION
+
+        return PRESET_NONE
+
+    @property
+    @override
+    def fan_mode(self) -> str | None:
+        """Return the fan setting."""
+        if TYPE_CHECKING:
+            assert self._fan_speed_key is not None
+
+        return cast(str, self._status[self._fan_speed_key]["value"])
+
+    @override
+    async def async_set_temperature(self, **kwargs: Any) -> None:
+        """Set new target temperature."""
+        await self.coordinator.device.number_set(self._id, kwargs[ATTR_TEMPERATURE])
+
+    @override
+    async def async_set_humidity(self, humidity: int) -> None:
+        """Set new target humidity."""
+        assert self._target_humidity_key is not None
+
+        await self.coordinator.device.number_set(
+            get_rpc_key_id(self._target_humidity_key), humidity
+        )
+
+    @override
+    async def async_set_fan_mode(self, fan_mode: str) -> None:
+        """Set new target fan mode."""
+        if TYPE_CHECKING:
+            assert self._fan_speed_key is not None
+
+        await self.coordinator.device.enum_set(
+            get_rpc_key_id(self._fan_speed_key), fan_mode
+        )
+
+    @override
+    async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
+        """Set new target hvac mode."""
+        if TYPE_CHECKING:
+            assert self._thermostat_enable_key is not None
+
+        await self.coordinator.device.boolean_set(
+            get_rpc_key_id(self._thermostat_enable_key), hvac_mode != HVACMode.OFF
+        )
+
+        if self._working_mode_key is None or hvac_mode == HVACMode.OFF:
+            return
+
+        await self.coordinator.device.enum_set(
+            get_rpc_key_id(self._working_mode_key),
+            self._ha_to_thermostat_mode[hvac_mode],
+        )
+
+    @override
+    async def async_set_preset_mode(self, preset_mode: str) -> None:
+        """Set new preset mode."""
+        if TYPE_CHECKING:
+            assert self._anti_freeze_key is not None
+
+        await self.coordinator.device.boolean_set(
+            get_rpc_key_id(self._anti_freeze_key),
+            preset_mode == PRESET_FROST_PROTECTION,
+        )
+
+
+RPC_LINKEDGO_THERMOSTAT: dict[str, RpcClimateDescription] = {
+    "linkedgo_thermostat_climate": RpcClimateDescription(
+        key="number",
+        sub_key="value",
+        role="target_temperature",
+        models={MODEL_LINKEDGO_ST802_THERMOSTAT, MODEL_LINKEDGO_ST1820_THERMOSTAT},
+    ),
+}
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    config_entry: ShellyConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    """Set up climate device."""
+    """Set up climate entities."""
+    if get_device_entry_gen(config_entry) in RPC_GENERATIONS:
+        return _async_setup_rpc_entry(hass, config_entry, async_add_entities)
 
-    if get_device_entry_gen(config_entry) == 2:
-        return
+    return _async_setup_block_entry(hass, config_entry, async_add_entities)
 
-    coordinator = get_entry_data(hass)[config_entry.entry_id].block
+
+@callback
+def _async_setup_block_entry(
+    hass: HomeAssistant,
+    config_entry: ShellyConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up entities for BLOCK device."""
+    coordinator = config_entry.runtime_data.block
     assert coordinator
     if coordinator.device.initialized:
-        async_setup_climate_entities(async_add_entities, coordinator)
+        _async_setup_block_climate_entities(async_add_entities, coordinator)
     else:
-        async_restore_climate_entities(
+        _async_restore_block_climate_entities(
             hass, config_entry, async_add_entities, coordinator
         )
 
 
 @callback
-def async_setup_climate_entities(
-    async_add_entities: AddEntitiesCallback,
+def _async_setup_block_climate_entities(
+    async_add_entities: AddConfigEntryEntitiesCallback,
     coordinator: ShellyBlockCoordinator,
 ) -> None:
-    """Set up online climate devices."""
+    """Set up online BLOCK climate devices."""
 
     device_block: Block | None = None
     sensor_block: Block | None = None
@@ -76,21 +335,18 @@ def async_setup_climate_entities(
 
 
 @callback
-def async_restore_climate_entities(
+def _async_restore_block_climate_entities(
     hass: HomeAssistant,
-    config_entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    config_entry: ShellyConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
     coordinator: ShellyBlockCoordinator,
 ) -> None:
-    """Restore sleeping climate devices."""
+    """Restore sleeping BLOCK climate devices."""
 
-    ent_reg = entity_registry.async_get(hass)
-    entries = entity_registry.async_entries_for_config_entry(
-        ent_reg, config_entry.entry_id
-    )
+    ent_reg = er.async_get(hass)
+    entries = er.async_entries_for_config_entry(ent_reg, config_entry.entry_id)
 
     for entry in entries:
-
         if entry.domain != CLIMATE_DOMAIN:
             continue
 
@@ -100,27 +356,88 @@ def async_restore_climate_entities(
         break
 
 
-class BlockSleepingClimate(
-    CoordinatorEntity[ShellyBlockCoordinator], RestoreEntity, ClimateEntity
-):
+@callback
+def _async_setup_rpc_entry(
+    hass: HomeAssistant,
+    config_entry: ShellyConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up entities for RPC device."""
+    coordinator = config_entry.runtime_data.rpc
+    assert coordinator
+    climate_key_ids = get_rpc_key_ids(coordinator.device.status, "thermostat")
+    blutrv_key_ids = get_rpc_key_ids(coordinator.device.status, BLU_TRV_IDENTIFIER)
+
+    climate_ids = []
+    for id_ in climate_key_ids:
+        climate_ids.append(id_)
+        # There are three configuration scenarios for WallDisplay:
+        # - relay mode (no thermostat)
+        # - thermostat mode using the internal relay as an actuator
+        # - thermostat mode using an external (from another device) relay as
+        #   an actuator
+        if is_rpc_thermostat_internal_actuator(coordinator.device.status):
+            # Wall Display relay is used as the thermostat actuator,
+            # we need to remove a switch entity
+            unique_id = f"{coordinator.mac}-switch:{id_}"
+            async_remove_shelly_entity(hass, "switch", unique_id)
+
+    if climate_ids:
+        async_add_entities(RpcClimate(coordinator, id_) for id_ in climate_ids)
+
+    if blutrv_key_ids:
+        async_add_entities(RpcBluTrvClimate(coordinator, id_) for id_ in blutrv_key_ids)
+
+    async_setup_entry_rpc(
+        hass,
+        config_entry,
+        async_add_entities,
+        RPC_LINKEDGO_THERMOSTAT,
+        RpcLinkedgoThermostatClimate,
+    )
+
+
+@dataclass(kw_only=True)
+class ShellyClimateExtraStoredData(ClimateExtraStoredData):
+    """Object to hold extra stored data."""
+
+    last_target_temp: float
+
+    @classmethod
+    @override
+    def from_dict(cls, restored: dict[str, Any]) -> Self | None:
+        """Initialize stored data from a dict."""
+        if (climate_data := ClimateExtraStoredData.from_dict(restored)) is None:
+            return None
+        try:
+            last_target_temp = restored["last_target_temp"]
+        except KeyError:
+            return None
+        return cls(**climate_data.as_dict(), last_target_temp=last_target_temp)
+
+
+class BlockSleepingClimate(CoordinatorEntity[ShellyBlockCoordinator], RestoreClimate):
     """Representation of a Shelly climate device."""
 
     _attr_hvac_modes = [HVACMode.OFF, HVACMode.HEAT]
-    _attr_icon = "mdi:thermostat"
     _attr_max_temp = SHTRV_01_TEMPERATURE_SETTINGS["max"]
     _attr_min_temp = SHTRV_01_TEMPERATURE_SETTINGS["min"]
-    _attr_supported_features: int = (
-        ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.PRESET_MODE
+    _attr_supported_features = (
+        ClimateEntityFeature.TARGET_TEMPERATURE
+        | ClimateEntityFeature.PRESET_MODE
+        | ClimateEntityFeature.TURN_OFF
+        | ClimateEntityFeature.TURN_ON
     )
     _attr_target_temperature_step = SHTRV_01_TEMPERATURE_SETTINGS["step"]
-    _attr_temperature_unit = TEMP_CELSIUS
+    _attr_native_temperature_unit = UnitOfTemperature.CELSIUS
+    _attr_has_entity_name = True
 
     def __init__(
         self,
         coordinator: ShellyBlockCoordinator,
         sensor_block: Block | None,
         device_block: Block | None,
-        entry: entity_registry.RegistryEntry | None = None,
+        entry: RegistryEntry | None = None,
     ) -> None:
         """Initialize climate."""
         super().__init__(coordinator)
@@ -129,9 +446,11 @@ class BlockSleepingClimate(
         self.control_result: dict[str, Any] | None = None
         self.device_block: Block | None = device_block
         self.last_state: State | None = None
-        self.last_state_attributes: Mapping[str, Any]
+        self.last_state_attributes: Mapping[str, Any] = {}
+        self._restored_current_temp: float | None = None
+        self._restored_target_temp: float | None = None
         self._preset_modes: list[str] = []
-        self._last_target_temp = 20.0
+        self._last_target_temp = SHTRV_01_TEMPERATURE_SETTINGS["default"]
 
         if self.block is not None and self.device_block is not None:
             self._unique_id = f"{self.coordinator.mac}-{self.block.description}"
@@ -144,41 +463,52 @@ class BlockSleepingClimate(
             ]
         elif entry is not None:
             self._unique_id = entry.unique_id
+        self._attr_device_info = get_entity_block_device_info(coordinator, sensor_block)
+        self._attr_name = None  # Main device entity
 
-        self._channel = cast(int, self._unique_id.split("_")[1])
+        self._channel = int(self._unique_id.split("_")[1])
 
     @property
+    @override
+    def extra_restore_state_data(self) -> ShellyClimateExtraStoredData:
+        """Return text specific state data to be restored."""
+        return ShellyClimateExtraStoredData(
+            **super().extra_restore_state_data.as_dict(),
+            last_target_temp=self._last_target_temp,
+        )
+
+    @property
+    @override
     def unique_id(self) -> str:
         """Set unique id of entity."""
         return self._unique_id
 
     @property
-    def name(self) -> str:
-        """Name of entity."""
-        return self.coordinator.name
-
-    @property
-    def target_temperature(self) -> float | None:
+    @override
+    def native_target_temperature(self) -> float | None:
         """Set target temperature."""
         if self.block is not None:
             return cast(float, self.block.targetTemp)
-        return self.last_state_attributes.get("temperature")
+        return self._restored_target_temp
 
     @property
-    def current_temperature(self) -> float | None:
+    @override
+    def native_current_temperature(self) -> float | None:
         """Return current temperature."""
         if self.block is not None:
             return cast(float, self.block.temp)
-        return self.last_state_attributes.get("current_temperature")
+        return self._restored_current_temp
 
     @property
+    @override
     def available(self) -> bool:
         """Device availability."""
         if self.device_block is not None:
             return not cast(bool, self.device_block.valveError)
-        return self.coordinator.last_update_success
+        return super().available
 
     @property
+    @override
     def hvac_mode(self) -> HVACMode:
         """HVAC current mode."""
         if self.device_block is None:
@@ -192,6 +522,7 @@ class BlockSleepingClimate(
         return HVACMode.HEAT
 
     @property
+    @override
     def preset_mode(self) -> str | None:
         """Preset current mode."""
         if self.device_block is None:
@@ -201,6 +532,7 @@ class BlockSleepingClimate(
         return self._preset_modes[cast(int, self.device_block.mode)]
 
     @property
+    @override
     def hvac_action(self) -> HVACAction:
         """HVAC current action."""
         if (
@@ -213,80 +545,90 @@ class BlockSleepingClimate(
         return HVACAction.HEATING if bool(self.device_block.status) else HVACAction.IDLE
 
     @property
+    @override
     def preset_modes(self) -> list[str]:
         """Preset available modes."""
         return self._preset_modes
 
-    @property
-    def device_info(self) -> DeviceInfo:
-        """Device info."""
-        return {
-            "connections": {
-                (device_registry.CONNECTION_NETWORK_MAC, self.coordinator.mac)
-            }
-        }
-
     def _check_is_off(self) -> bool:
         """Return if valve is off or on."""
         return bool(
-            self.target_temperature is None
-            or (self.target_temperature <= self._attr_min_temp)
+            self.native_target_temperature is None
+            or (self.native_target_temperature <= self._attr_min_temp)
         )
 
     async def set_state_full_path(self, **kwargs: Any) -> Any:
         """Set block state (HTTP request)."""
         LOGGER.debug("Setting state for entity %s, state: %s", self.name, kwargs)
         try:
-            return await self.coordinator.device.http_request(
-                "get", f"thermostat/{self._channel}", kwargs
+            return await self.coordinator.device.set_thermostat_state(
+                self._channel,
+                **kwargs,
             )
         except DeviceConnectionError as err:
             self.coordinator.last_update_success = False
             raise HomeAssistantError(
-                f"Setting state for entity {self.name} failed, state: {kwargs}, error: {repr(err)}"
+                translation_domain=DOMAIN,
+                translation_key="device_communication_action_error",
+                translation_placeholders={
+                    "entity": self.entity_id,
+                    "device": self.coordinator.name,
+                },
             ) from err
         except InvalidAuthError:
-            self.coordinator.entry.async_start_reauth(self.hass)
+            await self.coordinator.async_shutdown_device_and_start_reauth()
 
+    @override
     async def async_set_temperature(self, **kwargs: Any) -> None:
         """Set new target temperature."""
-        if (current_temp := kwargs.get(ATTR_TEMPERATURE)) is None:
-            return
-        await self.set_state_full_path(target_t_enabled=1, target_t=f"{current_temp}")
+        target_temp = kwargs[ATTR_TEMPERATURE]
 
+        # Shelly TRV accepts target_t in Fahrenheit or Celsius, but you must
+        # send the units that the device expects
+        if self.block is not None and self.block.channel is not None:
+            therm = self.coordinator.device.settings["thermostats"][
+                int(self.block.channel)
+            ]
+            LOGGER.debug("Themostat settings: %s", therm)
+            if therm.get("target_t", {}).get("units", "C") == "F":
+                target_temp = TemperatureConverter.convert(
+                    cast(float, target_temp),
+                    UnitOfTemperature.CELSIUS,
+                    UnitOfTemperature.FAHRENHEIT,
+                )
+
+        await self.set_state_full_path(target_t_enabled=1, target_t=target_temp)
+
+    @override
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         """Set hvac mode."""
         if hvac_mode == HVACMode.OFF:
-            if isinstance(self.target_temperature, float):
-                self._last_target_temp = self.target_temperature
+            if (target_temp := self.native_target_temperature) is not None:
+                self._last_target_temp = target_temp
             await self.set_state_full_path(
-                target_t_enabled=1, target_t=f"{self._attr_min_temp}"
+                target_t_enabled=1, target_t=self._attr_min_temp
             )
         if hvac_mode == HVACMode.HEAT:
             await self.set_state_full_path(
                 target_t_enabled=1, target_t=self._last_target_temp
             )
 
+    @override
     async def async_set_preset_mode(self, preset_mode: str) -> None:
         """Set preset mode."""
-        if not self._preset_modes:
-            return
-
         preset_index = self._preset_modes.index(preset_mode)
 
         if preset_index == 0:
             await self.set_state_full_path(schedule=0)
         else:
-            await self.set_state_full_path(
-                schedule=1, schedule_profile=f"{preset_index}"
-            )
+            await self.set_state_full_path(schedule=1, schedule_profile=preset_index)
 
+    @override
     async def async_added_to_hass(self) -> None:
         """Handle entity which will be added."""
         LOGGER.info("Restoring entity %s", self.name)
 
         last_state = await self.async_get_last_state()
-
         if last_state is not None:
             self.last_state = last_state
             self.last_state_attributes = self.last_state.attributes
@@ -294,14 +636,53 @@ class BlockSleepingClimate(
                 list, self.last_state.attributes.get("preset_modes")
             )
 
+        last_extra_data = await self.async_get_last_extra_data()
+        if last_extra_data is not None:
+            restored = last_extra_data.as_dict()
+            if (data := ShellyClimateExtraStoredData.from_dict(restored)) is not None:
+                self._last_target_temp = data.last_target_temp
+            else:
+                # Saved before 2026.11 without the temperatures, remove in 2027.5
+                self._last_target_temp = restored["last_target_temp"]
+
+        # The restored target is sent to the device when turning off and on again
+        if (
+            climate_data := await self.async_get_last_climate_data(validate_range=True)
+        ) is not None:
+            self._restored_current_temp = climate_data.native_current_temperature
+            self._restored_target_temp = climate_data.native_target_temperature
+
         await super().async_added_to_hass()
 
     @callback
+    @override
     def _handle_coordinator_update(self) -> None:
         """Handle device update."""
         if not self.coordinator.device.initialized:
             self.async_write_ha_state()
             return
+
+        if self.coordinator.device.status.get("calibrated") is False:
+            ir.async_create_issue(
+                self.hass,
+                DOMAIN,
+                NOT_CALIBRATED_ISSUE_ID.format(unique=self.coordinator.mac),
+                is_fixable=False,
+                is_persistent=False,
+                severity=ir.IssueSeverity.ERROR,
+                translation_key="device_not_calibrated",
+                translation_placeholders={
+                    "device_name": self.coordinator.name,
+                    "ip_address": self.coordinator.device.ip_address,
+                },
+                config_entry_id=self.coordinator.config_entry.entry_id,
+            )
+        else:
+            ir.async_delete_issue(
+                self.hass,
+                DOMAIN,
+                NOT_CALIBRATED_ISSUE_ID.format(unique=self.coordinator.mac),
+            )
 
         assert self.coordinator.device.blocks
 
@@ -324,6 +705,155 @@ class BlockSleepingClimate(
                     ]["schedule_profile_names"],
                 ]
             except InvalidAuthError:
-                self.coordinator.entry.async_start_reauth(self.hass)
+                self.hass.async_create_task(
+                    self.coordinator.async_shutdown_device_and_start_reauth(),
+                    eager_start=True,
+                )
             else:
                 self.async_write_ha_state()
+
+
+class RpcClimate(ShellyRpcEntity, ClimateEntity):
+    """Entity that controls a thermostat on RPC based Shelly devices."""
+
+    _attr_max_temp = RPC_THERMOSTAT_SETTINGS["max"]
+    _attr_min_temp = RPC_THERMOSTAT_SETTINGS["min"]
+    _attr_supported_features = (
+        ClimateEntityFeature.TARGET_TEMPERATURE
+        | ClimateEntityFeature.TURN_OFF
+        | ClimateEntityFeature.TURN_ON
+    )
+    _attr_target_temperature_step = RPC_THERMOSTAT_SETTINGS["step"]
+    _attr_native_temperature_unit = UnitOfTemperature.CELSIUS
+
+    def __init__(self, coordinator: ShellyRpcCoordinator, id_: int) -> None:
+        """Initialize."""
+        super().__init__(coordinator, f"thermostat:{id_}")
+        self._attr_name = None  # Main device entity
+        self._id = id_
+        self._thermostat_type = coordinator.device.config[self.key].get(
+            "type", "heating"
+        )
+        self._invert_output = coordinator.device.config[self.key].get(
+            "invert_output", False
+        )
+        if self._thermostat_type == "cooling":
+            self._attr_hvac_modes = [HVACMode.OFF, HVACMode.COOL]
+        else:
+            self._attr_hvac_modes = [HVACMode.OFF, HVACMode.HEAT]
+        self._humidity_key: str | None = None
+        # Check if there is a corresponding humidity key for the thermostat ID
+        if (humidity_key := f"humidity:{id_}") in self.coordinator.device.status:
+            self._humidity_key = humidity_key
+
+    @property
+    @override
+    def native_target_temperature(self) -> float | None:
+        """Set target temperature."""
+        return cast(float, self.status["target_C"])
+
+    @property
+    @override
+    def native_current_temperature(self) -> float | None:
+        """Return current temperature."""
+        return cast(float, self.status["current_C"])
+
+    @property
+    @override
+    def current_humidity(self) -> float | None:
+        """Return current humidity."""
+        if self._humidity_key is None:
+            return None
+
+        return cast(float, self.coordinator.device.status[self._humidity_key]["rh"])
+
+    @property
+    @override
+    def hvac_mode(self) -> HVACMode:
+        """HVAC current mode."""
+        if not self.status["enable"]:
+            return HVACMode.OFF
+
+        return HVACMode.COOL if self._thermostat_type == "cooling" else HVACMode.HEAT
+
+    @property
+    @override
+    def hvac_action(self) -> HVACAction:
+        """HVAC current action."""
+        # When inverted, relay on means idle; otherwise relay on means active.
+        if self.status["output"] == self._invert_output:
+            return HVACAction.IDLE
+
+        return (
+            HVACAction.COOLING
+            if self._thermostat_type == "cooling"
+            else HVACAction.HEATING
+        )
+
+    @override
+    async def async_set_temperature(self, **kwargs: Any) -> None:
+        """Set new target temperature."""
+        await self.coordinator.device.climate_set_target_temperature(
+            self._id, kwargs[ATTR_TEMPERATURE]
+        )
+
+    @override
+    async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
+        """Set hvac mode."""
+        await self.coordinator.device.climate_set_hvac_mode(self._id, str(hvac_mode))
+
+
+class RpcBluTrvClimate(ShellyRpcEntity, ClimateEntity):
+    """Entity that controls a thermostat on RPC based Shelly devices."""
+
+    _attr_max_temp = BLU_TRV_TEMPERATURE_SETTINGS["max"]
+    _attr_min_temp = BLU_TRV_TEMPERATURE_SETTINGS["min"]
+    _attr_supported_features = (
+        ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.TURN_ON
+    )
+    _attr_hvac_modes = [HVACMode.HEAT]
+    _attr_hvac_mode = HVACMode.HEAT
+    _attr_target_temperature_step = BLU_TRV_TEMPERATURE_SETTINGS["step"]
+    _attr_native_temperature_unit = UnitOfTemperature.CELSIUS
+
+    def __init__(self, coordinator: ShellyRpcCoordinator, id_: int) -> None:
+        """Initialize."""
+        super().__init__(coordinator, f"{BLU_TRV_IDENTIFIER}:{id_}")
+        self._attr_name = None  # Main device entity
+        self._id = id_
+        self._config = coordinator.device.config[self.key]
+        ble_addr: str = self._config["addr"]
+        self._attr_unique_id = f"{ble_addr}-{self.key}"
+        self._attr_device_info = get_entity_blu_trv_device_info(coordinator, self.key)
+
+    @property
+    @override
+    def native_target_temperature(self) -> float | None:
+        """Set target temperature."""
+        if not self._config["enable"]:
+            return None
+
+        return cast(float, self.status["target_C"])
+
+    @property
+    @override
+    def native_current_temperature(self) -> float | None:
+        """Return current temperature."""
+        return cast(float, self.status["current_C"])
+
+    @property
+    @override
+    def hvac_action(self) -> HVACAction:
+        """HVAC current action."""
+        if not self.status["pos"]:
+            return HVACAction.IDLE
+
+        return HVACAction.HEATING
+
+    @rpc_call
+    @override
+    async def async_set_temperature(self, **kwargs: Any) -> None:
+        """Set new target temperature."""
+        await self.coordinator.device.blu_trv_set_target_temperature(
+            self._id, kwargs[ATTR_TEMPERATURE]
+        )

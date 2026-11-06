@@ -1,16 +1,19 @@
 {
   "domain": "nuheat",
   "name": "NuHeat",
-  "documentation": "https://www.home-assistant.io/integrations/nuheat",
-  "requirements": ["nuheat==1.0.0"],
+  "categories": ["climate.thermostats_heating"],
   "codeowners": ["@tstabrawa"],
   "config_flow": true,
+  "connectivity": ["cloud"],
   "dhcp": [
     {
       "hostname": "nuheat",
       "macaddress": "002338*"
     }
   ],
+  "documentation": "https://www.home-assistant.io/integrations/nuheat",
+  "integration_type": "device",
   "iot_class": "cloud_polling",
-  "loggers": ["nuheat"]
+  "loggers": ["nuheat"],
+  "requirements": ["nuheat==1.0.1"]
 }

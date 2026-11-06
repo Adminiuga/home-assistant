@@ -1,9 +1,9 @@
 """Support for Arduino-compatible Microcontrollers through Firmata."""
-import asyncio
+
 from copy import copy
 import logging
 
-import voluptuous as vol
+import probatio
 
 from homeassistant.config_entries import SOURCE_IMPORT, ConfigEntry
 from homeassistant.const import (
@@ -18,6 +18,7 @@ from homeassistant.const import (
     EVENT_HOMEASSISTANT_STOP,
 )
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryError
 from homeassistant.helpers import config_validation as cv, device_registry as dr
 from homeassistant.helpers.typing import ConfigType
 
@@ -47,80 +48,83 @@ _LOGGER = logging.getLogger(__name__)
 
 DATA_CONFIGS = "board_configs"
 
-ANALOG_PIN_SCHEMA = vol.All(cv.string, vol.Match(r"^A[0-9]+$"))
+ANALOG_PIN_SCHEMA = probatio.All(cv.string, probatio.Match(r"^A[0-9]+$"))
 
-SWITCH_SCHEMA = vol.Schema(
+SWITCH_SCHEMA = probatio.Schema(
     {
-        vol.Required(CONF_NAME): cv.string,
+        probatio.Required(CONF_NAME): cv.string,
         # Both digital and analog pins may be used as digital output
-        vol.Required(CONF_PIN): vol.Any(cv.positive_int, ANALOG_PIN_SCHEMA),
-        vol.Required(CONF_PIN_MODE): PIN_MODE_OUTPUT,
-        vol.Optional(CONF_INITIAL_STATE, default=False): cv.boolean,
-        vol.Optional(CONF_NEGATE_STATE, default=False): cv.boolean,
+        probatio.Required(CONF_PIN): probatio.Any(cv.positive_int, ANALOG_PIN_SCHEMA),
+        probatio.Required(CONF_PIN_MODE): PIN_MODE_OUTPUT,
+        probatio.Optional(CONF_INITIAL_STATE, default=False): cv.boolean,
+        probatio.Optional(CONF_NEGATE_STATE, default=False): cv.boolean,
     },
     required=True,
 )
 
-LIGHT_SCHEMA = vol.Schema(
+LIGHT_SCHEMA = probatio.Schema(
     {
-        vol.Required(CONF_NAME): cv.string,
+        probatio.Required(CONF_NAME): cv.string,
         # Both digital and analog pins may be used as PWM/analog output
-        vol.Required(CONF_PIN): vol.Any(cv.positive_int, ANALOG_PIN_SCHEMA),
-        vol.Required(CONF_PIN_MODE): PIN_MODE_PWM,
-        vol.Optional(CONF_INITIAL_STATE, default=0): cv.positive_int,
-        vol.Optional(CONF_MINIMUM, default=0): cv.positive_int,
-        vol.Optional(CONF_MAXIMUM, default=255): cv.positive_int,
+        probatio.Required(CONF_PIN): probatio.Any(cv.positive_int, ANALOG_PIN_SCHEMA),
+        probatio.Required(CONF_PIN_MODE): PIN_MODE_PWM,
+        probatio.Optional(CONF_INITIAL_STATE, default=0): cv.positive_int,
+        probatio.Optional(CONF_MINIMUM, default=0): cv.positive_int,
+        probatio.Optional(CONF_MAXIMUM, default=255): cv.positive_int,
     },
     required=True,
 )
 
-BINARY_SENSOR_SCHEMA = vol.Schema(
+BINARY_SENSOR_SCHEMA = probatio.Schema(
     {
-        vol.Required(CONF_NAME): cv.string,
+        probatio.Required(CONF_NAME): cv.string,
         # Both digital and analog pins may be used as digital input
-        vol.Required(CONF_PIN): vol.Any(cv.positive_int, ANALOG_PIN_SCHEMA),
-        vol.Required(CONF_PIN_MODE): vol.Any(PIN_MODE_INPUT, PIN_MODE_PULLUP),
-        vol.Optional(CONF_NEGATE_STATE, default=False): cv.boolean,
+        probatio.Required(CONF_PIN): probatio.Any(cv.positive_int, ANALOG_PIN_SCHEMA),
+        probatio.Required(CONF_PIN_MODE): probatio.Any(PIN_MODE_INPUT, PIN_MODE_PULLUP),
+        probatio.Optional(CONF_NEGATE_STATE, default=False): cv.boolean,
     },
     required=True,
 )
 
-SENSOR_SCHEMA = vol.Schema(
+SENSOR_SCHEMA = probatio.Schema(
     {
-        vol.Required(CONF_NAME): cv.string,
+        probatio.Required(CONF_NAME): cv.string,
         # Currently only analog input sensor is implemented
-        vol.Required(CONF_PIN): ANALOG_PIN_SCHEMA,
-        vol.Required(CONF_PIN_MODE): PIN_MODE_ANALOG,
+        probatio.Required(CONF_PIN): ANALOG_PIN_SCHEMA,
+        probatio.Required(CONF_PIN_MODE): PIN_MODE_ANALOG,
         # Default differential is 40 to avoid a flood of messages on initial setup
         # in case pin is unplugged. Firmata responds really really fast
-        vol.Optional(CONF_DIFFERENTIAL, default=40): vol.All(
-            cv.positive_int, vol.Range(min=1)
+        probatio.Optional(CONF_DIFFERENTIAL, default=40): probatio.All(
+            cv.positive_int, probatio.Range(min=1)
         ),
     },
     required=True,
 )
 
-BOARD_CONFIG_SCHEMA = vol.Schema(
+BOARD_CONFIG_SCHEMA = probatio.Schema(
     {
-        vol.Required(CONF_SERIAL_PORT): cv.string,
-        vol.Optional(CONF_SERIAL_BAUD_RATE): cv.positive_int,
-        vol.Optional(CONF_ARDUINO_INSTANCE_ID): cv.positive_int,
-        vol.Optional(CONF_ARDUINO_WAIT): cv.positive_int,
-        vol.Optional(CONF_SLEEP_TUNE): vol.All(
-            vol.Coerce(float), vol.Range(min=0.0001)
+        probatio.Required(CONF_SERIAL_PORT): cv.string,
+        probatio.Optional(CONF_SERIAL_BAUD_RATE): cv.positive_int,
+        probatio.Optional(CONF_ARDUINO_INSTANCE_ID): cv.positive_int,
+        probatio.Optional(CONF_ARDUINO_WAIT): cv.positive_int,
+        probatio.Optional(CONF_SLEEP_TUNE): probatio.All(
+            probatio.Coerce(float), probatio.Range(min=0.0001)
         ),
-        vol.Optional(CONF_SAMPLING_INTERVAL): cv.positive_int,
-        vol.Optional(CONF_SWITCHES): [SWITCH_SCHEMA],
-        vol.Optional(CONF_LIGHTS): [LIGHT_SCHEMA],
-        vol.Optional(CONF_BINARY_SENSORS): [BINARY_SENSOR_SCHEMA],
-        vol.Optional(CONF_SENSORS): [SENSOR_SCHEMA],
+        probatio.Optional(CONF_SAMPLING_INTERVAL): cv.positive_int,
+        probatio.Optional(CONF_SWITCHES): [SWITCH_SCHEMA],
+        probatio.Optional(CONF_LIGHTS): [LIGHT_SCHEMA],
+        probatio.Optional(CONF_BINARY_SENSORS): [BINARY_SENSOR_SCHEMA],
+        probatio.Optional(CONF_SENSORS): [SENSOR_SCHEMA],
     },
     required=True,
 )
 
-CONFIG_SCHEMA = vol.Schema(
-    {DOMAIN: vol.All(cv.ensure_list, [BOARD_CONFIG_SCHEMA])}, extra=vol.ALLOW_EXTRA
+CONFIG_SCHEMA = probatio.Schema(
+    {DOMAIN: probatio.All(probatio.EnsureList(), [BOARD_CONFIG_SCHEMA])},
+    extra=probatio.ALLOW_EXTRA,
 )
+
+type FirmataConfigEntry = ConfigEntry[FirmataBoard]
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
@@ -158,11 +162,10 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     return True
 
 
-async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
+async def async_setup_entry(
+    hass: HomeAssistant, config_entry: FirmataConfigEntry
+) -> None:
     """Set up a Firmata board for a config entry."""
-    if DOMAIN not in hass.data:
-        hass.data[DOMAIN] = {}
-
     _LOGGER.debug(
         "Setting up Firmata id %s, name %s, config %s",
         config_entry.entry_id,
@@ -173,15 +176,17 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> b
     board = FirmataBoard(config_entry.data)
 
     if not await board.async_setup():
-        return False
+        raise ConfigEntryError(
+            translation_domain=DOMAIN,
+            translation_key="setup_failed",
+            translation_placeholders={"name": board.name},
+        )
 
-    hass.data[DOMAIN][config_entry.entry_id] = board
+    config_entry.runtime_data = board
 
     async def handle_shutdown(event) -> None:
         """Handle shutdown of board when Home Assistant shuts down."""
-        # Ensure board was not already removed previously before shutdown
-        if config_entry.entry_id in hass.data[DOMAIN]:
-            await board.async_reset()
+        await board.async_reset()
 
     config_entry.async_on_unload(
         hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, handle_shutdown)
@@ -205,22 +210,21 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> b
             if conf in config_entry.data
         ],
     )
-    return True
 
 
-async def async_unload_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
+async def async_unload_entry(
+    hass: HomeAssistant, config_entry: FirmataConfigEntry
+) -> None:
     """Shutdown and close a Firmata board for a config entry."""
     _LOGGER.debug("Closing Firmata board %s", config_entry.data[CONF_NAME])
-
-    unload_entries = []
-    for (conf, platform) in CONF_PLATFORM_MAP.items():
-        if conf in config_entry.data:
-            unload_entries.append(
-                hass.config_entries.async_forward_entry_unload(config_entry, platform)
+    try:
+        if platforms := [
+            platform
+            for conf, platform in CONF_PLATFORM_MAP.items()
+            if conf in config_entry.data
+        ]:
+            await hass.config_entries.async_unload_platforms_or_raise(
+                config_entry, platforms
             )
-    results = []
-    if unload_entries:
-        results = await asyncio.gather(*unload_entries)
-    results.append(await hass.data[DOMAIN].pop(config_entry.entry_id).async_reset())
-
-    return False not in results
+    finally:
+        await config_entry.runtime_data.async_reset()

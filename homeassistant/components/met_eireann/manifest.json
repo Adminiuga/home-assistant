@@ -1,10 +1,13 @@
 {
   "domain": "met_eireann",
-  "name": "Met Éireann",
-  "config_flow": true,
-  "documentation": "https://www.home-assistant.io/integrations/met_eireann",
-  "requirements": ["pyMetEireann==2021.8.0"],
+  "name": "Met \u00c9ireann",
+  "categories": ["weather_alerts.forecasts"],
   "codeowners": ["@DylanGore"],
+  "config_flow": true,
+  "connectivity": ["cloud"],
+  "documentation": "https://www.home-assistant.io/integrations/met_eireann",
+  "integration_type": "service",
   "iot_class": "cloud_polling",
-  "loggers": ["meteireann"]
+  "loggers": ["meteireann"],
+  "requirements": ["PyMetEireann==2024.11.0"]
 }

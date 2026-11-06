@@ -3,183 +3,1171 @@
 Support for bandwidth sensors of network clients.
 Support for uptime sensors of network clients.
 """
-from datetime import datetime, timedelta
 
-from homeassistant.components.sensor import DOMAIN, SensorDeviceClass, SensorEntity
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import DATA_MEGABYTES
-from homeassistant.core import HomeAssistant, callback
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from decimal import Decimal
+from enum import StrEnum
+from functools import partial
+from typing import Literal, cast, override
+
+from aiounifi.interfaces.api_handlers import APIHandler, ItemEvent
+from aiounifi.interfaces.clients import Clients
+from aiounifi.interfaces.devices import Devices
+from aiounifi.interfaces.firewall_policies import FirewallPolicies
+from aiounifi.interfaces.outlets import Outlets
+from aiounifi.interfaces.ports import Ports
+from aiounifi.interfaces.wlans import Wlans
+from aiounifi.models.api import ApiItem
+from aiounifi.models.client import Client
+from aiounifi.models.device import (
+    Device,
+    TypedDeviceTemperature,
+    TypedDeviceUplink,
+    TypedDeviceUptimeStatsWanMonitor,
+)
+from aiounifi.models.firewall_policy import FirewallPolicy
+from aiounifi.models.outlet import Outlet
+from aiounifi.models.port import Port
+from aiounifi.models.wlan import Wlan
+
+from homeassistant.components.sensor import (
+    SensorDeviceClass,
+    SensorEntity,
+    SensorEntityDescription,
+    SensorStateClass,
+)
+from homeassistant.const import (
+    PERCENTAGE,
+    EntityCategory,
+    Platform,
+    UnitOfDataRate,
+    UnitOfElectricCurrent,
+    UnitOfElectricPotential,
+    UnitOfPower,
+    UnitOfTemperature,
+    UnitOfTime,
+)
+from homeassistant.core import Event as core_Event, HomeAssistant, callback
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
-from homeassistant.helpers.entity import EntityCategory
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
-import homeassistant.util.dt as dt_util
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.typing import StateType
+from homeassistant.util import dt as dt_util, slugify
 
-from .const import DOMAIN as UNIFI_DOMAIN
-from .unifi_client import UniFiClient
+from . import UnifiConfigEntry
+from .const import DEVICE_STATES, DOMAIN
+from .device_tracker import async_client_allowed_fn
+from .entity import (
+    UnifiEntity,
+    UnifiEntityDescription,
+    async_client_device_info_fn,
+    async_device_available_fn,
+    async_device_device_info_fn,
+    async_device_supported_fn,
+    async_firewall_policy_supported_fn,
+    async_unifi_network_device_info_fn,
+    async_wlan_available_fn,
+    async_wlan_device_info_fn,
+    is_locally_administered_mac,
+)
+from .hub import UnifiHub
 
-RX_SENSOR = "rx"
-TX_SENSOR = "tx"
-UPTIME_SENSOR = "uptime"
+PARALLEL_UPDATES = 0
+
+# UniFi pushes device telemetry every few seconds; limit state changes
+TELEMETRY_UPDATE_INTERVAL = timedelta(seconds=15)
+# A change this large is shown at once, so short peaks are kept
+TELEMETRY_IMMEDIATE_CHANGE = 10.0
+
+# UniFi names the first WAN "WAN", not "WAN1".
+type WanName = Literal["WAN", "WAN2", "WAN3"]
+
+
+class FirewallPolicyScheduleStatus(StrEnum):
+    """Whether a firewall policy currently applies."""
+
+    DISABLED = "disabled"
+    INACTIVE = "inactive"
+    ACTIVE = "active"
+
+
+@callback
+def async_bandwidth_sensor_allowed_fn(hub: UnifiHub, obj_id: str) -> bool:
+    """Check if client is allowed."""
+    if obj_id in hub.config.option_supported_clients:
+        return True
+    client = hub.api.clients[obj_id]
+    if (
+        hub.config.option_ignore_local_mac
+        and not client.is_wired
+        and is_locally_administered_mac(client.mac)
+    ):
+        return False
+    return hub.config.option_allow_bandwidth_sensors
+
+
+@callback
+def async_uptime_sensor_allowed_fn(hub: UnifiHub, obj_id: str) -> bool:
+    """Check if client is allowed."""
+    if obj_id in hub.config.option_supported_clients:
+        return True
+    client = hub.api.clients[obj_id]
+    if (
+        hub.config.option_ignore_local_mac
+        and not client.is_wired
+        and is_locally_administered_mac(client.mac)
+    ):
+        return False
+    return hub.config.option_allow_uptime_sensors
+
+
+@callback
+def async_client_rx_value_fn(hub: UnifiHub, client: Client) -> float:
+    """Calculate receiving data transfer value."""
+    if hub.entity_loader.wireless_clients.is_wireless(client):
+        return client.rx_bytes_r / 1000000
+    return client.wired_rx_bytes_r / 1000000
+
+
+@callback
+def async_client_tx_value_fn(hub: UnifiHub, client: Client) -> float:
+    """Calculate transmission data transfer value."""
+    if hub.entity_loader.wireless_clients.is_wireless(client):
+        return client.tx_bytes_r / 1000000
+    return client.wired_tx_bytes_r / 1000000
+
+
+@callback
+def async_client_uptime_value_fn(hub: UnifiHub, client: Client) -> datetime:
+    """Calculate the uptime of the client."""
+    if client.uptime < 1000000000:
+        return dt_util.now() - timedelta(seconds=client.uptime)
+    return dt_util.utc_from_timestamp(float(client.uptime))
+
+
+@callback
+def async_wired_client_allowed_fn(hub: UnifiHub, obj_id: str) -> bool:
+    """Check if client is wired, tracked and reports a link speed.
+
+    Gate on the tracking options so the sensor (and its client device) is only
+    created for clients the user actually tracks, instead of every wired client
+    the controller has ever seen.
+    """
+    client = hub.api.clients[obj_id]
+    if not client.is_wired or client.wired_rate_mbps <= 0:
+        return False
+    return async_client_allowed_fn(hub, obj_id)
+
+
+@callback
+def async_wlan_client_value_fn(hub: UnifiHub, wlan: Wlan) -> int:
+    """Calculate the amount of clients connected to a wlan."""
+    return len(
+        [
+            client.mac
+            for client in hub.api.clients.values()
+            if client.essid == wlan.name
+            and dt_util.utcnow() - dt_util.utc_from_timestamp(client.last_seen or 0)
+            < hub.config.option_detection_time
+        ]
+    )
+
+
+@callback
+def async_device_clients_value_fn(hub: UnifiHub, device: Device) -> int:
+    """Calculate the amount of clients connected to a device."""
+
+    return len(
+        [
+            client.mac
+            for client in hub.api.clients.values()
+            if (
+                (
+                    client.access_point_mac != ""
+                    and client.access_point_mac == device.mac
+                )
+                or (client.access_point_mac == "" and client.switch_mac == device.mac)
+            )
+            and dt_util.utcnow() - dt_util.utc_from_timestamp(client.last_seen or 0)
+            < hub.config.option_detection_time
+        ]
+    )
+
+
+@callback
+def async_device_uptime_value_fn(hub: UnifiHub, device: Device) -> datetime | None:
+    """Calculate the approximate time the device started."""
+    if device.uptime <= 0:
+        # Library defaults to 0 if uptime is not provided, e.g. when offline
+        return None
+    return (dt_util.now() - timedelta(seconds=device.uptime)).replace(microsecond=0)
+
+
+@callback
+def async_uptime_value_changed_fn(
+    old: StateType | date | datetime | Decimal, new: datetime | float | str | None
+) -> bool:
+    """Reject new uptime if too similar to old. Avoids fluctuation."""
+    if isinstance(old, datetime) and isinstance(new, datetime):
+        return new != old and abs((new - old).total_seconds()) > 120
+    return old is None or (new != old)
+
+
+@callback
+def async_device_outlet_power_discovery_fn(hub: UnifiHub, obj_id: str) -> bool:
+    """Determine if an outlet has the power property."""
+    return hub.api.outlets[obj_id].has_metering is True
+
+
+@callback
+def async_device_outlet_discovery_fn(hub: UnifiHub, obj_id: str) -> bool:
+    """Determine if a device supports reading overall power metrics."""
+    return hub.api.devices[obj_id].outlet_ac_power_budget is not None
+
+
+@callback
+def async_device_battery_pool_discovery_fn(
+    field: str, hub: UnifiHub, obj_id: str
+) -> bool:
+    """Determine if a battery pool field is reported."""
+    return (
+        async_device_battery_pool_value_fn(field, hub, hub.api.devices[obj_id])
+        is not None
+    )
+
+
+@callback
+def async_device_battery_pool_value_fn(
+    field: str, hub: UnifiHub, device: Device
+) -> float | int | None:
+    """Retrieve a battery pool field."""
+    return cast(dict[str, float | int | None], device.battery_pool or {}).get(field)
+
+
+@callback
+def async_device_outlet_power_value_fn(
+    hub: UnifiHub, outlet: Outlet
+) -> float | str | None:
+    """Return outlet power only when the relay state is known."""
+    if (relay_state := cast(bool | None, outlet.raw.get("relay_state"))) is None:
+        return None
+    return outlet.power if relay_state else "0"
+
+
+@callback
+def async_device_uplink_mac_discovery_fn(hub: UnifiHub, obj_id: str) -> bool:
+    """Determine if a device supports reading uplink MAC address."""
+    return async_device_uplink_mac_value_fn(hub, hub.api.devices[obj_id]) is not None
+
+
+@callback
+def async_device_uplink_mac_value_fn(hub: UnifiHub, device: Device) -> str | None:
+    """Return the uplink MAC when its telemetry is present."""
+    uplink = cast(TypedDeviceUplink | None, device.raw.get("uplink"))
+    return uplink.get("uplink_mac") if uplink is not None else None
+
+
+def device_system_stats_discovery_fn(
+    stat_index: int, hub: UnifiHub, obj_id: str
+) -> bool:
+    """Determine if a device supports reading item at index in system stats."""
+    return (
+        async_device_system_stats_value_fn(stat_index, hub, hub.api.devices[obj_id])
+        is not None
+    )
+
+
+@callback
+def async_device_system_stats_value_fn(
+    stat_index: int, hub: UnifiHub, device: Device
+) -> str | None:
+    """Return a reported system statistic, clearing missing readings."""
+    if device.raw.get("system-stats") is None:
+        return None
+    value = device.system_stats[stat_index]
+    return value if value != "" else None
+
+
+@callback
+def async_client_is_connected_fn(hub: UnifiHub, obj_id: str) -> bool:
+    """Check if client was last seen recently."""
+    client = hub.api.clients[obj_id]
+
+    if (
+        dt_util.utcnow() - dt_util.utc_from_timestamp(client.last_seen or 0)
+        > hub.config.option_detection_time
+    ):
+        return False
+
+    return True
+
+
+@callback
+def async_device_state_value_fn(hub: UnifiHub, device: Device) -> str | None:
+    """Retrieve the state of the device."""
+    return DEVICE_STATES.get(device.state)
+
+
+@callback
+def async_device_wan_latency_discovery_fn(
+    wan: WanName,
+    monitor_target: str,
+    hub: UnifiHub,
+    obj_id: str,
+) -> bool:
+    """Determine if an device have a latency monitor."""
+    if (device := hub.api.devices[obj_id]) and device.uptime_stats:
+        return _device_wan_latency_monitor(wan, monitor_target, device) is not None
+    return False
+
+
+@callback
+def async_device_wan_latency_value_fn(
+    wan: WanName,
+    monitor_target: str,
+    hub: UnifiHub,
+    device: Device,
+) -> int | None:
+    """Retrieve the monitor target from WAN monitors."""
+    target = _device_wan_latency_monitor(wan, monitor_target, device)
+
+    return target.get("latency_average") if target is not None else None
+
+
+@callback
+def _device_wan_latency_monitor(
+    wan: WanName, monitor_target: str, device: Device
+) -> TypedDeviceUptimeStatsWanMonitor | None:
+    """Return the target of the WAN latency monitor."""
+    if device.uptime_stats and (uptime_stats_wan := device.uptime_stats.get(wan)):
+        for monitor in uptime_stats_wan.get("monitors") or []:
+            if monitor_target in (monitor.get("target") or ""):
+                return monitor
+    return None
+
+
+@callback
+def async_firewall_policy_schedule_status_value_fn(
+    hub: UnifiHub, policy: FirewallPolicy
+) -> FirewallPolicyScheduleStatus | None:
+    """Calculate whether a firewall policy currently applies.
+
+    The schedule follows the controller's clock, not Home Assistant's.
+    """
+    if not policy.enabled:
+        return FirewallPolicyScheduleStatus.DISABLED
+    if policy.raw.get("schedule") is None:
+        return None
+    if (active := policy.is_active(dt_util.now(hub.time_zone))) is None:
+        return None
+    return (
+        FirewallPolicyScheduleStatus.ACTIVE
+        if active
+        else FirewallPolicyScheduleStatus.INACTIVE
+    )
+
+
+def make_wan_latency_sensors() -> tuple[UnifiSensorEntityDescription, ...]:
+    """Create WAN latency sensors from WAN monitor data."""
+
+    def make_wan_latency_entity_description(
+        wan: WanName, name: str, monitor_target: str
+    ) -> UnifiSensorEntityDescription:
+        name_wan = f"{name} {wan}"
+        return UnifiSensorEntityDescription[Devices, Device](
+            key=f"{name_wan} latency",
+            translation_key="wan_latency",
+            entity_category=EntityCategory.DIAGNOSTIC,
+            native_unit_of_measurement=UnitOfTime.MILLISECONDS,
+            state_class=SensorStateClass.MEASUREMENT,
+            device_class=SensorDeviceClass.DURATION,
+            entity_registry_enabled_default=False,
+            api_handler_fn=lambda api: api.devices,
+            available_fn=async_device_available_fn,
+            device_info_fn=async_device_device_info_fn,
+            object_fn=lambda api, obj_id: api.devices[obj_id],
+            discovery_fn=partial(
+                async_device_wan_latency_discovery_fn, wan, monitor_target
+            ),
+            supported_fn=async_device_supported_fn,
+            translation_placeholders_fn=lambda _: {"target": name, "wan": wan},
+            unique_id_fn=lambda hub, obj_id: f"{slugify(name_wan)}_latency-{obj_id}",
+            value_fn=partial(async_device_wan_latency_value_fn, wan, monitor_target),
+        )
+
+    wans: tuple[WanName, ...] = ("WAN", "WAN2", "WAN3")
+    return tuple(
+        make_wan_latency_entity_description(wan, name, target)
+        for wan in wans
+        for name, target in (
+            ("Microsoft", "microsoft"),
+            ("Google", "google"),
+            ("Cloudflare", "1.1.1.1"),
+        )
+    )
+
+
+@callback
+def async_device_temperatures_value_fn(
+    temperature_name: str, hub: UnifiHub, device: Device
+) -> float | None:
+    """Retrieve the temperature of the device."""
+    if device.temperatures:
+        return _device_temperature(temperature_name, device.temperatures)
+    return None
+
+
+@callback
+def async_device_temperatures_discovery_fn(
+    temperature_name: str, hub: UnifiHub, obj_id: str
+) -> bool:
+    """Determine if an device have a temperatures."""
+    if (device := hub.api.devices[obj_id]) and device.temperatures:
+        return any(
+            temperature_name in temperature["name"]
+            for temperature in device.temperatures
+        )
+
+    return False
+
+
+@callback
+def _device_temperature(
+    temperature_name: str, temperatures: list[TypedDeviceTemperature]
+) -> float | None:
+    """Return the temperature of the device."""
+    for temperature in temperatures:
+        if temperature_name in temperature["name"]:
+            if (value := temperature.get("value")) is not None:
+                return value
+    return None
+
+
+def make_device_temperatur_sensors() -> tuple[UnifiSensorEntityDescription, ...]:
+    """Create device temperature sensors."""
+
+    def make_device_temperature_entity_description(
+        name: str,
+    ) -> UnifiSensorEntityDescription:
+        return UnifiSensorEntityDescription[Devices, Device](
+            key=f"Device {name} temperature",
+            translation_key="device_sub_temperature",
+            device_class=SensorDeviceClass.TEMPERATURE,
+            entity_category=EntityCategory.DIAGNOSTIC,
+            state_class=SensorStateClass.MEASUREMENT,
+            native_unit_of_measurement=UnitOfTemperature.CELSIUS,
+            entity_registry_enabled_default=False,
+            api_handler_fn=lambda api: api.devices,
+            available_fn=async_device_available_fn,
+            device_info_fn=async_device_device_info_fn,
+            object_fn=lambda api, obj_id: api.devices[obj_id],
+            discovery_fn=partial(async_device_temperatures_discovery_fn, name),
+            supported_fn=async_device_supported_fn,
+            translation_placeholders_fn=lambda _: {"name": name},
+            unique_id_fn=lambda hub, obj_id: f"temperature-{slugify(name)}-{obj_id}",
+            value_fn=partial(async_device_temperatures_value_fn, name),
+            min_update_interval=TELEMETRY_UPDATE_INTERVAL,
+            immediate_change=TELEMETRY_IMMEDIATE_CHANGE,
+        )
+
+    return tuple(
+        make_device_temperature_entity_description(name)
+        for name in (
+            "CPU",
+            "Local",
+            "PHY",
+        )
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class UnifiSensorEntityDescription[HandlerT: APIHandler, ApiItemT: ApiItem](
+    SensorEntityDescription, UnifiEntityDescription[HandlerT, ApiItemT]
+):
+    """Class describing UniFi sensor entity."""
+
+    value_fn: Callable[[UnifiHub, ApiItemT], datetime | float | int | str | None]
+
+    # Optional
+    discovery_fn: Callable[[UnifiHub, str], bool] | None = None
+    """Require telemetry evidence for first discovery, not continued support."""
+    is_connected_fn: Callable[[UnifiHub, str], bool] | None = None
+    """Calculate if source is connected."""
+    value_changed_fn: Callable[
+        [StateType | date | datetime | Decimal, datetime | float | str | None],
+        bool,
+    ] = lambda old, new: old != new
+    """Calculate whether a state change should be recorded."""
+    min_update_interval: timedelta | None = None
+    """Minimum time between accepted value changes, for noisy telemetry."""
+    immediate_change: float | None = None
+    """Change from the shown value that is accepted within min_update_interval."""
+
+
+ENTITY_DESCRIPTIONS: tuple[UnifiSensorEntityDescription, ...] = (
+    UnifiSensorEntityDescription[Clients, Client](
+        key="Bandwidth sensor RX",
+        translation_key="client_bandwidth_rx",
+        device_class=SensorDeviceClass.DATA_RATE,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=UnitOfDataRate.MEGABYTES_PER_SECOND,
+        allowed_fn=async_bandwidth_sensor_allowed_fn,
+        api_handler_fn=lambda api: api.clients,
+        device_info_fn=async_client_device_info_fn,
+        is_connected_fn=async_client_is_connected_fn,
+        object_fn=lambda api, obj_id: api.clients[obj_id],
+        supported_fn=lambda hub, _: hub.config.option_allow_bandwidth_sensors,
+        unique_id_fn=lambda hub, obj_id: f"rx-{obj_id}",
+        value_fn=async_client_rx_value_fn,
+    ),
+    UnifiSensorEntityDescription[Clients, Client](
+        key="Bandwidth sensor TX",
+        translation_key="client_bandwidth_tx",
+        device_class=SensorDeviceClass.DATA_RATE,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=UnitOfDataRate.MEGABYTES_PER_SECOND,
+        allowed_fn=async_bandwidth_sensor_allowed_fn,
+        api_handler_fn=lambda api: api.clients,
+        device_info_fn=async_client_device_info_fn,
+        is_connected_fn=async_client_is_connected_fn,
+        object_fn=lambda api, obj_id: api.clients[obj_id],
+        supported_fn=lambda hub, _: hub.config.option_allow_bandwidth_sensors,
+        unique_id_fn=lambda hub, obj_id: f"tx-{obj_id}",
+        value_fn=async_client_tx_value_fn,
+    ),
+    UnifiSensorEntityDescription[Clients, Client](
+        key="Wired client speed",
+        translation_key="wired_client_link_speed",
+        device_class=SensorDeviceClass.DATA_RATE,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=UnitOfDataRate.MEGABITS_PER_SECOND,
+        entity_registry_enabled_default=False,
+        allowed_fn=async_wired_client_allowed_fn,
+        api_handler_fn=lambda api: api.clients,
+        device_info_fn=async_client_device_info_fn,
+        is_connected_fn=async_client_is_connected_fn,
+        object_fn=lambda api, obj_id: api.clients[obj_id],
+        unique_id_fn=lambda hub, obj_id: f"wired_speed-{obj_id}",
+        value_fn=lambda hub, client: client.wired_rate_mbps,
+    ),
+    UnifiSensorEntityDescription[Ports, Port](
+        key="PoE port power sensor",
+        translation_key="port_poe_power",
+        device_class=SensorDeviceClass.POWER,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=UnitOfPower.WATT,
+        entity_registry_enabled_default=False,
+        api_handler_fn=lambda api: api.ports,
+        available_fn=async_device_available_fn,
+        device_info_fn=async_device_device_info_fn,
+        object_fn=lambda api, obj_id: api.ports[obj_id],
+        discovery_fn=lambda hub, obj_id: bool(hub.api.ports[obj_id].port_poe),
+        supported_fn=lambda hub, obj_id: (
+            async_device_supported_fn(hub, obj_id)
+            and hub.api.ports[obj_id].raw.get("port_poe") is not False
+        ),
+        translation_placeholders_fn=lambda port: {"port_name": port.name},
+        unique_id_fn=lambda hub, obj_id: f"poe_power-{obj_id}",
+        value_fn=lambda _, obj: obj.poe_power if obj.poe_mode != "off" else "0",
+    ),
+    UnifiSensorEntityDescription[Ports, Port](
+        key="Port Bandwidth sensor RX",
+        translation_key="port_bandwidth_rx",
+        device_class=SensorDeviceClass.DATA_RATE,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        entity_registry_enabled_default=False,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=UnitOfDataRate.BYTES_PER_SECOND,
+        suggested_unit_of_measurement=UnitOfDataRate.MEGABITS_PER_SECOND,
+        allowed_fn=lambda hub, _: hub.config.option_allow_bandwidth_sensors,
+        api_handler_fn=lambda api: api.ports,
+        available_fn=async_device_available_fn,
+        device_info_fn=async_device_device_info_fn,
+        object_fn=lambda api, obj_id: api.ports[obj_id],
+        supported_fn=async_device_supported_fn,
+        translation_placeholders_fn=lambda port: {"port_name": port.name},
+        unique_id_fn=lambda hub, obj_id: f"port_rx-{obj_id}",
+        value_fn=lambda hub, port: port.rx_bytes_r,
+    ),
+    UnifiSensorEntityDescription[Ports, Port](
+        key="Port Bandwidth sensor TX",
+        translation_key="port_bandwidth_tx",
+        device_class=SensorDeviceClass.DATA_RATE,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        entity_registry_enabled_default=False,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=UnitOfDataRate.BYTES_PER_SECOND,
+        suggested_unit_of_measurement=UnitOfDataRate.MEGABITS_PER_SECOND,
+        allowed_fn=lambda hub, _: hub.config.option_allow_bandwidth_sensors,
+        api_handler_fn=lambda api: api.ports,
+        available_fn=async_device_available_fn,
+        device_info_fn=async_device_device_info_fn,
+        object_fn=lambda api, obj_id: api.ports[obj_id],
+        supported_fn=async_device_supported_fn,
+        translation_placeholders_fn=lambda port: {"port_name": port.name},
+        unique_id_fn=lambda hub, obj_id: f"port_tx-{obj_id}",
+        value_fn=lambda hub, port: port.tx_bytes_r,
+    ),
+    UnifiSensorEntityDescription[Ports, Port](
+        key="Port speed",
+        translation_key="port_link_speed",
+        device_class=SensorDeviceClass.DATA_RATE,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        native_unit_of_measurement=UnitOfDataRate.MEGABITS_PER_SECOND,
+        suggested_display_precision=0,
+        entity_registry_enabled_default=False,
+        api_handler_fn=lambda api: api.ports,
+        available_fn=async_device_available_fn,
+        device_info_fn=async_device_device_info_fn,
+        object_fn=lambda api, obj_id: api.ports[obj_id],
+        discovery_fn=lambda hub, obj_id: (
+            (hub.api.ports[obj_id].raw.get("speed") or 0) > 0
+        ),
+        supported_fn=async_device_supported_fn,
+        translation_placeholders_fn=lambda port: {"port_name": port.name},
+        unique_id_fn=lambda hub, obj_id: f"port_link_speed-{obj_id}",
+        value_fn=lambda hub, port: port.raw.get("speed"),
+    ),
+    UnifiSensorEntityDescription[Clients, Client](
+        key="Client uptime",
+        device_class=SensorDeviceClass.UPTIME,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        entity_registry_enabled_default=False,
+        allowed_fn=async_uptime_sensor_allowed_fn,
+        api_handler_fn=lambda api: api.clients,
+        device_info_fn=async_client_device_info_fn,
+        object_fn=lambda api, obj_id: api.clients[obj_id],
+        supported_fn=lambda hub, _: hub.config.option_allow_uptime_sensors,
+        unique_id_fn=lambda hub, obj_id: f"uptime-{obj_id}",
+        value_fn=async_client_uptime_value_fn,
+        value_changed_fn=async_uptime_value_changed_fn,
+    ),
+    UnifiSensorEntityDescription[Wlans, Wlan](
+        key="WLAN clients",
+        translation_key="wlan_clients",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        state_class=SensorStateClass.MEASUREMENT,
+        api_handler_fn=lambda api: api.wlans,
+        available_fn=async_wlan_available_fn,
+        device_info_fn=async_wlan_device_info_fn,
+        object_fn=lambda api, obj_id: api.wlans[obj_id],
+        should_poll=True,
+        unique_id_fn=lambda hub, obj_id: f"wlan_clients-{obj_id}",
+        value_fn=async_wlan_client_value_fn,
+    ),
+    UnifiSensorEntityDescription[Devices, Device](
+        key="Device clients",
+        translation_key="device_clients",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_registry_enabled_default=False,
+        api_handler_fn=lambda api: api.devices,
+        available_fn=async_device_available_fn,
+        device_info_fn=async_device_device_info_fn,
+        object_fn=lambda api, obj_id: api.devices[obj_id],
+        should_poll=True,
+        supported_fn=async_device_supported_fn,
+        unique_id_fn=lambda hub, obj_id: f"device_clients-{obj_id}",
+        value_fn=async_device_clients_value_fn,
+    ),
+    UnifiSensorEntityDescription[Outlets, Outlet](
+        key="Outlet power metering",
+        translation_key="outlet_power",
+        device_class=SensorDeviceClass.POWER,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=UnitOfPower.WATT,
+        api_handler_fn=lambda api: api.outlets,
+        available_fn=async_device_available_fn,
+        device_info_fn=async_device_device_info_fn,
+        object_fn=lambda api, obj_id: api.outlets[obj_id],
+        should_poll=True,
+        discovery_fn=async_device_outlet_power_discovery_fn,
+        supported_fn=lambda hub, obj_id: (
+            async_device_supported_fn(hub, obj_id)
+            and hub.api.outlets[obj_id].has_metering is not False
+        ),
+        translation_placeholders_fn=lambda outlet: {"outlet_name": outlet.name},
+        unique_id_fn=lambda hub, obj_id: f"outlet_power-{obj_id}",
+        value_fn=async_device_outlet_power_value_fn,
+    ),
+    UnifiSensorEntityDescription[Devices, Device](
+        key="SmartPower AC power budget",
+        translation_key="smartpower_ac_power_budget",
+        device_class=SensorDeviceClass.POWER,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=UnitOfPower.WATT,
+        suggested_display_precision=1,
+        api_handler_fn=lambda api: api.devices,
+        available_fn=async_device_available_fn,
+        device_info_fn=async_device_device_info_fn,
+        object_fn=lambda api, obj_id: api.devices[obj_id],
+        discovery_fn=async_device_outlet_discovery_fn,
+        supported_fn=async_device_supported_fn,
+        unique_id_fn=lambda hub, obj_id: f"ac_power_budget-{obj_id}",
+        value_fn=lambda hub, device: device.outlet_ac_power_budget,
+    ),
+    UnifiSensorEntityDescription[Devices, Device](
+        key="SmartPower AC power consumption",
+        translation_key="smartpower_ac_power_consumption",
+        device_class=SensorDeviceClass.POWER,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=UnitOfPower.WATT,
+        suggested_display_precision=1,
+        api_handler_fn=lambda api: api.devices,
+        available_fn=async_device_available_fn,
+        device_info_fn=async_device_device_info_fn,
+        object_fn=lambda api, obj_id: api.devices[obj_id],
+        discovery_fn=async_device_outlet_discovery_fn,
+        supported_fn=async_device_supported_fn,
+        unique_id_fn=lambda hub, obj_id: f"ac_power_conumption-{obj_id}",
+        value_fn=lambda hub, device: device.outlet_ac_power_consumption,
+    ),
+    UnifiSensorEntityDescription[Devices, Device](
+        key="UPS battery level",
+        translation_key="ups_battery_level",
+        device_class=SensorDeviceClass.BATTERY,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=PERCENTAGE,
+        api_handler_fn=lambda api: api.devices,
+        available_fn=async_device_available_fn,
+        device_info_fn=async_device_device_info_fn,
+        object_fn=lambda api, obj_id: api.devices[obj_id],
+        discovery_fn=partial(async_device_battery_pool_discovery_fn, "batteryLevel"),
+        supported_fn=async_device_supported_fn,
+        unique_id_fn=lambda hub, obj_id: f"ups_battery_level-{obj_id}",
+        value_fn=partial(async_device_battery_pool_value_fn, "batteryLevel"),
+    ),
+    UnifiSensorEntityDescription[Devices, Device](
+        key="UPS battery runtime",
+        translation_key="ups_battery_runtime",
+        device_class=SensorDeviceClass.DURATION,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        native_unit_of_measurement=UnitOfTime.SECONDS,
+        api_handler_fn=lambda api: api.devices,
+        available_fn=async_device_available_fn,
+        device_info_fn=async_device_device_info_fn,
+        object_fn=lambda api, obj_id: api.devices[obj_id],
+        discovery_fn=partial(async_device_battery_pool_discovery_fn, "timeToRemain"),
+        supported_fn=async_device_supported_fn,
+        unique_id_fn=lambda hub, obj_id: f"ups_battery_runtime-{obj_id}",
+        value_fn=partial(async_device_battery_pool_value_fn, "timeToRemain"),
+    ),
+    UnifiSensorEntityDescription[Devices, Device](
+        key="UPS output power",
+        translation_key="ups_output_power",
+        device_class=SensorDeviceClass.POWER,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=UnitOfPower.WATT,
+        api_handler_fn=lambda api: api.devices,
+        available_fn=async_device_available_fn,
+        device_info_fn=async_device_device_info_fn,
+        object_fn=lambda api, obj_id: api.devices[obj_id],
+        discovery_fn=partial(
+            async_device_battery_pool_discovery_fn,
+            "device_total_power_output",
+        ),
+        supported_fn=async_device_supported_fn,
+        unique_id_fn=lambda hub, obj_id: f"ups_output_power-{obj_id}",
+        value_fn=partial(
+            async_device_battery_pool_value_fn, "device_total_power_output"
+        ),
+    ),
+    UnifiSensorEntityDescription[Devices, Device](
+        key="UPS output current",
+        translation_key="ups_output_current",
+        device_class=SensorDeviceClass.CURRENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=UnitOfElectricCurrent.AMPERE,
+        api_handler_fn=lambda api: api.devices,
+        available_fn=async_device_available_fn,
+        device_info_fn=async_device_device_info_fn,
+        object_fn=lambda api, obj_id: api.devices[obj_id],
+        discovery_fn=partial(
+            async_device_battery_pool_discovery_fn,
+            "device_output_current",
+        ),
+        supported_fn=async_device_supported_fn,
+        unique_id_fn=lambda hub, obj_id: f"ups_output_current-{obj_id}",
+        value_fn=partial(async_device_battery_pool_value_fn, "device_output_current"),
+    ),
+    UnifiSensorEntityDescription[Devices, Device](
+        key="UPS output voltage",
+        translation_key="ups_output_voltage",
+        device_class=SensorDeviceClass.VOLTAGE,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=UnitOfElectricPotential.VOLT,
+        api_handler_fn=lambda api: api.devices,
+        available_fn=async_device_available_fn,
+        device_info_fn=async_device_device_info_fn,
+        object_fn=lambda api, obj_id: api.devices[obj_id],
+        discovery_fn=partial(
+            async_device_battery_pool_discovery_fn,
+            "device_output_voltage",
+        ),
+        supported_fn=async_device_supported_fn,
+        unique_id_fn=lambda hub, obj_id: f"ups_output_voltage-{obj_id}",
+        value_fn=partial(async_device_battery_pool_value_fn, "device_output_voltage"),
+    ),
+    UnifiSensorEntityDescription[Devices, Device](
+        key="UPS input voltage",
+        translation_key="ups_input_voltage",
+        device_class=SensorDeviceClass.VOLTAGE,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=UnitOfElectricPotential.VOLT,
+        api_handler_fn=lambda api: api.devices,
+        available_fn=async_device_available_fn,
+        device_info_fn=async_device_device_info_fn,
+        object_fn=lambda api, obj_id: api.devices[obj_id],
+        discovery_fn=partial(
+            async_device_battery_pool_discovery_fn,
+            "device_input_voltage",
+        ),
+        supported_fn=async_device_supported_fn,
+        unique_id_fn=lambda hub, obj_id: f"ups_input_voltage-{obj_id}",
+        value_fn=partial(async_device_battery_pool_value_fn, "device_input_voltage"),
+    ),
+    UnifiSensorEntityDescription[Devices, Device](
+        key="UPS bypass voltage",
+        translation_key="ups_bypass_voltage",
+        device_class=SensorDeviceClass.VOLTAGE,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=UnitOfElectricPotential.VOLT,
+        api_handler_fn=lambda api: api.devices,
+        available_fn=async_device_available_fn,
+        device_info_fn=async_device_device_info_fn,
+        object_fn=lambda api, obj_id: api.devices[obj_id],
+        discovery_fn=partial(
+            async_device_battery_pool_discovery_fn,
+            "device_bypass_voltage",
+        ),
+        supported_fn=async_device_supported_fn,
+        unique_id_fn=lambda hub, obj_id: f"ups_bypass_voltage-{obj_id}",
+        value_fn=partial(async_device_battery_pool_value_fn, "device_bypass_voltage"),
+    ),
+    UnifiSensorEntityDescription[Devices, Device](
+        key="UPS output power factor",
+        translation_key="ups_output_power_factor",
+        device_class=SensorDeviceClass.POWER_FACTOR,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        state_class=SensorStateClass.MEASUREMENT,
+        api_handler_fn=lambda api: api.devices,
+        available_fn=async_device_available_fn,
+        device_info_fn=async_device_device_info_fn,
+        object_fn=lambda api, obj_id: api.devices[obj_id],
+        discovery_fn=partial(
+            async_device_battery_pool_discovery_fn,
+            "device_total_power_factor",
+        ),
+        supported_fn=async_device_supported_fn,
+        unique_id_fn=lambda hub, obj_id: f"ups_output_power_factor-{obj_id}",
+        value_fn=partial(
+            async_device_battery_pool_value_fn, "device_total_power_factor"
+        ),
+    ),
+    UnifiSensorEntityDescription[Devices, Device](
+        key="Device uptime",
+        device_class=SensorDeviceClass.UPTIME,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        api_handler_fn=lambda api: api.devices,
+        available_fn=async_device_available_fn,
+        device_info_fn=async_device_device_info_fn,
+        object_fn=lambda api, obj_id: api.devices[obj_id],
+        supported_fn=async_device_supported_fn,
+        unique_id_fn=lambda hub, obj_id: f"device_uptime-{obj_id}",
+        value_fn=async_device_uptime_value_fn,
+        value_changed_fn=async_uptime_value_changed_fn,
+    ),
+    UnifiSensorEntityDescription[Devices, Device](
+        key="Device temperature",
+        device_class=SensorDeviceClass.TEMPERATURE,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        native_unit_of_measurement=UnitOfTemperature.CELSIUS,
+        state_class=SensorStateClass.MEASUREMENT,
+        api_handler_fn=lambda api: api.devices,
+        available_fn=async_device_available_fn,
+        device_info_fn=async_device_device_info_fn,
+        object_fn=lambda api, obj_id: api.devices[obj_id],
+        discovery_fn=lambda hub, obj_id: hub.api.devices[obj_id].has_temperature,
+        supported_fn=lambda hub, obj_id: (
+            async_device_supported_fn(hub, obj_id)
+            and hub.api.devices[obj_id].raw.get("has_temperature") is not False
+        ),
+        unique_id_fn=lambda hub, obj_id: f"device_temperature-{obj_id}",
+        value_fn=lambda hub, device: device.general_temperature,
+    ),
+    UnifiSensorEntityDescription[Devices, Device](
+        key="Device Uplink MAC",
+        translation_key="device_uplink_mac",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        api_handler_fn=lambda api: api.devices,
+        available_fn=async_device_available_fn,
+        device_info_fn=async_device_device_info_fn,
+        object_fn=lambda api, obj_id: api.devices[obj_id],
+        unique_id_fn=lambda hub, obj_id: f"device_uplink_mac-{obj_id}",
+        discovery_fn=async_device_uplink_mac_discovery_fn,
+        supported_fn=async_device_supported_fn,
+        value_fn=async_device_uplink_mac_value_fn,
+        is_connected_fn=lambda hub, obj_id: hub.api.devices[obj_id].state == 1,
+    ),
+    UnifiSensorEntityDescription[Devices, Device](
+        key="Device State",
+        translation_key="device_state",
+        device_class=SensorDeviceClass.ENUM,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        api_handler_fn=lambda api: api.devices,
+        available_fn=async_device_available_fn,
+        device_info_fn=async_device_device_info_fn,
+        object_fn=lambda api, obj_id: api.devices[obj_id],
+        supported_fn=async_device_supported_fn,
+        unique_id_fn=lambda hub, obj_id: f"device_state-{obj_id}",
+        value_fn=async_device_state_value_fn,
+        options=list(DEVICE_STATES.values()),
+    ),
+    UnifiSensorEntityDescription[Devices, Device](
+        key="Device CPU utilization",
+        translation_key="device_cpu_utilization",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        native_unit_of_measurement=PERCENTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        api_handler_fn=lambda api: api.devices,
+        available_fn=async_device_available_fn,
+        device_info_fn=async_device_device_info_fn,
+        object_fn=lambda api, obj_id: api.devices[obj_id],
+        discovery_fn=partial(device_system_stats_discovery_fn, 0),
+        supported_fn=async_device_supported_fn,
+        unique_id_fn=lambda hub, obj_id: f"cpu_utilization-{obj_id}",
+        value_fn=partial(async_device_system_stats_value_fn, 0),
+        min_update_interval=TELEMETRY_UPDATE_INTERVAL,
+        immediate_change=TELEMETRY_IMMEDIATE_CHANGE,
+    ),
+    UnifiSensorEntityDescription[Devices, Device](
+        key="Device memory utilization",
+        translation_key="device_memory_utilization",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        native_unit_of_measurement=PERCENTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        api_handler_fn=lambda api: api.devices,
+        available_fn=async_device_available_fn,
+        device_info_fn=async_device_device_info_fn,
+        object_fn=lambda api, obj_id: api.devices[obj_id],
+        discovery_fn=partial(device_system_stats_discovery_fn, 1),
+        supported_fn=async_device_supported_fn,
+        unique_id_fn=lambda hub, obj_id: f"memory_utilization-{obj_id}",
+        value_fn=partial(async_device_system_stats_value_fn, 1),
+        min_update_interval=TELEMETRY_UPDATE_INTERVAL,
+        immediate_change=TELEMETRY_IMMEDIATE_CHANGE,
+    ),
+    UnifiSensorEntityDescription[FirewallPolicies, FirewallPolicy](
+        key="Firewall policy schedule status",
+        translation_key="firewall_policy_schedule_status",
+        device_class=SensorDeviceClass.ENUM,
+        entity_registry_enabled_default=False,
+        options=list(FirewallPolicyScheduleStatus),
+        api_handler_fn=lambda api: api.firewall_policies,
+        device_info_fn=async_unifi_network_device_info_fn,
+        object_fn=lambda api, obj_id: api.firewall_policies[obj_id],
+        supported_fn=async_firewall_policy_supported_fn,
+        translation_placeholders_fn=lambda policy: {"policy_name": policy.name},
+        unique_id_fn=lambda hub, obj_id: f"firewall_policy_schedule_status-{obj_id}",
+        value_fn=async_firewall_policy_schedule_status_value_fn,
+    ),
+)
+
+ENTITY_DESCRIPTIONS += make_wan_latency_sensors() + make_device_temperatur_sensors()
+
+
+@callback
+def _async_should_add_sensor(
+    hub: UnifiHub, description: UnifiSensorEntityDescription, obj_id: str
+) -> bool:
+    """Check sensor eligibility and prune unsupported telemetry sensors."""
+    if not description.allowed_fn(hub, obj_id):
+        return False
+    supported = description.supported_fn(hub, obj_id)
+    if (description.key, obj_id) in hub.entity_loader.known_objects and (
+        supported or description.discovery_fn is None
+    ):
+        return False
+    if description.discovery_fn is None:
+        return supported
+    if supported and description.discovery_fn(hub, obj_id):
+        return True
+    registry = er.async_get(hub.hass)
+    entity_id = registry.async_get_entity_id(
+        Platform.SENSOR, DOMAIN, description.unique_id_fn(hub, obj_id)
+    )
+    if (
+        entity_id is None
+        or registry.entities[entity_id].config_entry_id != hub.config.entry.entry_id
+    ):
+        return False
+    if not supported:
+        registry.async_remove(entity_id)
+        hub.entity_loader.known_objects.discard((description.key, obj_id))
+    return supported
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    config_entry: UnifiConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up sensors for UniFi Network integration."""
-    controller = hass.data[UNIFI_DOMAIN][config_entry.entry_id]
-    controller.entities[DOMAIN] = {
-        RX_SENSOR: set(),
-        TX_SENSOR: set(),
-        UPTIME_SENSOR: set(),
-    }
+    hub = config_entry.runtime_data
 
     @callback
-    def items_added(
-        clients: set = controller.api.clients, devices: set = controller.api.devices
-    ) -> None:
-        """Update the values of the controller."""
-        if controller.option_allow_bandwidth_sensors:
-            add_bandwidth_entities(controller, async_add_entities, clients)
-
-        if controller.option_allow_uptime_sensors:
-            add_uptime_entities(controller, async_add_entities, clients)
-
-    for signal in (controller.signal_update, controller.signal_options_update):
-        config_entry.async_on_unload(
-            async_dispatcher_connect(hass, signal, items_added)
+    def add_sensors() -> None:
+        """Discover sensors and restore registered sensors during telemetry gaps."""
+        async_add_entities(
+            UnifiSensorEntity(obj_id, hub, description)
+            for description in ENTITY_DESCRIPTIONS
+            for obj_id in description.api_handler_fn(hub.api)
+            if _async_should_add_sensor(hub, description, obj_id)
         )
 
-    items_added()
-
-
-@callback
-def add_bandwidth_entities(controller, async_add_entities, clients):
-    """Add new sensor entities from the controller."""
-    sensors = []
-
-    for mac in clients:
-        for sensor_class in (UniFiRxBandwidthSensor, UniFiTxBandwidthSensor):
-            if mac in controller.entities[DOMAIN][sensor_class.TYPE]:
-                continue
-
-            client = controller.api.clients[mac]
-            sensors.append(sensor_class(client, controller))
-
-    async_add_entities(sensors)
-
-
-@callback
-def add_uptime_entities(controller, async_add_entities, clients):
-    """Add new sensor entities from the controller."""
-    sensors = []
-
-    for mac in clients:
-        if mac in controller.entities[DOMAIN][UniFiUpTimeSensor.TYPE]:
-            continue
-
-        client = controller.api.clients[mac]
-        sensors.append(UniFiUpTimeSensor(client, controller))
-
-    async_add_entities(sensors)
-
-
-class UniFiBandwidthSensor(UniFiClient, SensorEntity):
-    """UniFi Network bandwidth sensor base class."""
-
-    DOMAIN = DOMAIN
-
-    _attr_entity_category = EntityCategory.DIAGNOSTIC
-    _attr_native_unit_of_measurement = DATA_MEGABYTES
-
-    @property
-    def name(self) -> str:
-        """Return the name of the client."""
-        return f"{super().name} {self.TYPE.upper()}"
-
-    async def options_updated(self) -> None:
-        """Config entry options are updated, remove entity if option is disabled."""
-        if not self.controller.option_allow_bandwidth_sensors:
-            await self.remove_item({self.client.mac})
-
-
-class UniFiRxBandwidthSensor(UniFiBandwidthSensor):
-    """Receiving bandwidth sensor."""
-
-    TYPE = RX_SENSOR
-
-    @property
-    def native_value(self) -> int:
-        """Return the state of the sensor."""
-        if self._is_wired:
-            return self.client.wired_rx_bytes_r / 1000000
-        return self.client.rx_bytes_r / 1000000
-
-
-class UniFiTxBandwidthSensor(UniFiBandwidthSensor):
-    """Transmitting bandwidth sensor."""
-
-    TYPE = TX_SENSOR
-
-    @property
-    def native_value(self) -> int:
-        """Return the state of the sensor."""
-        if self._is_wired:
-            return self.client.wired_tx_bytes_r / 1000000
-        return self.client.tx_bytes_r / 1000000
-
-
-class UniFiUpTimeSensor(UniFiClient, SensorEntity):
-    """UniFi Network client uptime sensor."""
-
-    DOMAIN = DOMAIN
-    TYPE = UPTIME_SENSOR
-
-    _attr_device_class = SensorDeviceClass.TIMESTAMP
-    _attr_entity_category = EntityCategory.DIAGNOSTIC
-
-    def __init__(self, client, controller):
-        """Set up tracked client."""
-        super().__init__(client, controller)
-
-        self.last_updated_time = self.client.uptime
+    add_sensors()
+    hub.adoption.async_on_adoption(add_sensors)
+    config_entry.async_on_unload(
+        async_dispatcher_connect(hass, hub.signal_options_update, add_sensors)
+    )
 
     @callback
-    def async_update_callback(self) -> None:
-        """Update sensor when time has changed significantly.
+    def create_sensor(
+        description: UnifiSensorEntityDescription, event: ItemEvent, obj_id: str
+    ) -> None:
+        """Discover sensors on updates and remove lost telemetry capabilities."""
+        if _async_should_add_sensor(hub, description, obj_id):
+            async_add_entities([UnifiSensorEntity(obj_id, hub, description)])
 
-        This will help avoid unnecessary updates to the state machine.
+    for description in ENTITY_DESCRIPTIONS:
+        config_entry.async_on_unload(
+            description.api_handler_fn(hub.api).subscribe(
+                partial(create_sensor, description),
+                (ItemEvent.ADDED, ItemEvent.CHANGED)
+                if description.discovery_fn is not None
+                else ItemEvent.ADDED,
+            )
+        )
+
+
+class UnifiSensorEntity[HandlerT: APIHandler, ApiItemT: ApiItem](
+    UnifiEntity[HandlerT, ApiItemT], SensorEntity
+):
+    """Base representation of a UniFi sensor."""
+
+    entity_description: UnifiSensorEntityDescription[HandlerT, ApiItemT]
+    _value_accepted_at: datetime | None = None
+
+    @callback
+    def _make_disconnected(self, *_: core_Event) -> None:
+        """No heart beat by device.
+
+        Set sensor as unavailable when client device is disconnected
         """
-        update_state = True
+        if self._attr_available:
+            self._attr_available = False
+            self.async_write_ha_state()
 
-        if self.client.uptime < 1000000000:
-            if self.client.uptime > self.last_updated_time:
-                update_state = False
-        else:
-            if self.client.uptime <= self.last_updated_time:
-                update_state = False
+    @callback
+    @override
+    def async_update_state(self, event: ItemEvent, obj_id: str) -> None:
+        """Update entity state.
 
-        self.last_updated_time = self.client.uptime
+        Update native_value.
+        """
+        description = self.entity_description
+        obj = description.object_fn(self.api, self._obj_id)
+        if not self._attr_available:
+            # Show the current value as soon as the entity is back
+            self._value_accepted_at = None
+        # Update the value only if value is considered to
+        # have changed relative to its previous state
+        if description.value_changed_fn(
+            self.native_value, (value := description.value_fn(self.hub, obj))
+        ) and self._async_min_update_interval_passed(event, value):
+            self._attr_native_value = value
 
-        if not update_state:
-            return
+        if description.is_connected_fn is not None:
+            # Send heartbeat if client is connected
+            if description.is_connected_fn(self.hub, self._obj_id):
+                self.hub.update_heartbeat(
+                    self._attr_unique_id,
+                    dt_util.utcnow() + self.hub.config.option_detection_time,
+                )
 
-        super().async_update_callback()
+    @callback
+    def _async_min_update_interval_passed(
+        self, event: ItemEvent, value: datetime | float | str | None
+    ) -> bool:
+        """Hold back a changed value until min_update_interval has passed."""
+        if (
+            interval := self.entity_description.min_update_interval
+        ) is None or not self._attr_available:
+            return True
+        now = dt_util.utcnow()
+        if (
+            event is ItemEvent.ADDED
+            or value is None
+            or self.native_value is None
+            or self._value_accepted_at is None
+            or now - self._value_accepted_at >= interval
+            # The clock was set back
+            or now < self._value_accepted_at
+            or (
+                (threshold := self.entity_description.immediate_change) is not None
+                and self._async_immediate_change(value, threshold)
+            )
+        ):
+            self._value_accepted_at = now
+            return True
+        return False
 
-    @property
-    def name(self) -> str:
-        """Return the name of the client."""
-        return f"{super().name} {self.TYPE.capitalize()}"
+    @callback
+    def _async_immediate_change(
+        self, value: datetime | float | str, threshold: float
+    ) -> bool:
+        """Return True if value differs enough to skip min_update_interval."""
+        # UniFi reports CPU and memory as numeric strings; str() lets any
+        # non-numeric value fail the same way
+        try:
+            return abs(float(str(value)) - float(str(self.native_value))) >= threshold
+        except ValueError:
+            return False
 
-    @property
-    def native_value(self) -> datetime:
-        """Return the uptime of the client."""
-        if self.client.uptime < 1000000000:
-            return dt_util.now() - timedelta(seconds=self.client.uptime)
-        return dt_util.utc_from_timestamp(float(self.client.uptime))
+    @override
+    async def async_added_to_hass(self) -> None:
+        """Register callbacks."""
+        await super().async_added_to_hass()
 
-    async def options_updated(self) -> None:
-        """Config entry options are updated, remove entity if option is disabled."""
-        if not self.controller.option_allow_uptime_sensors:
-            await self.remove_item({self.client.mac})
+        if self.entity_description.is_connected_fn is not None:
+            # Register callback for missed heartbeat
+            self.async_on_remove(
+                async_dispatcher_connect(
+                    self.hass,
+                    f"{self.hub.signal_heartbeat_missed}_{self.unique_id}",
+                    self._make_disconnected,
+                )
+            )
+
+    @override
+    async def async_will_remove_from_hass(self) -> None:
+        """Disconnect object when removed."""
+        await super().async_will_remove_from_hass()
+
+        if self.entity_description.is_connected_fn is not None:
+            # Remove heartbeat registration
+            self.hub.remove_heartbeat(self._attr_unique_id)

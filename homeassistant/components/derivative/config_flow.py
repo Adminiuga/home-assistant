@@ -1,27 +1,25 @@
 """Config flow for Derivative integration."""
-from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, cast
+from typing import Any, cast, override
 
-import voluptuous as vol
+import probatio
 
-from homeassistant.const import (
-    CONF_NAME,
-    CONF_SOURCE,
-    TIME_DAYS,
-    TIME_HOURS,
-    TIME_MINUTES,
-    TIME_SECONDS,
-)
+from homeassistant.components.counter import DOMAIN as COUNTER_DOMAIN
+from homeassistant.components.input_number import DOMAIN as INPUT_NUMBER_DOMAIN
+from homeassistant.components.sensor import DOMAIN as SENSOR_DOMAIN
+from homeassistant.const import CONF_NAME, CONF_SOURCE, EntityStateAttribute, UnitOfTime
+from homeassistant.core import callback
 from homeassistant.helpers import selector
 from homeassistant.helpers.schema_config_entry_flow import (
+    SchemaCommonFlowHandler,
     SchemaConfigFlowHandler,
     SchemaFlowFormStep,
-    SchemaFlowMenuStep,
+    SchemaOptionsFlowHandler,
 )
 
 from .const import (
+    CONF_MAX_SUB_INTERVAL,
     CONF_ROUND_DIGITS,
     CONF_TIME_WINDOW,
     CONF_UNIT_PREFIX,
@@ -30,9 +28,8 @@ from .const import (
 )
 
 UNIT_PREFIXES = [
-    selector.SelectOptionDict(value="none", label="none"),
     selector.SelectOptionDict(value="n", label="n (nano)"),
-    selector.SelectOptionDict(value="µ", label="µ (micro)"),
+    selector.SelectOptionDict(value="μ", label="μ (micro)"),
     selector.SelectOptionDict(value="m", label="m (milli)"),
     selector.SelectOptionDict(value="k", label="k (kilo)"),
     selector.SelectOptionDict(value="M", label="M (mega)"),
@@ -41,47 +38,98 @@ UNIT_PREFIXES = [
     selector.SelectOptionDict(value="P", label="P (peta)"),
 ]
 TIME_UNITS = [
-    selector.SelectOptionDict(value=TIME_SECONDS, label="Seconds"),
-    selector.SelectOptionDict(value=TIME_MINUTES, label="Minutes"),
-    selector.SelectOptionDict(value=TIME_HOURS, label="Hours"),
-    selector.SelectOptionDict(value=TIME_DAYS, label="Days"),
+    UnitOfTime.SECONDS,
+    UnitOfTime.MINUTES,
+    UnitOfTime.HOURS,
+    UnitOfTime.DAYS,
 ]
 
-OPTIONS_SCHEMA = vol.Schema(
-    {
-        vol.Required(CONF_ROUND_DIGITS, default=2): selector.NumberSelector(
+ALLOWED_DOMAINS = [COUNTER_DOMAIN, INPUT_NUMBER_DOMAIN, SENSOR_DOMAIN]
+
+
+@callback
+def entity_selector_compatible(
+    handler: SchemaOptionsFlowHandler,
+) -> selector.EntitySelector:
+    """Return an entity selector which compatible entities."""
+    current = handler.hass.states.get(handler.options[CONF_SOURCE])
+    unit_of_measurement = (
+        current.attributes.get(EntityStateAttribute.UNIT_OF_MEASUREMENT)
+        if current
+        else None
+    )
+
+    entities = [
+        ent.entity_id
+        for ent in handler.hass.states.async_all(ALLOWED_DOMAINS)
+        if ent.attributes.get(EntityStateAttribute.UNIT_OF_MEASUREMENT)
+        == unit_of_measurement
+        and ent.domain in ALLOWED_DOMAINS
+    ]
+
+    return selector.EntitySelector(
+        selector.EntitySelectorConfig(include_entities=entities)
+    )
+
+
+async def _get_options_dict(handler: SchemaCommonFlowHandler | None) -> dict:
+    if handler is None or not isinstance(
+        handler.parent_handler, SchemaOptionsFlowHandler
+    ):
+        entity_selector = selector.EntitySelector(
+            selector.EntitySelectorConfig(domain=ALLOWED_DOMAINS)
+        )
+    else:
+        entity_selector = entity_selector_compatible(handler.parent_handler)
+
+    return {
+        probatio.Required(CONF_SOURCE): entity_selector,
+        probatio.Required(CONF_ROUND_DIGITS, default=2): selector.NumberSelector(
             selector.NumberSelectorConfig(
                 min=0,
                 max=6,
                 mode=selector.NumberSelectorMode.BOX,
                 unit_of_measurement="decimals",
+                translation_key="round",
             ),
         ),
-        vol.Required(CONF_TIME_WINDOW): selector.DurationSelector(),
-        vol.Required(CONF_UNIT_PREFIX, default="none"): selector.SelectSelector(
+        probatio.Required(CONF_TIME_WINDOW): selector.DurationSelector(),
+        probatio.Optional(CONF_UNIT_PREFIX): selector.SelectSelector(
             selector.SelectSelectorConfig(options=UNIT_PREFIXES),
         ),
-        vol.Required(CONF_UNIT_TIME, default=TIME_HOURS): selector.SelectSelector(
-            selector.SelectSelectorConfig(options=TIME_UNITS),
+        probatio.Required(
+            CONF_UNIT_TIME, default=UnitOfTime.HOURS
+        ): selector.SelectSelector(
+            selector.SelectSelectorConfig(
+                options=TIME_UNITS, translation_key="time_unit"
+            ),
+        ),
+        probatio.Optional(CONF_MAX_SUB_INTERVAL): selector.DurationSelector(
+            selector.DurationSelectorConfig(allow_negative=False)
         ),
     }
-)
 
-CONFIG_SCHEMA = vol.Schema(
-    {
-        vol.Required(CONF_NAME): selector.TextSelector(),
-        vol.Required(CONF_SOURCE): selector.EntitySelector(
-            selector.EntitySelectorConfig(domain="sensor"),
-        ),
-    }
-).extend(OPTIONS_SCHEMA.schema)
 
-CONFIG_FLOW: dict[str, SchemaFlowFormStep | SchemaFlowMenuStep] = {
-    "user": SchemaFlowFormStep(CONFIG_SCHEMA)
+async def _get_options_schema(handler: SchemaCommonFlowHandler) -> probatio.Schema:
+    return probatio.Schema(await _get_options_dict(handler))
+
+
+async def _get_config_schema(handler: SchemaCommonFlowHandler) -> probatio.Schema:
+    options = await _get_options_dict(handler)
+    return probatio.Schema(
+        {
+            probatio.Required(CONF_NAME): selector.TextSelector(),
+            **options,
+        }
+    )
+
+
+CONFIG_FLOW = {
+    "user": SchemaFlowFormStep(_get_config_schema),
 }
 
-OPTIONS_FLOW: dict[str, SchemaFlowFormStep | SchemaFlowMenuStep] = {
-    "init": SchemaFlowFormStep(OPTIONS_SCHEMA)
+OPTIONS_FLOW = {
+    "init": SchemaFlowFormStep(_get_options_schema),
 }
 
 
@@ -90,7 +138,12 @@ class ConfigFlowHandler(SchemaConfigFlowHandler, domain=DOMAIN):
 
     config_flow = CONFIG_FLOW
     options_flow = OPTIONS_FLOW
+    options_flow_reloads = True
 
+    VERSION = 1
+    MINOR_VERSION = 4
+
+    @override
     def async_config_entry_title(self, options: Mapping[str, Any]) -> str:
         """Return config entry title."""
         return cast(str, options[CONF_NAME])

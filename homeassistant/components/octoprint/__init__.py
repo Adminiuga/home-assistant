@@ -1,16 +1,14 @@
 """Support for monitoring OctoPrint 3D printers."""
-from __future__ import annotations
 
-from datetime import timedelta
+import asyncio
 import logging
-from typing import cast
+from typing import Any
 
-from pyoctoprintapi import ApiError, OctoprintClient, PrinterOffline
-from pyoctoprintapi.exceptions import UnauthorizedException
-import voluptuous as vol
-from yarl import URL
+import aiohttp
+import probatio
+from pyoctoprintapi import OctoprintClient
 
-from homeassistant.config_entries import SOURCE_IMPORT, ConfigEntry
+from homeassistant.config_entries import SOURCE_IMPORT
 from homeassistant.const import (
     CONF_API_KEY,
     CONF_BINARY_SENSORS,
@@ -22,19 +20,24 @@ from homeassistant.const import (
     CONF_SENSORS,
     CONF_SSL,
     CONF_VERIFY_SSL,
+    EVENT_HOMEASSISTANT_STOP,
     Platform,
 )
-from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryAuthFailed
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
-import homeassistant.helpers.config_validation as cv
-from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.core import (
+    DOMAIN as HOMEASSISTANT_DOMAIN,
+    Event,
+    HomeAssistant,
+    callback,
+)
+from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.helpers import config_validation as cv, issue_registry as ir
 from homeassistant.helpers.typing import ConfigType
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import slugify as util_slugify
-import homeassistant.util.dt as dt_util
+from homeassistant.util.ssl import get_default_context, get_default_no_verify_context
 
 from .const import DOMAIN
+from .coordinator import OctoprintConfigEntry, OctoprintDataUpdateCoordinator
+from .services import async_setup_services
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -42,13 +45,13 @@ _LOGGER = logging.getLogger(__name__)
 def has_all_unique_names(value):
     """Validate that printers have an unique name."""
     names = [util_slugify(printer["name"]) for printer in value]
-    vol.Schema(vol.Unique())(names)
+    probatio.Schema(probatio.Unique())(names)
     return value
 
 
 def ensure_valid_path(value):
     """Validate the path, ensuring it starts and ends with a /."""
-    vol.Schema(cv.string)(value)
+    probatio.Schema(cv.string)(value)
     if value[0] != "/":
         value = f"/{value}"
     if value[-1] != "/":
@@ -56,7 +59,13 @@ def ensure_valid_path(value):
     return value
 
 
-PLATFORMS = [Platform.BINARY_SENSOR, Platform.BUTTON, Platform.CAMERA, Platform.SENSOR]
+PLATFORMS = [
+    Platform.BINARY_SENSOR,
+    Platform.BUTTON,
+    Platform.CAMERA,
+    Platform.NUMBER,
+    Platform.SENSOR,
+]
 DEFAULT_NAME = "OctoPrint"
 CONF_NUMBER_OF_TOOLS = "number_of_tools"
 CONF_BED = "bed"
@@ -66,12 +75,12 @@ BINARY_SENSOR_TYPES = [
     "Printing Error",
 ]
 
-BINARY_SENSOR_SCHEMA = vol.Schema(
+BINARY_SENSOR_SCHEMA = probatio.Schema(
     {
-        vol.Optional(
+        probatio.Optional(
             CONF_MONITORED_CONDITIONS, default=list(BINARY_SENSOR_TYPES)
-        ): vol.All(cv.ensure_list, [vol.In(BINARY_SENSOR_TYPES)]),
-        vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
+        ): probatio.All(probatio.EnsureList(), [probatio.In(BINARY_SENSOR_TYPES)]),
+        probatio.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
     }
 )
 
@@ -83,94 +92,159 @@ SENSOR_TYPES = [
     "Time Elapsed",
 ]
 
-SENSOR_SCHEMA = vol.Schema(
+SENSOR_SCHEMA = probatio.Schema(
     {
-        vol.Optional(CONF_MONITORED_CONDITIONS, default=list(SENSOR_TYPES)): vol.All(
-            cv.ensure_list, [vol.In(SENSOR_TYPES)]
-        ),
-        vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
+        probatio.Optional(
+            CONF_MONITORED_CONDITIONS, default=list(SENSOR_TYPES)
+        ): probatio.All(probatio.EnsureList(), [probatio.In(SENSOR_TYPES)]),
+        probatio.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
     }
 )
 
-CONFIG_SCHEMA = vol.Schema(
-    vol.All(
-        cv.deprecated(DOMAIN),
-        {
-            DOMAIN: vol.All(
-                cv.ensure_list,
-                [
-                    vol.Schema(
-                        {
-                            vol.Required(CONF_API_KEY): cv.string,
-                            vol.Required(CONF_HOST): cv.string,
-                            vol.Optional(CONF_SSL, default=False): cv.boolean,
-                            vol.Optional(CONF_PORT, default=80): cv.port,
-                            vol.Optional(CONF_PATH, default="/"): ensure_valid_path,
-                            # Following values are not longer used in the configuration of the integration
-                            # and are here for historical purposes
-                            vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
-                            vol.Optional(
-                                CONF_NUMBER_OF_TOOLS, default=0
-                            ): cv.positive_int,
-                            vol.Optional(CONF_BED, default=False): cv.boolean,
-                            vol.Optional(CONF_SENSORS, default={}): SENSOR_SCHEMA,
-                            vol.Optional(
-                                CONF_BINARY_SENSORS, default={}
-                            ): BINARY_SENSOR_SCHEMA,
-                        }
-                    )
-                ],
-                has_all_unique_names,
-            )
-        },
-    ),
-    extra=vol.ALLOW_EXTRA,
+CONFIG_SCHEMA = probatio.Schema(
+    {
+        DOMAIN: probatio.All(
+            probatio.EnsureList(),
+            [
+                probatio.Schema(
+                    {
+                        probatio.Required(probatio.Secret(CONF_API_KEY)): cv.string,
+                        probatio.Required(CONF_HOST): cv.string,
+                        probatio.Optional(CONF_SSL, default=False): cv.boolean,
+                        probatio.Optional(CONF_PORT, default=80): probatio.Port(),
+                        probatio.Optional(CONF_PATH, default="/"): ensure_valid_path,
+                        # Following values are not longer used in the configuration
+                        # of the integration and are here for historical purposes
+                        probatio.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
+                        probatio.Optional(
+                            CONF_NUMBER_OF_TOOLS, default=0
+                        ): cv.positive_int,
+                        probatio.Optional(CONF_BED, default=False): cv.boolean,
+                        probatio.Optional(CONF_SENSORS, default={}): SENSOR_SCHEMA,
+                        probatio.Optional(
+                            CONF_BINARY_SENSORS, default={}
+                        ): BINARY_SENSOR_SCHEMA,
+                    }
+                )
+            ],
+            has_all_unique_names,
+        )
+    },
+    extra=probatio.ALLOW_EXTRA,
 )
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the OctoPrint component."""
+    async_setup_services(hass)
     if DOMAIN not in config:
         return True
 
-    domain_config = config[DOMAIN]
-
-    for conf in domain_config:
-        hass.async_create_task(
-            hass.config_entries.flow.async_init(
-                DOMAIN,
-                context={"source": SOURCE_IMPORT},
-                data={
+    hass.async_create_task(
+        _async_import_yaml(
+            hass,
+            [
+                {
                     CONF_API_KEY: conf[CONF_API_KEY],
                     CONF_HOST: conf[CONF_HOST],
                     CONF_PATH: conf[CONF_PATH],
                     CONF_PORT: conf[CONF_PORT],
                     CONF_SSL: conf[CONF_SSL],
-                },
-            )
+                }
+                for conf in config[DOMAIN]
+            ],
         )
+    )
 
     return True
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def _async_import_yaml(
+    hass: HomeAssistant, import_data: list[dict[str, Any]]
+) -> None:
+    """Import the YAML devices into config entries."""
+    # Eager tasks register the import flows before setup waits for them.
+    results = await asyncio.gather(
+        *(
+            hass.async_create_task(
+                hass.config_entries.flow.async_init(
+                    DOMAIN, context={"source": SOURCE_IMPORT}, data=data
+                )
+            )
+            for data in import_data
+        )
+    )
+    failed_reasons = {
+        result["reason"]
+        for result in results
+        if result["type"] is FlowResultType.ABORT
+        and result["reason"] != "already_configured"
+    }
+    for reason in failed_reasons:
+        ir.async_create_issue(
+            hass,
+            DOMAIN,
+            f"deprecated_yaml_import_issue_{reason}",
+            breaks_in_ha_version="2027.6.0",
+            is_fixable=False,
+            issue_domain=DOMAIN,
+            severity=ir.IssueSeverity.WARNING,
+            translation_key=f"deprecated_yaml_import_issue_{reason}",
+            translation_placeholders={
+                "domain": DOMAIN,
+                "integration_title": DEFAULT_NAME,
+            },
+        )
+    # The shared issue tells users to remove all YAML, which would drop failed devices.
+    if failed_reasons:
+        return
+
+    ir.async_create_issue(
+        hass,
+        HOMEASSISTANT_DOMAIN,
+        f"deprecated_yaml_{DOMAIN}",
+        breaks_in_ha_version="2027.6.0",
+        is_fixable=False,
+        issue_domain=DOMAIN,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key="deprecated_yaml",
+        translation_placeholders={
+            "domain": DOMAIN,
+            "integration_title": DEFAULT_NAME,
+        },
+    )
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: OctoprintConfigEntry) -> None:
     """Set up OctoPrint from a config entry."""
-
-    if DOMAIN not in hass.data:
-        hass.data[DOMAIN] = {}
-
     if CONF_VERIFY_SSL not in entry.data:
         data = {**entry.data, CONF_VERIFY_SSL: True}
         hass.config_entries.async_update_entry(entry, data=data)
 
-    verify_ssl = entry.data[CONF_VERIFY_SSL]
-    websession = async_get_clientsession(hass, verify_ssl=verify_ssl)
+    connector = aiohttp.TCPConnector(
+        force_close=True,
+        ssl=get_default_no_verify_context()
+        if not entry.data[CONF_VERIFY_SSL]
+        else get_default_context(),
+    )
+    session = aiohttp.ClientSession(connector=connector)
+
+    @callback
+    def _async_close_websession(event: Event | None = None) -> None:
+        """Close websession."""
+        session.detach()
+
+    entry.async_on_unload(_async_close_websession)
+    entry.async_on_unload(
+        hass.bus.async_listen(EVENT_HOMEASSISTANT_STOP, _async_close_websession)
+    )
+
     client = OctoprintClient(
-        entry.data[CONF_HOST],
-        websession,
-        entry.data[CONF_PORT],
-        entry.data[CONF_SSL],
-        entry.data[CONF_PATH],
+        host=entry.data[CONF_HOST],
+        session=session,
+        port=entry.data[CONF_PORT],
+        ssl=entry.data[CONF_SSL],
+        path=entry.data[CONF_PATH],
     )
 
     client.set_api_key(entry.data[CONF_API_KEY])
@@ -179,92 +253,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     await coordinator.async_config_entry_first_refresh()
 
-    hass.data[DOMAIN][entry.entry_id] = {
-        "coordinator": coordinator,
-        "client": client,
-    }
+    entry.runtime_data = coordinator
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    return True
 
-
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_unload_entry(hass: HomeAssistant, entry: OctoprintConfigEntry) -> None:
     """Unload a config entry."""
-    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-
-    if unload_ok:
-        hass.data[DOMAIN].pop(entry.entry_id)
-
-    return unload_ok
-
-
-class OctoprintDataUpdateCoordinator(DataUpdateCoordinator):
-    """Class to manage fetching Octoprint data."""
-
-    config_entry: ConfigEntry
-
-    def __init__(
-        self,
-        hass: HomeAssistant,
-        octoprint: OctoprintClient,
-        config_entry: ConfigEntry,
-        interval: int,
-    ) -> None:
-        """Initialize."""
-        super().__init__(
-            hass,
-            _LOGGER,
-            name=f"octoprint-{config_entry.entry_id}",
-            update_interval=timedelta(seconds=interval),
-        )
-        self.config_entry = config_entry
-        self._octoprint = octoprint
-        self._printer_offline = False
-        self.data = {"printer": None, "job": None, "last_read_time": None}
-
-    async def _async_update_data(self):
-        """Update data via API."""
-        printer = None
-        try:
-            job = await self._octoprint.get_job_info()
-        except UnauthorizedException as err:
-            raise ConfigEntryAuthFailed from err
-        except ApiError as err:
-            raise UpdateFailed(err) from err
-
-        # If octoprint is on, but the printer is disconnected
-        # printer will return a 409, so continue using the last
-        # reading if there is one
-        try:
-            printer = await self._octoprint.get_printer_info()
-        except PrinterOffline:
-            if not self._printer_offline:
-                _LOGGER.debug("Unable to retrieve printer information: Printer offline")
-                self._printer_offline = True
-        except UnauthorizedException as err:
-            raise ConfigEntryAuthFailed from err
-        except ApiError as err:
-            raise UpdateFailed(err) from err
-        else:
-            self._printer_offline = False
-
-        return {"job": job, "printer": printer, "last_read_time": dt_util.utcnow()}
-
-    @property
-    def device_info(self) -> DeviceInfo:
-        """Device info."""
-        unique_id = cast(str, self.config_entry.unique_id)
-        configuration_url = URL.build(
-            scheme=self.config_entry.data[CONF_SSL] and "https" or "http",
-            host=self.config_entry.data[CONF_HOST],
-            port=self.config_entry.data[CONF_PORT],
-            path=self.config_entry.data[CONF_PATH],
-        )
-
-        return DeviceInfo(
-            identifiers={(DOMAIN, unique_id)},
-            manufacturer="OctoPrint",
-            name="OctoPrint",
-            configuration_url=str(configuration_url),
-        )
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)

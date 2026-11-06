@@ -1,32 +1,33 @@
 """Support for Netgear routers."""
-from __future__ import annotations
 
 import logging
+from typing import override
 
-from homeassistant.components.device_tracker import ScannerEntity, SourceType
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.components.device_tracker import ScannerEntity
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .const import DEVICE_ICONS, DOMAIN, KEY_COORDINATOR, KEY_ROUTER
-from .router import NetgearBaseEntity, NetgearRouter
+from .const import DEVICE_ICONS
+from .coordinator import NetgearConfigEntry, NetgearTrackerCoordinator
+from .entity import NetgearDeviceEntity
 
 _LOGGER = logging.getLogger(__name__)
 
 
 async def async_setup_entry(
-    hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
+    hass: HomeAssistant,
+    entry: NetgearConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up device tracker for Netgear component."""
-    router = hass.data[DOMAIN][entry.entry_id][KEY_ROUTER]
-    coordinator = hass.data[DOMAIN][entry.entry_id][KEY_COORDINATOR]
+    router = entry.runtime_data.router
+    coordinator_tracker = entry.runtime_data.coordinator_tracker
     tracked = set()
 
     @callback
     def new_device_callback() -> None:
         """Add new devices if needed."""
-        if not coordinator.data:
+        if not coordinator_tracker.data:
             return
 
         new_entities = []
@@ -35,27 +36,32 @@ async def async_setup_entry(
             if mac in tracked:
                 continue
 
-            new_entities.append(NetgearScannerEntity(coordinator, router, device))
+            new_entities.append(NetgearScannerEntity(coordinator_tracker, device))
             tracked.add(mac)
 
         async_add_entities(new_entities)
 
-    entry.async_on_unload(coordinator.async_add_listener(new_device_callback))
+    entry.async_on_unload(coordinator_tracker.async_add_listener(new_device_callback))
 
-    coordinator.data = True
+    coordinator_tracker.data = True
     new_device_callback()
 
 
-class NetgearScannerEntity(NetgearBaseEntity, ScannerEntity):
+class NetgearScannerEntity(NetgearDeviceEntity, ScannerEntity):
     """Representation of a device connected to a Netgear router."""
 
+    _attr_has_entity_name = False
+
     def __init__(
-        self, coordinator: DataUpdateCoordinator, router: NetgearRouter, device: dict
+        self,
+        coordinator: NetgearTrackerCoordinator,
+        device: dict,
     ) -> None:
         """Initialize a Netgear device."""
-        super().__init__(coordinator, router, device)
+        super().__init__(coordinator, device)
         self._hostname = self.get_hostname()
         self._icon = DEVICE_ICONS.get(device["device_type"], "mdi:help-network")
+        self._attr_name = self._device_name
 
     def get_hostname(self) -> str | None:
         """Return the hostname of the given device or None if we don't know."""
@@ -65,6 +71,7 @@ class NetgearScannerEntity(NetgearBaseEntity, ScannerEntity):
         return hostname
 
     @callback
+    @override
     def async_update_device(self) -> None:
         """Update the Netgear device."""
         self._device = self._router.devices[self._mac]
@@ -72,31 +79,31 @@ class NetgearScannerEntity(NetgearBaseEntity, ScannerEntity):
         self._icon = DEVICE_ICONS.get(self._device["device_type"], "mdi:help-network")
 
     @property
+    @override
     def is_connected(self) -> bool:
         """Return true if the device is connected to the router."""
         return self._active
 
     @property
-    def source_type(self) -> SourceType:
-        """Return the source type."""
-        return SourceType.ROUTER
-
-    @property
+    @override
     def ip_address(self) -> str:
         """Return the IP address."""
         return self._device["ip"]
 
     @property
+    @override
     def mac_address(self) -> str:
         """Return the mac address."""
         return self._mac
 
     @property
+    @override
     def hostname(self) -> str | None:
         """Return the hostname."""
         return self._hostname
 
     @property
+    @override
     def icon(self) -> str:
         """Return the icon."""
         return self._icon

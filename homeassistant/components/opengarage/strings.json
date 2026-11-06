@@ -1,5 +1,13 @@
 {
   "config": {
+    "abort": {
+      "already_configured": "[%key:common::config_flow::abort::already_configured_device%]"
+    },
+    "error": {
+      "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]",
+      "invalid_auth": "[%key:common::config_flow::error::invalid_auth%]",
+      "unknown": "[%key:common::config_flow::error::unknown%]"
+    },
     "step": {
       "user": {
         "data": {
@@ -7,16 +15,37 @@
           "host": "[%key:common::config_flow::data::host%]",
           "port": "[%key:common::config_flow::data::port%]",
           "verify_ssl": "[%key:common::config_flow::data::verify_ssl%]"
+        },
+        "data_description": {
+          "host": "The hostname or IP address of your OpenGarage device."
         }
       }
+    }
+  },
+  "entity": {
+    "binary_sensor": {
+      "vehicle": {
+        "name": "Vehicle"
+      }
     },
-    "error": {
-      "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]",
-      "invalid_auth": "[%key:common::config_flow::error::invalid_auth%]",
-      "unknown": "[%key:common::config_flow::error::unknown%]"
+    "light": {
+      "light": {
+        "name": "[%key:component::light::title%]"
+      }
+    }
+  },
+  "exceptions": {
+    "light_control_failed": {
+      "message": "Unable to control the opener light because OpenGarage returned error code {result}."
     },
-    "abort": {
-      "already_configured": "[%key:common::config_flow::abort::already_configured_device%]"
+    "light_control_invalid_auth": {
+      "message": "Unable to control the opener light because the device key is incorrect."
+    },
+    "light_control_state_not_confirmed": {
+      "message": "Unable to confirm the requested opener light state."
+    },
+    "light_control_unavailable": {
+      "message": "Unable to control the opener light because the device is unavailable or does not support light control."
     }
   }
 }

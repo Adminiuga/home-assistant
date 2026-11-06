@@ -1,4 +1,5 @@
 """Test real forwarded middleware."""
+
 from http import HTTPStatus
 from ipaddress import ip_network
 from unittest.mock import Mock, patch
@@ -6,6 +7,7 @@ from unittest.mock import Mock, patch
 from aiohttp import web
 from aiohttp.hdrs import X_FORWARDED_FOR, X_FORWARDED_HOST, X_FORWARDED_PROTO
 import pytest
+from pytest_homeassistant.typing import ClientSessionGenerator
 
 from homeassistant.components.http.forwarded import async_setup_forwarded
 
@@ -15,7 +17,9 @@ async def mock_handler(request):
     return web.Response(text=request.remote)
 
 
-async def test_x_forwarded_for_without_trusted_proxy(aiohttp_client, caplog):
+async def test_x_forwarded_for_without_trusted_proxy(
+    aiohttp_client: ClientSessionGenerator, caplog: pytest.LogCaptureFixture
+) -> None:
     """Test that we get the IP from the transport."""
 
     async def handler(request):
@@ -43,7 +47,7 @@ async def test_x_forwarded_for_without_trusted_proxy(aiohttp_client, caplog):
 
 
 @pytest.mark.parametrize(
-    "trusted_proxies,x_forwarded_for,remote",
+    ("trusted_proxies", "x_forwarded_for", "remote"),
     [
         (
             ["127.0.0.0/24", "1.1.1.1", "10.10.10.0/24"],
@@ -60,8 +64,8 @@ async def test_x_forwarded_for_without_trusted_proxy(aiohttp_client, caplog):
     ],
 )
 async def test_x_forwarded_for_with_trusted_proxy(
-    trusted_proxies, x_forwarded_for, remote, aiohttp_client
-):
+    trusted_proxies, x_forwarded_for, remote, aiohttp_client: ClientSessionGenerator
+) -> None:
     """Test that we get the IP from the forwarded for header."""
 
     async def handler(request):
@@ -85,7 +89,59 @@ async def test_x_forwarded_for_with_trusted_proxy(
     assert resp.status == HTTPStatus.OK
 
 
-async def test_x_forwarded_for_disabled_with_proxy(aiohttp_client, caplog):
+@pytest.mark.parametrize(
+    ("trusted_proxies", "x_forwarded_for", "remote"),
+    [
+        (
+            ["127.0.0.0/24", "1.1.1.1", "10.10.10.0/24"],
+            ["10.10.10.10", "1.1.1.1"],
+            "10.10.10.10",
+        ),
+        (
+            ["127.0.0.0/24", "1.1.1.1"],
+            ["123.123.123.123", "2.2.2.2", "1.1.1.1"],
+            "2.2.2.2",
+        ),
+        (["127.0.0.0/24"], ["123.123.123.123", "2.2.2.2", "1.1.1.1"], "1.1.1.1"),
+        (["127.0.0.1", "1.1.1.1"], ["123.123.123.123", "1.1.1.1"], "123.123.123.123"),
+        (
+            ["127.0.0.1", "1.1.1.1"],
+            ["123.123.123.123", "2.2.2.2", "1.1.1.1"],
+            "2.2.2.2",
+        ),
+    ],
+)
+async def test_x_multiple_forwarded_for_with_trusted_proxy(
+    trusted_proxies, x_forwarded_for, remote, aiohttp_client: ClientSessionGenerator
+) -> None:
+    """Test that we get the IP from multiple forwarded for headers."""
+
+    async def handler(request):
+        url = mock_api_client.make_url("/")
+        assert request.host == f"{url.host}:{url.port}"
+        assert request.scheme == "http"
+        assert not request.secure
+        assert request.remote == remote
+
+        return web.Response()
+
+    app = web.Application()
+    app.router.add_get("/", handler)
+    async_setup_forwarded(
+        app, True, [ip_network(trusted_proxy) for trusted_proxy in trusted_proxies]
+    )
+
+    mock_api_client = await aiohttp_client(app)
+    resp = await mock_api_client.get(
+        "/", headers=[(X_FORWARDED_FOR, addr) for addr in x_forwarded_for]
+    )
+
+    assert resp.status == HTTPStatus.OK
+
+
+async def test_x_forwarded_for_disabled_with_proxy(
+    aiohttp_client: ClientSessionGenerator, caplog: pytest.LogCaptureFixture
+) -> None:
     """Test that we warn when processing is disabled, but proxy has been detected."""
 
     async def handler(request):
@@ -112,7 +168,9 @@ async def test_x_forwarded_for_disabled_with_proxy(aiohttp_client, caplog):
     )
 
 
-async def test_x_forwarded_for_with_spoofed_header(aiohttp_client):
+async def test_x_forwarded_for_with_spoofed_header(
+    aiohttp_client: ClientSessionGenerator,
+) -> None:
     """Test that we get the IP from the transport with a spoofed header."""
 
     async def handler(request):
@@ -150,8 +208,10 @@ async def test_x_forwarded_for_with_spoofed_header(aiohttp_client):
     ],
 )
 async def test_x_forwarded_for_with_malformed_header(
-    x_forwarded_for, aiohttp_client, caplog
-):
+    x_forwarded_for,
+    aiohttp_client: ClientSessionGenerator,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """Test that we get a HTTP 400 bad request with a malformed header."""
     app = web.Application()
     app.router.add_get("/", mock_handler)
@@ -165,28 +225,8 @@ async def test_x_forwarded_for_with_malformed_header(
     assert "Invalid IP address in X-Forwarded-For" in caplog.text
 
 
-async def test_x_forwarded_for_with_multiple_headers(aiohttp_client, caplog):
-    """Test that we get a HTTP 400 bad request with multiple headers."""
-    app = web.Application()
-    app.router.add_get("/", mock_handler)
-    async_setup_forwarded(app, True, [ip_network("127.0.0.1")])
-
-    mock_api_client = await aiohttp_client(app)
-
-    resp = await mock_api_client.get(
-        "/",
-        headers=[
-            (X_FORWARDED_FOR, "222.222.222.222"),
-            (X_FORWARDED_FOR, "123.123.123.123"),
-        ],
-    )
-
-    assert resp.status == HTTPStatus.BAD_REQUEST
-    assert "Too many headers for X-Forwarded-For" in caplog.text
-
-
 @pytest.mark.parametrize(
-    "x_forwarded_for,remote,x_forwarded_proto,secure",
+    ("x_forwarded_for", "remote", "x_forwarded_proto", "secure"),
     [
         ("10.10.10.10, 127.0.0.1, 127.0.0.2", "10.10.10.10", "https, http, http", True),
         ("10.10.10.10, 127.0.0.1, 127.0.0.2", "10.10.10.10", "https,http,http", True),
@@ -214,8 +254,12 @@ async def test_x_forwarded_for_with_multiple_headers(aiohttp_client, caplog):
     ],
 )
 async def test_x_forwarded_proto_with_trusted_proxy(
-    x_forwarded_for, remote, x_forwarded_proto, secure, aiohttp_client
-):
+    x_forwarded_for,
+    remote,
+    x_forwarded_proto,
+    secure,
+    aiohttp_client: ClientSessionGenerator,
+) -> None:
     """Test that we get the proto header if proxy is trusted."""
 
     async def handler(request):
@@ -241,7 +285,68 @@ async def test_x_forwarded_proto_with_trusted_proxy(
     assert resp.status == HTTPStatus.OK
 
 
-async def test_x_forwarded_proto_with_trusted_proxy_multiple_for(aiohttp_client):
+@pytest.mark.parametrize(
+    ("x_forwarded_for", "remote", "x_forwarded_proto", "secure"),
+    [
+        (
+            "10.10.10.10, 127.0.0.1, 127.0.0.2",
+            "10.10.10.10",
+            ["https", "http", "http"],
+            True,
+        ),
+        (
+            "10.10.10.10, 127.0.0.1, 127.0.0.2",
+            "10.10.10.10",
+            ["http", "https", "https"],
+            False,
+        ),
+        (
+            "255.255.255.255, 10.10.10.10, 127.0.0.1",
+            "10.10.10.10",
+            ["http", "https", "http"],
+            True,
+        ),
+        (
+            "255.255.255.255, 10.10.10.10, 127.0.0.1",
+            "10.10.10.10",
+            ["https", "http", "https"],
+            False,
+        ),
+    ],
+)
+async def test_x_multiple_forwarded_proto_with_trusted_proxy(
+    x_forwarded_for,
+    remote,
+    x_forwarded_proto,
+    secure,
+    aiohttp_client: ClientSessionGenerator,
+) -> None:
+    """Test that we get the proto header if proxy is trusted."""
+
+    async def handler(request):
+        assert request.remote == remote
+        assert request.scheme == ("https" if secure else "http")
+        assert request.secure == secure
+
+        return web.Response()
+
+    app = web.Application()
+    app.router.add_get("/", handler)
+    async_setup_forwarded(app, True, [ip_network("127.0.0.0/24")])
+
+    mock_api_client = await aiohttp_client(app)
+    resp = await mock_api_client.get(
+        "/",
+        headers=[(X_FORWARDED_FOR, x_forwarded_for)]
+        + [(X_FORWARDED_PROTO, proto) for proto in x_forwarded_proto],
+    )
+
+    assert resp.status == HTTPStatus.OK
+
+
+async def test_x_forwarded_proto_with_trusted_proxy_multiple_for(
+    aiohttp_client: ClientSessionGenerator,
+) -> None:
     """Test that we get the proto with 1 element in the proto, multiple in the for."""
 
     async def handler(request):
@@ -269,7 +374,41 @@ async def test_x_forwarded_proto_with_trusted_proxy_multiple_for(aiohttp_client)
     assert resp.status == HTTPStatus.OK
 
 
-async def test_x_forwarded_proto_not_processed_without_for(aiohttp_client):
+async def test_x_forwarded_proto_with_trusted_proxy_multiple_for_2(
+    aiohttp_client: ClientSessionGenerator,
+) -> None:
+    """Test that we get the proto with 1 element in the proto, multiple in the for."""
+
+    async def handler(request):
+        url = mock_api_client.make_url("/")
+        assert request.host == f"{url.host}:{url.port}"
+        assert request.scheme == "https"
+        assert request.secure
+        assert request.remote == "255.255.255.255"
+
+        return web.Response()
+
+    app = web.Application()
+    app.router.add_get("/", handler)
+    async_setup_forwarded(app, True, [ip_network("127.0.0.0/24")])
+
+    mock_api_client = await aiohttp_client(app)
+    resp = await mock_api_client.get(
+        "/",
+        headers=[
+            (X_FORWARDED_FOR, "255.255.255.255"),
+            (X_FORWARDED_FOR, "127.0.0.1"),
+            (X_FORWARDED_FOR, "127.0.0.2"),
+            (X_FORWARDED_PROTO, "https"),
+        ],
+    )
+
+    assert resp.status == HTTPStatus.OK
+
+
+async def test_x_forwarded_proto_not_processed_without_for(
+    aiohttp_client: ClientSessionGenerator,
+) -> None:
     """Test that proto header isn't processed without a for header."""
 
     async def handler(request):
@@ -291,33 +430,15 @@ async def test_x_forwarded_proto_not_processed_without_for(aiohttp_client):
     assert resp.status == HTTPStatus.OK
 
 
-async def test_x_forwarded_proto_with_multiple_headers(aiohttp_client, caplog):
-    """Test that we get a HTTP 400 bad request with multiple headers."""
-    app = web.Application()
-    app.router.add_get("/", mock_handler)
-    async_setup_forwarded(app, True, [ip_network("127.0.0.1")])
-
-    mock_api_client = await aiohttp_client(app)
-    resp = await mock_api_client.get(
-        "/",
-        headers=[
-            (X_FORWARDED_FOR, "222.222.222.222"),
-            (X_FORWARDED_PROTO, "https"),
-            (X_FORWARDED_PROTO, "http"),
-        ],
-    )
-
-    assert resp.status == HTTPStatus.BAD_REQUEST
-    assert "Too many headers for X-Forward-Proto" in caplog.text
-
-
 @pytest.mark.parametrize(
     "x_forwarded_proto",
     ["", ",", "https, , https", "https, https, "],
 )
 async def test_x_forwarded_proto_empty_element(
-    x_forwarded_proto, aiohttp_client, caplog
-):
+    x_forwarded_proto,
+    aiohttp_client: ClientSessionGenerator,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """Test that we get a HTTP 400 bad request with empty proto."""
     app = web.Application()
     app.router.add_get("/", mock_handler)
@@ -334,15 +455,20 @@ async def test_x_forwarded_proto_empty_element(
 
 
 @pytest.mark.parametrize(
-    "x_forwarded_for,x_forwarded_proto,expected,got",
+    ("x_forwarded_for", "x_forwarded_proto", "expected", "got"),
     [
         ("1.1.1.1, 2.2.2.2", "https, https, https", 2, 3),
         ("1.1.1.1, 2.2.2.2, 3.3.3.3, 4.4.4.4", "https, https, https", 4, 3),
     ],
 )
 async def test_x_forwarded_proto_incorrect_number_of_elements(
-    x_forwarded_for, x_forwarded_proto, expected, got, aiohttp_client, caplog
-):
+    x_forwarded_for,
+    x_forwarded_proto,
+    expected,
+    got,
+    aiohttp_client: ClientSessionGenerator,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """Test that we get a HTTP 400 bad request with incorrect number of elements."""
     app = web.Application()
     app.router.add_get("/", mock_handler)
@@ -359,12 +485,14 @@ async def test_x_forwarded_proto_incorrect_number_of_elements(
 
     assert resp.status == HTTPStatus.BAD_REQUEST
     assert (
-        f"Incorrect number of elements in X-Forward-Proto. Expected 1 or {expected}, got {got}"
-        in caplog.text
+        "Incorrect number of elements in X-Forward-Proto."
+        f" Expected 1 or {expected}, got {got}" in caplog.text
     )
 
 
-async def test_x_forwarded_host_with_trusted_proxy(aiohttp_client):
+async def test_x_forwarded_host_with_trusted_proxy(
+    aiohttp_client: ClientSessionGenerator,
+) -> None:
     """Test that we get the host header if proxy is trusted."""
 
     async def handler(request):
@@ -388,7 +516,9 @@ async def test_x_forwarded_host_with_trusted_proxy(aiohttp_client):
     assert resp.status == HTTPStatus.OK
 
 
-async def test_x_forwarded_host_not_processed_without_for(aiohttp_client):
+async def test_x_forwarded_host_not_processed_without_for(
+    aiohttp_client: ClientSessionGenerator,
+) -> None:
     """Test that host header isn't processed without a for header."""
 
     async def handler(request):
@@ -410,8 +540,10 @@ async def test_x_forwarded_host_not_processed_without_for(aiohttp_client):
     assert resp.status == HTTPStatus.OK
 
 
-async def test_x_forwarded_host_with_multiple_headers(aiohttp_client, caplog):
-    """Test that we get a HTTP 400 bad request with multiple headers."""
+async def test_x_forwarded_host_with_multiple_headers(
+    aiohttp_client: ClientSessionGenerator, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Test that we get a HTTP 200 OK with multiple headers."""
     app = web.Application()
     app.router.add_get("/", mock_handler)
     async_setup_forwarded(app, True, [ip_network("127.0.0.1")])
@@ -426,11 +558,12 @@ async def test_x_forwarded_host_with_multiple_headers(aiohttp_client, caplog):
         ],
     )
 
-    assert resp.status == HTTPStatus.BAD_REQUEST
-    assert "Too many headers for X-Forwarded-Host" in caplog.text
+    assert resp.status == HTTPStatus.OK
 
 
-async def test_x_forwarded_host_with_empty_header(aiohttp_client, caplog):
+async def test_x_forwarded_host_with_empty_header(
+    aiohttp_client: ClientSessionGenerator, caplog: pytest.LogCaptureFixture
+) -> None:
     """Test that we get a HTTP 400 bad request with empty host value."""
     app = web.Application()
     app.router.add_get("/", mock_handler)
@@ -445,7 +578,9 @@ async def test_x_forwarded_host_with_empty_header(aiohttp_client, caplog):
     assert "Empty value received in X-Forward-Host header" in caplog.text
 
 
-async def test_x_forwarded_cloud(aiohttp_client, caplog):
+async def test_x_forwarded_cloud(
+    aiohttp_client: ClientSessionGenerator, caplog: pytest.LogCaptureFixture
+) -> None:
     """Test that cloud requests are not processed."""
     app = web.Application()
     app.router.add_get("/", mock_handler)

@@ -1,9 +1,13 @@
 {
   "domain": "touchline",
   "name": "Roth Touchline",
+  "categories": ["climate.thermostats_heating"],
+  "codeowners": ["@mnordseth"],
+  "config_flow": true,
+  "connectivity": ["network"],
   "documentation": "https://www.home-assistant.io/integrations/touchline",
-  "requirements": ["pytouchline==0.7"],
-  "codeowners": [],
+  "integration_type": "hub",
   "iot_class": "local_polling",
-  "loggers": ["pytouchline"]
+  "loggers": ["pytouchline_extended"],
+  "requirements": ["pytouchline_extended==0.4.5"]
 }

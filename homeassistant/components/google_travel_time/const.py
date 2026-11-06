@@ -1,13 +1,21 @@
 """Constants for Google Travel Time."""
+
+from enum import StrEnum
+
+from google_maps_routing_api import (
+    TrafficModel,
+    TransitRoutingPreference,
+    TransitTravelMode,
+    TravelMode,
+    Units,
+)
+
 DOMAIN = "google_travel_time"
 
 ATTRIBUTION = "Powered by Google"
 
 CONF_DESTINATION = "destination"
-CONF_OPTIONS = "options"
 CONF_ORIGIN = "origin"
-CONF_TRAVEL_MODE = "travel_mode"
-CONF_LANGUAGE = "language"
 CONF_AVOID = "avoid"
 CONF_UNITS = "units"
 CONF_ARRIVAL_TIME = "arrival_time"
@@ -67,7 +75,7 @@ ALL_LANGUAGES = [
     "sr",
     "sv",
     "ta",
-    "te",
+    "te",  # codespell:ignore te
     "th",
     "tl",
     "tr",
@@ -77,13 +85,63 @@ ALL_LANGUAGES = [
     "zh-TW",
 ]
 
-AVOID = ["tolls", "highways", "ferries", "indoor"]
+AVOID_OPTIONS = ["tolls", "highways", "ferries", "indoor"]
 TRANSIT_PREFS = ["less_walking", "fewer_transfers"]
-TRANSPORT_TYPE = ["bus", "subway", "train", "tram", "rail"]
-TRAVEL_MODE = ["driving", "walking", "bicycling", "transit"]
-TRAVEL_MODEL = ["best_guess", "pessimistic", "optimistic"]
+TRANSIT_PREFS_TO_API_ENUM = {
+    "less_walking": TransitRoutingPreference.LESS_WALKING,
+    "fewer_transfers": TransitRoutingPreference.FEWER_TRANSFERS,
+}
+TRANSPORT_TYPES = ["bus", "subway", "train", "tram", "rail"]
+TRANSPORT_TYPES_TO_API_ENUM = {
+    "bus": TransitTravelMode.BUS,
+    "subway": TransitTravelMode.SUBWAY,
+    "train": TransitTravelMode.TRAIN,
+    "tram": TransitTravelMode.LIGHT_RAIL,
+    "rail": TransitTravelMode.RAIL,
+}
+TRAVEL_MODES = ["driving", "walking", "bicycling", "transit"]
+TRAVEL_MODES_WITHOUT_TRANSIT = ["driving", "walking", "bicycling"]
+TRAVEL_MODES_TO_API_ENUM = {
+    "driving": TravelMode.DRIVE,
+    "walking": TravelMode.WALK,
+    "bicycling": TravelMode.BICYCLE,
+    "transit": TravelMode.TRANSIT,
+}
+TRAFFIC_MODELS = ["best_guess", "pessimistic", "optimistic"]
+TRAFFIC_MODELS_TO_API_ENUM = {
+    "best_guess": TrafficModel.BEST_GUESS,
+    "pessimistic": TrafficModel.PESSIMISTIC,
+    "optimistic": TrafficModel.OPTIMISTIC,
+}
 
 # googlemaps library uses "metric" or "imperial" terminology in distance_matrix
 UNITS_METRIC = "metric"
 UNITS_IMPERIAL = "imperial"
 UNITS = [UNITS_METRIC, UNITS_IMPERIAL]
+UNITS_TO_API_ENUM = {
+    UNITS_METRIC: Units.METRIC,
+    UNITS_IMPERIAL: Units.IMPERIAL,
+}
+
+
+class GoogleTravelTimeService(StrEnum):
+    """Store keys for Google Travel Time services."""
+
+    GET_TRAVEL_TIMES = "get_travel_times"
+    GET_TRANSIT_TIMES = "get_transit_times"
+
+
+class GoogleTravelTimeServiceArgument(StrEnum):
+    """Store keys for Google Travel Time service arguments."""
+
+    ORIGIN = "origin"
+    DESTINATION = "destination"
+    MODE = "mode"
+    UNITS = "units"
+    LANGUAGE = "language"
+    AVOID = "avoid"
+    TRAFFIC_MODEL = "traffic_model"
+    DEPARTURE_TIME = "departure_time"
+    TRANSIT_MODE = "transit_mode"
+    TRANSIT_ROUTING_PREFERENCE = "transit_routing_preference"
+    ARRIVAL_TIME = "arrival_time"

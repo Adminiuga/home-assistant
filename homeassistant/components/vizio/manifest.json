@@ -1,13 +1,18 @@
 {
   "domain": "vizio",
   "name": "VIZIO SmartCast",
-  "documentation": "https://www.home-assistant.io/integrations/vizio",
-  "requirements": ["pyvizio==0.1.57"],
+  "categories": [
+    "media_entertainment.tv_streaming",
+    "media_entertainment.speakers_audio"
+  ],
   "codeowners": ["@raman325"],
   "config_flow": true,
-  "zeroconf": ["_viziocast._tcp.local."],
-  "quality_scale": "platinum",
+  "connectivity": ["network"],
+  "documentation": "https://www.home-assistant.io/integrations/vizio",
+  "integration_type": "device",
   "iot_class": "local_polling",
-  "loggers": ["pyvizio"],
-  "integration_type": "hub"
+  "loggers": ["vizaio"],
+  "quality_scale": "platinum",
+  "requirements": ["vizaio==0.7.0"],
+  "zeroconf": ["_viziocast._tcp.local."]
 }

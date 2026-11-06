@@ -1,26 +1,32 @@
 """Config flow for Gogogate2."""
-from __future__ import annotations
 
 import dataclasses
+import logging
 import re
-from typing import Any
+from typing import Any, Self, override
 
 from ismartgate.common import AbstractInfoResponse, ApiError
 from ismartgate.const import GogoGate2ApiErrorCode, ISmartGateApiErrorCode
-import voluptuous as vol
+import probatio
 
-from homeassistant.components import dhcp, zeroconf
-from homeassistant.config_entries import ConfigFlow
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import (
     CONF_DEVICE,
     CONF_IP_ADDRESS,
     CONF_PASSWORD,
     CONF_USERNAME,
 )
-from homeassistant.data_entry_flow import AbortFlow, FlowResult
+from homeassistant.data_entry_flow import AbortFlow
+from homeassistant.helpers.service_info.dhcp import DhcpServiceInfo
+from homeassistant.helpers.service_info.zeroconf import (
+    ATTR_PROPERTIES_ID,
+    ZeroconfServiceInfo,
+)
 
 from .common import get_api
 from .const import DEVICE_TYPE_GOGOGATE2, DEVICE_TYPE_ISMARTGATE, DOMAIN
+
+_LOGGER = logging.getLogger(__name__)
 
 DEVICE_NAMES = {
     DEVICE_TYPE_GOGOGATE2: "Gogogate2",
@@ -38,38 +44,44 @@ class Gogogate2FlowHandler(ConfigFlow, domain=DOMAIN):
         self._ip_address: str | None = None
         self._device_type: str | None = None
 
+    @override
     async def async_step_homekit(
-        self, discovery_info: zeroconf.ZeroconfServiceInfo
-    ) -> FlowResult:
+        self, discovery_info: ZeroconfServiceInfo
+    ) -> ConfigFlowResult:
         """Handle homekit discovery."""
-        await self.async_set_unique_id(
-            discovery_info.properties[zeroconf.ATTR_PROPERTIES_ID]
-        )
+        await self.async_set_unique_id(discovery_info.properties[ATTR_PROPERTIES_ID])
         return await self._async_discovery_handler(discovery_info.host)
 
-    async def async_step_dhcp(self, discovery_info: dhcp.DhcpServiceInfo) -> FlowResult:
+    @override
+    async def async_step_dhcp(
+        self, discovery_info: DhcpServiceInfo
+    ) -> ConfigFlowResult:
         """Handle dhcp discovery."""
         await self.async_set_unique_id(discovery_info.macaddress)
         return await self._async_discovery_handler(discovery_info.ip)
 
-    async def _async_discovery_handler(self, ip_address: str) -> FlowResult:
+    async def _async_discovery_handler(self, ip_address: str) -> ConfigFlowResult:
         """Start the user flow from any discovery."""
-        self.context[CONF_IP_ADDRESS] = ip_address
         self._abort_if_unique_id_configured({CONF_IP_ADDRESS: ip_address})
 
         self._async_abort_entries_match({CONF_IP_ADDRESS: ip_address})
 
         self._ip_address = ip_address
-        for progress in self._async_in_progress():
-            if progress.get("context", {}).get(CONF_IP_ADDRESS) == self._ip_address:
-                raise AbortFlow("already_in_progress")
+        if self.hass.config_entries.flow.async_has_matching_flow(self):
+            raise AbortFlow("already_in_progress")
 
         self._device_type = DEVICE_TYPE_ISMARTGATE
         return await self.async_step_user()
 
+    @override
+    def is_matching(self, other_flow: Self) -> bool:
+        """Return True if other_flow is matching this flow."""
+        return other_flow._ip_address == self._ip_address
+
+    @override
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle user initiated flow."""
         user_input = user_input or {}
         errors = {}
@@ -82,8 +94,6 @@ class Gogogate2FlowHandler(ConfigFlow, domain=DOMAIN):
                 title = data_dict.get(
                     "gogogatename", data_dict.get("ismartgatename", "Cover")
                 )
-                await self.async_set_unique_id(re.sub("\\..*$", "", data.remoteaccess))
-                return self.async_create_entry(title=title, data=user_input)
 
             except ApiError as api_error:
                 device_type = user_input[CONF_DEVICE]
@@ -108,32 +118,38 @@ class Gogogate2FlowHandler(ConfigFlow, domain=DOMAIN):
                 else:
                     errors["base"] = "cannot_connect"
 
-            except Exception:  # pylint: disable=broad-except
+            except Exception:
+                _LOGGER.exception("Unexpected exception")
                 errors["base"] = "cannot_connect"
+
+            else:
+                await self.async_set_unique_id(re.sub("\\..*$", "", data.remoteaccess))
+                return self.async_create_entry(title=title, data=user_input)
 
         if self._ip_address and self._device_type:
             self.context["title_placeholders"] = {
-                CONF_DEVICE: DEVICE_NAMES[self._device_type],
-                CONF_IP_ADDRESS: self._ip_address,
+                "device": DEVICE_NAMES[self._device_type],
+                "ip_address": self._ip_address,
             }
         return self.async_show_form(
             step_id="user",
-            data_schema=vol.Schema(
+            data_schema=probatio.Schema(
                 {
-                    vol.Required(
+                    probatio.Required(
                         CONF_DEVICE,
                         default=self._device_type
                         or user_input.get(CONF_DEVICE, DEVICE_TYPE_GOGOGATE2),
-                    ): vol.In((DEVICE_TYPE_GOGOGATE2, DEVICE_TYPE_ISMARTGATE)),
-                    vol.Required(
+                    ): probatio.In((DEVICE_TYPE_GOGOGATE2, DEVICE_TYPE_ISMARTGATE)),
+                    probatio.Required(
                         CONF_IP_ADDRESS,
                         default=user_input.get(CONF_IP_ADDRESS, self._ip_address),
                     ): str,
-                    vol.Required(
+                    probatio.Required(
                         CONF_USERNAME, default=user_input.get(CONF_USERNAME, "")
                     ): str,
-                    vol.Required(
-                        CONF_PASSWORD, default=user_input.get(CONF_PASSWORD, "")
+                    probatio.Required(
+                        probatio.Secret(CONF_PASSWORD),
+                        default=user_input.get(CONF_PASSWORD, ""),
                     ): str,
                 }
             ),

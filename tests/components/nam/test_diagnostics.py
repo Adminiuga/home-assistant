@@ -1,19 +1,28 @@
 """Test NAM diagnostics."""
-import json
 
-from . import init_integration
+import pytest
+from pytest_homeassistant.common import MockConfigEntry
+from pytest_homeassistant.components.diagnostics import get_diagnostics_for_config_entry
+from pytest_homeassistant.typing import ClientSessionGenerator
+from syrupy.assertion import SnapshotAssertion
 
-from tests.common import load_fixture
-from tests.components.diagnostics import get_diagnostics_for_config_entry
+from homeassistant.core import HomeAssistant
+
+from . import setup_integration
 
 
-async def test_entry_diagnostics(hass, hass_client):
+@pytest.mark.usefixtures("mock_nam_client")
+async def test_entry_diagnostics(
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    mock_config_entry: MockConfigEntry,
+    snapshot: SnapshotAssertion,
+) -> None:
     """Test config entry diagnostics."""
-    entry = await init_integration(hass)
+    await setup_integration(hass, mock_config_entry)
 
-    diagnostics_data = json.loads(load_fixture("diagnostics_data.json", "nam"))
+    result = await get_diagnostics_for_config_entry(
+        hass, hass_client, mock_config_entry
+    )
 
-    result = await get_diagnostics_for_config_entry(hass, hass_client, entry)
-
-    assert result["info"] == {"host": "10.10.2.3"}
-    assert result["data"] == diagnostics_data
+    assert result == snapshot

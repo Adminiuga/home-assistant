@@ -1,47 +1,52 @@
 """Script to check the configuration file."""
-from __future__ import annotations
 
 import argparse
 import asyncio
 from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
 from glob import glob
+import json
 import logging
 import os
 from typing import Any
 from unittest.mock import patch
 
-from homeassistant import core
+from annotatedyaml import loader as yaml_loader
+from annotatedyaml.loader import Secrets
+
+from homeassistant import core, loader, runner
 from homeassistant.config import get_default_config_dir
 from homeassistant.config_entries import ConfigEntries
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers import area_registry, device_registry, entity_registry
+from homeassistant.helpers import (
+    area_registry as ar,
+    device_registry as dr,
+    entity_registry as er,
+    issue_registry as ir,
+)
 from homeassistant.helpers.check_config import async_check_ha_config_file
-from homeassistant.util.yaml import Secrets
-import homeassistant.util.yaml.loader as yaml_loader
 
 # mypy: allow-untyped-calls, allow-untyped-defs
 
-REQUIREMENTS = ("colorlog==6.6.0",)
+REQUIREMENTS = ("colorlog==6.10.1",)
 
 _LOGGER = logging.getLogger(__name__)
-# pylint: disable=protected-access
 MOCKS: dict[str, tuple[str, Callable]] = {
-    "load": ("homeassistant.util.yaml.loader.load_yaml", yaml_loader.load_yaml),
-    "load*": ("homeassistant.config.load_yaml", yaml_loader.load_yaml),
-    "secrets": ("homeassistant.util.yaml.loader.secret_yaml", yaml_loader.secret_yaml),
+    "load": ("annotatedyaml.loader.load_yaml", yaml_loader.load_yaml),
+    "load*": ("homeassistant.config.load_yaml_dict", yaml_loader.load_yaml_dict),
+    "secrets": ("annotatedyaml.loader.secret_yaml", yaml_loader.secret_yaml),
 }
 
 PATCHES: dict[str, Any] = {}
 
 C_HEAD = "bold"
 ERROR_STR = "General Errors"
+WARNING_STR = "General Warnings"
 
 
 def color(the_color, *args, reset=None):
     """Color helper."""
-    # pylint: disable=import-outside-toplevel
-    from colorlog.escape_codes import escape_codes, parse_colors
+    from colorlog.escape_codes import escape_codes, parse_colors  # noqa: PLC0415
 
     try:
         if not args:
@@ -76,16 +81,61 @@ def run(script_args: list) -> int:
     parser.add_argument(
         "-s", "--secrets", action="store_true", help="Show secret information"
     )
+    parser.add_argument("--json", action="store_true", help="Output JSON format")
+    parser.add_argument(
+        "--fail-on-warnings",
+        action="store_true",
+        help="Exit non-zero if warnings are present",
+    )
 
+    # Parse all args including --config & --script. Do not use script_args.
+    # Example: python -m homeassistant --config "." --script check_config
     args, unknown = parser.parse_known_args()
     if unknown:
         print(color("red", "Unknown arguments:", ", ".join(unknown)))
 
     config_dir = os.path.join(os.getcwd(), args.config)
 
-    print(color("bold", "Testing configuration at", config_dir))
+    if not args.json:
+        print(color("bold", "Testing configuration at", config_dir))
 
     res = check(config_dir, args.secrets)
+
+    # JSON output branch
+    if args.json:
+        json_object = {
+            "config_dir": config_dir,
+            "total_errors": sum(len(errors) for errors in res["except"].values()),
+            "total_warnings": sum(len(warnings) for warnings in res["warn"].values()),
+            "errors": res["except"],
+            "warnings": res["warn"],
+            "components": list(res["components"].keys()),
+        }
+
+        # Include secrets information if requested
+        if args.secrets:
+            # Build list of missing secrets (referenced but not found)
+            missing_secrets = [
+                key for key, val in res["secrets"].items() if val is None
+            ]
+
+            # Build list of used secrets (found and used)
+            used_secrets = [
+                key for key, val in res["secrets"].items() if val is not None
+            ]
+
+            json_object["secrets"] = {
+                "secret_files": res["secret_cache"],
+                "used_secrets": used_secrets,
+                "missing_secrets": missing_secrets,
+                "total_secrets": len(res["secrets"]),
+                "total_missing": len(missing_secrets),
+            }
+
+        print(json.dumps(json_object, indent=2))
+
+        # Determine exit code for JSON mode
+        return 1 if res["except"] or (args.fail_on_warnings and res["warn"]) else 0
 
     domain_info: list[str] = []
     if args.info:
@@ -97,7 +147,7 @@ def run(script_args: list) -> int:
         yaml_files = [
             f
             for f in glob(os.path.join(config_dir, "**/*.yaml"), recursive=True)
-            if not f.startswith(deps)
+            if not f.startswith(deps)  # Avoid scanning legacy deps folder
         ]
 
         for yfn in sorted(yaml_files):
@@ -110,6 +160,18 @@ def run(script_args: list) -> int:
             domain_info.append(domain)
             print(" ", color("bold_red", domain + ":"), color("red", "", reset="red"))
             dump_dict(config, reset="red")
+            print(color("reset"))
+
+    if res["warn"]:
+        print(color("bold_white", "Incorrect config"))
+        for domain, config in res["warn"].items():
+            domain_info.append(domain)
+            print(
+                " ",
+                color("bold_yellow", domain + ":"),
+                color("yellow", "", reset="yellow"),
+            )
+            dump_dict(config, reset="yellow")
             print(color("reset"))
 
     if domain_info:
@@ -147,7 +209,8 @@ def run(script_args: list) -> int:
                 continue
             print(" -", skey + ":", sval)
 
-    return len(res["except"])
+    # Determine final exit code
+    return 1 if res["except"] or (args.fail_on_warnings and res["warn"]) else 0
 
 
 def check(config_dir, secrets=False):
@@ -156,18 +219,19 @@ def check(config_dir, secrets=False):
     res: dict[str, Any] = {
         "yaml_files": OrderedDict(),  # yaml_files loaded
         "secrets": OrderedDict(),  # secret cache and secrets loaded
-        "except": OrderedDict(),  # exceptions raised (with config)
-        #'components' is a HomeAssistantConfig  # noqa: E265
+        "except": OrderedDict(),  # critical exceptions raised (with config)
+        "warn": OrderedDict(),  # non critical exceptions raised (with config)
+        #'components' is a HomeAssistantConfig
         "secret_cache": {},
     }
 
-    # pylint: disable=possibly-unused-variable
+    # pylint: disable-next=possibly-unused-variable
     def mock_load(filename, secrets=None):
         """Mock hass.util.load_yaml to save config file names."""
         res["yaml_files"][filename] = True
         return MOCKS["load"][1](filename, secrets)
 
-    # pylint: disable=possibly-unused-variable
+    # pylint: disable-next=possibly-unused-variable
     def mock_secrets(ldr, node):
         """Mock _get_secrets."""
         try:
@@ -196,12 +260,14 @@ def check(config_dir, secrets=False):
 
     def secrets_proxy(*args):
         secrets = Secrets(*args)
-        res["secret_cache"] = secrets._cache
+        res["secret_cache"] = secrets._cache  # noqa: SLF001
         return secrets
 
     try:
         with patch.object(yaml_loader, "Secrets", secrets_proxy):
-            res["components"] = asyncio.run(async_check_config(config_dir))
+            res["components"] = asyncio.run(
+                async_check_config(config_dir), loop_factory=runner.create_event_loop
+            )
         res["secret_cache"] = {
             str(key): val for key, val in res["secret_cache"].items()
         }
@@ -211,7 +277,13 @@ def check(config_dir, secrets=False):
             if err.config:
                 res["except"].setdefault(domain, []).append(err.config)
 
-    except Exception as err:  # pylint: disable=broad-except
+        for err in res["components"].warnings:
+            domain = err.domain or WARNING_STR
+            res["warn"].setdefault(domain, []).append(err.message)
+            if err.config:
+                res["warn"].setdefault(domain, []).append(err.config)
+
+    except Exception as err:  # noqa: BLE001
         print(color("red", "Fatal error while loading config:"), str(err))
         res["except"].setdefault(ERROR_STR, []).append(str(err))
     finally:
@@ -227,12 +299,16 @@ def check(config_dir, secrets=False):
 
 async def async_check_config(config_dir):
     """Check the HA config."""
-    hass = core.HomeAssistant()
-    hass.config.config_dir = config_dir
+    hass = core.HomeAssistant(config_dir)
+    loader.async_setup(hass)
     hass.config_entries = ConfigEntries(hass, {})
-    await area_registry.async_load(hass)
-    await device_registry.async_load(hass)
-    await entity_registry.async_load(hass)
+    # The device registry migration waits for the config entries to load
+    await hass.config_entries.async_initialize()
+    dr.async_setup(hass)
+    await ar.async_load(hass)
+    await dr.async_load(hass)
+    await er.async_load(hass)
+    await ir.async_load(hass, read_only=True)
     components = await async_check_ha_config_file(hass)
     await hass.async_stop(force=True)
     return components
@@ -265,13 +341,13 @@ def dump_dict(layer, indent_count=3, listi=False, **kwargs):
         for key, value in sorted(layer.items(), key=sort_dict_key):
             if isinstance(value, (dict, list)):
                 print(indent_str, str(key) + ":", line_info(value, **kwargs))
-                dump_dict(value, indent_count + 2)
+                dump_dict(value, indent_count + 2, **kwargs)
             else:
-                print(indent_str, str(key) + ":", value)
+                print(indent_str, str(key) + ":", value, line_info(key, **kwargs))
             indent_str = indent_count * " "
     if isinstance(layer, Sequence):
         for i in layer:
             if isinstance(i, dict):
-                dump_dict(i, indent_count + 2, True)
+                dump_dict(i, indent_count + 2, True, **kwargs)
             else:
                 print(" ", indent_str, i)

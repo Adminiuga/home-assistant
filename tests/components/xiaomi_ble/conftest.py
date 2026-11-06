@@ -1,5 +1,6 @@
 """Session fixtures."""
 
+from collections.abc import Generator
 from unittest import mock
 
 import pytest
@@ -18,9 +19,8 @@ class MockBleakClient:
 
     services = MockServices()
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, **kwargs) -> None:
         """Mock BleakClient."""
-        pass
 
     async def __aenter__(self, *args, **kwargs):
         """Mock BleakClient.__aenter__."""
@@ -28,15 +28,12 @@ class MockBleakClient:
 
     async def __aexit__(self, *args, **kwargs):
         """Mock BleakClient.__aexit__."""
-        pass
 
     async def connect(self, *args, **kwargs):
         """Mock BleakClient.connect."""
-        pass
 
     async def disconnect(self, *args, **kwargs):
         """Mock BleakClient.disconnect."""
-        pass
 
 
 class MockBleakClientBattery5(MockBleakClient):
@@ -48,7 +45,7 @@ class MockBleakClientBattery5(MockBleakClient):
 
 
 @pytest.fixture(autouse=True)
-def mock_bluetooth(enable_bluetooth):
+def mock_bluetooth(enable_bluetooth: None) -> Generator[None]:
     """Auto mock bluetooth."""
 
     with mock.patch("xiaomi_ble.parser.BleakClient", MockBleakClientBattery5):

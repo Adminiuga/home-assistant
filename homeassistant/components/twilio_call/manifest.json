@@ -1,9 +1,12 @@
 {
   "domain": "twilio_call",
   "name": "Twilio Call",
-  "documentation": "https://www.home-assistant.io/integrations/twilio_call",
-  "dependencies": ["twilio"],
+  "categories": ["messaging_notifications.email_sms_calls"],
   "codeowners": [],
+  "connectivity": ["cloud"],
+  "dependencies": ["twilio"],
+  "documentation": "https://www.home-assistant.io/integrations/twilio_call",
   "iot_class": "cloud_push",
-  "loggers": ["twilio"]
+  "loggers": ["twilio"],
+  "quality_scale": "legacy"
 }

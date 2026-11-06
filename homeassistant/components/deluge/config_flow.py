@@ -1,24 +1,16 @@
 """Config flow for the Deluge integration."""
-from __future__ import annotations
 
 from collections.abc import Mapping
-import socket
+import logging
 from ssl import SSLError
-from typing import Any
+from typing import Any, override
 
 from deluge_client.client import DelugeRPCClient
-import voluptuous as vol
+import probatio
 
-from homeassistant.config_entries import SOURCE_REAUTH, ConfigFlow
-from homeassistant.const import (
-    CONF_HOST,
-    CONF_PASSWORD,
-    CONF_PORT,
-    CONF_SOURCE,
-    CONF_USERNAME,
-)
-from homeassistant.data_entry_flow import FlowResult
-import homeassistant.helpers.config_validation as cv
+from homeassistant.config_entries import SOURCE_REAUTH, ConfigFlow, ConfigFlowResult
+from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_PORT, CONF_USERNAME
+from homeassistant.helpers import config_validation as cv
 
 from .const import (
     CONF_WEB_PORT,
@@ -28,13 +20,16 @@ from .const import (
     DOMAIN,
 )
 
+_LOGGER = logging.getLogger(__name__)
+
 
 class DelugeFlowHandler(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Deluge."""
 
+    @override
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle a flow initiated by the user."""
         errors = {}
 
@@ -45,12 +40,10 @@ class DelugeFlowHandler(ConfigFlow, domain=DOMAIN):
                         user_input[CONF_HOST] == entry.data[CONF_HOST]
                         and user_input[CONF_PORT] == entry.data[CONF_PORT]
                     ):
-                        if self.context.get(CONF_SOURCE) == SOURCE_REAUTH:
-                            self.hass.config_entries.async_update_entry(
+                        if self.source == SOURCE_REAUTH:
+                            return self.async_update_reload_and_abort(
                                 entry, data=user_input
                             )
-                            await self.hass.config_entries.async_reload(entry.entry_id)
-                            return self.async_abort(reason="reauth_successful")
                         return self.async_abort(reason="already_configured")
                 return self.async_create_entry(
                     title=DEFAULT_NAME,
@@ -58,17 +51,21 @@ class DelugeFlowHandler(ConfigFlow, domain=DOMAIN):
                 )
             errors["base"] = error
         user_input = user_input or {}
-        schema = vol.Schema(
+        schema = probatio.Schema(
             {
-                vol.Required(CONF_HOST, default=user_input.get(CONF_HOST)): cv.string,
-                vol.Required(
+                probatio.Required(
+                    CONF_HOST, default=user_input.get(CONF_HOST)
+                ): cv.string,
+                probatio.Required(
                     CONF_USERNAME, default=user_input.get(CONF_USERNAME)
                 ): cv.string,
-                vol.Required(CONF_PASSWORD, default=""): cv.string,
-                vol.Optional(
+                probatio.Required(
+                    probatio.Secret(CONF_PASSWORD), default=""
+                ): cv.string,
+                probatio.Optional(
                     CONF_PORT, default=user_input.get(CONF_PORT, DEFAULT_RPC_PORT)
                 ): int,
-                vol.Optional(
+                probatio.Optional(
                     CONF_WEB_PORT,
                     default=user_input.get(CONF_WEB_PORT, DEFAULT_WEB_PORT),
                 ): int,
@@ -76,7 +73,9 @@ class DelugeFlowHandler(ConfigFlow, domain=DOMAIN):
         )
         return self.async_show_form(step_id="user", data_schema=schema, errors=errors)
 
-    async def async_step_reauth(self, entry_data: Mapping[str, Any]) -> FlowResult:
+    async def async_step_reauth(
+        self, entry_data: Mapping[str, Any]
+    ) -> ConfigFlowResult:
         """Handle a reauthorization flow request."""
         return await self.async_step_user()
 
@@ -87,18 +86,15 @@ class DelugeFlowHandler(ConfigFlow, domain=DOMAIN):
         username = user_input[CONF_USERNAME]
         password = user_input[CONF_PASSWORD]
         api = DelugeRPCClient(
-            host=host, port=port, username=username, password=password
+            host=host, port=port, username=username, password=password, decode_utf8=True
         )
         try:
             await self.hass.async_add_executor_job(api.connect)
-        except (
-            ConnectionRefusedError,
-            socket.timeout,
-            SSLError,
-        ):
+        except ConnectionRefusedError, TimeoutError, SSLError:
             return "cannot_connect"
-        except Exception as ex:  # pylint:disable=broad-except
+        except Exception as ex:
+            _LOGGER.exception("Unexpected error")
             if type(ex).__name__ == "BadLoginError":
-                return "invalid_auth"  # pragma: no cover
+                return "invalid_auth"
             return "unknown"
         return None

@@ -1,4 +1,7 @@
 """Hue sensor entities."""
+
+from typing import Any, override
+
 from aiohue.v1.sensors import (
     TYPE_ZLL_LIGHTLEVEL,
     TYPE_ZLL_ROTARY,
@@ -11,10 +14,11 @@ from homeassistant.components.sensor import (
     SensorEntity,
     SensorStateClass,
 )
-from homeassistant.const import LIGHT_LUX, PERCENTAGE, TEMP_CELSIUS
-from homeassistant.helpers.entity import EntityCategory
+from homeassistant.const import LIGHT_LUX, PERCENTAGE, EntityCategory, UnitOfTemperature
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from ..const import DOMAIN as HUE_DOMAIN
+from ..bridge import HueConfigEntry
 from .sensor_base import SENSOR_CONFIG_MAP, GenericHueSensor, GenericZLLSensor
 
 LIGHT_LEVEL_NAME_FORMAT = "{} light level"
@@ -22,9 +26,13 @@ REMOTE_NAME_FORMAT = "{} battery level"
 TEMPERATURE_NAME_FORMAT = "{} temperature"
 
 
-async def async_setup_entry(hass, config_entry, async_add_entities):
+async def async_setup_entry(
+    hass: HomeAssistant,
+    config_entry: HueConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
     """Defer sensor setup to the shared sensor module."""
-    bridge = hass.data[HUE_DOMAIN][config_entry.entry_id]
+    bridge = config_entry.runtime_data
 
     if not bridge.sensor_manager:
         return
@@ -32,10 +40,12 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
     await bridge.sensor_manager.async_register_component("sensor", async_add_entities)
 
 
+# pylint: disable-next=home-assistant-enforce-class-module
 class GenericHueGaugeSensorEntity(GenericZLLSensor, SensorEntity):
     """Parent class for all 'gauge' Hue device sensors."""
 
 
+# pylint: disable-next=home-assistant-enforce-class-module
 class HueLightLevel(GenericHueGaugeSensorEntity):
     """The light level sensor entity for a Hue motion sensor device."""
 
@@ -43,6 +53,7 @@ class HueLightLevel(GenericHueGaugeSensorEntity):
     _attr_native_unit_of_measurement = LIGHT_LUX
 
     @property
+    @override
     def native_value(self):
         """Return the state of the device."""
         if self.sensor.lightlevel is None:
@@ -56,7 +67,8 @@ class HueLightLevel(GenericHueGaugeSensorEntity):
         return round(float(10 ** ((self.sensor.lightlevel - 1) / 10000)), 2)
 
     @property
-    def extra_state_attributes(self):
+    @override
+    def extra_state_attributes(self) -> dict[str, Any]:
         """Return the device state attributes."""
         attributes = super().extra_state_attributes
         attributes.update(
@@ -71,14 +83,16 @@ class HueLightLevel(GenericHueGaugeSensorEntity):
         return attributes
 
 
+# pylint: disable-next=home-assistant-enforce-class-module
 class HueTemperature(GenericHueGaugeSensorEntity):
     """The temperature sensor entity for a Hue motion sensor device."""
 
     _attr_device_class = SensorDeviceClass.TEMPERATURE
     _attr_state_class = SensorStateClass.MEASUREMENT
-    _attr_native_unit_of_measurement = TEMP_CELSIUS
+    _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
 
     @property
+    @override
     def native_value(self):
         """Return the state of the device."""
         if self.sensor.temperature is None:
@@ -87,6 +101,7 @@ class HueTemperature(GenericHueGaugeSensorEntity):
         return self.sensor.temperature / 100
 
 
+# pylint: disable-next=home-assistant-enforce-class-module
 class HueBattery(GenericHueSensor, SensorEntity):
     """Battery class for when a batt-powered device is only represented as an event."""
 
@@ -96,11 +111,13 @@ class HueBattery(GenericHueSensor, SensorEntity):
     _attr_entity_category = EntityCategory.DIAGNOSTIC
 
     @property
+    @override
     def unique_id(self):
         """Return a unique identifier for this device."""
         return f"{self.sensor.uniqueid}-battery"
 
     @property
+    @override
     def native_value(self):
         """Return the state of the battery."""
         return self.sensor.battery

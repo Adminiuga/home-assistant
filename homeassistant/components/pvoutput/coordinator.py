@@ -1,7 +1,16 @@
 """DataUpdateCoordinator for the PVOutput integration."""
-from __future__ import annotations
 
-from pvo import PVOutput, PVOutputAuthenticationError, PVOutputNoDataError, Status
+from typing import override
+
+from pvo import (
+    PVOutput,
+    PVOutputAuthenticationError,
+    PVOutputConnectionError,
+    PVOutputError,
+    PVOutputNoDataError,
+    Status,
+    System,
+)
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_API_KEY
@@ -12,28 +21,70 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 
 from .const import CONF_SYSTEM_ID, DOMAIN, LOGGER, SCAN_INTERVAL
 
+type PvOutputConfigEntry = ConfigEntry[PVOutputDataUpdateCoordinator]
+
 
 class PVOutputDataUpdateCoordinator(DataUpdateCoordinator[Status]):
     """The PVOutput Data Update Coordinator."""
 
-    config_entry: ConfigEntry
+    config_entry: PvOutputConfigEntry
+    system: System
 
-    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
+    def __init__(self, hass: HomeAssistant, entry: PvOutputConfigEntry) -> None:
         """Initialize the PVOutput coordinator."""
-        self.config_entry = entry
         self.pvoutput = PVOutput(
             api_key=entry.data[CONF_API_KEY],
             system_id=entry.data[CONF_SYSTEM_ID],
             session=async_get_clientsession(hass),
         )
 
-        super().__init__(hass, LOGGER, name=DOMAIN, update_interval=SCAN_INTERVAL)
+        super().__init__(
+            hass, LOGGER, config_entry=entry, name=DOMAIN, update_interval=SCAN_INTERVAL
+        )
 
+    @override
+    async def _async_setup(self) -> None:
+        """Fetch the system information once, it does not change at runtime."""
+        try:
+            self.system = await self.pvoutput.system()
+        except PVOutputAuthenticationError as err:
+            raise ConfigEntryAuthFailed(
+                translation_domain=DOMAIN,
+                translation_key="authentication_failed",
+            ) from err
+        except PVOutputConnectionError as err:
+            raise UpdateFailed(
+                translation_domain=DOMAIN,
+                translation_key="communication_error",
+            ) from err
+        except PVOutputError as err:
+            raise UpdateFailed(
+                translation_domain=DOMAIN,
+                translation_key="unknown_error",
+            ) from err
+
+    @override
     async def _async_update_data(self) -> Status:
         """Fetch system status from PVOutput."""
         try:
             return await self.pvoutput.status()
-        except PVOutputNoDataError as err:
-            raise UpdateFailed("PVOutput has no data available") from err
         except PVOutputAuthenticationError as err:
-            raise ConfigEntryAuthFailed from err
+            raise ConfigEntryAuthFailed(
+                translation_domain=DOMAIN,
+                translation_key="authentication_failed",
+            ) from err
+        except PVOutputNoDataError as err:
+            raise UpdateFailed(
+                translation_domain=DOMAIN,
+                translation_key="no_data_available",
+            ) from err
+        except PVOutputConnectionError as err:
+            raise UpdateFailed(
+                translation_domain=DOMAIN,
+                translation_key="communication_error",
+            ) from err
+        except PVOutputError as err:
+            raise UpdateFailed(
+                translation_domain=DOMAIN,
+                translation_key="unknown_error",
+            ) from err

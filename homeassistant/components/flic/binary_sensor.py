@@ -1,13 +1,15 @@
 """Support to use flic buttons as a binary sensor."""
-from __future__ import annotations
 
 import logging
 import threading
 
+import probatio
 import pyflic
-import voluptuous as vol
 
-from homeassistant.components.binary_sensor import PLATFORM_SCHEMA, BinarySensorEntity
+from homeassistant.components.binary_sensor import (
+    PLATFORM_SCHEMA as BINARY_SENSOR_PLATFORM_SCHEMA,
+    BinarySensorEntity,
+)
 from homeassistant.const import (
     CONF_DISCOVERY,
     CONF_HOST,
@@ -16,7 +18,7 @@ from homeassistant.const import (
     EVENT_HOMEASSISTANT_STOP,
 )
 from homeassistant.core import HomeAssistant
-import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.device_registry import format_mac
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
@@ -41,14 +43,14 @@ EVENT_DATA_ADDRESS = "button_address"
 EVENT_DATA_TYPE = "click_type"
 EVENT_DATA_QUEUED_TIME = "queued_time"
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
+PLATFORM_SCHEMA = BINARY_SENSOR_PLATFORM_SCHEMA.extend(
     {
-        vol.Optional(CONF_HOST, default=DEFAULT_HOST): cv.string,
-        vol.Optional(CONF_PORT, default=DEFAULT_PORT): cv.port,
-        vol.Optional(CONF_DISCOVERY, default=True): cv.boolean,
-        vol.Optional(CONF_TIMEOUT, default=DEFAULT_TIMEOUT): cv.positive_int,
-        vol.Optional(CONF_IGNORED_CLICK_TYPES): vol.All(
-            cv.ensure_list, [vol.In(CLICK_TYPES)]
+        probatio.Optional(CONF_HOST, default=DEFAULT_HOST): cv.string,
+        probatio.Optional(CONF_PORT, default=DEFAULT_PORT): probatio.Port(),
+        probatio.Optional(CONF_DISCOVERY, default=True): cv.boolean,
+        probatio.Optional(CONF_TIMEOUT, default=DEFAULT_TIMEOUT): cv.positive_int,
+        probatio.Optional(CONF_IGNORED_CLICK_TYPES): probatio.All(
+            probatio.EnsureList(), [probatio.In(CLICK_TYPES)]
         ),
     }
 )
@@ -104,7 +106,7 @@ def start_scanning(config, add_entities, client):
     def scan_completed_callback(scan_wizard, result, address, name):
         """Restart scan wizard to constantly check for new buttons."""
         if result == pyflic.ScanWizardResult.WizardSuccess:
-            _LOGGER.info("Found new button %s", address)
+            _LOGGER.debug("Found new button %s", address)
         elif result != pyflic.ScanWizardResult.WizardFailedTimeout:
             _LOGGER.warning(
                 "Failed to connect to button %s. Reason: %s", address, result
@@ -128,7 +130,7 @@ def setup_button(
     timeout: int = config[CONF_TIMEOUT]
     ignored_click_types: list[str] | None = config.get(CONF_IGNORED_CLICK_TYPES)
     button = FlicButton(hass, client, address, timeout, ignored_click_types)
-    _LOGGER.info("Connected to button %s", address)
+    _LOGGER.debug("Connected to button %s", address)
 
     add_entities([button])
 
@@ -199,7 +201,7 @@ class FlicButton(BinarySensorEntity):
                 time_string,
             )
             return True
-        _LOGGER.info(
+        _LOGGER.debug(
             "Queued %s allowed for %s. Time in queue was %s",
             click_type,
             self._address,

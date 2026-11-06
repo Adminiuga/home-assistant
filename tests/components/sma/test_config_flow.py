@@ -1,139 +1,563 @@
 """Test the sma config flow."""
-from unittest.mock import patch
 
-from pysma.exceptions import (
-    SmaAuthenticationException,
-    SmaConnectionException,
-    SmaReadException,
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from pysma import SmaAuthenticationException, SmaConnectionException, SmaReadException
+from pysma.helpers import DeviceInfo
+import pytest
+from pytest_homeassistant.plugins import MockConfigEntry
+
+from homeassistant.components.sma.const import CONF_GROUP, DOMAIN
+from homeassistant.config_entries import SOURCE_DHCP, SOURCE_USER
+from homeassistant.const import (
+    CONF_HOST,
+    CONF_MAC,
+    CONF_PASSWORD,
+    CONF_SSL,
+    CONF_VERIFY_SSL,
+)
+from homeassistant.core import HomeAssistant
+from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.helpers.device_registry import format_mac
+from homeassistant.helpers.service_info.dhcp import DhcpServiceInfo
+
+from . import (
+    MOCK_DEVICE,
+    MOCK_DHCP_DISCOVERY,
+    MOCK_DHCP_DISCOVERY_INPUT,
+    MOCK_USER_INPUT,
+    MOCK_USER_REAUTH,
+    MOCK_USER_RECONFIGURE,
 )
 
-from homeassistant.components.sma.const import DOMAIN
-from homeassistant.config_entries import SOURCE_USER
-from homeassistant.data_entry_flow import FlowResultType
+DHCP_DISCOVERY = DhcpServiceInfo(
+    ip="1.1.1.1",
+    hostname="SMA123456",
+    macaddress="0015bb00abcd",
+)
 
-from . import MOCK_DEVICE, MOCK_USER_INPUT, _patch_async_setup_entry
+DHCP_DISCOVERY_DUPLICATE = DhcpServiceInfo(
+    ip="1.1.1.1",
+    hostname="SMA123456789",
+    macaddress="0015bb00abcd",
+)
+
+DHCP_DISCOVERY_DUPLICATE_001 = DhcpServiceInfo(
+    ip="1.1.1.1",
+    hostname="SMA123456789-001",
+    macaddress="0015bb00abcd",
+)
 
 
-async def test_form(hass):
+async def test_form(
+    hass: HomeAssistant, mock_setup_entry: AsyncMock, mock_sma_client: MagicMock
+) -> None:
     """Test we get the form."""
 
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": SOURCE_USER}
     )
-    assert result["type"] == FlowResultType.FORM
+    assert result["type"] is FlowResultType.FORM
     assert result["errors"] == {}
 
-    with patch("pysma.SMA.new_session", return_value=True), patch(
-        "pysma.SMA.device_info", return_value=MOCK_DEVICE
-    ), _patch_async_setup_entry() as mock_setup_entry:
-        result = await hass.config_entries.flow.async_configure(
-            result["flow_id"],
-            MOCK_USER_INPUT,
-        )
-        await hass.async_block_till_done()
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        MOCK_USER_INPUT,
+    )
+    await hass.async_block_till_done()
 
-    assert result["type"] == FlowResultType.CREATE_ENTRY
+    assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["title"] == MOCK_USER_INPUT["host"]
     assert result["data"] == MOCK_USER_INPUT
+    assert result["result"].unique_id == str(MOCK_DEVICE.serial)
 
     assert len(mock_setup_entry.mock_calls) == 1
 
 
-async def test_form_cannot_connect(hass):
+@pytest.mark.parametrize(
+    ("exception", "error"),
+    [
+        (SmaConnectionException, "cannot_connect"),
+        (SmaAuthenticationException, "invalid_auth"),
+        (SmaReadException, "cannot_retrieve_device_info"),
+        (Exception, "unknown"),
+    ],
+)
+@pytest.mark.usefixtures("mock_setup_entry")
+async def test_form_exceptions(
+    hass: HomeAssistant,
+    mock_sma_client: MagicMock,
+    exception: Exception,
+    error: str,
+) -> None:
     """Test we handle cannot connect error."""
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": SOURCE_USER}
     )
 
-    with patch(
-        "pysma.SMA.new_session", side_effect=SmaConnectionException
-    ), _patch_async_setup_entry() as mock_setup_entry:
-        result = await hass.config_entries.flow.async_configure(
-            result["flow_id"],
-            MOCK_USER_INPUT,
-        )
+    mock_sma_client.new_session.side_effect = exception
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        MOCK_USER_INPUT,
+    )
 
-    assert result["type"] == FlowResultType.FORM
-    assert result["errors"] == {"base": "cannot_connect"}
-    assert len(mock_setup_entry.mock_calls) == 0
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": error}
+
+    mock_sma_client.new_session.side_effect = None
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        MOCK_USER_INPUT,
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
 
 
-async def test_form_invalid_auth(hass):
-    """Test we handle invalid auth error."""
+@pytest.mark.usefixtures("mock_setup_entry")
+async def test_form_device_info_error_closes_session(
+    hass: HomeAssistant, mock_sma_client: MagicMock
+) -> None:
+    """Test the session is closed when reading the device info fails."""
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": SOURCE_USER}
     )
 
-    with patch(
-        "pysma.SMA.new_session", side_effect=SmaAuthenticationException
-    ), _patch_async_setup_entry() as mock_setup_entry:
-        result = await hass.config_entries.flow.async_configure(
-            result["flow_id"],
-            MOCK_USER_INPUT,
-        )
-
-    assert result["type"] == FlowResultType.FORM
-    assert result["errors"] == {"base": "invalid_auth"}
-    assert len(mock_setup_entry.mock_calls) == 0
-
-
-async def test_form_cannot_retrieve_device_info(hass):
-    """Test we handle cannot retrieve device info error."""
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": SOURCE_USER}
+    mock_sma_client.device_info.side_effect = SmaReadException
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        MOCK_USER_INPUT,
     )
 
-    with patch("pysma.SMA.new_session", return_value=True), patch(
-        "pysma.SMA.read", side_effect=SmaReadException
-    ), _patch_async_setup_entry() as mock_setup_entry:
-        result = await hass.config_entries.flow.async_configure(
-            result["flow_id"],
-            MOCK_USER_INPUT,
-        )
-
-    assert result["type"] == FlowResultType.FORM
+    assert result["type"] is FlowResultType.FORM
     assert result["errors"] == {"base": "cannot_retrieve_device_info"}
-    assert len(mock_setup_entry.mock_calls) == 0
+    mock_sma_client.close_session.assert_called_once()
+
+    mock_sma_client.device_info.side_effect = None
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        MOCK_USER_INPUT,
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert mock_sma_client.close_session.call_count == 2
 
 
-async def test_form_unexpected_exception(hass):
-    """Test we handle unexpected exception."""
+@pytest.mark.usefixtures("mock_setup_entry")
+async def test_form_already_configured(
+    hass: HomeAssistant, mock_sma_client: AsyncMock
+) -> None:
+    """Test starting a flow by user when already configured."""
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_USER_INPUT, unique_id="123456789")
+    entry.add_to_hass(hass)
+
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": SOURCE_USER}
     )
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "user"
 
-    with patch(
-        "pysma.SMA.new_session", side_effect=Exception
-    ), _patch_async_setup_entry() as mock_setup_entry:
-        result = await hass.config_entries.flow.async_configure(
-            result["flow_id"],
-            MOCK_USER_INPUT,
-        )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input=MOCK_USER_INPUT,
+    )
+    await hass.async_block_till_done()
 
-    assert result["type"] == FlowResultType.FORM
-    assert result["errors"] == {"base": "unknown"}
-    assert len(mock_setup_entry.mock_calls) == 0
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "already_configured"
 
 
-async def test_form_already_configured(hass, mock_config_entry):
-    """Test starting a flow by user when already configured."""
+@pytest.mark.usefixtures("mock_setup_entry")
+async def test_dhcp_discovery(hass: HomeAssistant, mock_sma_client: AsyncMock) -> None:
+    """Test we can setup from dhcp discovery."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": SOURCE_DHCP},
+        data=DHCP_DISCOVERY,
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "discovery_confirm"
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        MOCK_DHCP_DISCOVERY_INPUT,
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["title"] == MOCK_DHCP_DISCOVERY["host"]
+    assert result["data"] == MOCK_DHCP_DISCOVERY
+    assert result["result"].unique_id == DHCP_DISCOVERY.hostname.replace("SMA", "")
+
+
+@pytest.mark.usefixtures("mock_setup_entry")
+async def test_dhcp_already_configured(
+    hass: HomeAssistant, mock_config_entry: MockConfigEntry
+) -> None:
+    """Test starting a flow by dhcp when already configured."""
+    mock_config_entry.add_to_hass(hass)
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_DHCP}, data=DHCP_DISCOVERY_DUPLICATE
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "already_configured"
+
+
+@pytest.mark.usefixtures("mock_setup_entry")
+async def test_dhcp_updates_host(
+    hass: HomeAssistant, mock_config_entry: MockConfigEntry
+) -> None:
+    """Test DHCP discovery updates the host of a device that changed IP address."""
     mock_config_entry.add_to_hass(hass)
 
     result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": SOURCE_USER}
+        DOMAIN,
+        context={"source": SOURCE_DHCP},
+        data=DhcpServiceInfo(
+            ip="1.1.1.2", hostname="SMA123456789", macaddress="0015bb00abcd"
+        ),
     )
 
-    with patch("pysma.SMA.new_session", return_value=True), patch(
-        "pysma.SMA.device_info", return_value=MOCK_DEVICE
-    ), patch(
-        "pysma.SMA.close_session", return_value=True
-    ), _patch_async_setup_entry() as mock_setup_entry:
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "already_configured"
+    assert mock_config_entry.data[CONF_HOST] == "1.1.1.2"
+
+
+async def test_dhcp_already_configured_duplicate(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_sma_client: MagicMock,
+) -> None:
+    """Test starting a flow by DHCP when already configured and MAC is added."""
+    mock_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert CONF_MAC not in mock_config_entry.data
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": SOURCE_DHCP},
+        data=DHCP_DISCOVERY_DUPLICATE_001,
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "already_configured"
+    await hass.async_block_till_done()
+
+    assert mock_config_entry.data.get(CONF_MAC) == format_mac(
+        DHCP_DISCOVERY_DUPLICATE_001.macaddress
+    )
+
+
+@pytest.mark.parametrize(
+    ("hostname", "result_type"),
+    [
+        pytest.param("SMA987654321", FlowResultType.FORM, id="other_serial"),
+        pytest.param("evcharger", FlowResultType.ABORT, id="not_sma"),
+    ],
+)
+async def test_dhcp_other_device_on_same_host(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    hostname: str,
+    result_type: FlowResultType,
+) -> None:
+    """Test another device on the host of an entry doesn't change that entry."""
+    mock_config_entry.add_to_hass(hass)
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": SOURCE_DHCP},
+        data=DhcpServiceInfo(
+            ip=mock_config_entry.data[CONF_HOST],
+            hostname=hostname,
+            macaddress="0015bb00ffff",
+        ),
+    )
+
+    assert result["type"] is result_type
+    assert CONF_MAC not in mock_config_entry.data
+
+
+@pytest.mark.parametrize(
+    ("hostname", "unique_id"),
+    [
+        pytest.param("SMA123456789", "123456789", id="serial"),
+        pytest.param("SMA-123456789", "123456789", id="dash_serial"),
+        pytest.param("sma123456789-2856", "123456789", id="serial_suffix"),
+    ],
+)
+@pytest.mark.usefixtures("mock_setup_entry")
+async def test_dhcp_hostname_serial(
+    hass: HomeAssistant, hostname: str, unique_id: str
+) -> None:
+    """Test the serial number is read from the DHCP hostname."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": SOURCE_DHCP},
+        data=DhcpServiceInfo(
+            ip="1.1.1.2", hostname=hostname, macaddress="0015bb00abcd"
+        ),
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "discovery_confirm"
+    flow = hass.config_entries.flow.async_get(result["flow_id"])
+    assert flow["context"]["unique_id"] == unique_id
+
+
+@pytest.mark.parametrize(
+    "hostname",
+    [
+        pytest.param("SMA", id="prefix_only"),
+        pytest.param("SMA-EVCharger", id="name"),
+        pytest.param("smaevc22", id="no_serial"),
+        pytest.param("sma12abc", id="partial_serial"),
+    ],
+)
+async def test_dhcp_not_supported(hass: HomeAssistant, hostname: str) -> None:
+    """Test DHCP discovery aborts for hostnames without a serial number."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": SOURCE_DHCP},
+        data=DhcpServiceInfo(
+            ip="1.1.1.2", hostname=hostname, macaddress="0015bb00abcd"
+        ),
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "not_supported"
+
+
+@pytest.mark.parametrize(
+    ("exception", "error"),
+    [
+        (SmaConnectionException, "cannot_connect"),
+        (SmaAuthenticationException, "invalid_auth"),
+        (SmaReadException, "cannot_retrieve_device_info"),
+        (Exception, "unknown"),
+    ],
+)
+@pytest.mark.usefixtures("mock_setup_entry")
+async def test_dhcp_exceptions(
+    hass: HomeAssistant, mock_sma_client: AsyncMock, exception: Exception, error: str
+) -> None:
+    """Test we handle cannot connect error in DHCP flow."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": SOURCE_DHCP},
+        data=DHCP_DISCOVERY,
+    )
+
+    with patch("homeassistant.components.sma.config_flow.SMAWebConnect") as mock_sma:
+        mock_sma_instance = mock_sma.return_value
+        mock_sma_instance.new_session = AsyncMock(side_effect=exception)
 
         result = await hass.config_entries.flow.async_configure(
             result["flow_id"],
-            MOCK_USER_INPUT,
+            MOCK_DHCP_DISCOVERY_INPUT,
         )
 
-    assert result["type"] == FlowResultType.ABORT
-    assert result["reason"] == "already_configured"
-    assert len(mock_setup_entry.mock_calls) == 0
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": error}
+
+    with patch("homeassistant.components.sma.config_flow.SMAWebConnect") as mock_sma:
+        mock_sma_instance = mock_sma.return_value
+        mock_sma_instance.new_session = AsyncMock(return_value=True)
+        mock_sma_instance.device_info = AsyncMock(return_value=MOCK_DEVICE)
+        mock_sma_instance.close_session = AsyncMock(return_value=True)
+
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            MOCK_DHCP_DISCOVERY_INPUT,
+        )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["title"] == MOCK_DHCP_DISCOVERY["host"]
+    assert result["data"] == MOCK_DHCP_DISCOVERY
+    assert result["result"].unique_id == DHCP_DISCOVERY.hostname.replace("SMA", "")
+
+
+async def test_full_flow_reauth(
+    hass: HomeAssistant, mock_setup_entry: MockConfigEntry, mock_sma_client: AsyncMock
+) -> None:
+    """Test the full flow of the config flow."""
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_USER_INPUT, unique_id="123456789")
+    entry.add_to_hass(hass)
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
+    )
+
+    result = await entry.start_reauth_flow(hass)
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "reauth_confirm"
+
+    # There is no user input
+    result = await hass.config_entries.flow.async_configure(result["flow_id"])
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "reauth_confirm"
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        MOCK_USER_REAUTH,
+    )
+    await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reauth_successful"
+    assert len(mock_setup_entry.mock_calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("exception", "error"),
+    [
+        (SmaConnectionException, "cannot_connect"),
+        (SmaAuthenticationException, "invalid_auth"),
+        (SmaReadException, "cannot_retrieve_device_info"),
+        (Exception, "unknown"),
+    ],
+)
+@pytest.mark.usefixtures("mock_setup_entry")
+async def test_reauth_flow_exceptions(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    exception: Exception,
+    error: str,
+) -> None:
+    """Test we handle errors during reauth flow properly."""
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_USER_INPUT, unique_id="123456789")
+    entry.add_to_hass(hass)
+
+    result = await entry.start_reauth_flow(hass)
+
+    with patch("homeassistant.components.sma.config_flow.SMAWebConnect") as mock_sma:
+        mock_sma_instance = mock_sma.return_value
+        mock_sma_instance.new_session = AsyncMock(side_effect=exception)
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            MOCK_USER_REAUTH,
+        )
+
+        assert result["type"] is FlowResultType.FORM
+        assert result["errors"] == {"base": error}
+        assert result["step_id"] == "reauth_confirm"
+
+        mock_sma_instance.new_session = AsyncMock(return_value=True)
+        mock_sma_instance.device_info = AsyncMock(return_value=MOCK_DEVICE)
+        mock_sma_instance.close_session = AsyncMock(return_value=True)
+
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            MOCK_USER_REAUTH,
+        )
+        await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reauth_successful"
+
+
+async def test_full_flow_reconfigure(
+    hass: HomeAssistant,
+    mock_setup_entry: MockConfigEntry,
+    mock_sma_client: AsyncMock,
+) -> None:
+    """Test the full flow of the config flow."""
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_USER_INPUT, unique_id="123456789")
+    entry.add_to_hass(hass)
+    result = await entry.start_reconfigure_flow(hass)
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "reconfigure"
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input=MOCK_USER_RECONFIGURE,
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    assert entry.data[CONF_HOST] == "1.1.1.2"
+    assert entry.data[CONF_SSL] is True
+    assert entry.data[CONF_VERIFY_SSL] is False
+    assert entry.data[CONF_GROUP] == "user"
+    assert entry.data[CONF_PASSWORD] == "new_password"
+    assert len(mock_setup_entry.mock_calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("exception", "error"),
+    [
+        (SmaConnectionException, "cannot_connect"),
+        (SmaAuthenticationException, "invalid_auth"),
+        (SmaReadException, "cannot_retrieve_device_info"),
+        (Exception, "unknown"),
+    ],
+)
+async def test_full_flow_reconfigure_exceptions(
+    hass: HomeAssistant,
+    mock_setup_entry: MockConfigEntry,
+    mock_sma_client: AsyncMock,
+    exception: Exception,
+    error: str,
+) -> None:
+    """Test we handle cannot connect error and recover from it."""
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_USER_INPUT, unique_id="123456789")
+    entry.add_to_hass(hass)
+    result = await entry.start_reconfigure_flow(hass)
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "reconfigure"
+
+    mock_sma_client.new_session.side_effect = exception
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        MOCK_USER_RECONFIGURE,
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": error}
+
+    mock_sma_client.new_session.side_effect = None
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input=MOCK_USER_RECONFIGURE,
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    assert entry.data[CONF_HOST] == "1.1.1.2"
+    assert entry.data[CONF_SSL] is True
+    assert entry.data[CONF_VERIFY_SSL] is False
+    assert entry.data[CONF_GROUP] == "user"
+    assert entry.data[CONF_PASSWORD] == "new_password"
+    assert len(mock_setup_entry.mock_calls) == 1
+
+
+@pytest.mark.usefixtures("mock_setup_entry")
+async def test_reconfigure_mismatch_id(
+    hass: HomeAssistant, mock_sma_client: AsyncMock
+) -> None:
+    """Test when a mismatch happens during reconfigure."""
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_USER_INPUT, unique_id="123456789")
+    entry.add_to_hass(hass)
+    result = await entry.start_reconfigure_flow(hass)
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "reconfigure"
+
+    # New device, on purpose to demonstrate we can't switch
+    different_device = DeviceInfo(
+        manufacturer="SMA",
+        name="Different SMA Device",
+        type="Sunny Boy 5.0",
+        serial=987654321,
+        sw_version="2.0.0",
+    )
+    mock_sma_client.device_info = AsyncMock(return_value=different_device)
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input=MOCK_USER_RECONFIGURE,
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "unique_id_mismatch"

@@ -1,9 +1,13 @@
 {
   "domain": "lacrosse_view",
   "name": "LaCrosse View",
-  "config_flow": true,
-  "documentation": "https://www.home-assistant.io/integrations/lacrosse_view",
-  "requirements": ["lacrosse-view==0.0.9"],
+  "categories": ["sensors.temperature_humidity"],
   "codeowners": ["@IceBotYT"],
-  "iot_class": "cloud_polling"
+  "config_flow": true,
+  "connectivity": ["cloud"],
+  "documentation": "https://www.home-assistant.io/integrations/lacrosse_view",
+  "integration_type": "hub",
+  "iot_class": "cloud_polling",
+  "loggers": ["lacrosse_view"],
+  "requirements": ["lacrosse-view==1.1.2"]
 }

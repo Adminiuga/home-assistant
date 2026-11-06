@@ -1,14 +1,16 @@
 """Support for an exposed aREST RESTful API of a device."""
-from __future__ import annotations
 
 from datetime import timedelta
 from http import HTTPStatus
 import logging
 
+import probatio
 import requests
-import voluptuous as vol
 
-from homeassistant.components.sensor import PLATFORM_SCHEMA, SensorEntity
+from homeassistant.components.sensor import (
+    PLATFORM_SCHEMA as SENSOR_PLATFORM_SCHEMA,
+    SensorEntity,
+)
 from homeassistant.const import (
     CONF_MONITORED_VARIABLES,
     CONF_NAME,
@@ -18,7 +20,7 @@ from homeassistant.const import (
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import TemplateError
-import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 from homeassistant.util import Throttle
@@ -32,22 +34,22 @@ CONF_PINS = "pins"
 
 DEFAULT_NAME = "aREST sensor"
 
-PIN_VARIABLE_SCHEMA = vol.Schema(
+PIN_VARIABLE_SCHEMA = probatio.Schema(
     {
-        vol.Optional(CONF_NAME): cv.string,
-        vol.Optional(CONF_UNIT_OF_MEASUREMENT): cv.string,
-        vol.Optional(CONF_VALUE_TEMPLATE): cv.template,
+        probatio.Optional(CONF_NAME): cv.string,
+        probatio.Optional(CONF_UNIT_OF_MEASUREMENT): cv.string,
+        probatio.Optional(CONF_VALUE_TEMPLATE): cv.template,
     }
 )
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
+PLATFORM_SCHEMA = SENSOR_PLATFORM_SCHEMA.extend(
     {
-        vol.Required(CONF_RESOURCE): cv.url,
-        vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
-        vol.Optional(CONF_PINS, default={}): vol.Schema(
+        probatio.Required(CONF_RESOURCE): cv.url,
+        probatio.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
+        probatio.Optional(CONF_PINS, default={}): probatio.Schema(
             {cv.string: PIN_VARIABLE_SCHEMA}
         ),
-        vol.Optional(CONF_MONITORED_VARIABLES, default={}): vol.Schema(
+        probatio.Optional(CONF_MONITORED_VARIABLES, default={}): probatio.Schema(
             {cv.string: PIN_VARIABLE_SCHEMA}
         ),
     }
@@ -82,8 +84,6 @@ def setup_platform(
         """Create a renderer based on variable_template value."""
         if value_template is None:
             return lambda value: value
-
-        value_template.hass = hass
 
         def _render(value):
             try:
@@ -180,7 +180,7 @@ class ArestData:
         self._resource = resource
         self._pin = pin
         self.data = {}
-        self._attr_available = True
+        self.available = True
 
     @Throttle(MIN_TIME_BETWEEN_UPDATES)
     def update(self):
@@ -201,7 +201,7 @@ class ArestData:
                         f"{self._resource}/digital/{self._pin}", timeout=10
                     )
                     self.data = {"value": response.json()["return_value"]}
-            self._attr_available = True
+            self.available = True
         except requests.exceptions.ConnectionError:
             _LOGGER.error("No route to device %s", self._resource)
-            self._attr_available = False
+            self.available = False

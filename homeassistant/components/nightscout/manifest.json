@@ -1,11 +1,13 @@
 {
   "domain": "nightscout",
   "name": "Nightscout",
-  "config_flow": true,
-  "documentation": "https://www.home-assistant.io/integrations/nightscout",
-  "requirements": ["py-nightscout==1.2.2"],
+  "categories": ["health_wellbeing"],
   "codeowners": ["@marciogranzotto"],
-  "quality_scale": "platinum",
+  "config_flow": true,
+  "connectivity": ["cloud", "network"],
+  "documentation": "https://www.home-assistant.io/integrations/nightscout",
+  "integration_type": "service",
   "iot_class": "cloud_polling",
-  "loggers": ["py_nightscout"]
+  "loggers": ["py_nightscout"],
+  "requirements": ["py-nightscout==1.2.2"]
 }

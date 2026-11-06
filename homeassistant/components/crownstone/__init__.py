@@ -1,25 +1,35 @@
 """Integration for Crownstone."""
-from __future__ import annotations
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import issue_registry as ir
 
-from .const import DOMAIN
-from .entry_manager import CrownstoneEntryManager
+DOMAIN = "crownstone"
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Initiate setup for a Crownstone config entry."""
-    manager = CrownstoneEntryManager(hass, entry)
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        DOMAIN,
+        is_fixable=False,
+        severity=ir.IssueSeverity.ERROR,
+        translation_key="integration_removed",
+        translation_placeholders={
+            "entries": f"/config/integrations/integration/{DOMAIN}"
+        },
+    )
 
-    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = manager
 
-    return await manager.async_setup()
-
-
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Unload a config entry."""
-    unload_ok: bool = await hass.data[DOMAIN][entry.entry_id].async_unload()
-    if len(hass.data[DOMAIN]) == 0:
-        hass.data.pop(DOMAIN)
-    return unload_ok
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Remove a config entry."""
+    if not hass.config_entries.async_loaded_entries(DOMAIN):
+        ir.async_delete_issue(hass, DOMAIN, DOMAIN)
+        # Remove any remaining disabled or ignored entries
+        while entries := hass.config_entries.async_entries(DOMAIN):
+            await hass.config_entries.async_remove(entries[0].entry_id)

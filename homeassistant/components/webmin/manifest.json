@@ -1,0 +1,13 @@
+{
+  "domain": "webmin",
+  "name": "Webmin",
+  "categories": ["computers_network.nas_servers"],
+  "codeowners": ["@autinerd"],
+  "config_flow": true,
+  "connectivity": ["network"],
+  "documentation": "https://www.home-assistant.io/integrations/webmin",
+  "integration_type": "device",
+  "iot_class": "local_polling",
+  "loggers": ["webmin"],
+  "requirements": ["webmin-xmlrpc==0.0.2"]
+}

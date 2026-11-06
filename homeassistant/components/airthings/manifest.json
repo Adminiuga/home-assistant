@@ -1,10 +1,26 @@
 {
   "domain": "airthings",
   "name": "Airthings",
+  "categories": ["sensors.air_quality"],
+  "codeowners": ["@danielhiversen", "@LaStrada"],
   "config_flow": true,
+  "connectivity": ["cloud"],
+  "dhcp": [
+    {
+      "hostname": "airthings-view"
+    },
+    {
+      "hostname": "airthings-hub",
+      "macaddress": "D0141190*"
+    },
+    {
+      "hostname": "airthings-hub",
+      "macaddress": "70B3D52A0*"
+    }
+  ],
   "documentation": "https://www.home-assistant.io/integrations/airthings",
-  "requirements": ["airthings_cloud==0.1.0"],
-  "codeowners": ["@danielhiversen"],
+  "integration_type": "hub",
   "iot_class": "cloud_polling",
-  "loggers": ["airthings"]
+  "loggers": ["airthings"],
+  "requirements": ["airthings-cloud==0.3.1"]
 }

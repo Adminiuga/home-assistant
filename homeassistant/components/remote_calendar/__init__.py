@@ -1,0 +1,30 @@
+"""The Remote Calendar integration."""
+
+import logging
+
+from homeassistant.const import Platform
+from homeassistant.core import HomeAssistant
+
+from .coordinator import RemoteCalendarConfigEntry, RemoteCalendarDataUpdateCoordinator
+
+_LOGGER = logging.getLogger(__name__)
+
+
+PLATFORMS: list[Platform] = [Platform.CALENDAR]
+
+
+async def async_setup_entry(
+    hass: HomeAssistant, entry: RemoteCalendarConfigEntry
+) -> None:
+    """Set up Remote Calendar from a config entry."""
+    coordinator = RemoteCalendarDataUpdateCoordinator(hass, entry)
+    entry.runtime_data = coordinator
+    await coordinator.async_config_entry_first_refresh()
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+
+async def async_unload_entry(
+    hass: HomeAssistant, entry: RemoteCalendarConfigEntry
+) -> None:
+    """Handle unload of an entry."""
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)

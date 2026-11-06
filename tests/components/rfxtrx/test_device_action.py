@@ -1,77 +1,57 @@
 """The tests for RFXCOM RFXtrx device actions."""
-from __future__ import annotations
 
 from typing import Any, NamedTuple
 
-import RFXtrx
 import pytest
+from pytest_homeassistant.common import MockConfigEntry, async_get_device_automations
+from pytest_unordered import unordered
+import RFXtrx
 
-import homeassistant.components.automation as automation
+from homeassistant.components import automation
 from homeassistant.components.device_automation import DeviceAutomationType
-from homeassistant.components.rfxtrx import DOMAIN
-from homeassistant.helpers.device_registry import DeviceRegistry
+from homeassistant.components.rfxtrx import DOMAIN, device_action
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import device_registry as dr
 from homeassistant.setup import async_setup_component
 
-from .conftest import create_rfx_test_cfg
-
-from tests.common import (
-    MockConfigEntry,
-    assert_lists_same,
-    async_get_device_automations,
-    mock_device_registry,
-    mock_registry,
-)
-
-
-@pytest.fixture(name="device_reg")
-def device_reg_fixture(hass):
-    """Return an empty, loaded, registry."""
-    return mock_device_registry(hass)
-
-
-@pytest.fixture(name="entity_reg")
-def entity_reg_fixture(hass):
-    """Return an empty, loaded, registry."""
-    return mock_registry(hass)
+from .conftest import create_rfx_test_entry, get_device_identifier
 
 
 class DeviceTestData(NamedTuple):
     """Test data linked to a device."""
 
     code: str
-    device_identifiers: set[tuple[str, str, str, str]]
+    device_identifier: tuple[str, str]
 
 
-DEVICE_LIGHTING_1 = DeviceTestData("0710002a45050170", {("rfxtrx", "10", "0", "E5")})
+DEVICE_LIGHTING_1 = DeviceTestData("0710002a45050170", ("rfxtrx", "10_0_E5"))
 
-DEVICE_BLINDS_1 = DeviceTestData(
-    "09190000009ba8010100", {("rfxtrx", "19", "0", "009ba8:1")}
-)
+DEVICE_BLINDS_1 = DeviceTestData("09190000009ba8010100", ("rfxtrx", "19_0_009ba8:1"))
 
-DEVICE_TEMPHUM_1 = DeviceTestData(
-    "0a52080705020095220269", {("rfxtrx", "52", "8", "05:02")}
-)
+DEVICE_TEMPHUM_1 = DeviceTestData("0a52080705020095220269", ("rfxtrx", "52_8_05:02"))
 
 
 @pytest.mark.parametrize("device", [DEVICE_LIGHTING_1, DEVICE_TEMPHUM_1])
-async def test_device_test_data(rfxtrx, device: DeviceTestData):
+async def test_device_test_data(rfxtrx, device: DeviceTestData) -> None:
     """Verify that our testing data remains correct."""
     pkt: RFXtrx.lowlevel.Packet = RFXtrx.lowlevel.parse(bytearray.fromhex(device.code))
-    assert device.device_identifiers == {
-        ("rfxtrx", f"{pkt.packettype:x}", f"{pkt.subtype:x}", pkt.id_string)
-    }
+    assert device.device_identifier == (
+        "rfxtrx",
+        f"{pkt.packettype:x}_{pkt.subtype:x}_{pkt.id_string}",
+    )
 
 
-async def setup_entry(hass, devices):
+async def setup_entry(hass: HomeAssistant, devices: dict[str, Any]) -> MockConfigEntry:
     """Construct a config setup."""
-    entry_data = create_rfx_test_cfg(devices=devices)
-    mock_entry = MockConfigEntry(domain="rfxtrx", unique_id=DOMAIN, data=entry_data)
-
+    mock_entry = create_rfx_test_entry(devices=devices)
     mock_entry.add_to_hass(hass)
 
     await hass.config_entries.async_setup(mock_entry.entry_id)
     await hass.async_block_till_done()
     await hass.async_start()
+
+    return mock_entry
 
 
 def _get_expected_actions(data):
@@ -80,24 +60,32 @@ def _get_expected_actions(data):
 
 
 @pytest.mark.parametrize(
-    "device,expected",
+    ("device", "expected"),
     [
-        [
+        (
             DEVICE_LIGHTING_1,
             list(_get_expected_actions(RFXtrx.lowlevel.Lighting1.COMMANDS)),
-        ],
-        [
+        ),
+        (
             DEVICE_BLINDS_1,
             list(_get_expected_actions(RFXtrx.lowlevel.RollerTrol.COMMANDS)),
-        ],
-        [DEVICE_TEMPHUM_1, []],
+        ),
+        (DEVICE_TEMPHUM_1, []),
     ],
 )
-async def test_get_actions(hass, device_reg: DeviceRegistry, device, expected):
+async def test_get_actions(
+    hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
+    device: DeviceTestData,
+    expected,
+) -> None:
     """Test we get the expected actions from a rfxtrx."""
-    await setup_entry(hass, {device.code: {}})
+    mock_entry = await setup_entry(hass, {device.code: {}})
 
-    device_entry = device_reg.async_get_device(device.device_identifiers, set())
+    device_entry = device_registry.async_get_device_by_identifier(
+        get_device_identifier(mock_entry, device.device_identifier[1]),
+        mock_entry.entry_id,
+    )
     assert device_entry
 
     actions = await async_get_device_automations(
@@ -110,37 +98,45 @@ async def test_get_actions(hass, device_reg: DeviceRegistry, device, expected):
         for action_type in expected
     ]
 
-    assert_lists_same(actions, expected_actions)
+    assert actions == unordered(expected_actions)
 
 
 @pytest.mark.parametrize(
-    "device,config,expected",
+    ("device", "config", "expected"),
     [
-        [
+        (
             DEVICE_LIGHTING_1,
             {"type": "send_command", "subtype": "On"},
             "0710000045050100",
-        ],
-        [
+        ),
+        (
             DEVICE_LIGHTING_1,
             {"type": "send_command", "subtype": "Off"},
             "0710000045050000",
-        ],
-        [
+        ),
+        (
             DEVICE_BLINDS_1,
             {"type": "send_command", "subtype": "Stop"},
             "09190000009ba8010200",
-        ],
+        ),
     ],
 )
 async def test_action(
-    hass, device_reg: DeviceRegistry, rfxtrx: RFXtrx.Connect, device, config, expected
-):
+    hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
+    rfxtrx: RFXtrx.Connect,
+    device: DeviceTestData,
+    config,
+    expected,
+) -> None:
     """Test for actions."""
 
-    await setup_entry(hass, {device.code: {}})
+    mock_entry = await setup_entry(hass, {device.code: {}})
 
-    device_entry = device_reg.async_get_device(device.device_identifiers, set())
+    device_entry = device_registry.async_get_device_by_identifier(
+        get_device_identifier(mock_entry, device.device_identifier[1]),
+        mock_entry.entry_id,
+    )
     assert device_entry
 
     assert await async_setup_component(
@@ -169,14 +165,64 @@ async def test_action(
     rfxtrx.transport.send.assert_called_once_with(bytearray.fromhex(expected))
 
 
-async def test_invalid_action(hass, device_reg: DeviceRegistry):
+async def test_get_actions_missing_identifier(
+    hass: HomeAssistant, device_registry: dr.DeviceRegistry
+) -> None:
+    """Test we get no actions for a device without a rfxtrx identifier."""
+    mock_entry = await setup_entry(hass, {})
+
+    device_entry = device_registry.async_get_or_create(
+        config_entry_id=mock_entry.entry_id,
+        identifiers={("dummy_only", "id")},
+    )
+
+    assert await device_action.async_get_actions(hass, device_entry.id) == []
+
+
+async def test_get_actions_missing_subentry(
+    hass: HomeAssistant, device_registry: dr.DeviceRegistry
+) -> None:
+    """Test we get no actions for a device pointing at a removed subentry."""
+    mock_entry = await setup_entry(hass, {})
+
+    device_entry = device_registry.async_get_or_create(
+        config_entry_id=mock_entry.entry_id,
+        identifiers={(DOMAIN, "not_a_real_subentry_id")},
+    )
+
+    assert await device_action.async_get_actions(hass, device_entry.id) == []
+
+
+async def test_get_actions_invalid_event_code(
+    hass: HomeAssistant, device_registry: dr.DeviceRegistry
+) -> None:
+    """Test we get no actions for a device whose subentry has an invalid event code."""
+    mock_entry = await setup_entry(hass, {"invalid": {}})
+    subentry = next(iter(mock_entry.subentries.values()))
+
+    device_entry = device_registry.async_get_or_create(
+        config_entry_id=mock_entry.entry_id,
+        config_subentry_id=subentry.subentry_id,
+        identifiers={(DOMAIN, subentry.subentry_id)},
+    )
+
+    assert await device_action.async_get_actions(hass, device_entry.id) == []
+
+
+async def test_invalid_action(
+    hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """Test for invalid actions."""
     device = DEVICE_LIGHTING_1
 
-    await setup_entry(hass, {device.code: {}})
+    mock_entry = await setup_entry(hass, {device.code: {}})
 
-    device_identifers: Any = device.device_identifiers
-    device_entry = device_reg.async_get_device(device_identifers, set())
+    device_entry = device_registry.async_get_device_by_identifier(
+        get_device_identifier(mock_entry, device.device_identifier[1]),
+        mock_entry.entry_id,
+    )
     assert device_entry
 
     assert await async_setup_component(
@@ -201,8 +247,35 @@ async def test_invalid_action(hass, device_reg: DeviceRegistry):
     )
     await hass.async_block_till_done()
 
-    assert len(notifications := hass.states.async_all("persistent_notification")) == 1
-    assert (
-        "The following integrations and platforms could not be set up"
-        in notifications[0].attributes["message"]
+    assert "Subtype invalid not found in device commands" in caplog.text
+
+
+async def test_action_not_connected(
+    hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
+) -> None:
+    """Test an action when RFXtrx is not connected."""
+    device = DEVICE_LIGHTING_1
+
+    mock_entry = await setup_entry(hass, {device.code: {}})
+
+    device_entry = device_registry.async_get_device_by_identifier(
+        get_device_identifier(mock_entry, device.device_identifier[1]),
+        mock_entry.entry_id,
     )
+    assert device_entry
+
+    await hass.config_entries.async_unload(mock_entry.entry_id)
+
+    with pytest.raises(HomeAssistantError, match="RFXtrx is not connected"):
+        await device_action.async_call_action_from_config(
+            hass,
+            {
+                "domain": DOMAIN,
+                "device_id": device_entry.id,
+                "type": "send_command",
+                "subtype": "On",
+            },
+            {},
+            None,
+        )

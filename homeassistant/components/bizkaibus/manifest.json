@@ -1,9 +1,12 @@
 {
   "domain": "bizkaibus",
   "name": "Bizkaibus",
-  "documentation": "https://www.home-assistant.io/integrations/bizkaibus",
+  "categories": ["vehicles_transport.public_transport"],
   "codeowners": ["@UgaitzEtxebarria"],
-  "requirements": ["bizkaibus==0.1.1"],
+  "connectivity": ["cloud"],
+  "documentation": "https://www.home-assistant.io/integrations/bizkaibus",
   "iot_class": "cloud_polling",
-  "loggers": ["bizkaibus"]
+  "loggers": ["bizkaibus"],
+  "quality_scale": "legacy",
+  "requirements": ["bizkaibus==0.1.1"]
 }

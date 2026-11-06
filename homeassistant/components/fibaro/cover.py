@@ -1,125 +1,173 @@
 """Support for Fibaro cover - curtains, rollershutters etc."""
-from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast, override
+
+from pyfibaro.fibaro_device import DeviceModel
 
 from homeassistant.components.cover import (
     ATTR_POSITION,
     ATTR_TILT_POSITION,
-    ENTITY_ID_FORMAT,
     CoverEntity,
     CoverEntityFeature,
 )
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from . import FIBARO_DEVICES, FibaroDevice
-from .const import DOMAIN
+from . import FibaroConfigEntry, FibaroController
+from .entity import FibaroEntity
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    entry: FibaroConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up the Fibaro covers."""
-    async_add_entities(
-        [
-            FibaroCover(device)
-            for device in hass.data[DOMAIN][entry.entry_id][FIBARO_DEVICES][
-                Platform.COVER
-            ]
-        ],
-        True,
-    )
+    controller = entry.runtime_data
+
+    entities: list[FibaroEntity] = []
+    for device in controller.fibaro_devices[Platform.COVER]:
+        # Positionable covers report the position over value
+        if device.value.has_value:
+            entities.append(PositionableFibaroCover(device, controller))
+        else:
+            entities.append(FibaroCover(device, controller))
+    async_add_entities(entities, True)
 
 
-class FibaroCover(FibaroDevice, CoverEntity):
-    """Representation a Fibaro Cover."""
-
-    def __init__(self, fibaro_device):
-        """Initialize the Vera device."""
-        super().__init__(fibaro_device)
-        self.entity_id = ENTITY_ID_FORMAT.format(self.ha_id)
-
-        if self._is_open_close_only():
-            self._attr_supported_features = (
-                CoverEntityFeature.OPEN | CoverEntityFeature.CLOSE
-            )
-            if "stop" in self.fibaro_device.actions:
-                self._attr_supported_features |= CoverEntityFeature.STOP
+class PositionableFibaroCover(FibaroEntity, CoverEntity):
+    """Representation of a fibaro cover which supports positioning."""
 
     @staticmethod
-    def bound(position):
+    def bound(position: int | None) -> int | None:
         """Normalize the position."""
         if position is None:
             return None
-        position = int(position)
         if position <= 5:
             return 0
         if position >= 95:
             return 100
         return position
 
-    def _is_open_close_only(self) -> bool:
-        """Return if only open / close is supported."""
-        # Normally positionable devices report the position over value,
-        # so if it is missing we have a device which supports open / close only
-        if "value" not in self.fibaro_device.properties:
-            return True
-        return False
+    @override
+    def update(self) -> None:
+        """Update the state."""
+        super().update()
 
-    @property
-    def current_cover_position(self) -> int | None:
-        """Return current position of cover. 0 is closed, 100 is open."""
-        return self.bound(self.level)
+        self._attr_current_cover_position = self.bound(self.level)
+        self._attr_current_cover_tilt_position = self.bound(self.level2)
 
-    @property
-    def current_cover_tilt_position(self) -> int | None:
-        """Return the current tilt position for venetian blinds."""
-        return self.bound(self.level2)
+        # Be aware that opening and closing is only available for some modern
+        # devices.
+        # For example the Fibaro Roller Shutter 4 reports this correctly.
+        device_state = self.fibaro_device.state.str_value(default="").lower()
+        self._attr_is_opening = device_state == "opening"
+        self._attr_is_closing = device_state == "closing"
 
+        closed: bool | None = None
+        if self.current_cover_position is not None:
+            closed = self.current_cover_position == 0
+        self._attr_is_closed = closed
+
+    @override
     def set_cover_position(self, **kwargs: Any) -> None:
         """Move the cover to a specific position."""
-        self.set_level(kwargs.get(ATTR_POSITION))
+        self.set_level(cast(int, kwargs.get(ATTR_POSITION)))
 
+    @override
     def set_cover_tilt_position(self, **kwargs: Any) -> None:
-        """Move the cover to a specific position."""
-        self.set_level2(kwargs.get(ATTR_TILT_POSITION))
+        """Move the slats to a specific position."""
+        self.set_level2(cast(int, kwargs.get(ATTR_TILT_POSITION)))
 
-    @property
-    def is_closed(self) -> bool | None:
-        """Return if the cover is closed."""
-        if self._is_open_close_only():
-            if (
-                "state" not in self.fibaro_device.properties
-                or self.fibaro_device.properties.state.lower() == "unknown"
-            ):
-                return None
-            return self.fibaro_device.properties.state.lower() == "closed"
-
-        if self.current_cover_position is None:
-            return None
-        return self.current_cover_position == 0
-
+    @override
     def open_cover(self, **kwargs: Any) -> None:
         """Open the cover."""
         self.action("open")
 
+    @override
     def close_cover(self, **kwargs: Any) -> None:
         """Close the cover."""
         self.action("close")
 
+    @override
     def open_cover_tilt(self, **kwargs: Any) -> None:
         """Open the cover tilt."""
         self.set_level2(100)
 
+    @override
     def close_cover_tilt(self, **kwargs: Any) -> None:
         """Close the cover."""
         self.set_level2(0)
 
+    @override
     def stop_cover(self, **kwargs: Any) -> None:
         """Stop the cover."""
         self.action("stop")
+
+
+class FibaroCover(FibaroEntity, CoverEntity):
+    """Representation of a fibaro cover which supports only open / close commands."""
+
+    def __init__(
+        self, fibaro_device: DeviceModel, controller: FibaroController
+    ) -> None:
+        """Initialize the device."""
+        super().__init__(fibaro_device, controller)
+
+        self._attr_supported_features = (
+            CoverEntityFeature.OPEN | CoverEntityFeature.CLOSE
+        )
+        if "stop" in self.fibaro_device.actions:
+            self._attr_supported_features |= CoverEntityFeature.STOP
+        if "rotateSlatsUp" in self.fibaro_device.actions:
+            self._attr_supported_features |= CoverEntityFeature.OPEN_TILT
+        if "rotateSlatsDown" in self.fibaro_device.actions:
+            self._attr_supported_features |= CoverEntityFeature.CLOSE_TILT
+        if "stopSlats" in self.fibaro_device.actions:
+            self._attr_supported_features |= CoverEntityFeature.STOP_TILT
+
+    @override
+    def update(self) -> None:
+        """Update the state."""
+        super().update()
+
+        device_state = self.fibaro_device.state.str_value(default="").lower()
+
+        self._attr_is_opening = device_state == "opening"
+        self._attr_is_closing = device_state == "closing"
+
+        closed: bool | None = None
+        if device_state not in {"", "unknown"}:
+            closed = device_state == "closed"
+        self._attr_is_closed = closed
+
+    @override
+    def open_cover(self, **kwargs: Any) -> None:
+        """Open the cover."""
+        self.action("open")
+
+    @override
+    def close_cover(self, **kwargs: Any) -> None:
+        """Close the cover."""
+        self.action("close")
+
+    @override
+    def stop_cover(self, **kwargs: Any) -> None:
+        """Stop the cover."""
+        self.action("stop")
+
+    @override
+    def open_cover_tilt(self, **kwargs: Any) -> None:
+        """Open the cover slats."""
+        self.action("rotateSlatsUp")
+
+    @override
+    def close_cover_tilt(self, **kwargs: Any) -> None:
+        """Close the cover slats."""
+        self.action("rotateSlatsDown")
+
+    @override
+    def stop_cover_tilt(self, **kwargs: Any) -> None:
+        """Stop the cover slats turning."""
+        self.action("stopSlats")

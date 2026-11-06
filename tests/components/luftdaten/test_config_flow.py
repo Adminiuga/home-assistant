@@ -1,16 +1,17 @@
 """Define tests for the Luftdaten config flow."""
+
 from unittest.mock import MagicMock
 
 from luftdaten.exceptions import LuftdatenConnectionError
+import pytest
+from pytest_homeassistant.common import MockConfigEntry
 
-from homeassistant.components.luftdaten import DOMAIN
-from homeassistant.components.luftdaten.const import CONF_SENSOR_ID
+from homeassistant.components.luftdaten.const import CONF_SENSOR_ID, DOMAIN
 from homeassistant.config_entries import SOURCE_USER
 from homeassistant.const import CONF_SHOW_ON_MAP
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
-
-from tests.common import MockConfigEntry
+from homeassistant.helpers.httpx_client import get_async_client
 
 
 async def test_duplicate_error(
@@ -23,49 +24,46 @@ async def test_duplicate_error(
         DOMAIN, context={"source": SOURCE_USER}
     )
 
-    assert result.get("type") == FlowResultType.FORM
-    assert result.get("step_id") == SOURCE_USER
-    assert "flow_id" in result
+    assert result.get("type") is FlowResultType.FORM
+    assert result.get("step_id") == "user"
 
     result2 = await hass.config_entries.flow.async_configure(
         result["flow_id"],
         user_input={CONF_SENSOR_ID: 12345},
     )
 
-    assert result2.get("type") == FlowResultType.ABORT
+    assert result2.get("type") is FlowResultType.ABORT
     assert result2.get("reason") == "already_configured"
 
 
 async def test_communication_error(
-    hass: HomeAssistant, mock_luftdaten_config_flow: MagicMock
+    hass: HomeAssistant, mock_luftdaten: MagicMock
 ) -> None:
     """Test that no sensor is added while unable to communicate with API."""
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": SOURCE_USER}
     )
 
-    assert result.get("type") == FlowResultType.FORM
-    assert result.get("step_id") == SOURCE_USER
-    assert "flow_id" in result
+    assert result.get("type") is FlowResultType.FORM
+    assert result.get("step_id") == "user"
 
-    mock_luftdaten_config_flow.get_data.side_effect = LuftdatenConnectionError
+    mock_luftdaten.get_data.side_effect = LuftdatenConnectionError
     result2 = await hass.config_entries.flow.async_configure(
         result["flow_id"],
         user_input={CONF_SENSOR_ID: 12345},
     )
 
-    assert result2.get("type") == FlowResultType.FORM
-    assert result2.get("step_id") == SOURCE_USER
+    assert result2.get("type") is FlowResultType.FORM
+    assert result2.get("step_id") == "user"
     assert result2.get("errors") == {CONF_SENSOR_ID: "cannot_connect"}
-    assert "flow_id" in result2
 
-    mock_luftdaten_config_flow.get_data.side_effect = None
+    mock_luftdaten.get_data.side_effect = None
     result3 = await hass.config_entries.flow.async_configure(
         result2["flow_id"],
         user_input={CONF_SENSOR_ID: 12345},
     )
 
-    assert result3.get("type") == FlowResultType.CREATE_ENTRY
+    assert result3.get("type") is FlowResultType.CREATE_ENTRY
     assert result3.get("title") == "12345"
     assert result3.get("data") == {
         CONF_SENSOR_ID: 12345,
@@ -73,36 +71,32 @@ async def test_communication_error(
     }
 
 
-async def test_invalid_sensor(
-    hass: HomeAssistant, mock_luftdaten_config_flow: MagicMock
-) -> None:
+async def test_invalid_sensor(hass: HomeAssistant, mock_luftdaten: MagicMock) -> None:
     """Test that an invalid sensor throws an error."""
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": SOURCE_USER}
     )
 
-    assert result.get("type") == FlowResultType.FORM
-    assert result.get("step_id") == SOURCE_USER
-    assert "flow_id" in result
+    assert result.get("type") is FlowResultType.FORM
+    assert result.get("step_id") == "user"
 
-    mock_luftdaten_config_flow.validate_sensor.return_value = False
+    mock_luftdaten.validate_sensor.return_value = False
     result2 = await hass.config_entries.flow.async_configure(
         result["flow_id"],
         user_input={CONF_SENSOR_ID: 11111},
     )
 
-    assert result2.get("type") == FlowResultType.FORM
-    assert result2.get("step_id") == SOURCE_USER
+    assert result2.get("type") is FlowResultType.FORM
+    assert result2.get("step_id") == "user"
     assert result2.get("errors") == {CONF_SENSOR_ID: "invalid_sensor"}
-    assert "flow_id" in result2
 
-    mock_luftdaten_config_flow.validate_sensor.return_value = True
+    mock_luftdaten.validate_sensor.return_value = True
     result3 = await hass.config_entries.flow.async_configure(
         result2["flow_id"],
         user_input={CONF_SENSOR_ID: 12345},
     )
 
-    assert result3.get("type") == FlowResultType.CREATE_ENTRY
+    assert result3.get("type") is FlowResultType.CREATE_ENTRY
     assert result3.get("title") == "12345"
     assert result3.get("data") == {
         CONF_SENSOR_ID: 12345,
@@ -110,19 +104,15 @@ async def test_invalid_sensor(
     }
 
 
-async def test_step_user(
-    hass: HomeAssistant,
-    mock_setup_entry: MagicMock,
-    mock_luftdaten_config_flow: MagicMock,
-) -> None:
+@pytest.mark.usefixtures("mock_setup_entry", "mock_luftdaten")
+async def test_step_user(hass: HomeAssistant, mock_luftdaten_class: MagicMock) -> None:
     """Test that the user step works."""
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": SOURCE_USER}
     )
 
-    assert result.get("type") == FlowResultType.FORM
-    assert result.get("step_id") == SOURCE_USER
-    assert "flow_id" in result
+    assert result.get("type") is FlowResultType.FORM
+    assert result.get("step_id") == "user"
 
     result2 = await hass.config_entries.flow.async_configure(
         result["flow_id"],
@@ -132,9 +122,13 @@ async def test_step_user(
         },
     )
 
-    assert result2.get("type") == FlowResultType.CREATE_ENTRY
+    assert result2.get("type") is FlowResultType.CREATE_ENTRY
     assert result2.get("title") == "12345"
     assert result2.get("data") == {
         CONF_SENSOR_ID: 12345,
         CONF_SHOW_ON_MAP: True,
     }
+    assert result2["result"].unique_id == "12345"
+    mock_luftdaten_class.assert_called_once_with(
+        12345, httpx_client=get_async_client(hass)
+    )

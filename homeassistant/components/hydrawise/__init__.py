@@ -1,114 +1,115 @@
 """Support for Hydrawise cloud."""
-from datetime import timedelta
-import logging
 
-from hydrawiser.core import Hydrawiser
-from requests.exceptions import ConnectTimeout, HTTPError
-import voluptuous as vol
+from collections.abc import Iterable
 
-from homeassistant.components import persistent_notification
-from homeassistant.const import CONF_ACCESS_TOKEN, CONF_SCAN_INTERVAL
+from pydrawise import Controller, auth, hybrid
+
+from homeassistant.const import CONF_API_KEY, CONF_PASSWORD, CONF_USERNAME, Platform
 from homeassistant.core import HomeAssistant, callback
-import homeassistant.helpers.config_validation as cv
-from homeassistant.helpers.dispatcher import async_dispatcher_connect, dispatcher_send
-from homeassistant.helpers.entity import Entity, EntityDescription
-from homeassistant.helpers.event import track_time_interval
+from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.helpers import config_validation as cv, device_registry as dr
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.typing import ConfigType
 
-_LOGGER = logging.getLogger(__name__)
-
-ALLOWED_WATERING_TIME = [5, 10, 15, 30, 45, 60]
-
-CONF_WATERING_TIME = "watering_minutes"
-
-NOTIFICATION_ID = "hydrawise_notification"
-NOTIFICATION_TITLE = "Hydrawise Setup"
-
-DATA_HYDRAWISE = "hydrawise"
-DOMAIN = "hydrawise"
-DEFAULT_WATERING_TIME = 15
-
-SCAN_INTERVAL = timedelta(seconds=30)
-
-SIGNAL_UPDATE_HYDRAWISE = "hydrawise_update"
-
-CONFIG_SCHEMA = vol.Schema(
-    {
-        DOMAIN: vol.Schema(
-            {
-                vol.Required(CONF_ACCESS_TOKEN): cv.string,
-                vol.Optional(CONF_SCAN_INTERVAL, default=SCAN_INTERVAL): cv.time_period,
-            }
-        )
-    },
-    extra=vol.ALLOW_EXTRA,
+from .const import APP_ID, DOMAIN, MANUFACTURER
+from .coordinator import (
+    HydrawiseConfigEntry,
+    HydrawiseMainDataUpdateCoordinator,
+    HydrawiseUpdateCoordinators,
+    HydrawiseWaterUseDataUpdateCoordinator,
 )
+from .services import async_setup_services
+
+PLATFORMS: list[Platform] = [
+    Platform.BINARY_SENSOR,
+    Platform.SENSOR,
+    Platform.SWITCH,
+    Platform.VALVE,
+]
+
+_REQUIRED_AUTH_KEYS = (CONF_USERNAME, CONF_PASSWORD, CONF_API_KEY)
 
 
-def setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    """Set up the Hunter Hydrawise component."""
-    conf = config[DOMAIN]
-    access_token = conf[CONF_ACCESS_TOKEN]
-    scan_interval = conf.get(CONF_SCAN_INTERVAL)
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
-    try:
-        hydrawise = Hydrawiser(user_token=access_token)
-        hass.data[DATA_HYDRAWISE] = HydrawiseHub(hydrawise)
-    except (ConnectTimeout, HTTPError) as ex:
-        _LOGGER.error("Unable to connect to Hydrawise cloud service: %s", str(ex))
-        persistent_notification.create(
-            hass,
-            f"Error: {ex}<br />You will need to restart hass after fixing.",
-            title=NOTIFICATION_TITLE,
-            notification_id=NOTIFICATION_ID,
-        )
-        return False
 
-    def hub_refresh(event_time):
-        """Call Hydrawise hub to refresh information."""
-        _LOGGER.debug("Updating Hydrawise Hub component")
-        hass.data[DATA_HYDRAWISE].data.update_controller_info()
-        dispatcher_send(hass, SIGNAL_UPDATE_HYDRAWISE)
-
-    # Call the Hydrawise API to refresh updates
-    track_time_interval(hass, hub_refresh, scan_interval)
-
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Set up the Hunter Hydrawise integration."""
+    async_setup_services(hass)
     return True
 
 
-class HydrawiseHub:
-    """Representation of a base Hydrawise device."""
-
-    def __init__(self, data):
-        """Initialize the entity."""
-        self.data = data
-
-
-class HydrawiseEntity(Entity):
-    """Entity class for Hydrawise devices."""
-
-    _attr_attribution = "Data provided by hydrawise.com"
-
-    def __init__(self, data, description: EntityDescription):
-        """Initialize the Hydrawise entity."""
-        self.entity_description = description
-        self.data = data
-        self._attr_name = f"{self.data['name']} {description.name}"
-
-    async def async_added_to_hass(self):
-        """Register callbacks."""
-        self.async_on_remove(
-            async_dispatcher_connect(
-                self.hass, SIGNAL_UPDATE_HYDRAWISE, self._update_callback
-            )
+async def async_setup_entry(
+    hass: HomeAssistant, config_entry: HydrawiseConfigEntry
+) -> None:
+    """Set up Hydrawise from a config entry."""
+    if any(k not in config_entry.data for k in _REQUIRED_AUTH_KEYS):
+        # If we are missing any required authentication keys, trigger a reauth flow.
+        raise ConfigEntryAuthFailed(
+            translation_domain=DOMAIN,
+            translation_key="missing_credentials",
         )
 
-    @callback
-    def _update_callback(self):
-        """Call update method."""
-        self.async_schedule_update_ha_state(True)
+    hydrawise = hybrid.HybridClient(
+        auth.HybridAuth(
+            config_entry.data[CONF_USERNAME],
+            config_entry.data[CONF_PASSWORD],
+            config_entry.data[CONF_API_KEY],
+            session=async_get_clientsession(hass),
+        ),
+        app_id=APP_ID,
+    )
 
-    @property
-    def extra_state_attributes(self):
-        """Return the state attributes."""
-        return {"identifier": self.data.get("relay")}
+    main_coordinator = HydrawiseMainDataUpdateCoordinator(hass, config_entry, hydrawise)
+    await main_coordinator.async_config_entry_first_refresh()
+    water_use_coordinator = HydrawiseWaterUseDataUpdateCoordinator(
+        hass, config_entry, hydrawise, main_coordinator
+    )
+
+    device_registry = dr.async_get(hass)
+
+    @callback
+    def _async_register_controller_devices(controllers: Iterable[Controller]) -> None:
+        """Register controller devices so children can resolve via_device_id.
+
+        Runs as the first new-controller callback so via_device parents are
+        registered before the new-zone callbacks construct zone entities that
+        resolve their via_device_id. Registration must not run before
+        _add_remove_zones computes the previous controllers, or newly discovered
+        controllers would be treated as already-known and their controller-level
+        entities would never be added.
+        """
+        for controller in controllers:
+            device_registry.async_get_or_create(
+                config_entry_id=config_entry.entry_id,
+                identifiers={(DOMAIN, str(controller.id))},
+                manufacturer=MANUFACTURER,
+                model=controller.hardware.model.description,
+                name=controller.name,
+                serial_number=controller.hardware.serial_number or None,
+                sw_version=controller.software_version or None,
+            )
+
+    # Register the controllers known at setup before the platforms construct
+    # their entities.
+    _async_register_controller_devices(main_coordinator.data.controllers.values())
+    main_coordinator.new_controllers_callbacks.append(
+        _async_register_controller_devices
+    )
+
+    # async_track_zones is registered first on water_use_coordinator,
+    # so the water-use coordinator's data is in sync before
+    # callbacks below construct entities for newly added zones.
+    water_use_coordinator.async_track_zones()
+    main_coordinator.async_track_zones()
+    await water_use_coordinator.async_config_entry_first_refresh()
+    config_entry.runtime_data = HydrawiseUpdateCoordinators(
+        main=main_coordinator,
+        water_use=water_use_coordinator,
+    )
+    await hass.config_entries.async_forward_entry_setups(config_entry, PLATFORMS)
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: HydrawiseConfigEntry) -> None:
+    """Unload a config entry."""
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)

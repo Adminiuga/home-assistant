@@ -1,19 +1,9 @@
 {
   "config": {
-    "flow_title": "{name} ({host})",
-    "step": {
-      "confirm": {
-        "description": "Do you want to set up {name}?",
-        "data": {
-          "access_token": "[%key:common::config_flow::data::access_token%]"
-        }
-      },
-      "user": {
-        "data": {
-          "host": "[%key:common::config_flow::data::host%]",
-          "access_token": "[%key:common::config_flow::data::access_token%]"
-        }
-      }
+    "abort": {
+      "already_configured": "[%key:common::config_flow::abort::already_configured_device%]",
+      "unique_id_mismatch": "Please ensure you reconfigure against the same device.",
+      "wrong_device": "The access token belongs to a different Bond device than the one configured."
     },
     "error": {
       "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]",
@@ -21,8 +11,114 @@
       "old_firmware": "Unsupported old firmware on the Bond device - please upgrade before continuing",
       "unknown": "[%key:common::config_flow::error::unknown%]"
     },
-    "abort": {
-      "already_configured": "[%key:common::config_flow::abort::already_configured_device%]"
+    "flow_title": "{name} ({host})",
+    "step": {
+      "confirm": {
+        "data": {
+          "access_token": "[%key:common::config_flow::data::access_token%]"
+        },
+        "description": "Do you want to set up {name}?"
+      },
+      "reauth_confirm": {
+        "data": {
+          "access_token": "[%key:common::config_flow::data::access_token%]"
+        },
+        "description": "The access token for the Bond device at {host} is no longer valid. Please enter the new access token.",
+        "title": "[%key:common::config_flow::title::reauth%]"
+      },
+      "reconfigure": {
+        "data": {
+          "access_token": "[%key:common::config_flow::data::access_token%]",
+          "host": "[%key:common::config_flow::data::host%]"
+        },
+        "data_description": {
+          "host": "[%key:component::bond::config::step::user::data_description::host%]"
+        }
+      },
+      "user": {
+        "data": {
+          "access_token": "[%key:common::config_flow::data::access_token%]",
+          "host": "[%key:common::config_flow::data::host%]"
+        },
+        "data_description": {
+          "host": "The IP address of your Bond hub."
+        }
+      }
+    }
+  },
+  "exceptions": {
+    "invalid_token": {
+      "message": "The Bond access token is no longer valid"
+    }
+  },
+  "services": {
+    "set_fan_speed_tracked_state": {
+      "description": "Sets the tracked fan speed for a Bond fan.",
+      "fields": {
+        "entity_id": {
+          "description": "Name(s) of entities to set the tracked fan speed.",
+          "name": "Entity"
+        },
+        "speed": {
+          "description": "The fan speed as a percentage.",
+          "name": "Fan speed"
+        }
+      },
+      "name": "Set fan speed tracked state"
+    },
+    "set_light_brightness_tracked_state": {
+      "description": "Sets the tracked brightness state of a Bond light.",
+      "fields": {
+        "brightness": {
+          "description": "The tracked brightness of the light.",
+          "name": "Brightness"
+        },
+        "entity_id": {
+          "description": "Name(s) of entities to set the tracked brightness state of.",
+          "name": "Entity"
+        }
+      },
+      "name": "Set light brightness tracked state"
+    },
+    "set_light_power_tracked_state": {
+      "description": "Sets the tracked power state of a Bond light.",
+      "fields": {
+        "entity_id": {
+          "description": "[%key:component::bond::services::set_switch_power_tracked_state::fields::entity_id::description%]",
+          "name": "Entity"
+        },
+        "power_state": {
+          "description": "[%key:component::bond::services::set_switch_power_tracked_state::fields::power_state::description%]",
+          "name": "[%key:component::bond::services::set_switch_power_tracked_state::fields::power_state::name%]"
+        }
+      },
+      "name": "Set light power tracked state"
+    },
+    "set_switch_power_tracked_state": {
+      "description": "Sets the tracked power state of a Bond switch.",
+      "fields": {
+        "entity_id": {
+          "description": "Name(s) of entities to set the tracked power state of.",
+          "name": "Entity"
+        },
+        "power_state": {
+          "description": "The tracked power state.",
+          "name": "Power state"
+        }
+      },
+      "name": "Set switch power tracked state"
+    },
+    "start_decreasing_brightness": {
+      "description": "Starts decreasing the brightness of a light (deprecated).",
+      "name": "Start decreasing brightness"
+    },
+    "start_increasing_brightness": {
+      "description": "Starts increasing the brightness of a light (deprecated).",
+      "name": "Start increasing brightness"
+    },
+    "stop": {
+      "description": "Stops any in-progress action and empties the queue (deprecated).",
+      "name": "[%key:common::action::stop%]"
     }
   }
 }

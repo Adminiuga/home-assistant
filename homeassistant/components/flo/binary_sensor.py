@@ -1,28 +1,25 @@
 """Support for Flo Water Monitor binary sensors."""
-from __future__ import annotations
+
+from typing import Any, override
 
 from homeassistant.components.binary_sensor import (
     BinarySensorDeviceClass,
     BinarySensorEntity,
 )
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .const import DOMAIN as FLO_DOMAIN
-from .device import FloDeviceDataUpdateCoordinator
+from .coordinator import FloConfigEntry
 from .entity import FloEntity
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    config_entry: FloConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up the Flo sensors from config entry."""
-    devices: list[FloDeviceDataUpdateCoordinator] = hass.data[FLO_DOMAIN][
-        config_entry.entry_id
-    ]["devices"]
+    devices = config_entry.runtime_data.devices
     entities: list[BinarySensorEntity] = []
     for device in devices:
         if device.device_type == "puck_oem":
@@ -45,18 +42,21 @@ class FloPendingAlertsBinarySensor(FloEntity, BinarySensorEntity):
     """Binary sensor that reports on if there are any pending system alerts."""
 
     _attr_device_class = BinarySensorDeviceClass.PROBLEM
+    _attr_translation_key = "pending_system_alerts"
 
     def __init__(self, device):
         """Initialize the pending alerts binary sensor."""
-        super().__init__("pending_system_alerts", "Pending system alerts", device)
+        super().__init__("pending_system_alerts", device)
 
     @property
-    def is_on(self):
+    @override
+    def is_on(self) -> bool:
         """Return true if the Flo device has pending alerts."""
         return self._device.has_alerts
 
     @property
-    def extra_state_attributes(self):
+    @override
+    def extra_state_attributes(self) -> dict[str, Any]:
         """Return the state attributes."""
         if not self._device.has_alerts:
             return {}
@@ -71,12 +71,14 @@ class FloWaterDetectedBinarySensor(FloEntity, BinarySensorEntity):
     """Binary sensor that reports if water is detected (for leak detectors)."""
 
     _attr_device_class = BinarySensorDeviceClass.PROBLEM
+    _attr_translation_key = "water_detected"
 
     def __init__(self, device):
         """Initialize the pending alerts binary sensor."""
-        super().__init__("water_detected", "Water detected", device)
+        super().__init__("water_detected", device)
 
     @property
-    def is_on(self):
+    @override
+    def is_on(self) -> bool:
         """Return true if the Flo device is detecting water."""
         return self._device.water_detected

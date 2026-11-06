@@ -1,9 +1,12 @@
 """Config flow for OwnTracks."""
-import secrets
 
-from homeassistant import config_entries
+import secrets
+from typing import Any, override
+
 from homeassistant.components import cloud, webhook
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_WEBHOOK_ID
+from homeassistant.core import DOMAIN as HOMEASSISTANT_DOMAIN
 
 from .const import DOMAIN
 from .helper import supports_encryption
@@ -12,28 +15,34 @@ CONF_SECRET = "secret"
 CONF_CLOUDHOOK = "cloudhook"
 
 
-class OwnTracksFlow(config_entries.ConfigFlow, domain=DOMAIN):
+class OwnTracksFlow(ConfigFlow, domain=DOMAIN):
     """Set up OwnTracks."""
 
     VERSION = 1
 
-    async def async_step_user(self, user_input=None):
+    @override
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle a user initiated set up flow to create OwnTracks webhook."""
-        if self._async_current_entries():
-            return self.async_abort(reason="single_instance_allowed")
-
         if user_input is None:
             return self.async_show_form(step_id="user")
 
         try:
             webhook_id, webhook_url, cloudhook = await self._get_webhook_id()
         except cloud.CloudNotConnected:
-            return self.async_abort(reason="cloud_not_connected")
+            return self.async_abort(
+                reason="cloud_not_connected",
+                translation_domain=HOMEASSISTANT_DOMAIN,
+            )
 
         secret = secrets.token_hex(16)
 
         if supports_encryption():
-            secret_desc = f"The encryption key is {secret} (on Android under preferences -> advanced)"
+            secret_desc = (
+                f"The encryption key is {secret} (on Android under Preferences >"
+                " Advanced)"
+            )
         else:
             secret_desc = "Encryption is not supported because nacl is not installed."
 

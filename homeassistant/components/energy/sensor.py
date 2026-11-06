@@ -1,28 +1,26 @@
 """Helper sensor for calculating utility costs."""
-from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Mapping
 import copy
 from dataclasses import dataclass
 import logging
-from typing import Any, Final, Literal, cast
+from typing import Any, Final, Literal, Self, cast, override
 
 from homeassistant.components.sensor import (
-    ATTR_LAST_RESET,
-    ATTR_STATE_CLASS,
+    RestoreSensor,
     SensorDeviceClass,
     SensorEntity,
+    SensorEntityCapabilityAttribute,
+    SensorEntityStateAttribute,
+    SensorExtraStoredData,
     SensorStateClass,
 )
-from homeassistant.components.sensor.recorder import reset_detected
+from homeassistant.components.sensor.recorder import reset_detected  # pylint: disable=home-assistant-component-root-import
 from homeassistant.const import (
-    ATTR_UNIT_OF_MEASUREMENT,
-    VOLUME_CUBIC_FEET,
-    VOLUME_CUBIC_METERS,
-    VOLUME_GALLONS,
-    VOLUME_LITERS,
+    EntityStateAttribute,
     UnitOfEnergy,
+    UnitOfPower,
     UnitOfVolume,
 )
 from homeassistant.core import (
@@ -32,38 +30,40 @@ from homeassistant.core import (
     split_entity_id,
     valid_entity_id,
 )
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
-from homeassistant.util import unit_conversion
-import homeassistant.util.dt as dt_util
+from homeassistant.util import dt as dt_util, unit_conversion
 from homeassistant.util.unit_system import METRIC_SYSTEM
 
 from .const import DOMAIN
-from .data import EnergyManager, async_get_manager
+from .data import EnergyManager, PowerConfig, async_get_manager
+from .helpers import generate_power_sensor_entity_id, generate_power_sensor_unique_id
 
 SUPPORTED_STATE_CLASSES = {
     SensorStateClass.MEASUREMENT,
     SensorStateClass.TOTAL,
     SensorStateClass.TOTAL_INCREASING,
 }
-VALID_ENERGY_UNITS: set[str] = {
-    UnitOfEnergy.WATT_HOUR,
-    UnitOfEnergy.KILO_WATT_HOUR,
-    UnitOfEnergy.MEGA_WATT_HOUR,
-    UnitOfEnergy.GIGA_JOULE,
-}
+VALID_ENERGY_UNITS: set[str] = set(UnitOfEnergy)
+
 VALID_ENERGY_UNITS_GAS = {
-    VOLUME_CUBIC_FEET,
-    VOLUME_CUBIC_METERS,
+    UnitOfVolume.CENTUM_CUBIC_FEET,
+    UnitOfVolume.CUBIC_FEET,
+    UnitOfVolume.CUBIC_METERS,
+    UnitOfVolume.LITERS,
+    UnitOfVolume.MILLE_CUBIC_FEET,
     *VALID_ENERGY_UNITS,
 }
-VALID_VOLUME_UNITS_WATER = {
-    VOLUME_CUBIC_FEET,
-    VOLUME_CUBIC_METERS,
-    VOLUME_GALLONS,
-    VOLUME_LITERS,
+VALID_VOLUME_UNITS_WATER: set[str] = {
+    UnitOfVolume.CENTUM_CUBIC_FEET,
+    UnitOfVolume.CUBIC_FEET,
+    UnitOfVolume.CUBIC_METERS,
+    UnitOfVolume.GALLONS,
+    UnitOfVolume.LITERS,
+    UnitOfVolume.MILLE_CUBIC_FEET,
 }
 _LOGGER = logging.getLogger(__name__)
 
@@ -79,41 +79,34 @@ async def async_setup_platform(
     await sensor_manager.async_start()
 
 
-@dataclass
+@dataclass(slots=True)
 class SourceAdapter:
     """Adapter to allow sources and their flows to be used as sensors."""
 
     source_type: Literal["grid", "gas", "water"]
-    flow_type: Literal["flow_from", "flow_to", None]
+    flow_type: Literal["flow_from", "flow_to"] | None
     stat_energy_key: Literal["stat_energy_from", "stat_energy_to"]
     total_money_key: Literal["stat_cost", "stat_compensation"]
-    name_suffix: str
+    translation_key: str
     entity_id_suffix: str
 
 
 SOURCE_ADAPTERS: Final = (
+    # Grid import cost (unified format)
     SourceAdapter(
         "grid",
-        "flow_from",
+        None,  # No flow_type - unified format
         "stat_energy_from",
         "stat_cost",
-        "Cost",
         "cost",
-    ),
-    SourceAdapter(
-        "grid",
-        "flow_to",
-        "stat_energy_to",
-        "stat_compensation",
-        "Compensation",
-        "compensation",
+        "cost",
     ),
     SourceAdapter(
         "gas",
         None,
         "stat_energy_from",
         "stat_cost",
-        "Cost",
+        "cost",
         "cost",
     ),
     SourceAdapter(
@@ -121,10 +114,28 @@ SOURCE_ADAPTERS: Final = (
         None,
         "stat_energy_from",
         "stat_cost",
-        "Cost",
+        "cost",
         "cost",
     ),
 )
+
+# Separate adapter for grid export compensation (needs different price field)
+GRID_EXPORT_ADAPTER: Final = SourceAdapter(
+    "grid",
+    None,  # No flow_type - unified format
+    "stat_energy_to",
+    "stat_compensation",
+    "compensation",
+    "compensation",
+)
+
+
+class EntityNotFoundError(HomeAssistantError):
+    """When a referenced entity was not found."""
+
+
+class PriceUnitMismatchError(HomeAssistantError):
+    """When the price unit cannot be converted to the meter unit."""
 
 
 class SensorManager:
@@ -137,6 +148,7 @@ class SensorManager:
         self.manager = manager
         self.async_add_entities = async_add_entities
         self.current_entities: dict[tuple[str, str | None, str], EnergyCostSensor] = {}
+        self.current_power_entities: dict[str, EnergyPowerSensor] = {}
 
     async def async_start(self) -> None:
         """Start."""
@@ -147,18 +159,26 @@ class SensorManager:
 
     async def _process_manager_data(self) -> None:
         """Process manager data."""
-        to_add: list[EnergyCostSensor] = []
+        to_add: list[EnergyCostSensor | EnergyPowerSensor] = []
         to_remove = dict(self.current_entities)
+        power_to_remove = dict(self.current_power_entities)
 
         async def finish() -> None:
             if to_add:
                 self.async_add_entities(to_add)
-                await asyncio.gather(*(ent.add_finished.wait() for ent in to_add))
+                await asyncio.wait(ent.add_finished for ent in to_add)
 
             for key, entity in to_remove.items():
                 self.current_entities.pop(key)
-                await entity.async_remove()
+                await _async_remove_if_added(entity)
 
+            for power_key, power_entity in power_to_remove.items():
+                self.current_power_entities.pop(power_key)
+                await _async_remove_if_added(power_entity)
+
+        # This guard is for the optional typing of EnergyManager.data.
+        # In practice, data is always set to default preferences in async_update
+        # before listeners are called, so this case should never happen.
         if not self.manager.data:
             await finish()
             return
@@ -168,24 +188,28 @@ class SensorManager:
                 if adapter.source_type != energy_source["type"]:
                     continue
 
-                if adapter.flow_type is None:
-                    self._process_sensor_data(
-                        adapter,
-                        # Opting out of the type complexity because can't get it to work
-                        energy_source,  # type: ignore[arg-type]
-                        to_add,
-                        to_remove,
-                    )
-                    continue
+                self._process_sensor_data(
+                    adapter,
+                    energy_source,
+                    to_add,
+                    to_remove,
+                )
 
-                for flow in energy_source[adapter.flow_type]:  # type: ignore[typeddict-item]
-                    self._process_sensor_data(
-                        adapter,
-                        # Opting out of the type complexity because can't get it to work
-                        flow,  # type: ignore[arg-type]
-                        to_add,
-                        to_remove,
-                    )
+            # Handle grid export compensation
+            # (unified format uses different price fields)
+            if energy_source["type"] == "grid":
+                self._process_grid_export_sensor(
+                    energy_source,
+                    to_add,
+                    to_remove,
+                )
+
+            # Process power sensors for battery and grid sources
+            self._process_power_sensor_data(
+                energy_source,
+                to_add,
+                power_to_remove,
+            )
 
         await finish()
 
@@ -193,8 +217,8 @@ class SensorManager:
     def _process_sensor_data(
         self,
         adapter: SourceAdapter,
-        config: dict,
-        to_add: list[EnergyCostSensor],
+        config: Mapping[str, Any],
+        to_add: list[EnergyCostSensor | EnergyPowerSensor],
         to_remove: dict[tuple[str, str | None, str], EnergyCostSensor],
     ) -> None:
         """Process sensor data."""
@@ -202,11 +226,17 @@ class SensorManager:
         if config.get(adapter.total_money_key) is not None:
             return
 
-        key = (adapter.source_type, adapter.flow_type, config[adapter.stat_energy_key])
+        # Skip if the energy stat is not configured
+        # (e.g., export-only or power-only grids)
+        stat_energy = config.get(adapter.stat_energy_key)
+        if not stat_energy:
+            return
+
+        key = (adapter.source_type, adapter.flow_type, stat_energy)
 
         # Make sure the right data is there
         # If the entity existed, we don't pop it from to_remove so it's removed
-        if not valid_entity_id(config[adapter.stat_energy_key]) or (
+        if not valid_entity_id(stat_energy) or (
             config.get("entity_energy_price") is None
             and config.get("number_energy_price") is None
         ):
@@ -222,35 +252,226 @@ class SensorManager:
         )
         to_add.append(self.current_entities[key])
 
+    @callback
+    def _process_grid_export_sensor(
+        self,
+        config: Mapping[str, Any],
+        to_add: list[EnergyCostSensor | EnergyPowerSensor],
+        to_remove: dict[tuple[str, str | None, str], EnergyCostSensor],
+    ) -> None:
+        """Process grid export compensation sensor (unified format).
 
-class EnergyCostSensor(SensorEntity):
+        The unified grid format uses different field names for export pricing:
+        - entity_energy_price_export instead of entity_energy_price
+        - number_energy_price_export instead of number_energy_price
+        """
+        # No export meter configured
+        stat_energy_to = config.get("stat_energy_to")
+        if stat_energy_to is None:
+            return
+
+        # Already have a compensation stat
+        if config.get("stat_compensation") is not None:
+            return
+
+        key = ("grid", None, stat_energy_to)
+
+        # Check for export pricing fields (different names in unified format)
+        if not valid_entity_id(stat_energy_to) or (
+            config.get("entity_energy_price_export") is None
+            and config.get("number_energy_price_export") is None
+        ):
+            return
+
+        # Create a config wrapper that maps the sell price fields to standard names
+        # so EnergyCostSensor can use them
+        export_config: dict[str, Any] = {
+            "stat_energy_to": stat_energy_to,
+            "stat_compensation": config.get("stat_compensation"),
+            "entity_energy_price": config.get("entity_energy_price_export"),
+            "number_energy_price": config.get("number_energy_price_export"),
+        }
+
+        if current_entity := to_remove.pop(key, None):
+            current_entity.update_config(export_config)
+            return
+
+        self.current_entities[key] = EnergyCostSensor(
+            GRID_EXPORT_ADAPTER,
+            export_config,
+        )
+        to_add.append(self.current_entities[key])
+
+    @callback
+    def _process_power_sensor_data(
+        self,
+        energy_source: Mapping[str, Any],
+        to_add: list[EnergyCostSensor | EnergyPowerSensor],
+        to_remove: dict[str, EnergyPowerSensor],
+    ) -> None:
+        """Process power sensor data for battery and grid sources."""
+        source_type = energy_source.get("type")
+
+        if source_type in ("battery", "grid"):
+            # Both battery and grid now use unified format
+            # with power_config at top level
+            power_config = energy_source.get("power_config")
+            if power_config and self._needs_power_sensor(power_config):
+                self._create_or_keep_power_sensor(
+                    source_type, power_config, to_add, to_remove
+                )
+
+    @staticmethod
+    def _needs_power_sensor(power_config: PowerConfig) -> bool:
+        """Check if power_config needs a transform sensor."""
+        # Only create sensors for inverted or two-sensor configs
+        # Standard stat_rate configs don't need a transform sensor
+        return "stat_rate_inverted" in power_config or (
+            "stat_rate_from" in power_config and "stat_rate_to" in power_config
+        )
+
+    def _create_or_keep_power_sensor(
+        self,
+        source_type: str,
+        power_config: PowerConfig,
+        to_add: list[EnergyCostSensor | EnergyPowerSensor],
+        to_remove: dict[str, EnergyPowerSensor],
+    ) -> None:
+        """Create a power sensor or keep an existing one."""
+        unique_id = generate_power_sensor_unique_id(source_type, power_config)
+
+        # If entity already exists, keep it
+        if unique_id in to_remove:
+            to_remove.pop(unique_id)
+            return
+
+        sensor = EnergyPowerSensor(
+            source_type,
+            power_config,
+            unique_id,
+            generate_power_sensor_entity_id(source_type, power_config),
+        )
+        self.current_power_entities[unique_id] = sensor
+        to_add.append(sensor)
+
+
+def _name_from_entity_id(entity_id: str) -> str:
+    """Return a name for an entity that has none."""
+    return split_entity_id(entity_id)[1].replace("_", " ").capitalize()
+
+
+def _unit_converter(unit: str) -> type[unit_conversion.BaseUnitConverter]:
+    """Return the converter for an energy or volume unit."""
+    if unit in VALID_ENERGY_UNITS:
+        return unit_conversion.EnergyConverter
+    return unit_conversion.VolumeConverter
+
+
+def _set_result_unless_done(future: asyncio.Future[None]) -> None:
+    """Set the result of a future unless it is done."""
+    if not future.done():
+        future.set_result(None)
+
+
+async def _async_remove_if_added(entity: SensorEntity) -> None:
+    """Remove an entity unless the platform rejected it."""
+    # add_to_platform_abort clears hass, e.g. for a disabled or duplicate entity
+    if entity.hass is not None:
+        await entity.async_remove()
+
+
+@dataclass
+class EnergyCostSensorExtraStoredData(SensorExtraStoredData):
+    """Data to price the energy used while Home Assistant was stopped."""
+
+    last_energy_sensor_state: State
+
+    @override
+    def as_dict(self) -> dict[str, Any]:
+        """Return a dict representation of the data."""
+        data = super().as_dict()
+        data["last_energy_sensor_state"] = self.last_energy_sensor_state.as_dict()
+        return data
+
+    @classmethod
+    @override
+    def from_dict(cls, restored: dict[str, Any]) -> Self | None:
+        """Initialize the data from a dict, if it has the last energy state."""
+        if (
+            (extra := SensorExtraStoredData.from_dict(restored)) is None
+            or not isinstance(
+                energy_state_dict := restored.get("last_energy_sensor_state"), dict
+            )
+            or (last_energy_sensor_state := State.from_dict(energy_state_dict)) is None
+        ):
+            return None
+        return cls(
+            extra.native_value,
+            extra.native_unit_of_measurement,
+            last_energy_sensor_state,
+        )
+
+
+class EnergyCostSensor(RestoreSensor):
     """Calculate costs incurred by consuming energy.
 
     This is intended as a fallback for when no specific cost sensor is available for the
     utility.
+
+    Expected config fields (from adapter or export_config wrapper):
+    - stat_energy_key (via adapter): Key to get the energy statistic ID
+    - total_money_key (via adapter): Key to get the existing cost/compensation stat
+    - entity_energy_price: Entity ID providing price per unit (e.g., $/kWh)
+    - number_energy_price: Fixed price per unit
+
+    Note: For grid export compensation, the unified format uses
+    different field names (entity_energy_price_export,
+    number_energy_price_export). The _process_grid_export_sensor
+    method in SensorManager creates a wrapper config that maps
+    these to the standard field names (entity_energy_price,
+    number_energy_price) so this class can use them.
     """
 
     _attr_entity_registry_visible_default = False
+    _attr_has_entity_name = True
+    _attr_should_poll = False
+
     _wrong_state_class_reported = False
     _wrong_unit_reported = False
+    _wrong_price_unit_reported = False
 
     def __init__(
         self,
         adapter: SourceAdapter,
-        config: dict,
+        config: Mapping[str, Any],
     ) -> None:
         """Initialize the sensor."""
         super().__init__()
 
         self._adapter = adapter
         self.entity_id = f"{config[adapter.stat_energy_key]}_{adapter.entity_id_suffix}"
+        self._attr_translation_key = adapter.translation_key
         self._attr_device_class = SensorDeviceClass.MONETARY
         self._attr_state_class = SensorStateClass.TOTAL
         self._config = config
         self._last_energy_sensor_state: State | None = None
-        # add_finished is set when either of async_added_to_hass or add_to_platform_abort
-        # is called
-        self.add_finished = asyncio.Event()
+        # SensorManager awaits add_finished; async_on_remove resolves it on the
+        # abort path too, since add_to_platform_abort fires on-remove callbacks.
+        self.add_finished: asyncio.Future[None] = (
+            asyncio.get_running_loop().create_future()
+        )
+        self.async_on_remove(lambda: _set_result_unless_done(self.add_finished))
+
+    @override
+    async def async_prepare_to_add_to_hass(self) -> None:
+        """Name the sensor after its energy sensor before it is registered."""
+        await super().async_prepare_to_add_to_hass()
+        energy_entity_id = self._config[self._adapter.stat_energy_key]
+        if energy_state := self.hass.states.get(energy_entity_id):
+            energy_name = energy_state.name
+        else:
+            energy_name = _name_from_entity_id(energy_entity_id)
+        self._attr_translation_placeholders = {"energy_name": energy_name}
 
     def _reset(self, energy_state: State) -> None:
         """Reset the cost sensor."""
@@ -285,7 +506,9 @@ class EnergyCostSensor(SensorEntity):
         if energy_state is None:
             return
 
-        state_class = energy_state.attributes.get(ATTR_STATE_CLASS)
+        state_class = energy_state.attributes.get(
+            SensorEntityCapabilityAttribute.STATE_CLASS
+        )
         if state_class not in SUPPORTED_STATE_CLASSES:
             if not self._wrong_state_class_reported:
                 self._wrong_state_class_reported = True
@@ -299,7 +522,7 @@ class EnergyCostSensor(SensorEntity):
         # last_reset must be set if the sensor is SensorStateClass.MEASUREMENT
         if (
             state_class == SensorStateClass.MEASUREMENT
-            and ATTR_LAST_RESET not in energy_state.attributes
+            and SensorEntityStateAttribute.LAST_RESET not in energy_state.attributes
         ):
             return
 
@@ -308,108 +531,164 @@ class EnergyCostSensor(SensorEntity):
         except ValueError:
             return
 
-        # Determine energy price
-        if self._config["entity_energy_price"] is not None:
-            energy_price_state = self.hass.states.get(
-                self._config["entity_energy_price"]
+        try:
+            energy_price, energy_price_unit = self._get_energy_price(
+                valid_units, default_price_unit
             )
-
-            if energy_price_state is None:
-                return
-
-            try:
-                energy_price = float(energy_price_state.state)
-            except ValueError:
-                return
-
-            energy_price_unit: str | None = energy_price_state.attributes.get(
-                ATTR_UNIT_OF_MEASUREMENT, ""
-            ).partition("/")[2]
-
-            # For backwards compatibility we don't validate the unit of the price
-            # If it is not valid, we assume it's our default price unit.
-            if energy_price_unit not in valid_units:
-                energy_price_unit = default_price_unit
-
-        else:
-            energy_price = cast(float, self._config["number_energy_price"])
-            energy_price_unit = default_price_unit
+        except EntityNotFoundError:
+            return
+        except ValueError:
+            energy_price = None
 
         if self._last_energy_sensor_state is None:
-            # Initialize as it's the first time all required entities are in place.
+            # Initialize as it's the first time all required entities are in place or
+            # only the price is missing. In the later case, cost will update the first
+            # time the energy is updated after the price entity is in place.
             self._reset(energy_state)
             return
 
-        energy_unit: str | None = energy_state.attributes.get(ATTR_UNIT_OF_MEASUREMENT)
+        if energy_price is None:
+            return
+
+        energy_unit: str | None = energy_state.attributes.get(
+            EntityStateAttribute.UNIT_OF_MEASUREMENT
+        )
 
         if energy_unit is None or energy_unit not in valid_units:
             if not self._wrong_unit_reported:
                 self._wrong_unit_reported = True
                 _LOGGER.warning(
                     "Found unexpected unit %s for %s",
-                    energy_state.attributes.get(ATTR_UNIT_OF_MEASUREMENT),
+                    energy_state.attributes.get(
+                        EntityStateAttribute.UNIT_OF_MEASUREMENT
+                    ),
                     energy_state.entity_id,
                 )
             return
 
-        if (
-            state_class != SensorStateClass.TOTAL_INCREASING
-            and energy_state.attributes.get(ATTR_LAST_RESET)
-            != self._last_energy_sensor_state.attributes.get(ATTR_LAST_RESET)
-        ):
-            # Energy meter was reset, reset cost sensor too
-            energy_state_copy = copy.copy(energy_state)
-            energy_state_copy.state = "0.0"
-            self._reset(energy_state_copy)
-        elif state_class == SensorStateClass.TOTAL_INCREASING and reset_detected(
-            self.hass,
-            cast(str, self._config[self._adapter.stat_energy_key]),
-            energy,
-            float(self._last_energy_sensor_state.state),
-            self._last_energy_sensor_state,
-        ):
-            # Energy meter was reset, reset cost sensor too
-            energy_state_copy = copy.copy(energy_state)
-            energy_state_copy.state = "0.0"
-            self._reset(energy_state_copy)
+        try:
+            converted_energy_price = self._convert_energy_price(
+                energy_price, energy_price_unit, energy_unit
+            )
+        except PriceUnitMismatchError:
+            if not self._wrong_price_unit_reported:
+                self._wrong_price_unit_reported = True
+                _LOGGER.warning(
+                    "Not updating cost of %s: unit %s does not match price unit"
+                    " per %s of %s",
+                    energy_state.entity_id,
+                    energy_unit,
+                    energy_price_unit,
+                    self._config["entity_energy_price"],
+                )
+            return
 
-        # Update with newly incurred cost
-        old_energy_value = float(self._last_energy_sensor_state.state)
-        cur_value = cast(float, self._attr_native_value)
+        last_energy = float(self._last_energy_sensor_state.state)
+        last_energy_unit = self._last_energy_sensor_state.attributes.get(
+            EntityStateAttribute.UNIT_OF_MEASUREMENT
+        )
+        if last_energy_unit != energy_unit:
+            try:
+                last_energy = _unit_converter(energy_unit).convert(
+                    last_energy, last_energy_unit, energy_unit
+                )
+            except HomeAssistantError:
+                # Readings in these units can't be compared, start from this one
+                self._last_energy_sensor_state = energy_state
+                return
 
-        if energy_price_unit is None:
-            converted_energy_price = energy_price
+        if state_class == SensorStateClass.TOTAL_INCREASING:
+            try:
+                meter_reset = reset_detected(
+                    self.hass,
+                    cast(str, self._config[self._adapter.stat_energy_key]),
+                    energy,
+                    last_energy,
+                    self._last_energy_sensor_state,
+                )
+            except HomeAssistantError:
+                # Negative reading, already logged by reset_detected
+                return
         else:
-            if self._adapter.source_type == "grid":
-                converter: Callable[
-                    [float, str, str], float
-                ] = unit_conversion.EnergyConverter.convert
-            elif self._adapter.source_type in ("gas", "water"):
-                converter = unit_conversion.VolumeConverter.convert
-
-            converted_energy_price = converter(
-                energy_price,
-                energy_unit,
-                energy_price_unit,
+            meter_reset = energy_state.attributes.get(
+                SensorEntityStateAttribute.LAST_RESET
+            ) != self._last_energy_sensor_state.attributes.get(
+                SensorEntityStateAttribute.LAST_RESET
             )
 
+        if meter_reset:
+            # Energy meter was reset, reset cost sensor too
+            energy_state_copy = copy.copy(energy_state)
+            energy_state_copy.state = "0.0"
+            self._reset(energy_state_copy)
+            last_energy = 0.0
+
+        # Update with newly incurred cost
+        cur_value = cast(float, self._attr_native_value)
+
         self._attr_native_value = (
-            cur_value + (energy - old_energy_value) * converted_energy_price
+            cur_value + (energy - last_energy) * converted_energy_price
         )
 
         self._last_energy_sensor_state = energy_state
 
+    def _get_energy_price(
+        self, valid_units: set[str], default_unit: str | None
+    ) -> tuple[float, str | None]:
+        """Get the energy price.
+
+        Raises:
+            EntityNotFoundError: When the energy price entity is not found.
+            ValueError: When the entity state is not a valid float.
+
+        """
+
+        if self._config["entity_energy_price"] is None:
+            return cast(float, self._config["number_energy_price"]), default_unit
+
+        energy_price_state = self.hass.states.get(self._config["entity_energy_price"])
+        if energy_price_state is None:
+            raise EntityNotFoundError
+
+        energy_price = float(energy_price_state.state)
+
+        energy_price_unit: str | None = energy_price_state.attributes.get(
+            EntityStateAttribute.UNIT_OF_MEASUREMENT, ""
+        ).partition("/")[2]
+
+        # For backwards compatibility we don't validate the unit of the price
+        # If it is not valid, we assume it's our default price unit.
+        if energy_price_unit not in valid_units:
+            energy_price_unit = default_unit
+
+        return energy_price, energy_price_unit
+
+    def _convert_energy_price(
+        self, energy_price: float, energy_price_unit: str | None, energy_unit: str
+    ) -> float:
+        """Convert the energy price to the correct unit.
+
+        Raises:
+            PriceUnitMismatchError: When the price unit cannot be converted to
+                the meter unit.
+
+        """
+        if energy_price_unit is None:
+            return energy_price
+
+        converter = _unit_converter(energy_unit)
+        if energy_price_unit not in converter.VALID_UNITS:
+            raise PriceUnitMismatchError
+
+        return converter.convert(energy_price, energy_unit, energy_price_unit)
+
+    @override
     async def async_added_to_hass(self) -> None:
         """Register callbacks."""
-        energy_state = self.hass.states.get(self._config[self._adapter.stat_energy_key])
-        if energy_state:
-            name = energy_state.name
-        else:
-            name = split_entity_id(self._config[self._adapter.stat_energy_key])[
-                0
-            ].replace("_", " ")
-
-        self._attr_name = f"{name} {self._adapter.name_suffix}"
+        # Start a new cycle from the last priced reading, so the energy used
+        # while stopped is priced too
+        if (restored := await self.async_get_last_sensor_data()) is not None:
+            self._reset(restored.last_energy_sensor_state)
 
         self._update_cost()
 
@@ -418,26 +697,34 @@ class EnergyCostSensor(SensorEntity):
             self._config[self._adapter.stat_energy_key]
         ] = self.entity_id
 
-        @callback
-        def async_state_changed_listener(*_: Any) -> None:
-            """Handle child updates."""
-            self._update_cost()
-            self.async_write_ha_state()
-
         self.async_on_remove(
             async_track_state_change_event(
                 self.hass,
                 cast(str, self._config[self._adapter.stat_energy_key]),
-                async_state_changed_listener,
+                self._async_state_changed_listener,
             )
         )
-        self.add_finished.set()
+        _set_result_unless_done(self.add_finished)
 
     @callback
-    def add_to_platform_abort(self) -> None:
-        """Abort adding an entity to a platform."""
-        self.add_finished.set()
+    def _async_state_changed_listener(self, *_: Any) -> None:
+        """Handle child updates."""
+        # Leave readings after the shutdown save to the next start
+        if self.hass.is_stopping:
+            return
+        self._update_cost()
+        self.async_write_ha_state()
 
+    @callback
+    @override
+    def async_entity_id_changed(self, old_entity_id: str) -> None:
+        """Update the stat ID stored for the frontend."""
+        super().async_entity_id_changed(old_entity_id)
+        self.hass.data[DOMAIN]["cost_sensors"][
+            self._config[self._adapter.stat_energy_key]
+        ] = self.entity_id
+
+    @override
     async def async_will_remove_from_hass(self) -> None:
         """Handle removing from hass."""
         self.hass.data[DOMAIN]["cost_sensors"].pop(
@@ -446,16 +733,46 @@ class EnergyCostSensor(SensorEntity):
         await super().async_will_remove_from_hass()
 
     @callback
-    def update_config(self, config: dict) -> None:
+    def update_config(self, config: Mapping[str, Any]) -> None:
         """Update the config."""
         self._config = config
 
     @property
+    @override
+    def extra_restore_state_data(self) -> SensorExtraStoredData:
+        """Return the data needed to price the energy used while stopped."""
+        # Only the save made while stopping stores the last priced reading.
+        # Restore state is also saved every 15 minutes while running. After a
+        # crash, the last of those saves holds an older reading, and restoring
+        # it would price the energy used since then a second time. A sensor
+        # removed by a config change must not price the time it was gone either.
+        if self._last_energy_sensor_state is None or not self.hass.is_stopping:
+            return super().extra_restore_state_data
+        return EnergyCostSensorExtraStoredData(
+            self.native_value,
+            self.native_unit_of_measurement,
+            self._last_energy_sensor_state,
+        )
+
+    @override
+    async def async_get_last_sensor_data(
+        self,
+    ) -> EnergyCostSensorExtraStoredData | None:
+        """Return the restored data, if it is complete."""
+        if (restored_last_extra_data := await self.async_get_last_extra_data()) is None:
+            return None
+        return EnergyCostSensorExtraStoredData.from_dict(
+            restored_last_extra_data.as_dict()
+        )
+
+    @property
+    @override
     def native_unit_of_measurement(self) -> str | None:
         """Return the units of measurement."""
         return self.hass.config.currency
 
     @property
+    @override
     def unique_id(self) -> str | None:
         """Return the unique ID of the sensor."""
         entity_registry = er.async_get(self.hass)
@@ -467,3 +784,207 @@ class EnergyCostSensor(SensorEntity):
             prefix = self._config[self._adapter.stat_energy_key]
 
         return f"{prefix}_{self._adapter.source_type}_{self._adapter.entity_id_suffix}"
+
+
+class EnergyPowerSensor(SensorEntity):
+    """Transform power sensor values (invert or combine two sensors).
+
+    This sensor handles non-standard power sensor configurations for the energy
+    dashboard by either inverting polarity or combining two positive sensors.
+    """
+
+    _attr_should_poll = False
+    _attr_device_class = SensorDeviceClass.POWER
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_has_entity_name = True
+    _wrong_unit_reported = False
+
+    def __init__(
+        self,
+        source_type: str,
+        config: PowerConfig,
+        unique_id: str,
+        entity_id: str,
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__()
+        self._source_type = source_type
+        self._config: PowerConfig = config
+        self._attr_unique_id = unique_id
+        self.entity_id = entity_id
+        self._source_sensors: list[str] = []
+        self._is_inverted = "stat_rate_inverted" in config
+        self._is_combined = "stat_rate_from" in config and "stat_rate_to" in config
+
+        # Combined mode always emits Watts because _update_state converts
+        # heterogeneous source units to W internally. Inverted mode copies
+        # the source unit in _update_state to track source changes.
+        if self._is_combined:
+            self._attr_native_unit_of_measurement = UnitOfPower.WATT
+            self._attr_translation_key = f"{source_type}_power"
+
+        # Determine source sensors
+        if self._is_inverted:
+            self._source_sensors = [config["stat_rate_inverted"]]
+            self._attr_translation_key = "power_inverted"
+        elif self._is_combined:
+            self._source_sensors = [
+                config["stat_rate_from"],
+                config["stat_rate_to"],
+            ]
+
+        # SensorManager awaits add_finished; async_on_remove resolves it on the
+        # abort path too, since add_to_platform_abort fires on-remove callbacks.
+        self.add_finished: asyncio.Future[None] = (
+            asyncio.get_running_loop().create_future()
+        )
+        self.async_on_remove(lambda: _set_result_unless_done(self.add_finished))
+
+    @override
+    async def async_prepare_to_add_to_hass(self) -> None:
+        """Name the sensor after its source sensor before it is registered."""
+        await super().async_prepare_to_add_to_hass()
+        if not self._is_inverted:
+            return
+        source = self._source_sensors[0]
+        if not (
+            (entry := er.async_get(self.hass).async_get(source))
+            and (source_name := entry.name or entry.original_name)
+        ):
+            source_name = _name_from_entity_id(source)
+        self._attr_translation_placeholders = {"source_name": source_name}
+
+    @property
+    @override
+    def available(self) -> bool:
+        """Return if entity is available."""
+        if self._is_inverted:
+            source = self.hass.states.get(self._source_sensors[0])
+            return source is not None and source.state not in (
+                "unknown",
+                "unavailable",
+            )
+        if self._is_combined:
+            discharge = self.hass.states.get(self._source_sensors[0])
+            charge = self.hass.states.get(self._source_sensors[1])
+            return (
+                discharge is not None
+                and charge is not None
+                and discharge.state not in ("unknown", "unavailable")
+                and charge.state not in ("unknown", "unavailable")
+            )
+        return True
+
+    @callback
+    def _update_state(self) -> None:
+        """Update the sensor state based on source sensors."""
+        if self._is_inverted:
+            source_state = self.hass.states.get(self._source_sensors[0])
+            if source_state is None or source_state.state in ("unknown", "unavailable"):
+                self._attr_native_value = None
+                return
+            try:
+                value = float(source_state.state)
+            except ValueError:
+                self._attr_native_value = None
+                return
+
+            self._attr_native_unit_of_measurement = source_state.attributes.get(
+                EntityStateAttribute.UNIT_OF_MEASUREMENT
+            )
+            self._attr_native_value = value * -1
+
+        elif self._is_combined:
+            discharge_state = self.hass.states.get(self._source_sensors[0])
+            charge_state = self.hass.states.get(self._source_sensors[1])
+
+            if (
+                discharge_state is None
+                or charge_state is None
+                or discharge_state.state in ("unknown", "unavailable")
+                or charge_state.state in ("unknown", "unavailable")
+            ):
+                self._attr_native_value = None
+                return
+
+            try:
+                discharge = float(discharge_state.state)
+                charge = float(charge_state.state)
+            except ValueError:
+                self._attr_native_value = None
+                return
+
+            # Get units from state attributes
+            discharge_unit = discharge_state.attributes.get(
+                EntityStateAttribute.UNIT_OF_MEASUREMENT
+            )
+            charge_unit = charge_state.attributes.get(
+                EntityStateAttribute.UNIT_OF_MEASUREMENT
+            )
+
+            # Convert to Watts if units are present
+            try:
+                if discharge_unit:
+                    discharge = unit_conversion.PowerConverter.convert(
+                        discharge, discharge_unit, UnitOfPower.WATT
+                    )
+                if charge_unit:
+                    charge = unit_conversion.PowerConverter.convert(
+                        charge, charge_unit, UnitOfPower.WATT
+                    )
+            except HomeAssistantError as err:
+                if not self._wrong_unit_reported:
+                    self._wrong_unit_reported = True
+                    _LOGGER.warning(
+                        "Unable to combine %s and %s: %s",
+                        discharge_state.entity_id,
+                        charge_state.entity_id,
+                        err,
+                    )
+                self._attr_native_value = None
+                return
+
+            self._attr_native_value = discharge - charge
+
+    @override
+    async def async_added_to_hass(self) -> None:
+        """Register callbacks."""
+        if self._source_sensors:
+            entity_reg = er.async_get(self.hass)
+            device_id = None
+            # Check first sensor
+            if source_entry := entity_reg.async_get(self._source_sensors[0]):
+                device_id = source_entry.device_id
+            # Assign power sensor to same device as source sensor(s)
+            # Note: We use manual entity registry update instead of _attr_device_info
+            # because device assignment depends on runtime information from the entity
+            # registry (which source sensor has a device). This information isn't
+            # available during __init__, and the entity is already registered before
+            # async_added_to_hass runs, making the standard _attr_device_info pattern
+            # incompatible with this use case.
+            # If first sensor has no device and we have a second sensor, check it
+            if not device_id and len(self._source_sensors) > 1:
+                if source_entry := entity_reg.async_get(self._source_sensors[1]):
+                    device_id = source_entry.device_id
+            # Update entity registry entry with device_id
+            if device_id and (power_entry := entity_reg.async_get(self.entity_id)):
+                entity_reg.async_update_entity(
+                    power_entry.entity_id, device_id=device_id
+                )
+        self._update_state()
+
+        # Track state changes on all source sensors
+        self.async_on_remove(
+            async_track_state_change_event(
+                self.hass,
+                self._source_sensors,
+                self._async_state_changed_listener,
+            )
+        )
+        _set_result_unless_done(self.add_finished)
+
+    @callback
+    def _async_state_changed_listener(self, *_: Any) -> None:
+        """Handle source sensor state changes."""
+        self._update_state()
+        self.async_write_ha_state()

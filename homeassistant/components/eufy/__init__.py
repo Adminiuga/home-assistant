@@ -1,6 +1,7 @@
-"""Support for Eufy devices."""
+"""Support for EufyHome devices."""
+
 import lakeside
-import voluptuous as vol
+import probatio
 
 from homeassistant.const import (
     CONF_ACCESS_TOKEN,
@@ -13,34 +14,35 @@ from homeassistant.const import (
     Platform,
 )
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers import discovery
-import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers import config_validation as cv, discovery
 from homeassistant.helpers.typing import ConfigType
 
 DOMAIN = "eufy"
 
-DEVICE_SCHEMA = vol.Schema(
+DEVICE_SCHEMA = probatio.Schema(
     {
-        vol.Required(CONF_ADDRESS): cv.string,
-        vol.Required(CONF_ACCESS_TOKEN): cv.string,
-        vol.Required(CONF_TYPE): cv.string,
-        vol.Optional(CONF_NAME): cv.string,
+        probatio.Required(CONF_ADDRESS): cv.string,
+        probatio.Required(probatio.Secret(CONF_ACCESS_TOKEN)): cv.string,
+        probatio.Required(CONF_TYPE): cv.string,
+        probatio.Optional(CONF_NAME): cv.string,
     }
 )
 
-CONFIG_SCHEMA = vol.Schema(
+CONFIG_SCHEMA = probatio.Schema(
     {
-        DOMAIN: vol.Schema(
+        DOMAIN: probatio.Schema(
             {
-                vol.Optional(CONF_DEVICES, default=[]): vol.All(
-                    cv.ensure_list, [DEVICE_SCHEMA]
+                probatio.Optional(CONF_DEVICES, default=[]): probatio.All(
+                    probatio.EnsureList(), [DEVICE_SCHEMA]
                 ),
-                vol.Inclusive(CONF_USERNAME, "authentication"): cv.string,
-                vol.Inclusive(CONF_PASSWORD, "authentication"): cv.string,
+                probatio.Inclusive(CONF_USERNAME, "authentication"): cv.string,
+                probatio.Inclusive(
+                    probatio.Secret(CONF_PASSWORD), "authentication"
+                ): cv.string,
             }
         )
     },
-    extra=vol.ALLOW_EXTRA,
+    extra=probatio.ALLOW_EXTRA,
 )
 
 PLATFORMS = {
@@ -55,7 +57,7 @@ PLATFORMS = {
 
 
 def setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    """Set up Eufy devices."""
+    """Set up EufyHome devices."""
 
     if CONF_USERNAME in config[DOMAIN] and CONF_PASSWORD in config[DOMAIN]:
         data = lakeside.get_devices(

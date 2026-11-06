@@ -1,62 +1,56 @@
 """mütesync binary sensor entities."""
+
+from typing import override
+
 from homeassistant.components.binary_sensor import BinarySensorEntity
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers import update_coordinator
-from homeassistant.helpers.device_registry import DeviceEntryType
-from homeassistant.helpers.entity import DeviceInfo
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
+from .coordinator import MutesyncConfigEntry, MutesyncUpdateCoordinator
 
-SENSORS = {
-    "in_meeting": "In Meeting",
-    "muted": "Muted",
-}
+SENSORS = (
+    "in_meeting",
+    "muted",
+)
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    config_entry: MutesyncConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    """Set up the mütesync button."""
-    coordinator = hass.data[DOMAIN][config_entry.entry_id]
+    """Set up the mütesync binary sensors."""
+    coordinator = config_entry.runtime_data
     async_add_entities(
         [MuteStatus(coordinator, sensor_type) for sensor_type in SENSORS], True
     )
 
 
-class MuteStatus(update_coordinator.CoordinatorEntity, BinarySensorEntity):
+class MuteStatus(CoordinatorEntity[MutesyncUpdateCoordinator], BinarySensorEntity):
     """Mütesync binary sensors."""
+
+    _attr_has_entity_name = True
 
     def __init__(self, coordinator, sensor_type):
         """Initialize our sensor."""
         super().__init__(coordinator)
         self._sensor_type = sensor_type
-
-    @property
-    def name(self):
-        """Return the name of the sensor."""
-        return SENSORS[self._sensor_type]
-
-    @property
-    def unique_id(self):
-        """Return the unique ID of the sensor."""
-        return f"{self.coordinator.data['user-id']}-{self._sensor_type}"
-
-    @property
-    def is_on(self):
-        """Return the state of the sensor."""
-        return self.coordinator.data[self._sensor_type]
-
-    @property
-    def device_info(self) -> DeviceInfo:
-        """Return the device info of the sensor."""
-        return DeviceInfo(
+        self._attr_translation_key = sensor_type
+        user_id = coordinator.data["user-id"]
+        self._attr_unique_id = f"{user_id}-{sensor_type}"
+        self._attr_device_info = DeviceInfo(
             entry_type=DeviceEntryType.SERVICE,
-            identifiers={(DOMAIN, self.coordinator.data["user-id"])},
+            identifiers={(DOMAIN, user_id)},
             manufacturer="mütesync",
             model="mutesync app",
             name="mutesync",
         )
+
+    @property
+    @override
+    def is_on(self) -> bool:
+        """Return the state of the sensor."""
+        return self.coordinator.data[self._sensor_type]

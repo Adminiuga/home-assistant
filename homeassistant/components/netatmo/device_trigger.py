@@ -1,13 +1,13 @@
 """Provides device automations for Netatmo."""
-from __future__ import annotations
 
-import voluptuous as vol
+import probatio
 
-from homeassistant.components.device_automation import DEVICE_TRIGGER_BASE_SCHEMA
-from homeassistant.components.device_automation.exceptions import (
+from homeassistant.components.device_automation import (
+    DEVICE_TRIGGER_BASE_SCHEMA,
     InvalidDeviceAutomationConfig,
 )
 from homeassistant.components.homeassistant.triggers import event as event_trigger
+from homeassistant.components.homeassistant.triggers.event import EventTriggerArgument
 from homeassistant.const import (
     ATTR_DEVICE_ID,
     CONF_DEVICE_ID,
@@ -16,11 +16,11 @@ from homeassistant.const import (
     CONF_PLATFORM,
     CONF_TYPE,
 )
-from homeassistant.core import CALLBACK_TYPE, HomeAssistant
+from homeassistant.core import CALLBACK_TYPE, HomeAssistant, async_noop
 from homeassistant.helpers import (
     config_validation as cv,
     device_registry as dr,
-    entity_registry,
+    entity_registry as er,
 )
 from homeassistant.helpers.trigger import TriggerActionType, TriggerInfo
 from homeassistant.helpers.typing import ConfigType
@@ -56,9 +56,9 @@ TRIGGER_TYPES = OUTDOOR_CAMERA_TRIGGERS + INDOOR_CAMERA_TRIGGERS + CLIMATE_TRIGG
 
 TRIGGER_SCHEMA = DEVICE_TRIGGER_BASE_SCHEMA.extend(
     {
-        vol.Required(CONF_ENTITY_ID): cv.entity_id,
-        vol.Required(CONF_TYPE): vol.In(TRIGGER_TYPES),
-        vol.Optional(CONF_SUBTYPE): str,
+        probatio.Required(CONF_ENTITY_ID): cv.entity_id_or_uuid,
+        probatio.Required(CONF_TYPE): probatio.In(TRIGGER_TYPES),
+        probatio.Optional(CONF_SUBTYPE): str,
     }
 )
 
@@ -70,7 +70,9 @@ async def async_validate_trigger_config(
     config = TRIGGER_SCHEMA(config)
 
     device_registry = dr.async_get(hass)
-    device = device_registry.async_get(config[CONF_DEVICE_ID])
+    device = device_registry.async_get(
+        config[CONF_DEVICE_ID], include_child_devices=False
+    )
 
     if not device or device.model is None:
         raise InvalidDeviceAutomationConfig(
@@ -93,36 +95,36 @@ async def async_get_triggers(
     hass: HomeAssistant, device_id: str
 ) -> list[dict[str, str]]:
     """List device triggers for Netatmo devices."""
-    registry = entity_registry.async_get(hass)
+    registry = er.async_get(hass)
     device_registry = dr.async_get(hass)
-    triggers = []
+    triggers: list[dict[str, str]] = []
 
-    for entry in entity_registry.async_entries_for_device(registry, device_id):
+    for entry in er.async_entries_for_device(registry, device_id):
         if (
-            device := device_registry.async_get(device_id)
+            device := device_registry.async_get(device_id, include_child_devices=False)
         ) is None or device.model is None:
             continue
 
         for trigger in DEVICES.get(device.model, []):
             if trigger in SUBTYPES:
-                for subtype in SUBTYPES[trigger]:
-                    triggers.append(
-                        {
-                            CONF_PLATFORM: "device",
-                            CONF_DEVICE_ID: device_id,
-                            CONF_DOMAIN: DOMAIN,
-                            CONF_ENTITY_ID: entry.entity_id,
-                            CONF_TYPE: trigger,
-                            CONF_SUBTYPE: subtype,
-                        }
-                    )
+                triggers.extend(
+                    {
+                        CONF_PLATFORM: "device",
+                        CONF_DEVICE_ID: device_id,
+                        CONF_DOMAIN: DOMAIN,
+                        CONF_ENTITY_ID: entry.id,
+                        CONF_TYPE: trigger,
+                        CONF_SUBTYPE: subtype,
+                    }
+                    for subtype in SUBTYPES[trigger]
+                )
             else:
                 triggers.append(
                     {
                         CONF_PLATFORM: "device",
                         CONF_DEVICE_ID: device_id,
                         CONF_DOMAIN: DOMAIN,
-                        CONF_ENTITY_ID: entry.entity_id,
+                        CONF_ENTITY_ID: entry.id,
                         CONF_TYPE: trigger,
                     }
                 )
@@ -138,18 +140,20 @@ async def async_attach_trigger(
 ) -> CALLBACK_TYPE:
     """Attach a trigger."""
     device_registry = dr.async_get(hass)
-    device = device_registry.async_get(config[CONF_DEVICE_ID])
+    device = device_registry.async_get(
+        config[CONF_DEVICE_ID], include_child_devices=False
+    )
 
     if not device:
-        return lambda: None
+        return async_noop
 
     if device.model not in DEVICES:
-        return lambda: None
+        return async_noop
 
     event_config = {
-        event_trigger.CONF_PLATFORM: "event",
-        event_trigger.CONF_EVENT_TYPE: NETATMO_EVENT,
-        event_trigger.CONF_EVENT_DATA: {
+        EventTriggerArgument.PLATFORM: "event",
+        EventTriggerArgument.EVENT_TYPE: NETATMO_EVENT,
+        EventTriggerArgument.EVENT_DATA: {
             "type": config[CONF_TYPE],
             ATTR_DEVICE_ID: config[ATTR_DEVICE_ID],
         },
@@ -157,7 +161,7 @@ async def async_attach_trigger(
 
     if config[CONF_TYPE] in SUBTYPES:
         event_config.update(
-            {event_trigger.CONF_EVENT_DATA: {"data": {"mode": config[CONF_SUBTYPE]}}}
+            {EventTriggerArgument.EVENT_DATA: {"data": {"mode": config[CONF_SUBTYPE]}}}
         )
 
     event_config = event_trigger.TRIGGER_SCHEMA(event_config)

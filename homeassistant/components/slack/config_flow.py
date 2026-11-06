@@ -1,37 +1,43 @@
 """Config flow for Slack integration."""
-from __future__ import annotations
 
+from collections.abc import Mapping
 import logging
+from typing import Any, override
 
-from slack import WebClient
-from slack.errors import SlackApiError
-import voluptuous as vol
+import probatio
+from slack_sdk.errors import SlackApiError
+from slack_sdk.web.async_client import AsyncSlackResponse, AsyncWebClient
 
-from homeassistant import config_entries
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_API_KEY, CONF_ICON, CONF_NAME, CONF_USERNAME
-from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers import aiohttp_client
 
 from .const import CONF_DEFAULT_CHANNEL, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
-CONFIG_SCHEMA = vol.Schema(
+CONFIG_SCHEMA = probatio.Schema(
     {
-        vol.Required(CONF_API_KEY): str,
-        vol.Required(CONF_DEFAULT_CHANNEL): str,
-        vol.Optional(CONF_ICON): str,
-        vol.Optional(CONF_USERNAME): str,
+        probatio.Required(probatio.Secret(CONF_API_KEY)): str,
+        probatio.Required(CONF_DEFAULT_CHANNEL): str,
+        probatio.Optional(CONF_ICON): str,
+        probatio.Optional(CONF_USERNAME): str,
+    }
+)
+REAUTH_SCHEMA = probatio.Schema(
+    {
+        probatio.Required(probatio.Secret(CONF_API_KEY)): str,
     }
 )
 
 
-class SlackFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
+class SlackFlowHandler(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Slack."""
 
+    @override
     async def async_step_user(
         self, user_input: dict[str, str] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle a flow initiated by the user."""
         errors = {}
 
@@ -55,25 +61,41 @@ class SlackFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             errors=errors,
         )
 
-    async def async_step_import(self, import_config: dict[str, str]) -> FlowResult:
-        """Import a config entry from configuration.yaml."""
-        _LOGGER.warning(
-            "Configuration of the Slack integration in YAML is deprecated and "
-            "will be removed in a future release; Your existing configuration "
-            "has been imported into the UI automatically and can be safely removed "
-            "from your configuration.yaml file"
+    async def async_step_reauth(
+        self, entry_data: Mapping[str, Any]
+    ) -> ConfigFlowResult:
+        """Handle reauthentication."""
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(
+        self, user_input: dict[str, str] | None = None
+    ) -> ConfigFlowResult:
+        """Confirm reauthentication with a new API key."""
+        errors = {}
+
+        if user_input is not None:
+            error, info = await self._async_try_connect(user_input[CONF_API_KEY])
+            if error is not None:
+                errors["base"] = error
+            elif info is not None:
+                await self.async_set_unique_id(info["team_id"].lower())
+                self._abort_if_unique_id_mismatch(reason="wrong_account")
+                return self.async_update_reload_and_abort(
+                    self._get_reauth_entry(), data_updates=user_input
+                )
+
+        return self.async_show_form(
+            step_id="reauth_confirm",
+            data_schema=REAUTH_SCHEMA,
+            errors=errors,
         )
-        entries = self._async_current_entries()
-        if any(x.data[CONF_API_KEY] == import_config[CONF_API_KEY] for x in entries):
-            return self.async_abort(reason="already_configured")
-        return await self.async_step_user(import_config)
 
     async def _async_try_connect(
         self, token: str
-    ) -> tuple[str, None] | tuple[None, dict[str, str]]:
+    ) -> tuple[str, None] | tuple[None, AsyncSlackResponse]:
         """Try connecting to Slack."""
         session = aiohttp_client.async_get_clientsession(self.hass)
-        client = WebClient(token=token, run_async=True, session=session)
+        client = AsyncWebClient(token=token, session=session)  # No run_async
 
         try:
             info = await client.auth_test()
@@ -81,7 +103,7 @@ class SlackFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             if ex.response["error"] == "invalid_auth":
                 return "invalid_auth", None
             return "cannot_connect", None
-        except Exception as ex:  # pylint:disable=broad-except
-            _LOGGER.exception("Unexpected exception: %s", ex)
+        except Exception:
+            _LOGGER.exception("Unexpected exception")
             return "unknown", None
         return None, info

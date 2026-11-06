@@ -1,14 +1,13 @@
-"""Support for the PRT Heatmiser themostats using the V3 protocol."""
-from __future__ import annotations
+"""Support for the PRT Heatmiser thermostats using the V3 protocol."""
 
 import logging
-from typing import Any
+from typing import Any, override
 
-from heatmiserV3 import connection, heatmiser
-import voluptuous as vol
+from heatmiserv3 import connection, heatmiser
+import probatio
 
 from homeassistant.components.climate import (
-    PLATFORM_SCHEMA,
+    PLATFORM_SCHEMA as CLIMATE_PLATFORM_SCHEMA,
     ClimateEntity,
     ClimateEntityFeature,
     HVACMode,
@@ -19,11 +18,10 @@ from homeassistant.const import (
     CONF_ID,
     CONF_NAME,
     CONF_PORT,
-    TEMP_CELSIUS,
-    TEMP_FAHRENHEIT,
+    UnitOfTemperature,
 )
 from homeassistant.core import HomeAssistant
-import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
@@ -31,18 +29,23 @@ _LOGGER = logging.getLogger(__name__)
 
 CONF_THERMOSTATS = "tstats"
 
-TSTATS_SCHEMA = vol.Schema(
-    vol.All(
-        cv.ensure_list,
-        [{vol.Required(CONF_ID): cv.positive_int, vol.Required(CONF_NAME): cv.string}],
+TSTATS_SCHEMA = probatio.Schema(
+    probatio.All(
+        probatio.EnsureList(),
+        [
+            {
+                probatio.Required(CONF_ID): cv.positive_int,
+                probatio.Required(CONF_NAME): cv.string,
+            }
+        ],
     )
 )
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
+PLATFORM_SCHEMA = CLIMATE_PLATFORM_SCHEMA.extend(
     {
-        vol.Required(CONF_HOST): cv.string,
-        vol.Required(CONF_PORT): cv.string,
-        vol.Optional(CONF_THERMOSTATS, default=[]): TSTATS_SCHEMA,
+        probatio.Required(CONF_HOST): cv.string,
+        probatio.Required(CONF_PORT): cv.string,
+        probatio.Optional(CONF_THERMOSTATS, default=[]): TSTATS_SCHEMA,
     }
 )
 
@@ -55,8 +58,6 @@ def setup_platform(
 ) -> None:
     """Set up the heatmiser thermostat."""
 
-    heatmiser_v3_thermostat = heatmiser.HeatmiserThermostat
-
     host = config[CONF_HOST]
     port = config[CONF_PORT]
 
@@ -65,10 +66,7 @@ def setup_platform(
     uh1_hub = connection.HeatmiserUH1(host, port)
 
     add_entities(
-        [
-            HeatmiserV3Thermostat(heatmiser_v3_thermostat, thermostat, uh1_hub)
-            for thermostat in thermostats
-        ],
+        [HeatmiserV3Thermostat(thermostat, uh1_hub) for thermostat in thermostats],
         True,
     )
 
@@ -77,55 +75,47 @@ class HeatmiserV3Thermostat(ClimateEntity):
     """Representation of a HeatmiserV3 thermostat."""
 
     _attr_hvac_modes = [HVACMode.HEAT, HVACMode.OFF]
-    _attr_supported_features = ClimateEntityFeature.TARGET_TEMPERATURE
+    _attr_supported_features = (
+        ClimateEntityFeature.TARGET_TEMPERATURE
+        | ClimateEntityFeature.TURN_OFF
+        | ClimateEntityFeature.TURN_ON
+    )
 
-    def __init__(self, therm, device, uh1):
+    def __init__(
+        self,
+        device: dict[str, Any],
+        uh1: connection.HeatmiserUH1,
+    ) -> None:
         """Initialize the thermostat."""
-        self.therm = therm(device[CONF_ID], "prt", uh1)
+        self.therm = heatmiser.HeatmiserThermostat(device[CONF_ID], "prt", uh1)
         self.uh1 = uh1
-        self._name = device[CONF_NAME]
-        self._current_temperature = None
-        self._target_temperature = None
+        self._attr_name = device[CONF_NAME]
         self._id = device
         self.dcb = None
         self._attr_hvac_mode = HVACMode.HEAT
 
-    @property
-    def name(self):
-        """Return the name of the thermostat, if any."""
-        return self._name
-
-    @property
-    def current_temperature(self):
-        """Return the current temperature."""
-        return self._current_temperature
-
-    @property
-    def target_temperature(self):
-        """Return the temperature we try to reach."""
-        return self._target_temperature
-
+    @override
     def set_temperature(self, **kwargs: Any) -> None:
         """Set new target temperature."""
         if (temperature := kwargs.get(ATTR_TEMPERATURE)) is None:
             return
-        self._target_temperature = int(temperature)
-        self.therm.set_target_temp(self._target_temperature)
+        self._attr_native_target_temperature = int(temperature)
+        self.therm.set_target_temp(self._attr_native_target_temperature)
 
     def update(self) -> None:
         """Get the latest data."""
         self.uh1.reopen()
         if not self.uh1.status:
-            _LOGGER.error("Failed to update device %s", self._name)
+            _LOGGER.error("Failed to update device %s", self.name)
             return
         self.dcb = self.therm.read_dcb()
-        self._attr_temperature_unit = (
-            TEMP_CELSIUS
+        self._attr_native_temperature_unit = (
+            UnitOfTemperature.CELSIUS
             if (self.therm.get_temperature_format() == "C")
-            else TEMP_FAHRENHEIT
+            else UnitOfTemperature.FAHRENHEIT
         )
-        self._current_temperature = int(self.therm.get_floor_temp())
-        self._target_temperature = int(self.therm.get_target_temp())
+        self._attr_native_current_temperature = int(self.therm.get_floor_temp())
+        self._attr_native_target_temperature = int(self.therm.get_target_temp())
         self._attr_hvac_mode = (
             HVACMode.OFF
             if (int(self.therm.get_current_state()) == 0)

@@ -1,12 +1,28 @@
 {
   "domain": "bond",
   "name": "Bond",
-  "config_flow": true,
-  "documentation": "https://www.home-assistant.io/integrations/bond",
-  "requirements": ["bond-async==0.1.22"],
-  "zeroconf": ["_bond._tcp.local."],
+  "categories": [
+    "climate.fans_ventilation",
+    "buttons_remotes",
+    "blinds_curtains"
+  ],
   "codeowners": ["@bdraco", "@prystupa", "@joshs85", "@marciogranzotto"],
-  "quality_scale": "platinum",
+  "config_flow": true,
+  "connectivity": ["infrared", "network", "rf"],
+  "dhcp": [
+    {
+      "hostname": "bond-*",
+      "macaddress": "3C6A2C1*"
+    },
+    {
+      "hostname": "bond-*",
+      "macaddress": "F44E38*"
+    }
+  ],
+  "documentation": "https://www.home-assistant.io/integrations/bond",
+  "integration_type": "hub",
   "iot_class": "local_push",
-  "loggers": ["bond_async"]
+  "loggers": ["bond_async"],
+  "requirements": ["bond-async==0.2.1"],
+  "zeroconf": ["_bond._tcp.local."]
 }

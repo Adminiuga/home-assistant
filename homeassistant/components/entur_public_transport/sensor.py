@@ -1,80 +1,69 @@
 """Real-time information about public transport departures in Norway."""
-from __future__ import annotations
 
 from datetime import datetime, timedelta
+from random import randint
+from typing import override
 
 from enturclient import EnturPublicTransportData
-import voluptuous as vol
+import probatio
 
-from homeassistant.components.sensor import PLATFORM_SCHEMA, SensorEntity
+from homeassistant.components.sensor import (
+    PLATFORM_SCHEMA as SENSOR_PLATFORM_SCHEMA,
+    SensorEntity,
+)
 from homeassistant.const import (
     CONF_LATITUDE,
     CONF_LONGITUDE,
     CONF_NAME,
     CONF_SHOW_ON_MAP,
-    TIME_MINUTES,
+    UnitOfTime,
 )
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
-from homeassistant.util import Throttle
-import homeassistant.util.dt as dt_util
+from homeassistant.util import Throttle, dt as dt_util
 
-API_CLIENT_NAME = "homeassistant-homeassistant"
+from .const import (
+    API_CLIENT_NAME,
+    ATTR_DELAY,
+    ATTR_EXPECTED_AT,
+    ATTR_NEXT_UP_AT,
+    ATTR_NEXT_UP_DELAY,
+    ATTR_NEXT_UP_IN,
+    ATTR_NEXT_UP_REALTIME,
+    ATTR_NEXT_UP_ROUTE,
+    ATTR_NEXT_UP_ROUTE_ID,
+    ATTR_REALTIME,
+    ATTR_ROUTE,
+    ATTR_ROUTE_ID,
+    ATTR_STOP_ID,
+    CONF_EXPAND_PLATFORMS,
+    CONF_NUMBER_OF_DEPARTURES,
+    CONF_OMIT_NON_BOARDING,
+    CONF_STOP_IDS,
+    CONF_WHITELIST_LINES,
+    DEFAULT_ICON_KEY,
+    DEFAULT_NAME,
+    ICONS,
+)
 
-CONF_STOP_IDS = "stop_ids"
-CONF_EXPAND_PLATFORMS = "expand_platforms"
-CONF_WHITELIST_LINES = "line_whitelist"
-CONF_OMIT_NON_BOARDING = "omit_non_boarding"
-CONF_NUMBER_OF_DEPARTURES = "number_of_departures"
-
-DEFAULT_NAME = "Entur"
-DEFAULT_ICON_KEY = "bus"
-
-ICONS = {
-    "air": "mdi:airplane",
-    "bus": "mdi:bus",
-    "metro": "mdi:subway",
-    "rail": "mdi:train",
-    "tram": "mdi:tram",
-    "water": "mdi:ferry",
-}
-
-SCAN_INTERVAL = timedelta(seconds=45)
-
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
+PLATFORM_SCHEMA = SENSOR_PLATFORM_SCHEMA.extend(
     {
-        vol.Required(CONF_STOP_IDS): vol.All(cv.ensure_list, [cv.string]),
-        vol.Optional(CONF_EXPAND_PLATFORMS, default=True): cv.boolean,
-        vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
-        vol.Optional(CONF_SHOW_ON_MAP, default=False): cv.boolean,
-        vol.Optional(CONF_WHITELIST_LINES, default=[]): cv.ensure_list,
-        vol.Optional(CONF_OMIT_NON_BOARDING, default=True): cv.boolean,
-        vol.Optional(CONF_NUMBER_OF_DEPARTURES, default=2): vol.All(
-            cv.positive_int, vol.Range(min=2, max=10)
+        probatio.Required(CONF_STOP_IDS): probatio.All(
+            probatio.EnsureList(), [cv.string]
+        ),
+        probatio.Optional(CONF_EXPAND_PLATFORMS, default=True): cv.boolean,
+        probatio.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
+        probatio.Optional(CONF_SHOW_ON_MAP, default=False): cv.boolean,
+        probatio.Optional(CONF_WHITELIST_LINES, default=[]): probatio.EnsureList(),
+        probatio.Optional(CONF_OMIT_NON_BOARDING, default=True): cv.boolean,
+        probatio.Optional(CONF_NUMBER_OF_DEPARTURES, default=2): probatio.All(
+            cv.positive_int, probatio.Range(min=2, max=10)
         ),
     }
 )
-
-
-ATTR_STOP_ID = "stop_id"
-
-ATTR_ROUTE = "route"
-ATTR_ROUTE_ID = "route_id"
-ATTR_EXPECTED_AT = "due_at"
-ATTR_DELAY = "delay"
-ATTR_REALTIME = "real_time"
-
-ATTR_NEXT_UP_IN = "next_due_in"
-ATTR_NEXT_UP_ROUTE = "next_route"
-ATTR_NEXT_UP_ROUTE_ID = "next_route_id"
-ATTR_NEXT_UP_AT = "next_due_at"
-ATTR_NEXT_UP_DELAY = "next_delay"
-ATTR_NEXT_UP_REALTIME = "next_real_time"
-
-ATTR_TRANSPORT_MODE = "transport_mode"
 
 
 def due_in_minutes(timestamp: datetime) -> int:
@@ -105,7 +94,7 @@ async def async_setup_platform(
     quays = [s for s in stop_ids if "Quay" in s]
 
     data = EnturPublicTransportData(
-        API_CLIENT_NAME,
+        API_CLIENT_NAME.format(str(randint(100000, 999999))),
         stops=stops,
         quays=quays,
         line_whitelist=line_whitelist,
@@ -172,27 +161,32 @@ class EnturPublicTransportSensor(SensorEntity):
         self._attributes: dict[str, str] = {}
 
     @property
+    @override
     def name(self) -> str:
         """Return the name of the sensor."""
         return self._name
 
     @property
+    @override
     def native_value(self) -> int | None:
         """Return the state of the sensor."""
         return self._state
 
     @property
-    def extra_state_attributes(self) -> dict:
+    @override
+    def extra_state_attributes(self) -> dict[str, str]:
         """Return the state attributes."""
         self._attributes[ATTR_STOP_ID] = self._stop
         return self._attributes
 
     @property
+    @override
     def native_unit_of_measurement(self) -> str:
         """Return the unit this state is expressed in."""
-        return TIME_MINUTES
+        return UnitOfTime.MINUTES
 
     @property
+    @override
     def icon(self) -> str:
         """Icon to use in the frontend."""
         return self._icon
@@ -236,9 +230,9 @@ class EnturPublicTransportSensor(SensorEntity):
         self._attributes[ATTR_NEXT_UP_AT] = calls[1].expected_departure_time.strftime(
             "%H:%M"
         )
-        self._attributes[
-            ATTR_NEXT_UP_IN
-        ] = f"{due_in_minutes(calls[1].expected_departure_time)} min"
+        self._attributes[ATTR_NEXT_UP_IN] = (
+            f"{due_in_minutes(calls[1].expected_departure_time)} min"
+        )
         self._attributes[ATTR_NEXT_UP_REALTIME] = calls[1].is_realtime
         self._attributes[ATTR_NEXT_UP_DELAY] = calls[1].delay_in_min
 

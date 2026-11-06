@@ -1,26 +1,18 @@
 {
   "domain": "unifi",
   "name": "UniFi Network",
-  "config_flow": true,
-  "documentation": "https://www.home-assistant.io/integrations/unifi",
-  "requirements": ["aiounifi==41"],
-  "codeowners": ["@Kane610"],
-  "quality_scale": "platinum",
-  "ssdp": [
-    {
-      "manufacturer": "Ubiquiti Networks",
-      "modelDescription": "UniFi Dream Machine"
-    },
-    {
-      "manufacturer": "Ubiquiti Networks",
-      "modelDescription": "UniFi Dream Machine Pro"
-    },
-    {
-      "manufacturer": "Ubiquiti Networks",
-      "modelDescription": "UniFi Dream Machine SE"
-    }
+  "categories": [
+    "computers_network.routers_network",
+    "presence_location.network_presence"
   ],
-  "iot_class": "local_push",
+  "codeowners": ["@Kane610"],
+  "config_flow": true,
+  "connectivity": ["network"],
+  "dependencies": ["unifi_discovery"],
+  "documentation": "https://www.home-assistant.io/integrations/unifi",
   "integration_type": "hub",
-  "loggers": ["aiounifi"]
+  "iot_class": "local_push",
+  "loggers": ["aiounifi"],
+  "quality_scale": "silver",
+  "requirements": ["aiounifi==98"]
 }

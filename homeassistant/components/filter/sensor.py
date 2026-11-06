@@ -1,127 +1,134 @@
 """Allows the creation of a sensor that filters state property."""
-from __future__ import annotations
 
 from collections import Counter, deque
 from copy import copy
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from functools import partial
 import logging
 from numbers import Number
 import statistics
-from typing import Any
+from typing import Any, cast, override
 
-import voluptuous as vol
+import probatio
 
 from homeassistant.components.binary_sensor import DOMAIN as BINARY_SENSOR_DOMAIN
 from homeassistant.components.input_number import DOMAIN as INPUT_NUMBER_DOMAIN
 from homeassistant.components.recorder import get_instance, history
 from homeassistant.components.sensor import (
-    ATTR_STATE_CLASS,
-    DEVICE_CLASSES as SENSOR_DEVICE_CLASSES,
     DOMAIN as SENSOR_DOMAIN,
-    PLATFORM_SCHEMA,
-    STATE_CLASSES as SENSOR_STATE_CLASSES,
+    PLATFORM_SCHEMA as SENSOR_PLATFORM_SCHEMA,
     SensorDeviceClass,
     SensorEntity,
+    SensorEntityCapabilityAttribute,
 )
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
-    ATTR_DEVICE_CLASS,
-    ATTR_ENTITY_ID,
-    ATTR_ICON,
-    ATTR_UNIT_OF_MEASUREMENT,
     CONF_ENTITY_ID,
     CONF_NAME,
     CONF_UNIQUE_ID,
     STATE_UNAVAILABLE,
     STATE_UNKNOWN,
+    EntityStateAttribute,
 )
-from homeassistant.core import Event, HomeAssistant, State, callback
-import homeassistant.helpers.config_validation as cv
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.core import (
+    Event,
+    EventStateChangedData,
+    HomeAssistant,
+    State,
+    callback,
+)
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.device import async_entity_id_to_device
+from homeassistant.helpers.device_registry import AnyDeviceEntry
+from homeassistant.helpers.entity_platform import (
+    AddConfigEntryEntitiesCallback,
+    AddEntitiesCallback,
+)
 from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.reload import async_setup_reload_service
-from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
+from homeassistant.helpers.start import async_at_started
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType, StateType
+from homeassistant.util import dt as dt_util
 from homeassistant.util.decorator import Registry
-import homeassistant.util.dt as dt_util
 
-from . import DOMAIN, PLATFORMS
+from .const import (
+    CONF_FILTER_LOWER_BOUND,
+    CONF_FILTER_NAME,
+    CONF_FILTER_PRECISION,
+    CONF_FILTER_RADIUS,
+    CONF_FILTER_TIME_CONSTANT,
+    CONF_FILTER_UPPER_BOUND,
+    CONF_FILTER_WINDOW_SIZE,
+    CONF_FILTERS,
+    CONF_TIME_SMA_TYPE,
+    DEFAULT_FILTER_RADIUS,
+    DEFAULT_FILTER_TIME_CONSTANT,
+    DEFAULT_PRECISION,
+    DEFAULT_WINDOW_SIZE,
+    DOMAIN,
+    FILTER_NAME_LOWPASS,
+    FILTER_NAME_OUTLIER,
+    FILTER_NAME_RANGE,
+    FILTER_NAME_THROTTLE,
+    FILTER_NAME_TIME_SMA,
+    FILTER_NAME_TIME_THROTTLE,
+    PLATFORMS,
+    TIME_SMA_LAST,
+    WINDOW_SIZE_UNIT_NUMBER_EVENTS,
+    WINDOW_SIZE_UNIT_TIME,
+    FilterEntityStateAttribute,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
-FILTER_NAME_RANGE = "range"
-FILTER_NAME_LOWPASS = "lowpass"
-FILTER_NAME_OUTLIER = "outlier"
-FILTER_NAME_THROTTLE = "throttle"
-FILTER_NAME_TIME_THROTTLE = "time_throttle"
-FILTER_NAME_TIME_SMA = "time_simple_moving_average"
 FILTERS: Registry[str, type[Filter]] = Registry()
 
-CONF_FILTERS = "filters"
-CONF_FILTER_NAME = "filter"
-CONF_FILTER_WINDOW_SIZE = "window_size"
-CONF_FILTER_PRECISION = "precision"
-CONF_FILTER_RADIUS = "radius"
-CONF_FILTER_TIME_CONSTANT = "time_constant"
-CONF_FILTER_LOWER_BOUND = "lower_bound"
-CONF_FILTER_UPPER_BOUND = "upper_bound"
-CONF_TIME_SMA_TYPE = "type"
-
-TIME_SMA_LAST = "last"
-
-WINDOW_SIZE_UNIT_NUMBER_EVENTS = 1
-WINDOW_SIZE_UNIT_TIME = 2
-
-DEFAULT_WINDOW_SIZE = 1
-DEFAULT_PRECISION = 2
-DEFAULT_FILTER_RADIUS = 2.0
-DEFAULT_FILTER_TIME_CONSTANT = 10
-
-NAME_TEMPLATE = "{} filter"
 ICON = "mdi:chart-line-variant"
 
-FILTER_SCHEMA = vol.Schema(
-    {vol.Optional(CONF_FILTER_PRECISION, default=DEFAULT_PRECISION): vol.Coerce(int)}
+FILTER_SCHEMA = probatio.Schema(
+    {probatio.Optional(CONF_FILTER_PRECISION): probatio.Coerce(int)}
 )
 
 FILTER_OUTLIER_SCHEMA = FILTER_SCHEMA.extend(
     {
-        vol.Required(CONF_FILTER_NAME): FILTER_NAME_OUTLIER,
-        vol.Optional(CONF_FILTER_WINDOW_SIZE, default=DEFAULT_WINDOW_SIZE): vol.Coerce(
-            int
-        ),
-        vol.Optional(CONF_FILTER_RADIUS, default=DEFAULT_FILTER_RADIUS): vol.Coerce(
-            float
-        ),
+        probatio.Required(CONF_FILTER_NAME): FILTER_NAME_OUTLIER,
+        probatio.Optional(
+            CONF_FILTER_WINDOW_SIZE, default=DEFAULT_WINDOW_SIZE
+        ): probatio.Coerce(int),
+        probatio.Optional(
+            CONF_FILTER_RADIUS, default=DEFAULT_FILTER_RADIUS
+        ): probatio.Coerce(float),
     }
 )
 
 FILTER_LOWPASS_SCHEMA = FILTER_SCHEMA.extend(
     {
-        vol.Required(CONF_FILTER_NAME): FILTER_NAME_LOWPASS,
-        vol.Optional(CONF_FILTER_WINDOW_SIZE, default=DEFAULT_WINDOW_SIZE): vol.Coerce(
-            int
-        ),
-        vol.Optional(
+        probatio.Required(CONF_FILTER_NAME): FILTER_NAME_LOWPASS,
+        probatio.Optional(
+            CONF_FILTER_WINDOW_SIZE, default=DEFAULT_WINDOW_SIZE
+        ): probatio.Coerce(int),
+        probatio.Optional(
             CONF_FILTER_TIME_CONSTANT, default=DEFAULT_FILTER_TIME_CONSTANT
-        ): vol.Coerce(int),
+        ): probatio.Coerce(int),
     }
 )
 
 FILTER_RANGE_SCHEMA = FILTER_SCHEMA.extend(
     {
-        vol.Required(CONF_FILTER_NAME): FILTER_NAME_RANGE,
-        vol.Optional(CONF_FILTER_LOWER_BOUND): vol.Coerce(float),
-        vol.Optional(CONF_FILTER_UPPER_BOUND): vol.Coerce(float),
+        probatio.Required(CONF_FILTER_NAME): FILTER_NAME_RANGE,
+        probatio.Optional(CONF_FILTER_LOWER_BOUND): probatio.Coerce(float),
+        probatio.Optional(CONF_FILTER_UPPER_BOUND): probatio.Coerce(float),
     }
 )
 
 FILTER_TIME_SMA_SCHEMA = FILTER_SCHEMA.extend(
     {
-        vol.Required(CONF_FILTER_NAME): FILTER_NAME_TIME_SMA,
-        vol.Optional(CONF_TIME_SMA_TYPE, default=TIME_SMA_LAST): vol.In(
+        probatio.Required(CONF_FILTER_NAME): FILTER_NAME_TIME_SMA,
+        probatio.Optional(CONF_TIME_SMA_TYPE, default=TIME_SMA_LAST): probatio.In(
             [TIME_SMA_LAST]
         ),
-        vol.Required(CONF_FILTER_WINDOW_SIZE): vol.All(
+        probatio.Required(CONF_FILTER_WINDOW_SIZE): probatio.All(
             cv.time_period, cv.positive_timedelta
         ),
     }
@@ -129,41 +136,44 @@ FILTER_TIME_SMA_SCHEMA = FILTER_SCHEMA.extend(
 
 FILTER_THROTTLE_SCHEMA = FILTER_SCHEMA.extend(
     {
-        vol.Required(CONF_FILTER_NAME): FILTER_NAME_THROTTLE,
-        vol.Optional(CONF_FILTER_WINDOW_SIZE, default=DEFAULT_WINDOW_SIZE): vol.Coerce(
-            int
-        ),
+        probatio.Required(CONF_FILTER_NAME): FILTER_NAME_THROTTLE,
+        probatio.Optional(
+            CONF_FILTER_WINDOW_SIZE, default=DEFAULT_WINDOW_SIZE
+        ): probatio.Coerce(int),
     }
 )
 
 FILTER_TIME_THROTTLE_SCHEMA = FILTER_SCHEMA.extend(
     {
-        vol.Required(CONF_FILTER_NAME): FILTER_NAME_TIME_THROTTLE,
-        vol.Required(CONF_FILTER_WINDOW_SIZE): vol.All(
+        probatio.Required(CONF_FILTER_NAME): FILTER_NAME_TIME_THROTTLE,
+        probatio.Required(CONF_FILTER_WINDOW_SIZE): probatio.All(
             cv.time_period, cv.positive_timedelta
         ),
     }
 )
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
+PLATFORM_SCHEMA = SENSOR_PLATFORM_SCHEMA.extend(
     {
-        vol.Required(CONF_ENTITY_ID): vol.Any(
+        probatio.Required(CONF_ENTITY_ID): probatio.Any(
             cv.entity_domain(SENSOR_DOMAIN),
             cv.entity_domain(BINARY_SENSOR_DOMAIN),
             cv.entity_domain(INPUT_NUMBER_DOMAIN),
         ),
-        vol.Optional(CONF_NAME): cv.string,
-        vol.Optional(CONF_UNIQUE_ID): cv.string,
-        vol.Required(CONF_FILTERS): vol.All(
-            cv.ensure_list,
+        probatio.Optional(CONF_NAME): cv.string,
+        probatio.Optional(CONF_UNIQUE_ID): cv.string,
+        probatio.Required(CONF_FILTERS): probatio.All(
+            probatio.EnsureList(),
             [
-                vol.Any(
-                    FILTER_OUTLIER_SCHEMA,
-                    FILTER_LOWPASS_SCHEMA,
-                    FILTER_TIME_SMA_SCHEMA,
-                    FILTER_THROTTLE_SCHEMA,
-                    FILTER_TIME_THROTTLE_SCHEMA,
-                    FILTER_RANGE_SCHEMA,
+                probatio.TaggedUnion(
+                    CONF_FILTER_NAME,
+                    [
+                        FILTER_OUTLIER_SCHEMA,
+                        FILTER_LOWPASS_SCHEMA,
+                        FILTER_TIME_SMA_SCHEMA,
+                        FILTER_THROTTLE_SCHEMA,
+                        FILTER_TIME_THROTTLE_SCHEMA,
+                        FILTER_RANGE_SCHEMA,
+                    ],
                 )
             ],
         ),
@@ -194,6 +204,42 @@ async def async_setup_platform(
     async_add_entities([SensorFilter(name, unique_id, entity_id, filters)])
 
 
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up the Filter sensor entry."""
+    name: str = entry.options[CONF_NAME]
+    entity_id: str = entry.options[CONF_ENTITY_ID]
+
+    filter_config = {
+        k: v for k, v in entry.options.items() if k not in (CONF_NAME, CONF_ENTITY_ID)
+    }
+    if CONF_FILTER_WINDOW_SIZE in filter_config and isinstance(
+        filter_config[CONF_FILTER_WINDOW_SIZE], dict
+    ):
+        filter_config[CONF_FILTER_WINDOW_SIZE] = timedelta(
+            **filter_config[CONF_FILTER_WINDOW_SIZE]
+        )
+
+    filters = [
+        FILTERS[filter_config.pop(CONF_FILTER_NAME)](entity=entity_id, **filter_config)
+    ]
+
+    async_add_entities(
+        [
+            SensorFilter(
+                name,
+                entry.entry_id,
+                entity_id,
+                filters,
+                device=async_entity_id_to_device(hass, entity_id),
+            )
+        ]
+    )
+
+
 class SensorFilter(SensorEntity):
     """Representation of a Filter Sensor."""
 
@@ -205,24 +251,30 @@ class SensorFilter(SensorEntity):
         unique_id: str | None,
         entity_id: str,
         filters: list[Filter],
+        device: AnyDeviceEntry | None = None,
     ) -> None:
         """Initialize the sensor."""
         self._attr_name = name
         self._attr_unique_id = unique_id
+        self.device_entry = device
         self._entity = entity_id
         self._attr_native_unit_of_measurement = None
-        self._state: str | None = None
+        self._state: StateType = None
         self._filters = filters
         self._attr_icon = None
         self._attr_device_class = None
         self._attr_state_class = None
-        self._attr_extra_state_attributes = {ATTR_ENTITY_ID: entity_id}
+        self._attr_extra_state_attributes = {
+            FilterEntityStateAttribute.ENTITY_ID: entity_id
+        }
 
     @callback
-    def _update_filter_sensor_state_event(self, event: Event) -> None:
+    def _update_filter_sensor_state_event(
+        self, event: Event[EventStateChangedData]
+    ) -> None:
         """Handle device state changes."""
         _LOGGER.debug("Update filter on event: %s", event)
-        self._update_filter_sensor_state(event.data.get("new_state"))
+        self._update_filter_sensor_state(event.data["new_state"])
 
     @callback
     def _update_filter_sensor_state(
@@ -237,12 +289,29 @@ class SensorFilter(SensorEntity):
             self.async_write_ha_state()
             return
 
-        if new_state.state in (STATE_UNKNOWN, STATE_UNAVAILABLE):
-            self._state = new_state.state
+        if new_state.state == STATE_UNKNOWN:
+            self._state = None
             self.async_write_ha_state()
             return
 
-        temp_state = new_state
+        if new_state.state == STATE_UNAVAILABLE:
+            self._attr_available = False
+            self.async_write_ha_state()
+            return
+
+        self._attr_available = True
+
+        temp_state = _State(new_state.last_updated, new_state.state)
+
+        # Reset before filtering so the new unit's first reading is kept
+        if self._attr_native_unit_of_measurement != new_state.attributes.get(
+            EntityStateAttribute.UNIT_OF_MEASUREMENT
+        ):
+            for filt in self._filters:
+                filt.reset()
+            self._attr_native_unit_of_measurement = new_state.attributes.get(
+                EntityStateAttribute.UNIT_OF_MEASUREMENT
+            )
 
         try:
             for filt in self._filters:
@@ -267,31 +336,21 @@ class SensorFilter(SensorEntity):
 
         self._state = temp_state.state
 
-        if self._attr_icon is None:
-            self._attr_icon = new_state.attributes.get(ATTR_ICON, ICON)
-
-        if (
-            self._attr_device_class is None
-            and new_state.attributes.get(ATTR_DEVICE_CLASS) in SENSOR_DEVICE_CLASSES
-        ):
-            self._attr_device_class = new_state.attributes.get(ATTR_DEVICE_CLASS)
-
-        if (
-            self._attr_state_class is None
-            and new_state.attributes.get(ATTR_STATE_CLASS) in SENSOR_STATE_CLASSES
-        ):
-            self._attr_state_class = new_state.attributes.get(ATTR_STATE_CLASS)
-
-        if self._attr_native_unit_of_measurement is None:
-            self._attr_native_unit_of_measurement = new_state.attributes.get(
-                ATTR_UNIT_OF_MEASUREMENT
-            )
+        self._attr_icon = new_state.attributes.get(EntityStateAttribute.ICON, ICON)
+        self._attr_device_class = new_state.attributes.get(
+            EntityStateAttribute.DEVICE_CLASS
+        )
+        self._attr_state_class = new_state.attributes.get(
+            SensorEntityCapabilityAttribute.STATE_CLASS
+        )
 
         if update_ha:
             self.async_write_ha_state()
 
+    @override
     async def async_added_to_hass(self) -> None:
         """Register callbacks."""
+        last_replayed: datetime | None = None
 
         if "recorder" in self.hass.config.components:
             history_list = []
@@ -302,14 +361,14 @@ class SensorFilter(SensorEntity):
             for filt in self._filters:
                 if (
                     filt.window_unit == WINDOW_SIZE_UNIT_NUMBER_EVENTS
-                    and largest_window_items < filt.window_size
+                    and largest_window_items < (size := cast(int, filt.window_size))
                 ):
-                    largest_window_items = filt.window_size
+                    largest_window_items = size
                 elif (
                     filt.window_unit == WINDOW_SIZE_UNIT_TIME
-                    and largest_window_time < filt.window_size
+                    and largest_window_time < (val := cast(timedelta, filt.window_size))
                 ):
-                    largest_window_time = filt.window_size
+                    largest_window_time = val
 
             # Retrieve the largest window_size of each type
             if largest_window_items > 0:
@@ -353,18 +412,33 @@ class SensorFilter(SensorEntity):
             for state in history_list:
                 if state.state not in [STATE_UNKNOWN, STATE_UNAVAILABLE, None]:
                     self._update_filter_sensor_state(state, False)
+            if history_list:
+                last_replayed = history_list[-1].last_updated
 
-        self.async_on_remove(
-            async_track_state_change_event(
-                self.hass, [self._entity], self._update_filter_sensor_state_event
+        @callback
+        def _async_hass_started(hass: HomeAssistant) -> None:
+            """Delay source entity tracking."""
+            self.async_on_remove(
+                async_track_state_change_event(
+                    self.hass, [self._entity], self._update_filter_sensor_state_event
+                )
             )
-        )
+            # Changes made while starting were not tracked
+            if (
+                (state := hass.states.get(self._entity)) is not None
+                and state.state not in (STATE_UNKNOWN, STATE_UNAVAILABLE)
+                and (last_replayed is None or state.last_updated > last_replayed)
+            ):
+                self._update_filter_sensor_state(state)
+
+        self.async_on_remove(async_at_started(self.hass, _async_hass_started))
 
     @property
-    def native_value(self) -> datetime | str | None:
+    @override
+    def native_value(self) -> datetime | StateType:
         """Return the state of the sensor."""
         if self._state is not None and self.device_class == SensorDeviceClass.TIMESTAMP:
-            return datetime.fromisoformat(self._state)
+            return datetime.fromisoformat(str(self._state))
 
         return self._state
 
@@ -372,7 +446,9 @@ class SensorFilter(SensorEntity):
 class FilterState:
     """State abstraction for filter usage."""
 
-    def __init__(self, state):
+    state: str | float | int
+
+    def __init__(self, state: _State) -> None:
         """Initialize with HA State object."""
         self.timestamp = state.last_updated
         try:
@@ -380,19 +456,33 @@ class FilterState:
         except ValueError:
             self.state = state.state
 
-    def set_precision(self, precision):
+    def set_precision(self, precision: int | None) -> None:
         """Set precision of Number based states."""
-        if isinstance(self.state, Number):
+        if precision is not None and isinstance(self.state, Number):
             value = round(float(self.state), precision)
             self.state = int(value) if precision == 0 else value
 
-    def __str__(self):
+    @override
+    def __str__(self) -> str:
         """Return state as the string representation of FilterState."""
         return str(self.state)
 
-    def __repr__(self):
+    @override
+    def __repr__(self) -> str:
         """Return timestamp and state as the representation of FilterState."""
         return f"{self.timestamp} : {self.state}"
+
+
+@dataclass
+class _State:
+    """Simplified State class.
+
+    The standard State class only accepts string in `state`,
+    and we are only interested in two properties.
+    """
+
+    last_updated: datetime
+    state: str | float | int
 
 
 class Filter:
@@ -400,11 +490,11 @@ class Filter:
 
     def __init__(
         self,
-        name,
-        window_size: int = 1,
-        precision: int | None = None,
-        entity: str | None = None,
-    ):
+        name: str,
+        window_size: int | timedelta,
+        entity: str,
+        precision: int | None,
+    ) -> None:
         """Initialize common attributes.
 
         :param window_size: size of the sliding window that holds previous values
@@ -412,12 +502,12 @@ class Filter:
         :param entity: used for debugging only
         """
         if isinstance(window_size, int):
-            self.states: deque = deque(maxlen=window_size)
+            self.states: deque[FilterState] = deque(maxlen=window_size)
             self.window_unit = WINDOW_SIZE_UNIT_NUMBER_EVENTS
         else:
             self.states = deque(maxlen=0)
             self.window_unit = WINDOW_SIZE_UNIT_TIME
-        self.precision = precision
+        self.filter_precision = precision
         self._name = name
         self._entity = entity
         self._skip_processing = False
@@ -426,32 +516,37 @@ class Filter:
         self._only_numbers = True
 
     @property
-    def window_size(self):
+    def window_size(self) -> int | timedelta:
         """Return window size."""
         return self._window_size
 
     @property
-    def name(self):
+    def name(self) -> str:
         """Return filter name."""
         return self._name
 
     @property
-    def skip_processing(self):
+    def skip_processing(self) -> bool:
         """Return whether the current filter_state should be skipped."""
         return self._skip_processing
 
-    def _filter_state(self, new_state):
-        """Implement filter."""
-        raise NotImplementedError()
+    def reset(self) -> None:
+        """Reset filter."""
+        self.states.clear()
 
-    def filter_state(self, new_state):
+    def _filter_state(self, new_state: FilterState) -> FilterState:
+        """Implement filter."""
+        raise NotImplementedError
+
+    def filter_state(self, new_state: _State) -> _State:
         """Implement a common interface for filters."""
         fstate = FilterState(new_state)
         if self._only_numbers and not isinstance(fstate.state, Number):
             raise ValueError(f"State <{fstate.state}> is not a Number")
 
         filtered = self._filter_state(fstate)
-        filtered.set_precision(self.precision)
+        filtered.set_precision(self.filter_precision)
+
         if self._store_raw:
             self.states.append(copy(FilterState(new_state)))
         else:
@@ -470,26 +565,32 @@ class RangeFilter(Filter, SensorEntity):
 
     def __init__(
         self,
-        entity,
-        precision: int | None = DEFAULT_PRECISION,
+        *,
+        entity: str,
+        precision: int | None = None,
         lower_bound: float | None = None,
         upper_bound: float | None = None,
-    ):
+    ) -> None:
         """Initialize Filter.
 
         :param upper_bound: band upper bound
         :param lower_bound: band lower bound
         """
-        super().__init__(FILTER_NAME_RANGE, precision=precision, entity=entity)
+        super().__init__(
+            FILTER_NAME_RANGE, DEFAULT_WINDOW_SIZE, precision=precision, entity=entity
+        )
         self._lower_bound = lower_bound
         self._upper_bound = upper_bound
         self._stats_internal: Counter = Counter()
 
-    def _filter_state(self, new_state):
+    @override
+    def _filter_state(self, new_state: FilterState) -> FilterState:
         """Implement the range filter."""
 
-        if self._upper_bound is not None and new_state.state > self._upper_bound:
+        # We can cast safely here thanks to self._only_numbers = True
+        new_state_value = cast(float, new_state.state)
 
+        if self._upper_bound is not None and new_state_value > self._upper_bound:
             self._stats_internal["erasures_up"] += 1
 
             _LOGGER.debug(
@@ -500,8 +601,7 @@ class RangeFilter(Filter, SensorEntity):
             )
             new_state.state = self._upper_bound
 
-        elif self._lower_bound is not None and new_state.state < self._lower_bound:
-
+        elif self._lower_bound is not None and new_state_value < self._lower_bound:
             self._stats_internal["erasures_low"] += 1
 
             _LOGGER.debug(
@@ -522,25 +622,38 @@ class OutlierFilter(Filter, SensorEntity):
     Determines if new state is in a band around the median.
     """
 
-    def __init__(self, window_size, precision, entity, radius: float):
+    def __init__(
+        self,
+        *,
+        window_size: int,
+        entity: str,
+        radius: float,
+        precision: int | None = None,
+    ) -> None:
         """Initialize Filter.
 
         :param radius: band radius
         """
-        super().__init__(FILTER_NAME_OUTLIER, window_size, precision, entity)
+        super().__init__(
+            FILTER_NAME_OUTLIER, window_size, precision=precision, entity=entity
+        )
         self._radius = radius
         self._stats_internal: Counter = Counter()
         self._store_raw = True
 
-    def _filter_state(self, new_state):
+    @override
+    def _filter_state(self, new_state: FilterState) -> FilterState:
         """Implement the outlier filter."""
 
-        median = statistics.median([s.state for s in self.states]) if self.states else 0
+        # We can cast safely here thanks to self._only_numbers = True
+        previous_state_values = [cast(float, s.state) for s in self.states]
+        new_state_value = cast(float, new_state.state)
+
+        median = statistics.median(previous_state_values) if self.states else 0
         if (
             len(self.states) == self.states.maxlen
-            and abs(new_state.state - median) > self._radius
+            and abs(new_state_value - median) > self._radius
         ):
-
             self._stats_internal["erasures"] += 1
 
             _LOGGER.debug(
@@ -557,12 +670,22 @@ class OutlierFilter(Filter, SensorEntity):
 class LowPassFilter(Filter, SensorEntity):
     """BASIC Low Pass Filter."""
 
-    def __init__(self, window_size, precision, entity, time_constant: int):
+    def __init__(
+        self,
+        *,
+        window_size: int,
+        entity: str,
+        time_constant: int,
+        precision: int = DEFAULT_PRECISION,
+    ) -> None:
         """Initialize Filter."""
-        super().__init__(FILTER_NAME_LOWPASS, window_size, precision, entity)
+        super().__init__(
+            FILTER_NAME_LOWPASS, window_size, precision=precision, entity=entity
+        )
         self._time_constant = time_constant
 
-    def _filter_state(self, new_state):
+    @override
+    def _filter_state(self, new_state: FilterState) -> FilterState:
         """Implement the low pass filter."""
 
         if not self.states:
@@ -570,9 +693,10 @@ class LowPassFilter(Filter, SensorEntity):
 
         new_weight = 1.0 / self._time_constant
         prev_weight = 1.0 - new_weight
-        new_state.state = (
-            prev_weight * self.states[-1].state + new_weight * new_state.state
-        )
+        # We can cast safely here thanks to self._only_numbers = True
+        prev_state_value = cast(float, self.states[-1].state)
+        new_state_value = cast(float, new_state.state)
+        new_state.state = prev_weight * prev_state_value + new_weight * new_state_value
 
         return new_state
 
@@ -585,42 +709,68 @@ class TimeSMAFilter(Filter, SensorEntity):
     """
 
     def __init__(
-        self, window_size, precision, entity, type
-    ):  # pylint: disable=redefined-builtin
+        self,
+        *,
+        window_size: timedelta,
+        entity: str,
+        type: str,  # pylint: disable=redefined-builtin
+        precision: int = DEFAULT_PRECISION,
+    ) -> None:
         """Initialize Filter.
 
         :param type: type of algorithm used to connect discrete values
         """
-        super().__init__(FILTER_NAME_TIME_SMA, window_size, precision, entity)
+        super().__init__(
+            FILTER_NAME_TIME_SMA, window_size, precision=precision, entity=entity
+        )
         self._time_window = window_size
-        self.last_leak = None
-        self.queue = deque()
+        self.last_leak: FilterState | None = None
+        self.queue = deque[FilterState]()
+        # running time weighted sum of the queue, so a sample costs no pass over it
+        self._queue_sum: float = 0
 
-    def _leak(self, left_boundary):
+    def _leak(self, left_boundary: datetime) -> None:
         """Remove timeouted elements."""
         while self.queue:
             if self.queue[0].timestamp + self._time_window <= left_boundary:
                 self.last_leak = self.queue.popleft()
+                if self.queue:
+                    self._queue_sum -= self._weighted(self.last_leak, self.queue[0])
+                else:
+                    # nothing left to weigh, so drop any rounding drift as well
+                    self._queue_sum = 0
             else:
                 return
 
-    def _filter_state(self, new_state):
+    @override
+    def _filter_state(self, new_state: FilterState) -> FilterState:
         """Implement the Simple Moving Average filter."""
 
         self._leak(new_state.timestamp)
+        if self.queue:
+            self._queue_sum += self._weighted(self.queue[-1], new_state)
         self.queue.append(copy(new_state))
 
-        moving_sum = 0
+        # the stretch before the oldest queued sample is covered by the value that
+        # left the window last, or by that oldest sample while nothing has left yet
         start = new_state.timestamp - self._time_window
-        prev_state = self.last_leak or self.queue[0]
-        for state in self.queue:
-            moving_sum += (state.timestamp - start).total_seconds() * prev_state.state
-            start = state.timestamp
-            prev_state = state
+        lead_state = self.last_leak if self.last_leak is not None else self.queue[0]
+        # We can cast safely here thanks to self._only_numbers = True
+        lead_value = cast(float, lead_state.state)
+        lead_seconds = (self.queue[0].timestamp - start).total_seconds()
+        moving_sum = lead_seconds * lead_value + self._queue_sum
 
         new_state.state = moving_sum / self._time_window.total_seconds()
 
         return new_state
+
+    @staticmethod
+    def _weighted(state: FilterState, until: FilterState) -> float:
+        """Return the value of a state weighted by the time until the next one."""
+        # The cast is safe, the base filter only lets numbers through
+        return (until.timestamp - state.timestamp).total_seconds() * cast(
+            float, state.state
+        )
 
 
 @FILTERS.register(FILTER_NAME_THROTTLE)
@@ -630,12 +780,17 @@ class ThrottleFilter(Filter, SensorEntity):
     One sample per window.
     """
 
-    def __init__(self, window_size, precision, entity):
+    def __init__(
+        self, *, window_size: int, entity: str, precision: None = None
+    ) -> None:
         """Initialize Filter."""
-        super().__init__(FILTER_NAME_THROTTLE, window_size, precision, entity)
+        super().__init__(
+            FILTER_NAME_THROTTLE, window_size, precision=precision, entity=entity
+        )
         self._only_numbers = False
 
-    def _filter_state(self, new_state):
+    @override
+    def _filter_state(self, new_state: FilterState) -> FilterState:
         """Implement the throttle filter."""
         if not self.states or len(self.states) == self.states.maxlen:
             self.states.clear()
@@ -653,14 +808,19 @@ class TimeThrottleFilter(Filter, SensorEntity):
     One sample per time period.
     """
 
-    def __init__(self, window_size, precision, entity):
+    def __init__(
+        self, *, window_size: timedelta, entity: str, precision: int | None = None
+    ) -> None:
         """Initialize Filter."""
-        super().__init__(FILTER_NAME_TIME_THROTTLE, window_size, precision, entity)
+        super().__init__(
+            FILTER_NAME_TIME_THROTTLE, window_size, precision=precision, entity=entity
+        )
         self._time_window = window_size
-        self._last_emitted_at = None
+        self._last_emitted_at: datetime | None = None
         self._only_numbers = False
 
-    def _filter_state(self, new_state):
+    @override
+    def _filter_state(self, new_state: FilterState) -> FilterState:
         """Implement the filter."""
         window_start = new_state.timestamp - self._time_window
         if not self._last_emitted_at or self._last_emitted_at <= window_start:

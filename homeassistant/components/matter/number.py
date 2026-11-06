@@ -1,0 +1,818 @@
+"""Matter Number Inputs."""
+
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any, override
+
+from chip.clusters import Objects as clusters
+from chip.clusters.ClusterObjects import ClusterAttributeDescriptor, ClusterCommand
+from matter_server.client.models import device_types
+from matter_server.common import custom_clusters
+
+from homeassistant.components.light import DEFAULT_MAX_KELVIN
+from homeassistant.components.number import (
+    NumberDeviceClass,
+    NumberEntity,
+    NumberEntityDescription,
+    NumberMode,
+)
+from homeassistant.const import (
+    EntityCategory,
+    Platform,
+    UnitOfLength,
+    UnitOfRatio,
+    UnitOfTemperature,
+    UnitOfTime,
+)
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.util import color as color_util
+
+from .const import MATTER_MAX_MIREDS
+from .entity import MatterEntity, MatterEntityDescription
+from .helpers import MatterConfigEntry
+from .models import MatterDiscoverySchema
+
+# Thermostat ClusterRevision (Matter spec 7.13.1) at which the
+# LocalTemperatureCalibration range was extended from ±2.5°C to the full
+# int8 storage range of ±12.7°C (Matter 1.4, see connectedhomeip
+# data_model/1.4/clusters/Thermostat.xml vs. data_model/1.3/clusters/Thermostat.xml)
+THERMOSTAT_EXTENDED_CALIBRATION_REVISION = 7
+
+
+async def async_setup_entry(
+    hass: HomeAssistant,
+    config_entry: MatterConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up Matter Number Input from Config Entry."""
+    matter = config_entry.runtime_data.adapter
+    matter.register_platform_handler(Platform.NUMBER, async_add_entities)
+
+
+def _startup_mireds_to_kelvin(value: int | None) -> int:
+    """Convert StartUpColorTemperatureMireds to Kelvin, 0 meaning previous."""
+    # Treat values outside the spec range (such as 0 or 0xFFFF) as null
+    if value is None or not 0 < value <= MATTER_MAX_MIREDS:
+        return 0
+    return color_util.color_temperature_mired_to_kelvin(value)
+
+
+def _kelvin_to_startup_mireds(value: float) -> int | None:
+    """Convert Kelvin to StartUpColorTemperatureMireds, 0 meaning previous."""
+    if value == 0:
+        return None
+    return min(color_util.color_temperature_kelvin_to_mired(value), MATTER_MAX_MIREDS)
+
+
+def _physical_min_mireds_to_max_kelvin(value: float) -> float:
+    """Convert ColorTempPhysicalMinMireds to the maximum Kelvin value."""
+    # Avoid dividing by zero when the device reports 0
+    if not value:
+        return DEFAULT_MAX_KELVIN
+    return color_util.color_temperature_mired_to_kelvin(value)
+
+
+@dataclass(frozen=True, kw_only=True)
+class MatterNumberEntityDescription(NumberEntityDescription, MatterEntityDescription):
+    """Describe Matter Number Input entities."""
+
+
+@dataclass(frozen=True, kw_only=True)
+class MatterRangeNumberEntityDescription(
+    NumberEntityDescription, MatterEntityDescription
+):
+    """Describe Matter Number Input entities with min and max values."""
+
+    ha_to_device: Callable[[Any], Any] = lambda x: x
+
+    # attribute descriptors to get the min and max value
+    min_attribute: type[ClusterAttributeDescriptor] | None = None
+    max_attribute: type[ClusterAttributeDescriptor]
+
+    # Functions to format the min and max values for display or conversion
+    format_min_value: Callable[[float], float] = lambda x: x
+    format_max_value: Callable[[float], float] = lambda x: x
+
+    # command: a custom callback to create the command to send to the device
+    # the callback's argument will be the converted device value from ha_to_device
+    # if omitted the command will just be a write_attribute
+    # command to the primary attribute
+    command: Callable[[int], ClusterCommand] | None = None
+
+
+class MatterNumber(MatterEntity, NumberEntity):
+    """Representation of a Matter Attribute as a Number entity."""
+
+    entity_description: MatterNumberEntityDescription
+
+    @override
+    async def async_set_native_value(self, value: float) -> None:
+        """Update the current value."""
+        sendvalue = int(value)
+        if value_convert := self.entity_description.ha_to_device:
+            sendvalue = value_convert(value)
+        await self.write_attribute(value=sendvalue)
+
+    @callback
+    @override
+    def _update_from_device(self) -> None:
+        """Update from device."""
+        value = self.get_matter_attribute_value(self._entity_info.primary_attribute)
+        if value_convert := self.entity_description.device_to_ha:
+            value = value_convert(value)
+        self._attr_native_value = value
+
+
+class MatterRangeNumber(MatterEntity, NumberEntity):
+    """Matter Attribute as a Number entity with min and max."""
+
+    entity_description: MatterRangeNumberEntityDescription
+
+    @override
+    async def async_set_native_value(self, value: float) -> None:
+        """Update the current value."""
+        send_value = self.entity_description.ha_to_device(value)
+        if self.entity_description.command:
+            # custom command defined to set the new value
+            await self.send_device_command(
+                self.entity_description.command(send_value),
+            )
+            return
+        # regular write attribute to set the new value
+        await self.write_attribute(
+            value=send_value,
+        )
+
+    @callback
+    @override
+    def _update_from_device(self) -> None:
+        """Update from device."""
+        # get the value from the primary attribute and convert
+        # it to the HA value if needed
+        value = self.get_matter_attribute_value(self._entity_info.primary_attribute)
+        if value is not None and (
+            value_convert := self.entity_description.device_to_ha
+        ):
+            value = value_convert(value)
+        self._attr_native_value = value
+
+        # min case 1: get min from the attribute and convert it
+        if self.entity_description.min_attribute:
+            min_value = self.get_matter_attribute_value(
+                self.entity_description.min_attribute
+            )
+            if min_value is not None:
+                min_convert = self.entity_description.format_min_value
+                self._attr_native_min_value = min_convert(min_value)
+        # min case 2: get the min from entity_description
+        elif self.entity_description.native_min_value is not None:
+            self._attr_native_min_value = self.entity_description.native_min_value
+
+        # get max from the attribute and convert it
+        max_value = self.get_matter_attribute_value(
+            self.entity_description.max_attribute
+        )
+        if max_value is not None:
+            max_convert = self.entity_description.format_max_value
+            self._attr_native_max_value = max_convert(max_value)
+
+
+class MatterStartUpColorTemperatureNumber(MatterRangeNumber):
+    """Matter StartUpColorTemperatureMireds as a Number entity in Kelvin."""
+
+    @override
+    async def async_set_native_value(self, value: float) -> None:
+        """Update the current value."""
+        send_value = self.entity_description.ha_to_device(value)
+        if send_value is not None:
+            # Devices ignore a start-up value outside their physical range
+            physical_max = self.get_matter_attribute_value(
+                clusters.ColorControl.Attributes.ColorTempPhysicalMaxMireds
+            )
+            send_value = min(send_value, physical_max or MATTER_MAX_MIREDS)
+        await self.write_attribute(value=send_value)
+
+    @callback
+    @override
+    def _update_from_device(self) -> None:
+        """Update from device."""
+        super()._update_from_device()
+        # A null start-up value means the previous color temperature is kept
+        if self._attr_native_value is None:
+            self._attr_native_value = 0
+
+
+class MatterLevelControlNumber(MatterEntity, NumberEntity):
+    """Representation of a Matter Attribute as a Number entity."""
+
+    entity_description: MatterNumberEntityDescription
+
+    @override
+    async def async_set_native_value(self, value: float) -> None:
+        """Set level value."""
+        send_value = int(value)
+        if value_convert := self.entity_description.ha_to_device:
+            send_value = value_convert(value)
+        await self.send_device_command(
+            clusters.LevelControl.Commands.MoveToLevel(
+                level=send_value,
+            )
+        )
+
+    @callback
+    @override
+    def _update_from_device(self) -> None:
+        """Update from device."""
+        value = self.get_matter_attribute_value(self._entity_info.primary_attribute)
+        if value_convert := self.entity_description.device_to_ha:
+            value = value_convert(value)
+        self._attr_native_value = value
+
+
+# Discovery schema(s) to map Matter Attributes to HA entities
+DISCOVERY_SCHEMAS = [
+    MatterDiscoverySchema(
+        platform=Platform.NUMBER,
+        entity_description=MatterNumberEntityDescription(
+            key="on_level",
+            entity_category=EntityCategory.CONFIG,
+            translation_key="on_level",
+            native_max_value=255,
+            native_min_value=0,
+            mode=NumberMode.BOX,
+            # use 255 to indicate that the value should revert to the default
+            device_to_ha=lambda x: 255 if x is None else x,
+            ha_to_device=lambda x: None if x == 255 else int(x),
+            native_step=1,
+        ),
+        entity_class=MatterNumber,
+        required_attributes=(clusters.LevelControl.Attributes.OnLevel,),
+        not_device_type=(device_types.Speaker,),
+        # allow None value to account for 'default' value
+        allow_none_value=True,
+    ),
+    MatterDiscoverySchema(
+        platform=Platform.NUMBER,
+        entity_description=MatterNumberEntityDescription(
+            key="power_on_level",
+            entity_category=EntityCategory.CONFIG,
+            translation_key="power_on_level",
+            native_max_value=255,
+            native_min_value=0,
+            mode=NumberMode.BOX,
+            # use 255 to indicate that the value should revert to the default
+            device_to_ha=lambda x: 255 if x is None else x,
+            ha_to_device=lambda x: None if x == 255 else int(x),
+            native_step=1,
+        ),
+        entity_class=MatterNumber,
+        required_attributes=(clusters.LevelControl.Attributes.StartUpCurrentLevel,),
+        not_device_type=(device_types.Speaker,),
+        # allow None value to account for 'default' value
+        allow_none_value=True,
+    ),
+    MatterDiscoverySchema(
+        platform=Platform.NUMBER,
+        entity_description=MatterRangeNumberEntityDescription(
+            key="power_on_color_temperature",
+            entity_category=EntityCategory.CONFIG,
+            translation_key="power_on_color_temperature",
+            native_unit_of_measurement=UnitOfTemperature.KELVIN,
+            # use 0 to indicate that the previous color temperature is kept
+            native_min_value=0,
+            device_to_ha=_startup_mireds_to_kelvin,
+            ha_to_device=_kelvin_to_startup_mireds,
+            format_max_value=_physical_min_mireds_to_max_kelvin,
+            max_attribute=clusters.ColorControl.Attributes.ColorTempPhysicalMinMireds,
+            native_step=1,
+            mode=NumberMode.BOX,
+        ),
+        entity_class=MatterStartUpColorTemperatureNumber,
+        required_attributes=(
+            clusters.ColorControl.Attributes.StartUpColorTemperatureMireds,
+            clusters.ColorControl.Attributes.ColorTempPhysicalMinMireds,
+        ),
+        featuremap_contains=clusters.ColorControl.Bitmaps.Feature.kColorTemperature,
+        # allow None value to account for 'previous' value
+        allow_none_value=True,
+    ),
+    MatterDiscoverySchema(
+        platform=Platform.NUMBER,
+        entity_description=MatterNumberEntityDescription(
+            key="on_transition_time",
+            entity_category=EntityCategory.CONFIG,
+            translation_key="on_transition_time",
+            native_max_value=65534,
+            native_min_value=0,
+            device_to_ha=lambda x: None if x is None else x / 10,
+            ha_to_device=lambda x: round(x * 10),
+            native_step=0.1,
+            native_unit_of_measurement=UnitOfTime.SECONDS,
+            mode=NumberMode.BOX,
+        ),
+        entity_class=MatterNumber,
+        required_attributes=(clusters.LevelControl.Attributes.OnTransitionTime,),
+        # allow None value to account for 'default' value
+        allow_none_value=True,
+    ),
+    MatterDiscoverySchema(
+        platform=Platform.NUMBER,
+        entity_description=MatterNumberEntityDescription(
+            key="off_transition_time",
+            entity_category=EntityCategory.CONFIG,
+            translation_key="off_transition_time",
+            native_max_value=65534,
+            native_min_value=0,
+            device_to_ha=lambda x: None if x is None else x / 10,
+            ha_to_device=lambda x: round(x * 10),
+            native_step=0.1,
+            native_unit_of_measurement=UnitOfTime.SECONDS,
+            mode=NumberMode.BOX,
+        ),
+        entity_class=MatterNumber,
+        required_attributes=(clusters.LevelControl.Attributes.OffTransitionTime,),
+        # allow None value to account for 'default' value
+        allow_none_value=True,
+    ),
+    MatterDiscoverySchema(
+        platform=Platform.NUMBER,
+        entity_description=MatterNumberEntityDescription(
+            key="on_off_transition_time",
+            entity_category=EntityCategory.CONFIG,
+            translation_key="on_off_transition_time",
+            native_max_value=65534,
+            native_min_value=0,
+            device_to_ha=lambda x: None if x is None else x / 10,
+            ha_to_device=lambda x: round(x * 10),
+            native_step=0.1,
+            native_unit_of_measurement=UnitOfTime.SECONDS,
+            mode=NumberMode.BOX,
+        ),
+        entity_class=MatterNumber,
+        required_attributes=(clusters.LevelControl.Attributes.OnOffTransitionTime,),
+        # allow None value to account for 'default' value
+        allow_none_value=True,
+    ),
+    MatterDiscoverySchema(
+        platform=Platform.NUMBER,
+        entity_description=MatterNumberEntityDescription(
+            key="EveWeatherAltitude",
+            device_class=NumberDeviceClass.DISTANCE,
+            entity_category=EntityCategory.CONFIG,
+            translation_key="altitude",
+            native_max_value=9000,
+            native_min_value=0,
+            native_unit_of_measurement=UnitOfLength.METERS,
+            native_step=1,
+            mode=NumberMode.BOX,
+        ),
+        entity_class=MatterNumber,
+        required_attributes=(custom_clusters.EveCluster.Attributes.Altitude,),
+    ),
+    MatterDiscoverySchema(
+        platform=Platform.NUMBER,
+        entity_description=MatterRangeNumberEntityDescription(
+            key="ThermostatOccupiedSetback",
+            entity_category=EntityCategory.CONFIG,
+            translation_key="occupied_setback",
+            native_unit_of_measurement=UnitOfTemperature.CELSIUS,
+            device_to_ha=lambda x: None if x is None else x / 10,
+            ha_to_device=lambda x: round(x * 10),
+            format_min_value=lambda x: x / 10,
+            format_max_value=lambda x: x / 10,
+            min_attribute=clusters.Thermostat.Attributes.OccupiedSetbackMin,
+            max_attribute=clusters.Thermostat.Attributes.OccupiedSetbackMax,
+            native_step=0.5,
+            mode=NumberMode.BOX,
+        ),
+        entity_class=MatterRangeNumber,
+        required_attributes=(
+            clusters.Thermostat.Attributes.OccupiedSetback,
+            clusters.Thermostat.Attributes.OccupiedSetbackMin,
+            clusters.Thermostat.Attributes.OccupiedSetbackMax,
+        ),
+        featuremap_contains=(clusters.Thermostat.Bitmaps.Feature.kSetback),
+    ),
+    # Matter 1.3 and earlier (ClusterRevision <= 6) limit LocalTemperatureCalibration
+    # to ±2.5°C; this schema also matches when ClusterRevision is unreadable.
+    MatterDiscoverySchema(
+        platform=Platform.NUMBER,
+        entity_description=MatterNumberEntityDescription(
+            key="TemperatureOffset",
+            device_class=NumberDeviceClass.TEMPERATURE_DELTA,
+            entity_category=EntityCategory.CONFIG,
+            translation_key="temperature_offset",
+            native_max_value=2.5,
+            native_min_value=-2.5,
+            native_step=0.1,
+            native_unit_of_measurement=UnitOfTemperature.CELSIUS,
+            device_to_ha=lambda x: None if x is None else x / 10,
+            ha_to_device=lambda x: round(x * 10),
+            mode=NumberMode.BOX,
+        ),
+        entity_class=MatterNumber,
+        required_attributes=(
+            clusters.Thermostat.Attributes.LocalTemperatureCalibration,
+        ),
+        cluster_revision_max=THERMOSTAT_EXTENDED_CALIBRATION_REVISION - 1,
+    ),
+    # Temperature offset, extended range (Matter 1.4+): SignedTemperature's
+    # usable range, ±127 in 0.1°C units (-128 is reserved).
+    MatterDiscoverySchema(
+        platform=Platform.NUMBER,
+        entity_description=MatterNumberEntityDescription(
+            key="TemperatureOffset",
+            device_class=NumberDeviceClass.TEMPERATURE_DELTA,
+            entity_category=EntityCategory.CONFIG,
+            translation_key="temperature_offset",
+            native_max_value=12.7,
+            native_min_value=-12.7,
+            native_step=0.1,
+            native_unit_of_measurement=UnitOfTemperature.CELSIUS,
+            device_to_ha=lambda x: None if x is None else x / 10,
+            ha_to_device=lambda x: round(x * 10),
+            mode=NumberMode.BOX,
+        ),
+        entity_class=MatterNumber,
+        required_attributes=(
+            clusters.Thermostat.Attributes.LocalTemperatureCalibration,
+        ),
+        cluster_revision_min=THERMOSTAT_EXTENDED_CALIBRATION_REVISION,
+    ),
+    MatterDiscoverySchema(
+        platform=Platform.NUMBER,
+        entity_description=MatterNumberEntityDescription(
+            key="pump_setpoint",
+            native_unit_of_measurement=UnitOfRatio.PERCENTAGE,
+            translation_key="pump_setpoint",
+            native_max_value=100,
+            native_min_value=0.5,
+            native_step=0.5,
+            device_to_ha=(
+                lambda x: (
+                    None if x is None else min(x, 200) / 2
+                )  # Matter range (1-200, capped at 200)
+            ),
+            ha_to_device=lambda x: round(x * 2),  # HA range 0.5-100.0%
+            mode=NumberMode.SLIDER,
+        ),
+        entity_class=MatterLevelControlNumber,
+        required_attributes=(clusters.LevelControl.Attributes.CurrentLevel,),
+        device_type=(device_types.Pump,),
+        allow_multi=True,
+    ),
+    MatterDiscoverySchema(
+        platform=Platform.NUMBER,
+        entity_description=MatterNumberEntityDescription(
+            key="PIROccupiedToUnoccupiedDelay",
+            entity_category=EntityCategory.CONFIG,
+            # pir_occupied_to_unoccupied_delay for old revisions
+            translation_key="hold_time",
+            native_max_value=65534,
+            native_min_value=0,
+            native_unit_of_measurement=UnitOfTime.SECONDS,
+            mode=NumberMode.BOX,
+        ),
+        entity_class=MatterNumber,
+        required_attributes=(
+            clusters.OccupancySensing.Attributes.PIROccupiedToUnoccupiedDelay,
+        ),
+        absent_attributes=(clusters.OccupancySensing.Attributes.HoldTime,),
+    ),
+    MatterDiscoverySchema(
+        platform=Platform.NUMBER,
+        entity_description=MatterNumberEntityDescription(
+            key="OccupancySensingHoldTime",
+            entity_category=EntityCategory.CONFIG,
+            translation_key="hold_time",
+            native_max_value=65534,
+            native_min_value=1,
+            native_unit_of_measurement=UnitOfTime.SECONDS,
+            mode=NumberMode.BOX,
+        ),
+        entity_class=MatterNumber,
+        required_attributes=(clusters.OccupancySensing.Attributes.HoldTime,),
+        # HoldTime is shared by PIR-specific numbers as a required attribute.
+        # Keep discovery open so this generic schema does not block them.
+        allow_multi=True,
+    ),
+    MatterDiscoverySchema(
+        platform=Platform.NUMBER,
+        entity_description=MatterNumberEntityDescription(
+            key="OccupancySensingPIRUnoccupiedToOccupiedDelay",
+            entity_category=EntityCategory.CONFIG,
+            translation_key="detection_delay",
+            native_max_value=65534,
+            native_min_value=0,
+            native_unit_of_measurement=UnitOfTime.SECONDS,
+            mode=NumberMode.BOX,
+        ),
+        entity_class=MatterNumber,
+        required_attributes=(
+            clusters.OccupancySensing.Attributes.PIRUnoccupiedToOccupiedDelay,
+            # This attribute is mandatory when
+            # PIRUnoccupiedToOccupiedDelay is present
+            clusters.OccupancySensing.Attributes.HoldTime,
+        ),
+        featuremap_contains=clusters.OccupancySensing.Bitmaps.Feature.kPassiveInfrared,
+        allow_multi=True,
+    ),
+    MatterDiscoverySchema(
+        platform=Platform.NUMBER,
+        entity_description=MatterNumberEntityDescription(
+            key="OccupancySensingPIRUnoccupiedToOccupiedThreshold",
+            entity_category=EntityCategory.CONFIG,
+            translation_key="detection_threshold",
+            native_max_value=254,
+            native_min_value=1,
+            mode=NumberMode.BOX,
+        ),
+        entity_class=MatterNumber,
+        required_attributes=(
+            clusters.OccupancySensing.Attributes.PIRUnoccupiedToOccupiedThreshold,
+            clusters.OccupancySensing.Attributes.HoldTime,
+        ),
+        featuremap_contains=clusters.OccupancySensing.Bitmaps.Feature.kPassiveInfrared,
+        allow_multi=True,
+    ),
+    MatterDiscoverySchema(
+        platform=Platform.NUMBER,
+        entity_description=MatterRangeNumberEntityDescription(
+            key="BooleanStateConfigurationCurrentSensitivityLevel",
+            entity_category=EntityCategory.CONFIG,
+            translation_key="sensitivity_level",
+            native_min_value=1,
+            native_step=1,
+            device_to_ha=lambda x: x + 1,
+            ha_to_device=lambda x: int(x) - 1,
+            max_attribute=(
+                clusters.BooleanStateConfiguration.Attributes.SupportedSensitivityLevels
+            ),
+            mode=NumberMode.SLIDER,
+        ),
+        entity_class=MatterRangeNumber,
+        required_attributes=(
+            clusters.BooleanStateConfiguration.Attributes.CurrentSensitivityLevel,
+            clusters.BooleanStateConfiguration.Attributes.SupportedSensitivityLevels,
+        ),
+        featuremap_contains=(
+            clusters.BooleanStateConfiguration.Bitmaps.Feature.kSensitivityLevel
+        ),
+        allow_multi=True,
+    ),
+    MatterDiscoverySchema(
+        platform=Platform.NUMBER,
+        entity_description=MatterNumberEntityDescription(
+            key="ValveConfigurationAndControlDefaultOpenDuration",
+            entity_category=EntityCategory.CONFIG,
+            translation_key="valve_configuration_and_control_default_open_duration",
+            native_max_value=65534,
+            native_min_value=0,
+            native_unit_of_measurement=UnitOfTime.SECONDS,
+            mode=NumberMode.BOX,
+            # use 0 to indicate that no default duration is configured
+            device_to_ha=lambda x: 0 if x is None else x,
+            ha_to_device=lambda x: None if x == 0 else int(x),
+        ),
+        entity_class=MatterNumber,
+        required_attributes=(
+            clusters.ValveConfigurationAndControl.Attributes.DefaultOpenDuration,
+        ),
+        allow_multi=True,
+        # allow None value to account for the 'no default' state
+        allow_none_value=True,
+    ),
+    MatterDiscoverySchema(
+        platform=Platform.NUMBER,
+        entity_description=MatterRangeNumberEntityDescription(
+            key="MicrowaveOvenControlCookTime",
+            translation_key="cook_time",
+            device_class=NumberDeviceClass.DURATION,
+            command=lambda value: (
+                clusters.MicrowaveOvenControl.Commands.SetCookingParameters(
+                    cookTime=int(value)
+                )
+            ),
+            native_min_value=1,  # 1 second minimum cook time
+            native_step=1,  # 1 second
+            native_unit_of_measurement=UnitOfTime.SECONDS,
+            max_attribute=clusters.MicrowaveOvenControl.Attributes.MaxCookTime,
+            mode=NumberMode.SLIDER,
+        ),
+        entity_class=MatterRangeNumber,
+        required_attributes=(
+            clusters.MicrowaveOvenControl.Attributes.CookTime,
+            clusters.MicrowaveOvenControl.Attributes.MaxCookTime,
+        ),
+    ),
+    MatterDiscoverySchema(
+        platform=Platform.NUMBER,
+        entity_description=MatterRangeNumberEntityDescription(
+            key="speaker_setpoint",
+            translation_key="speaker_setpoint",
+            native_unit_of_measurement=UnitOfRatio.PERCENTAGE,
+            command=lambda value: clusters.LevelControl.Commands.MoveToLevel(
+                level=int(value)
+            ),
+            native_min_value=0,
+            native_max_value=100,
+            native_step=1,
+            device_to_ha=lambda x: None if x is None else x,
+            min_attribute=clusters.LevelControl.Attributes.MinLevel,
+            max_attribute=clusters.LevelControl.Attributes.MaxLevel,
+            mode=NumberMode.SLIDER,
+        ),
+        entity_class=MatterRangeNumber,
+        required_attributes=(
+            clusters.LevelControl.Attributes.CurrentLevel,
+            clusters.LevelControl.Attributes.MinLevel,
+            clusters.LevelControl.Attributes.MaxLevel,
+        ),
+        device_type=(device_types.Speaker,),
+    ),
+    MatterDiscoverySchema(
+        platform=Platform.NUMBER,
+        entity_description=MatterNumberEntityDescription(
+            key="AutoRelockTimer",
+            entity_category=EntityCategory.CONFIG,
+            translation_key="auto_relock_timer",
+            native_max_value=65534,
+            native_min_value=0,
+            native_unit_of_measurement=UnitOfTime.SECONDS,
+            mode=NumberMode.BOX,
+        ),
+        entity_class=MatterNumber,
+        required_attributes=(clusters.DoorLock.Attributes.AutoRelockTime,),
+    ),
+    MatterDiscoverySchema(
+        platform=Platform.NUMBER,
+        entity_description=MatterRangeNumberEntityDescription(
+            key="TemperatureControlTemperatureSetpoint",
+            name=None,
+            translation_key="temperature_setpoint",
+            command=lambda value: clusters.TemperatureControl.Commands.SetTemperature(
+                targetTemperature=value
+            ),
+            native_unit_of_measurement=UnitOfTemperature.CELSIUS,
+            device_to_ha=lambda x: None if x is None else x / 100,
+            ha_to_device=lambda x: round(x * 100),
+            format_min_value=lambda x: x / 100,
+            format_max_value=lambda x: x / 100,
+            min_attribute=clusters.TemperatureControl.Attributes.MinTemperature,
+            max_attribute=clusters.TemperatureControl.Attributes.MaxTemperature,
+            mode=NumberMode.SLIDER,
+        ),
+        entity_class=MatterRangeNumber,
+        required_attributes=(
+            clusters.TemperatureControl.Attributes.TemperatureSetpoint,
+            clusters.TemperatureControl.Attributes.MinTemperature,
+            clusters.TemperatureControl.Attributes.MaxTemperature,
+        ),
+    ),
+    MatterDiscoverySchema(
+        platform=Platform.NUMBER,
+        entity_description=MatterNumberEntityDescription(
+            key="InovelliLEDIndicatorIntensityOff",
+            entity_category=EntityCategory.CONFIG,
+            translation_key="led_indicator_intensity_off",
+            native_max_value=75,
+            native_min_value=0,
+            native_step=1,
+            mode=NumberMode.BOX,
+        ),
+        entity_class=MatterNumber,
+        required_attributes=(
+            custom_clusters.InovelliCluster.Attributes.LEDIndicatorIntensityOff,
+        ),
+        product_id=(2, 16),
+    ),
+    MatterDiscoverySchema(
+        platform=Platform.NUMBER,
+        entity_description=MatterNumberEntityDescription(
+            key="InovelliLEDIndicatorIntensityOn",
+            entity_category=EntityCategory.CONFIG,
+            translation_key="led_indicator_intensity_on",
+            native_max_value=75,
+            native_min_value=0,
+            native_step=1,
+            mode=NumberMode.BOX,
+        ),
+        entity_class=MatterNumber,
+        required_attributes=(
+            custom_clusters.InovelliCluster.Attributes.LEDIndicatorIntensityOn,
+        ),
+        product_id=(2, 16),
+    ),
+    MatterDiscoverySchema(
+        platform=Platform.NUMBER,
+        entity_description=MatterNumberEntityDescription(
+            key="DoorLockWrongCodeEntryLimit",
+            entity_category=EntityCategory.CONFIG,
+            translation_key="wrong_code_entry_limit",
+            native_max_value=255,
+            native_min_value=1,
+            native_step=1,
+            mode=NumberMode.BOX,
+        ),
+        entity_class=MatterNumber,
+        required_attributes=(clusters.DoorLock.Attributes.WrongCodeEntryLimit,),
+    ),
+    MatterDiscoverySchema(
+        platform=Platform.NUMBER,
+        entity_description=MatterNumberEntityDescription(
+            key="DoorLockUserCodeTemporaryDisableTime",
+            entity_category=EntityCategory.CONFIG,
+            translation_key="user_code_temporary_disable_time",
+            native_max_value=255,
+            native_min_value=1,
+            native_step=1,
+            native_unit_of_measurement=UnitOfTime.SECONDS,
+            mode=NumberMode.BOX,
+        ),
+        entity_class=MatterNumber,
+        required_attributes=(
+            clusters.DoorLock.Attributes.UserCodeTemporaryDisableTime,
+        ),
+    ),
+    # WAGO specific attributes on the WindowCovering cluster.
+    # The travel times are also re-measured by the device on every full
+    # travel between the end positions, so they can change without a write.
+    MatterDiscoverySchema(
+        platform=Platform.NUMBER,
+        entity_description=MatterNumberEntityDescription(
+            key="WagoTravelTimeUp",
+            entity_category=EntityCategory.CONFIG,
+            translation_key="travel_time_up",
+            device_class=NumberDeviceClass.DURATION,
+            native_max_value=300,
+            native_min_value=0,
+            native_step=0.1,
+            native_unit_of_measurement=UnitOfTime.SECONDS,
+            mode=NumberMode.BOX,
+            # device stores the travel times in units of 10 ms
+            device_to_ha=lambda x: None if x is None else x / 100,
+            ha_to_device=lambda x: round(x * 100),
+        ),
+        entity_class=MatterNumber,
+        required_attributes=(clusters.WindowCovering.Attributes.WagoTravelTimeUp,),
+        vendor_id=(5428,),
+    ),
+    MatterDiscoverySchema(
+        platform=Platform.NUMBER,
+        entity_description=MatterNumberEntityDescription(
+            key="WagoTravelTimeDown",
+            entity_category=EntityCategory.CONFIG,
+            translation_key="travel_time_down",
+            device_class=NumberDeviceClass.DURATION,
+            native_max_value=300,
+            native_min_value=0,
+            native_step=0.1,
+            native_unit_of_measurement=UnitOfTime.SECONDS,
+            mode=NumberMode.BOX,
+            device_to_ha=lambda x: None if x is None else x / 100,
+            ha_to_device=lambda x: round(x * 100),
+        ),
+        entity_class=MatterNumber,
+        required_attributes=(clusters.WindowCovering.Attributes.WagoTravelTimeDown,),
+        vendor_id=(5428,),
+    ),
+    MatterDiscoverySchema(
+        platform=Platform.NUMBER,
+        entity_description=MatterNumberEntityDescription(
+            key="WagoSlatRotationTime",
+            entity_category=EntityCategory.CONFIG,
+            translation_key="slat_rotation_time",
+            device_class=NumberDeviceClass.DURATION,
+            native_max_value=10,
+            native_min_value=0,
+            native_step=0.1,
+            native_unit_of_measurement=UnitOfTime.SECONDS,
+            mode=NumberMode.BOX,
+            # device stores the slat rotation time in milliseconds
+            device_to_ha=lambda x: None if x is None else x / 1000,
+            ha_to_device=lambda x: round(x * 1000),
+        ),
+        entity_class=MatterNumber,
+        required_attributes=(clusters.WindowCovering.Attributes.WagoSlatRotationTime,),
+        vendor_id=(5428,),
+    ),
+    MatterDiscoverySchema(
+        platform=Platform.NUMBER,
+        entity_description=MatterNumberEntityDescription(
+            key="AqaraLedStripMusicSyncSensitivity",
+            translation_key="music_sync_sensitivity",
+            native_min_value=1,
+            native_max_value=100,
+            native_unit_of_measurement=UnitOfRatio.PERCENTAGE,
+            native_step=1,
+            mode=NumberMode.SLIDER,
+            entity_category=EntityCategory.CONFIG,
+        ),
+        entity_class=MatterNumber,
+        required_attributes=(
+            custom_clusters.AqaraLedStripCluster.Attributes.MusicSyncSensitivity,
+        ),
+        vendor_id=(4447,),
+    ),
+]

@@ -1,40 +1,37 @@
 """Config flow to configure the Meteo-France integration."""
-from __future__ import annotations
 
 import logging
+from typing import Any, override
 
 from meteofrance_api.client import MeteoFranceClient
-import voluptuous as vol
+from meteofrance_api.model import Place
+import probatio
+from requests import RequestException
 
-from homeassistant import config_entries
-from homeassistant.config_entries import SOURCE_IMPORT, ConfigEntry
-from homeassistant.const import CONF_LATITUDE, CONF_LONGITUDE, CONF_MODE
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.const import CONF_LATITUDE, CONF_LONGITUDE
 from homeassistant.core import callback
 
-from .const import CONF_CITY, DOMAIN, FORECAST_MODE, FORECAST_MODE_DAILY
+from .const import CONF_CITY, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
 
-class MeteoFranceFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
+class MeteoFranceFlowHandler(ConfigFlow, domain=DOMAIN):
     """Handle a Meteo-France config flow."""
 
     VERSION = 1
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Init MeteoFranceFlowHandler."""
-        self.places = []
-
-    @staticmethod
-    @callback
-    def async_get_options_flow(
-        config_entry: ConfigEntry,
-    ) -> MeteoFranceOptionsFlowHandler:
-        """Get the options flow for this handler."""
-        return MeteoFranceOptionsFlowHandler(config_entry)
+        self.places: list[Place] = []
 
     @callback
-    def _show_setup_form(self, user_input=None, errors=None):
+    def _show_setup_form(
+        self,
+        user_input: dict[str, Any] | None = None,
+        errors: dict[str, str] | None = None,
+    ) -> ConfigFlowResult:
         """Show the setup form to the user."""
 
         if user_input is None:
@@ -42,15 +39,22 @@ class MeteoFranceFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="user",
-            data_schema=vol.Schema(
-                {vol.Required(CONF_CITY, default=user_input.get(CONF_CITY, "")): str}
+            data_schema=probatio.Schema(
+                {
+                    probatio.Required(
+                        CONF_CITY, default=user_input.get(CONF_CITY, "")
+                    ): str
+                }
             ),
             errors=errors or {},
         )
 
-    async def async_step_user(self, user_input=None):
+    @override
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle a flow initiated by the user."""
-        errors = {}
+        errors: dict[str, str] = {}
 
         if user_input is None:
             return self._show_setup_form(user_input, errors)
@@ -61,9 +65,13 @@ class MeteoFranceFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
 
         if not latitude:
             client = MeteoFranceClient()
-            self.places = await self.hass.async_add_executor_job(
-                client.search_places, city
-            )
+            try:
+                self.places = await self.hass.async_add_executor_job(
+                    client.search_places, city
+                )
+            except RequestException:
+                errors["base"] = "cannot_connect"
+                return self._show_setup_form(user_input, errors)
             _LOGGER.debug("Places search result: %s", self.places)
             if not self.places:
                 errors[CONF_CITY] = "empty"
@@ -80,24 +88,22 @@ class MeteoFranceFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             data={CONF_LATITUDE: latitude, CONF_LONGITUDE: longitude},
         )
 
-    async def async_step_import(self, user_input):
-        """Import a config entry."""
-        return await self.async_step_user(user_input)
-
-    async def async_step_cities(self, user_input=None):
+    async def async_step_cities(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Step where the user choose the city from the API search results."""
         if not user_input:
-            if len(self.places) > 1 and self.source != SOURCE_IMPORT:
-                places_for_form = {}
+            if len(self.places) > 1:
+                places_for_form: dict[str, str] = {}
                 for place in self.places:
                     places_for_form[_build_place_key(place)] = f"{place}"
 
                 return self.async_show_form(
                     step_id="cities",
-                    data_schema=vol.Schema(
+                    data_schema=probatio.Schema(
                         {
-                            vol.Required(CONF_CITY): vol.All(
-                                vol.Coerce(str), vol.In(places_for_form)
+                            probatio.Required(CONF_CITY): probatio.All(
+                                probatio.Coerce(str), probatio.In(places_for_form)
                             )
                         }
                     ),
@@ -114,30 +120,5 @@ class MeteoFranceFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
 
-class MeteoFranceOptionsFlowHandler(config_entries.OptionsFlow):
-    """Handle a option flow."""
-
-    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
-        """Initialize options flow."""
-        self.config_entry = config_entry
-
-    async def async_step_init(self, user_input=None):
-        """Handle options flow."""
-        if user_input is not None:
-            return self.async_create_entry(title="", data=user_input)
-
-        data_schema = vol.Schema(
-            {
-                vol.Optional(
-                    CONF_MODE,
-                    default=self.config_entry.options.get(
-                        CONF_MODE, FORECAST_MODE_DAILY
-                    ),
-                ): vol.In(FORECAST_MODE)
-            }
-        )
-        return self.async_show_form(step_id="init", data_schema=data_schema)
-
-
-def _build_place_key(place) -> str:
+def _build_place_key(place: Place) -> str:
     return f"{place};{place.latitude};{place.longitude}"

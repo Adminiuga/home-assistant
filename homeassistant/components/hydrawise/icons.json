@@ -1,0 +1,56 @@
+{
+  "entity": {
+    "binary_sensor": {
+      "rain_sensor": {
+        "default": "mdi:weather-sunny",
+        "state": {
+          "off": "mdi:weather-sunny",
+          "on": "mdi:weather-pouring"
+        }
+      }
+    },
+    "sensor": {
+      "daily_active_water_time": {
+        "default": "mdi:timelapse"
+      },
+      "daily_active_water_use": {
+        "default": "mdi:water",
+        "range": {
+          "0": "mdi:water-outline",
+          "0.01": "mdi:water"
+        }
+      },
+      "daily_inactive_water_use": {
+        "default": "mdi:water",
+        "range": {
+          "0": "mdi:water-outline",
+          "0.01": "mdi:water"
+        }
+      },
+      "daily_total_water_use": {
+        "default": "mdi:water",
+        "range": {
+          "0": "mdi:water-outline",
+          "0.01": "mdi:water"
+        }
+      },
+      "next_cycle": {
+        "default": "mdi:clock-outline"
+      },
+      "watering_time": {
+        "default": "mdi:timer-outline"
+      }
+    }
+  },
+  "services": {
+    "resume": {
+      "service": "mdi:play"
+    },
+    "start_watering": {
+      "service": "mdi:sprinkler-variant"
+    },
+    "suspend": {
+      "service": "mdi:pause-circle-outline"
+    }
+  }
+}

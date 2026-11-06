@@ -1,136 +1,185 @@
 """The vizio component."""
-from __future__ import annotations
 
-from datetime import timedelta
-import logging
-from typing import Any
-
-from pyvizio.const import APPS
-from pyvizio.util import gen_apps_list_from_url
-import voluptuous as vol
-
-from homeassistant.components.media_player import MediaPlayerDeviceClass
-from homeassistant.config_entries import SOURCE_IMPORT, ConfigEntry, ConfigEntryState
-from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from homeassistant.helpers.typing import ConfigType
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
-
-from .const import CONF_APPS, CONF_DEVICE_CLASS, DOMAIN, VIZIO_SCHEMA
-
-_LOGGER = logging.getLogger(__name__)
-
-
-def validate_apps(config: ConfigType) -> ConfigType:
-    """Validate CONF_APPS is only used when CONF_DEVICE_CLASS is MediaPlayerDeviceClass.TV."""
-    if (
-        config.get(CONF_APPS) is not None
-        and config[CONF_DEVICE_CLASS] != MediaPlayerDeviceClass.TV
-    ):
-        raise vol.Invalid(
-            f"'{CONF_APPS}' can only be used if {CONF_DEVICE_CLASS}' is '{MediaPlayerDeviceClass.TV}'"
-        )
-
-    return config
-
-
-CONFIG_SCHEMA = vol.Schema(
-    {DOMAIN: vol.All(cv.ensure_list, [vol.All(VIZIO_SCHEMA, validate_apps)])},
-    extra=vol.ALLOW_EXTRA,
+from vizaio import (
+    DeviceType,
+    Vizio,
+    VizioError,
+    async_classify_device,
+    async_resolve_host,
 )
 
-PLATFORMS = [Platform.MEDIA_PLAYER]
+from homeassistant.components.media_player import MediaPlayerDeviceClass
+from homeassistant.const import (
+    CONF_ACCESS_TOKEN,
+    CONF_DEVICE_CLASS,
+    CONF_EXCLUDE,
+    CONF_HOST,
+    CONF_INCLUDE,
+    Platform,
+)
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.storage import Store
+from homeassistant.helpers.typing import ConfigType
+from homeassistant.util.hass_dict import HassKey
+
+from .const import (
+    CONF_APPS,
+    CONF_DEVICE_TYPE,
+    CONF_VOLUME_STEP,
+    DEFAULT_TIMEOUT,
+    DOMAIN,
+    VIZIO_DEVICE_CLASSES,
+)
+from .coordinator import (
+    VizioAppsDataUpdateCoordinator,
+    VizioConfigEntry,
+    VizioDeviceCoordinator,
+    VizioRuntimeData,
+)
+from .services import async_setup_services
+
+DATA_APPS: HassKey[VizioAppsDataUpdateCoordinator] = HassKey(f"{DOMAIN}_apps")
+
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+PLATFORMS = [
+    Platform.BINARY_SENSOR,
+    Platform.MEDIA_PLAYER,
+    Platform.REMOTE,
+    Platform.SENSOR,
+]
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    """Component setup, run import config flow for each entry in config."""
-    if DOMAIN in config:
-        for entry in config[DOMAIN]:
-            hass.async_create_task(
-                hass.config_entries.flow.async_init(
-                    DOMAIN, context={"source": SOURCE_IMPORT}, data=entry
-                )
-            )
-
+    """Set up the component."""
+    async_setup_services(hass)
     return True
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Load the saved entities."""
+async def async_migrate_entry(hass: HomeAssistant, entry: VizioConfigEntry) -> None:
+    """Migrate old config entries."""
+    if entry.version == 1 and entry.minor_version == 1:
+        # Settings imported from YAML were stored in data; they belong in options
+        data = dict(entry.data)
+        options = dict(entry.options)
+        if (volume_step := data.pop(CONF_VOLUME_STEP, None)) is not None:
+            options.setdefault(CONF_VOLUME_STEP, volume_step)
+        if apps := dict(data.pop(CONF_APPS, {})):
+            include_or_exclude = {
+                key: apps.pop(key)
+                for key in (CONF_INCLUDE, CONF_EXCLUDE)
+                if key in apps
+            }
+            if include_or_exclude:
+                options.setdefault(CONF_APPS, include_or_exclude)
+            if apps:
+                data[CONF_APPS] = apps
+        hass.config_entries.async_update_entry(
+            entry, data=data, options=options, minor_version=2
+        )
 
-    hass.data.setdefault(DOMAIN, {})
-    if (
-        CONF_APPS not in hass.data[DOMAIN]
-        and entry.data[CONF_DEVICE_CLASS] == MediaPlayerDeviceClass.TV
-    ):
-        coordinator = VizioAppsDataUpdateCoordinator(hass)
-        await coordinator.async_refresh()
-        hass.data[DOMAIN][CONF_APPS] = coordinator
+
+async def _async_resolve_device_type(
+    hass: HomeAssistant, entry: VizioConfigEntry
+) -> DeviceType:
+    """Resolve the vizaio device type for a config entry.
+
+    Speaker entries are classified once to distinguish battery-powered
+    Crave models (own volume scale, battery sensors) from soundbars, and
+    the result is persisted on the entry. Entries from before this key
+    existed are classified here as well.
+    """
+    if (stored := entry.data.get(CONF_DEVICE_TYPE)) is not None:
+        return DeviceType(stored)
+
+    device_class = entry.data[CONF_DEVICE_CLASS]
+    fallback: DeviceType = VIZIO_DEVICE_CLASSES[device_class]
+    if device_class != MediaPlayerDeviceClass.SPEAKER:
+        return fallback
+
+    try:
+        device_type = await async_classify_device(
+            entry.data[CONF_HOST],
+            session=async_get_clientsession(hass, False),
+        )
+    except VizioError:
+        # Device unreachable; use the generic profile and retry next setup
+        return fallback
+    if device_type is DeviceType.TV:
+        # Classification contradicts the configured device class; trust the user
+        return fallback
+
+    hass.config_entries.async_update_entry(
+        entry, data={**entry.data, CONF_DEVICE_TYPE: device_type.value}
+    )
+    return device_type
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: VizioConfigEntry) -> None:
+    """Load the saved entities."""
+    host = entry.data[CONF_HOST]
+    token = entry.data.get(CONF_ACCESS_TOKEN)
+    device_class = entry.data[CONF_DEVICE_CLASS]
+
+    # Entries created before the host was stored with a port need one probed
+    # and persisted, otherwise every request targets port 443. Resolving is a
+    # no-op for a host that already has one.
+    try:
+        resolved_host = await async_resolve_host(
+            host,
+            session=async_get_clientsession(hass, False),
+            timeout=DEFAULT_TIMEOUT,
+        )
+    except VizioError as err:
+        raise ConfigEntryNotReady(
+            translation_domain=DOMAIN,
+            translation_key="cannot_determine_port",
+            translation_placeholders={"host": host},
+        ) from err
+    if resolved_host != host:
+        host = resolved_host
+        hass.config_entries.async_update_entry(
+            entry, data={**entry.data, CONF_HOST: host}
+        )
+
+    # Create device
+    device = Vizio(
+        host,
+        device_type=await _async_resolve_device_type(hass, entry),
+        auth_token=token,
+        session=async_get_clientsession(hass, False),
+        timeout=DEFAULT_TIMEOUT,
+    )
+
+    # Create device coordinator
+    device_coordinator = VizioDeviceCoordinator(hass, entry, device)
+    await device_coordinator.async_config_entry_first_refresh()
+
+    # Create apps coordinator for TVs (shared across entries)
+    if device_class == MediaPlayerDeviceClass.TV and DATA_APPS not in hass.data:
+        apps_coordinator = VizioAppsDataUpdateCoordinator(hass, Store(hass, 1, DOMAIN))
+        await apps_coordinator.async_setup()
+        hass.data[DATA_APPS] = apps_coordinator
+        await apps_coordinator.async_refresh()
+
+    entry.runtime_data = VizioRuntimeData(
+        device_coordinator=device_coordinator,
+    )
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    return True
 
-
-async def async_unload_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
+async def async_unload_entry(hass: HomeAssistant, entry: VizioConfigEntry) -> None:
     """Unload a config entry."""
-    unload_ok = await hass.config_entries.async_unload_platforms(
-        config_entry, PLATFORMS
-    )
-    # Exclude this config entry because its not unloaded yet
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)
+
+    # Clean up apps coordinator if no TV entries remain
     if not any(
-        entry.state is ConfigEntryState.LOADED
-        and entry.entry_id != config_entry.entry_id
-        and entry.data[CONF_DEVICE_CLASS] == MediaPlayerDeviceClass.TV
-        for entry in hass.config_entries.async_entries(DOMAIN)
+        e.data[CONF_DEVICE_CLASS] == MediaPlayerDeviceClass.TV
+        for e in hass.config_entries.async_loaded_entries(DOMAIN)
+        if e.entry_id != entry.entry_id
     ):
-        hass.data[DOMAIN].pop(CONF_APPS, None)
-
-    if not hass.data[DOMAIN]:
-        hass.data.pop(DOMAIN)
-
-    return unload_ok
-
-
-class VizioAppsDataUpdateCoordinator(DataUpdateCoordinator):
-    """Define an object to hold Vizio app config data."""
-
-    def __init__(self, hass: HomeAssistant) -> None:
-        """Initialize."""
-        super().__init__(
-            hass,
-            _LOGGER,
-            name=DOMAIN,
-            update_interval=timedelta(days=1),
-            update_method=self._async_update_data,
-        )
-        self.data = APPS
-        self.fail_count = 0
-        self.fail_threshold = 10
-
-    async def _async_update_data(self) -> list[dict[str, Any]]:
-        """Update data via library."""
-        data = await gen_apps_list_from_url(session=async_get_clientsession(self.hass))
-        if not data:
-            # For every failure, increase the fail count until we reach the threshold.
-            # We then log a warning, increase the threshold, and reset the fail count.
-            # This is here to prevent silent failures but to reduce repeat logs.
-            if self.fail_count == self.fail_threshold:
-                _LOGGER.warning(
-                    (
-                        "Unable to retrieve the apps list from the external server "
-                        "for the last %s days"
-                    ),
-                    self.fail_threshold,
-                )
-                self.fail_count = 0
-                self.fail_threshold += 10
-            else:
-                self.fail_count += 1
-            return self.data
-        # Reset the fail count and threshold when the data is successfully retrieved
-        self.fail_count = 0
-        self.fail_threshold = 10
-        return sorted(data, key=lambda app: app["name"])
+        if apps_coordinator := hass.data.pop(DATA_APPS, None):
+            await apps_coordinator.async_shutdown()

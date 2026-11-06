@@ -1,15 +1,30 @@
 """Vera tests."""
-from unittest.mock import MagicMock, patch
 
+from collections.abc import Generator
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from pytest_homeassistant.common import MockConfigEntry
 from requests.exceptions import RequestException
 
-from homeassistant import config_entries, data_entry_flow
-from homeassistant.components.vera import CONF_CONTROLLER, CONF_LEGACY_UNIQUE_ID, DOMAIN
+from homeassistant import config_entries
+from homeassistant.components.vera.const import (
+    CONF_CONTROLLER,
+    CONF_LEGACY_UNIQUE_ID,
+    DOMAIN,
+)
 from homeassistant.const import CONF_EXCLUDE, CONF_LIGHTS, CONF_SOURCE
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
 
-from tests.common import MockConfigEntry, mock_registry
+
+@pytest.fixture(autouse=True)
+def mock_setup_entry() -> Generator[AsyncMock]:
+    """Override async_setup_entry."""
+    with patch(
+        "homeassistant.components.vera.async_setup_entry", return_value=None
+    ) as mock_setup_entry:
+        yield mock_setup_entry
 
 
 async def test_async_step_user_success(hass: HomeAssistant) -> None:
@@ -23,7 +38,7 @@ async def test_async_step_user_success(hass: HomeAssistant) -> None:
         result = await hass.config_entries.flow.async_init(
             DOMAIN, context={"source": config_entries.SOURCE_USER}
         )
-        assert result["type"] == FlowResultType.FORM
+        assert result["type"] is FlowResultType.FORM
         assert result["step_id"] == config_entries.SOURCE_USER
 
         result = await hass.config_entries.flow.async_configure(
@@ -34,7 +49,7 @@ async def test_async_step_user_success(hass: HomeAssistant) -> None:
                 CONF_EXCLUDE: "14 15",
             },
         )
-        assert result["type"] == FlowResultType.CREATE_ENTRY
+        assert result["type"] is FlowResultType.CREATE_ENTRY
         assert result["title"] == "http://127.0.0.1:123"
         assert result["data"] == {
             CONF_CONTROLLER: "http://127.0.0.1:123",
@@ -49,61 +64,6 @@ async def test_async_step_user_success(hass: HomeAssistant) -> None:
     assert entries
 
 
-async def test_async_step_import_success(hass: HomeAssistant) -> None:
-    """Test import step success."""
-    with patch("pyvera.VeraController") as vera_controller_class_mock:
-        controller = MagicMock()
-        controller.refresh_data = MagicMock()
-        controller.serial_number = "serial_number_1"
-        vera_controller_class_mock.return_value = controller
-
-        result = await hass.config_entries.flow.async_init(
-            DOMAIN,
-            context={"source": config_entries.SOURCE_IMPORT},
-            data={CONF_CONTROLLER: "http://127.0.0.1:123/"},
-        )
-
-        assert result["type"] == FlowResultType.CREATE_ENTRY
-        assert result["title"] == "http://127.0.0.1:123"
-        assert result["data"] == {
-            CONF_CONTROLLER: "http://127.0.0.1:123",
-            CONF_SOURCE: config_entries.SOURCE_IMPORT,
-            CONF_LEGACY_UNIQUE_ID: False,
-        }
-        assert result["result"].unique_id == controller.serial_number
-
-
-async def test_async_step_import_success_with_legacy_unique_id(
-    hass: HomeAssistant,
-) -> None:
-    """Test import step success with legacy unique id."""
-    entity_registry = mock_registry(hass)
-    entity_registry.async_get_or_create(
-        domain="switch", platform=DOMAIN, unique_id="12"
-    )
-
-    with patch("pyvera.VeraController") as vera_controller_class_mock:
-        controller = MagicMock()
-        controller.refresh_data = MagicMock()
-        controller.serial_number = "serial_number_1"
-        vera_controller_class_mock.return_value = controller
-
-        result = await hass.config_entries.flow.async_init(
-            DOMAIN,
-            context={"source": config_entries.SOURCE_IMPORT},
-            data={CONF_CONTROLLER: "http://127.0.0.1:123/"},
-        )
-
-        assert result["type"] == FlowResultType.CREATE_ENTRY
-        assert result["title"] == "http://127.0.0.1:123"
-        assert result["data"] == {
-            CONF_CONTROLLER: "http://127.0.0.1:123",
-            CONF_SOURCE: config_entries.SOURCE_IMPORT,
-            CONF_LEGACY_UNIQUE_ID: True,
-        }
-        assert result["result"].unique_id == controller.serial_number
-
-
 async def test_async_step_finish_error(hass: HomeAssistant) -> None:
     """Test finish step with error."""
     with patch("pyvera.VeraController") as vera_controller_class_mock:
@@ -112,19 +72,25 @@ async def test_async_step_finish_error(hass: HomeAssistant) -> None:
         vera_controller_class_mock.return_value = controller
 
         result = await hass.config_entries.flow.async_init(
-            DOMAIN,
-            context={"source": config_entries.SOURCE_IMPORT},
-            data={CONF_CONTROLLER: "http://127.0.0.1:123/"},
+            DOMAIN, context={"source": config_entries.SOURCE_USER}
         )
 
-        assert result["type"] == "abort"
+        assert result["type"] is FlowResultType.FORM
+        assert result["step_id"] == "user"
+
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            user_input={CONF_CONTROLLER: "http://127.0.0.1:123/"},
+        )
+
+        assert result["type"] is FlowResultType.ABORT
         assert result["reason"] == "cannot_connect"
         assert result["description_placeholders"] == {
             "base_url": "http://127.0.0.1:123"
         }
 
 
-async def test_options(hass):
+async def test_options(hass: HomeAssistant) -> None:
     """Test updating options."""
     base_url = "http://127.0.0.1/"
     entry = MockConfigEntry(
@@ -138,7 +104,7 @@ async def test_options(hass):
     result = await hass.config_entries.options.async_init(
         entry.entry_id, context={"source": "test"}, data=None
     )
-    assert result["type"] == data_entry_flow.FlowResultType.FORM
+    assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "init"
 
     result = await hass.config_entries.options.async_configure(
@@ -148,7 +114,7 @@ async def test_options(hass):
             CONF_EXCLUDE: "8,9;10  11 12_13bb14",
         },
     )
-    assert result["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
+    assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["data"] == {
         CONF_LIGHTS: [1, 2, 3, 4, 5, 6, 7],
         CONF_EXCLUDE: [8, 9, 10, 11, 12, 13, 14],

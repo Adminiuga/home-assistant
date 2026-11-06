@@ -1,10 +1,13 @@
 {
   "domain": "iotawatt",
   "name": "IoTaWatt",
+  "categories": ["energy.meters_monitoring"],
+  "codeowners": ["@gtdiehl", "@jyavenard", "@agners"],
   "config_flow": true,
+  "connectivity": ["network"],
   "documentation": "https://www.home-assistant.io/integrations/iotawatt",
-  "requirements": ["iotawattpy==0.1.0"],
-  "codeowners": ["@gtdiehl", "@jyavenard"],
+  "integration_type": "device",
   "iot_class": "local_polling",
-  "loggers": ["iotawattpy"]
+  "loggers": ["iotawattpy"],
+  "requirements": ["ha-iotawattpy==0.3.0"]
 }

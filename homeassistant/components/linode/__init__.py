@@ -1,13 +1,14 @@
 """Support for Linode."""
+
 from datetime import timedelta
 import logging
 
 import linode
-import voluptuous as vol
+import probatio
 
 from homeassistant.const import CONF_ACCESS_TOKEN, Platform
 from homeassistant.core import HomeAssistant
-import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.typing import ConfigType
 from homeassistant.util import Throttle
 
@@ -30,9 +31,13 @@ DOMAIN = "linode"
 
 MIN_TIME_BETWEEN_UPDATES = timedelta(seconds=60)
 
-CONFIG_SCHEMA = vol.Schema(
-    {DOMAIN: vol.Schema({vol.Required(CONF_ACCESS_TOKEN): cv.string})},
-    extra=vol.ALLOW_EXTRA,
+CONFIG_SCHEMA = probatio.Schema(
+    {
+        DOMAIN: probatio.Schema(
+            {probatio.Required(probatio.Secret(CONF_ACCESS_TOKEN)): cv.string}
+        )
+    },
+    extra=probatio.ALLOW_EXTRA,
 )
 
 
@@ -44,7 +49,7 @@ def setup(hass: HomeAssistant, config: ConfigType) -> bool:
     _linode = Linode(access_token)
 
     try:
-        _LOGGER.info("Linode Profile %s", _linode.manager.get_profile().username)
+        _LOGGER.debug("Linode Profile %s", _linode.manager.get_profile().username)
     except linode.errors.ApiError as _ex:
         _LOGGER.error(_ex)
         return False

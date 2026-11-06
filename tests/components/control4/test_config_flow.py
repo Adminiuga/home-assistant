@@ -1,197 +1,181 @@
 """Test the Control4 config flow."""
-import datetime
-from unittest.mock import AsyncMock, patch
 
-from pyControl4.account import C4Account
-from pyControl4.director import C4Director
-from pyControl4.error_handling import Unauthorized
+from unittest.mock import AsyncMock
 
-from homeassistant import config_entries
-from homeassistant.components.control4.const import DEFAULT_SCAN_INTERVAL, DOMAIN
-from homeassistant.const import (
-    CONF_HOST,
-    CONF_PASSWORD,
-    CONF_SCAN_INTERVAL,
-    CONF_USERNAME,
-)
+from aiohttp.client_exceptions import ClientError
+from pyControl4.error_handling import BadCredentials, NotFound, Unauthorized
+import pytest
+from pytest_homeassistant.common import MockConfigEntry
 
-from tests.common import MockConfigEntry
+from homeassistant.components.control4.const import DOMAIN
+from homeassistant.config_entries import SOURCE_USER
+from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_USERNAME
+from homeassistant.core import HomeAssistant
+from homeassistant.data_entry_flow import FlowResultType
+
+from .conftest import MOCK_HOST, MOCK_PASSWORD, MOCK_USERNAME
 
 
-def _get_mock_c4_account(
-    getAccountControllers={
-        "controllerCommonName": "control4_model_00AA00AA00AA",
-        "href": "https://apis.control4.com/account/v3/rest/accounts/000000",
-        "name": "Name",
-    },
-    getDirectorBearerToken={
-        "token": "token",
-        "token_expiration": datetime.datetime(2020, 7, 15, 13, 50, 15, 26940),
-    },
-):
-    c4_account_mock = AsyncMock(C4Account)
-
-    c4_account_mock.getAccountControllers.return_value = getAccountControllers
-    c4_account_mock.getDirectorBearerToken.return_value = getDirectorBearerToken
-
-    return c4_account_mock
-
-
-def _get_mock_c4_director(getAllItemInfo={}):
-    c4_director_mock = AsyncMock(C4Director)
-    c4_director_mock.getAllItemInfo.return_value = getAllItemInfo
-
-    return c4_director_mock
-
-
-async def test_form(hass):
-    """Test we get the form."""
+async def test_full_flow(
+    hass: HomeAssistant,
+    mock_c4_account: AsyncMock,
+    mock_c4_director: AsyncMock,
+    mock_setup_entry: AsyncMock,
+) -> None:
+    """Test full config flow."""
 
     result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": config_entries.SOURCE_USER}
+        DOMAIN, context={"source": SOURCE_USER}
     )
-    assert result["type"] == "form"
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "user"
     assert result["errors"] == {}
 
-    c4_account = _get_mock_c4_account()
-    c4_director = _get_mock_c4_director()
-    with patch(
-        "homeassistant.components.control4.config_flow.C4Account",
-        return_value=c4_account,
-    ), patch(
-        "homeassistant.components.control4.config_flow.C4Director",
-        return_value=c4_director,
-    ), patch(
-        "homeassistant.components.control4.async_setup_entry",
-        return_value=True,
-    ) as mock_setup_entry:
-        result2 = await hass.config_entries.flow.async_configure(
-            result["flow_id"],
-            {
-                CONF_HOST: "1.1.1.1",
-                CONF_USERNAME: "test-username",
-                CONF_PASSWORD: "test-password",
-            },
-        )
-        await hass.async_block_till_done()
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {
+            CONF_HOST: MOCK_HOST,
+            CONF_USERNAME: MOCK_USERNAME,
+            CONF_PASSWORD: MOCK_PASSWORD,
+        },
+    )
 
-    assert result2["type"] == "create_entry"
-    assert result2["title"] == "control4_model_00AA00AA00AA"
-    assert result2["data"] == {
-        CONF_HOST: "1.1.1.1",
-        CONF_USERNAME: "test-username",
-        CONF_PASSWORD: "test-password",
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["title"] == "control4_model_00AA00AA00AA"
+    assert result["data"] == {
+        CONF_HOST: MOCK_HOST,
+        CONF_USERNAME: MOCK_USERNAME,
+        CONF_PASSWORD: MOCK_PASSWORD,
         "controller_unique_id": "control4_model_00AA00AA00AA",
     }
+    assert result["result"].unique_id == "00:aa:00:aa:00:aa"
     assert len(mock_setup_entry.mock_calls) == 1
 
 
-async def test_form_invalid_auth(hass):
-    """Test we handle invalid auth."""
+@pytest.mark.parametrize(
+    ("exception", "error"),
+    [
+        (BadCredentials("Invalid username or password"), "invalid_auth"),
+        (Unauthorized("Permission denied"), "invalid_auth"),
+        (NotFound("something"), "controller_not_found"),
+        (Exception("Some other exception"), "unknown"),
+    ],
+)
+@pytest.mark.usefixtures("mock_setup_entry")
+async def test_user_flow_errors(
+    hass: HomeAssistant,
+    mock_c4_account: AsyncMock,
+    mock_c4_director: AsyncMock,
+    exception: Exception,
+    error: str,
+) -> None:
+    """Test we handle errors in the user flow."""
     result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": config_entries.SOURCE_USER}
+        DOMAIN, context={"source": SOURCE_USER}
     )
 
-    with patch(
-        "homeassistant.components.control4.config_flow.C4Account",
-        side_effect=Unauthorized("message"),
-    ):
-        result2 = await hass.config_entries.flow.async_configure(
-            result["flow_id"],
-            {
-                CONF_HOST: "1.1.1.1",
-                CONF_USERNAME: "test-username",
-                CONF_PASSWORD: "test-password",
-            },
-        )
+    mock_c4_account.get_account_bearer_token.side_effect = exception
 
-    assert result2["type"] == "form"
-    assert result2["errors"] == {"base": "invalid_auth"}
-
-
-async def test_form_unexpected_exception(hass):
-    """Test we handle an unexpected exception."""
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": config_entries.SOURCE_USER}
-    )
-
-    with patch(
-        "homeassistant.components.control4.config_flow.C4Account",
-        side_effect=ValueError("message"),
-    ):
-        result2 = await hass.config_entries.flow.async_configure(
-            result["flow_id"],
-            {
-                CONF_HOST: "1.1.1.1",
-                CONF_USERNAME: "test-username",
-                CONF_PASSWORD: "test-password",
-            },
-        )
-
-    assert result2["type"] == "form"
-    assert result2["errors"] == {"base": "unknown"}
-
-
-async def test_form_cannot_connect(hass):
-    """Test we handle cannot connect error."""
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": config_entries.SOURCE_USER}
-    )
-
-    with patch(
-        "homeassistant.components.control4.config_flow.Control4Validator.authenticate",
-        return_value=True,
-    ), patch(
-        "homeassistant.components.control4.config_flow.C4Director",
-        side_effect=Unauthorized("message"),
-    ):
-        result2 = await hass.config_entries.flow.async_configure(
-            result["flow_id"],
-            {
-                CONF_HOST: "1.1.1.1",
-                CONF_USERNAME: "test-username",
-                CONF_PASSWORD: "test-password",
-            },
-        )
-
-    assert result2["type"] == "form"
-    assert result2["errors"] == {"base": "cannot_connect"}
-
-
-async def test_option_flow(hass):
-    """Test config flow options."""
-    entry = MockConfigEntry(domain=DOMAIN, data={}, options=None)
-    entry.add_to_hass(hass)
-
-    result = await hass.config_entries.options.async_init(entry.entry_id)
-
-    assert result["type"] == "form"
-    assert result["step_id"] == "init"
-
-    result = await hass.config_entries.options.async_configure(
+    result = await hass.config_entries.flow.async_configure(
         result["flow_id"],
-        user_input={CONF_SCAN_INTERVAL: 4},
+        {
+            CONF_HOST: MOCK_HOST,
+            CONF_USERNAME: MOCK_USERNAME,
+            CONF_PASSWORD: MOCK_PASSWORD,
+        },
     )
-    assert result["type"] == "create_entry"
-    assert result["data"] == {
-        CONF_SCAN_INTERVAL: 4,
-    }
 
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": error}
 
-async def test_option_flow_defaults(hass):
-    """Test config flow options."""
-    entry = MockConfigEntry(domain=DOMAIN, data={}, options=None)
-    entry.add_to_hass(hass)
+    mock_c4_account.get_account_bearer_token.side_effect = None
 
-    result = await hass.config_entries.options.async_init(entry.entry_id)
-
-    assert result["type"] == "form"
-    assert result["step_id"] == "init"
-
-    result = await hass.config_entries.options.async_configure(
-        result["flow_id"], user_input={}
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {
+            CONF_HOST: MOCK_HOST,
+            CONF_USERNAME: MOCK_USERNAME,
+            CONF_PASSWORD: MOCK_PASSWORD,
+        },
     )
-    assert result["type"] == "create_entry"
-    assert result["data"] == {
-        CONF_SCAN_INTERVAL: DEFAULT_SCAN_INTERVAL,
-    }
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+
+
+@pytest.mark.parametrize(
+    ("exception", "error"),
+    [
+        (Unauthorized("Permission denied"), "director_auth_failed"),
+        (ClientError, "cannot_connect"),
+        (TimeoutError, "cannot_connect"),
+        (Exception("Some other exception"), "unknown"),
+    ],
+)
+@pytest.mark.usefixtures("mock_setup_entry")
+async def test_user_flow_director_errors(
+    hass: HomeAssistant,
+    mock_c4_account: AsyncMock,
+    mock_c4_director: AsyncMock,
+    exception: Exception,
+    error: str,
+) -> None:
+    """Test we handle director auth failure."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
+    )
+
+    mock_c4_director.get_all_item_info.side_effect = exception
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {
+            CONF_HOST: MOCK_HOST,
+            CONF_USERNAME: MOCK_USERNAME,
+            CONF_PASSWORD: MOCK_PASSWORD,
+        },
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": error}
+
+    mock_c4_director.get_all_item_info.side_effect = None
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {
+            CONF_HOST: MOCK_HOST,
+            CONF_USERNAME: MOCK_USERNAME,
+            CONF_PASSWORD: MOCK_PASSWORD,
+        },
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+
+
+async def test_duplicate_entry(
+    hass: HomeAssistant,
+    mock_c4_account: AsyncMock,
+    mock_c4_director: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test that duplicate entries are not created."""
+    mock_config_entry.add_to_hass(hass)
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "user"
+    assert result["errors"] == {}
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {
+            CONF_HOST: MOCK_HOST,
+            CONF_USERNAME: MOCK_USERNAME,
+            CONF_PASSWORD: MOCK_PASSWORD,
+        },
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "already_configured"

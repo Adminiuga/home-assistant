@@ -1,21 +1,21 @@
 """Support for X10 dimmer over Mochad."""
-from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, override
 
+import probatio
 from pymochad import controller, device
 from pymochad.exceptions import MochadException
-import voluptuous as vol
 
 from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
-    PLATFORM_SCHEMA,
+    PLATFORM_SCHEMA as LIGHT_PLATFORM_SCHEMA,
     ColorMode,
     LightEntity,
 )
 from homeassistant.const import CONF_ADDRESS, CONF_DEVICES, CONF_NAME, CONF_PLATFORM
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
@@ -25,16 +25,16 @@ from . import CONF_COMM_TYPE, DOMAIN, REQ_LOCK, MochadCtrl
 _LOGGER = logging.getLogger(__name__)
 CONF_BRIGHTNESS_LEVELS = "brightness_levels"
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
+PLATFORM_SCHEMA = LIGHT_PLATFORM_SCHEMA.extend(
     {
-        vol.Required(CONF_PLATFORM): DOMAIN,
+        probatio.Required(CONF_PLATFORM): DOMAIN,
         CONF_DEVICES: [
             {
-                vol.Optional(CONF_NAME): cv.string,
-                vol.Required(CONF_ADDRESS): cv.x10_address,
-                vol.Optional(CONF_COMM_TYPE): cv.string,
-                vol.Optional(CONF_BRIGHTNESS_LEVELS, default=32): vol.All(
-                    vol.Coerce(int), vol.In([32, 64, 256])
+                probatio.Optional(CONF_NAME): cv.string,
+                probatio.Required(CONF_ADDRESS): cv.x10_address,
+                probatio.Optional(CONF_COMM_TYPE): cv.string,
+                probatio.Optional(CONF_BRIGHTNESS_LEVELS, default=32): probatio.All(
+                    probatio.Coerce(int), probatio.In([32, 64, 256])
                 ),
             }
         ],
@@ -97,6 +97,7 @@ class MochadLight(LightEntity):
             self.light.send_cmd(f"bright {mochad_brightness}")
             self._controller.read_data()
 
+    @override
     def turn_on(self, **kwargs: Any) -> None:
         """Send the command to turn the light on."""
         _LOGGER.debug("Reconnect %s:%s", self._controller.server, self._controller.port)
@@ -120,8 +121,13 @@ class MochadLight(LightEntity):
                 self._attr_brightness = brightness
                 self._attr_is_on = True
             except (MochadException, OSError) as exc:
-                _LOGGER.error("Error with mochad communication: %s", exc)
+                raise HomeAssistantError(
+                    translation_domain=DOMAIN,
+                    translation_key="turn_on_failed",
+                    translation_placeholders={"error": str(exc)},
+                ) from exc
 
+    @override
     def turn_off(self, **kwargs: Any) -> None:
         """Send the command to turn the light on."""
         _LOGGER.debug("Reconnect %s:%s", self._controller.server, self._controller.port)
@@ -137,4 +143,8 @@ class MochadLight(LightEntity):
                     self._attr_brightness = 0
                 self._attr_is_on = False
             except (MochadException, OSError) as exc:
-                _LOGGER.error("Error with mochad communication: %s", exc)
+                raise HomeAssistantError(
+                    translation_domain=DOMAIN,
+                    translation_key="turn_off_failed",
+                    translation_placeholders={"error": str(exc)},
+                ) from exc

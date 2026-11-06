@@ -1,10 +1,13 @@
 {
   "domain": "melcloud",
   "name": "MELCloud",
+  "categories": ["climate.heat_pumps_air_conditioning"],
+  "codeowners": ["@erwindouna"],
   "config_flow": true,
+  "connectivity": ["cloud"],
   "documentation": "https://www.home-assistant.io/integrations/melcloud",
-  "requirements": ["pymelcloud==2.5.8"],
-  "codeowners": ["@vilppuvuorinen"],
+  "integration_type": "device",
   "iot_class": "cloud_polling",
-  "loggers": ["pymelcloud"]
+  "loggers": ["melcloud"],
+  "requirements": ["python-melcloud==0.1.3"]
 }

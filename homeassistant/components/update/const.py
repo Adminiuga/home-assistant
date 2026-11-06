@@ -1,13 +1,37 @@
 """Constants for the update component."""
-from __future__ import annotations
 
-from enum import IntEnum
-from typing import Final
+from enum import IntFlag, StrEnum
+from typing import TYPE_CHECKING, Final
+
+import probatio
+
+from homeassistant.util.hass_dict import HassKey
+
+if TYPE_CHECKING:
+    from homeassistant.helpers.entity_component import EntityComponent
+
+    from .entity import UpdateEntity
 
 DOMAIN: Final = "update"
+DATA_COMPONENT: HassKey[EntityComponent[UpdateEntity]] = HassKey(DOMAIN)
 
 
-class UpdateEntityFeature(IntEnum):
+class UpdateEntityStateAttribute(StrEnum):
+    """State attributes for update entities."""
+
+    AUTO_UPDATE = "auto_update"
+    DISPLAY_PRECISION = "display_precision"
+    INSTALLED_VERSION = "installed_version"
+    IN_PROGRESS = "in_progress"
+    LATEST_VERSION = "latest_version"
+    RELEASE_SUMMARY = "release_summary"
+    RELEASE_URL = "release_url"
+    SKIPPED_VERSION = "skipped_version"
+    TITLE = "title"
+    UPDATE_PERCENTAGE = "update_percentage"
+
+
+class UpdateEntityFeature(IntFlag):
     """Supported features of the update entity."""
 
     INSTALL = 1
@@ -22,6 +46,7 @@ SERVICE_SKIP: Final = "skip"
 
 ATTR_AUTO_UPDATE: Final = "auto_update"
 ATTR_BACKUP: Final = "backup"
+ATTR_DISPLAY_PRECISION: Final = "display_precision"
 ATTR_INSTALLED_VERSION: Final = "installed_version"
 ATTR_IN_PROGRESS: Final = "in_progress"
 ATTR_LATEST_VERSION: Final = "latest_version"
@@ -29,4 +54,29 @@ ATTR_RELEASE_SUMMARY: Final = "release_summary"
 ATTR_RELEASE_URL: Final = "release_url"
 ATTR_SKIPPED_VERSION: Final = "skipped_version"
 ATTR_TITLE: Final = "title"
+ATTR_UPDATE_PERCENTAGE: Final = "update_percentage"
 ATTR_VERSION: Final = "version"
+
+
+class UpdateDeviceClass(StrEnum):
+    """Device class for update."""
+
+    FIRMWARE = "firmware"
+
+
+DEVICE_CLASSES_SCHEMA = probatio.All(probatio.Lower, probatio.Coerce(UpdateDeviceClass))
+
+
+class UpdateService(StrEnum):
+    """Store keys for update services."""
+
+    CLEAR_SKIPPED = "clear_skipped"
+    INSTALL = "install"
+    SKIP = "skip"
+
+
+class UpdateServiceArgument(StrEnum):
+    """Store keys for update service arguments."""
+
+    BACKUP = "backup"
+    VERSION = "version"

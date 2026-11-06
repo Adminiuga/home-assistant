@@ -1,38 +1,27 @@
 """Fixtures for tests."""
 
-from unittest.mock import patch
+from collections.abc import Generator
+from itertools import cycle
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 
-def pytest_configure(config):
-    """Define custom markers."""
-    config.addinivalue_line(
-        "markers",
-        "credentials_invalid: Treat credentials as invalid.",
-    )
-    config.addinivalue_line(
-        "markers",
-        "maintenance: Set maintenance mode to on.",
-    )
-
-
 @pytest.fixture(autouse=True)
-def patch_mydevolo(request):
+def mydevolo() -> Generator[None]:
     """Fixture to patch mydevolo into a desired state."""
+    mydevolo = MagicMock()
+    mydevolo.uuid.return_value = "123456"
+    mydevolo.credentials_valid.return_value = True
+    mydevolo.maintenance.return_value = False
+    mydevolo.get_gateway_ids.return_value = ["1400000000000001", "1400000000000002"]
     with patch(
-        "homeassistant.components.devolo_home_control.Mydevolo.credentials_valid",
-        return_value=not bool(request.node.get_closest_marker("credentials_invalid")),
-    ), patch(
-        "homeassistant.components.devolo_home_control.Mydevolo.maintenance",
-        return_value=bool(request.node.get_closest_marker("maintenance")),
-    ), patch(
-        "homeassistant.components.devolo_home_control.Mydevolo.get_gateway_ids",
-        return_value=["1400000000000001", "1400000000000002"],
+        "homeassistant.components.devolo_home_control.Mydevolo",
+        side_effect=cycle([mydevolo]),
     ):
-        yield
+        yield mydevolo
 
 
 @pytest.fixture(autouse=True)
-def devolo_home_control_mock_async_zeroconf(mock_async_zeroconf):
+def devolo_home_control_mock_async_zeroconf(mock_async_zeroconf: MagicMock) -> None:
     """Auto mock zeroconf."""

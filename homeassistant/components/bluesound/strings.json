@@ -1,0 +1,58 @@
+{
+  "config": {
+    "abort": {
+      "already_configured": "[%key:common::config_flow::abort::already_configured_service%]",
+      "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]",
+      "no_ipv4_address": "No IPv4 address found."
+    },
+    "error": {
+      "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]"
+    },
+    "step": {
+      "confirm": {
+        "description": "[%key:common::config_flow::description::confirm_setup%]",
+        "title": "Discover Bluesound player"
+      },
+      "user": {
+        "data": {
+          "host": "[%key:common::config_flow::data::host%]",
+          "port": "[%key:common::config_flow::data::port%]"
+        },
+        "data_description": {
+          "host": "Hostname or IP address of your Bluesound player",
+          "port": "Port of your Bluesound player. This is usually 11000."
+        }
+      }
+    }
+  },
+  "entity": {
+    "button": {
+      "clear_sleep_timer": {
+        "name": "Clear sleep timer"
+      },
+      "set_sleep_timer": {
+        "name": "Set sleep timer"
+      }
+    }
+  },
+  "exceptions": {
+    "cannot_join_self": {
+      "message": "Cannot join player to itself"
+    },
+    "leader_not_loaded": {
+      "message": "The group leader {leader_id} is not set up in Home Assistant"
+    },
+    "player_unreachable": {
+      "message": "Could not reach the Bluesound player: {error}"
+    },
+    "setup_cannot_connect": {
+      "message": "Error connecting to {host}:{port}"
+    },
+    "source_not_found": {
+      "message": "Source {source} not found"
+    },
+    "unexpected_response": {
+      "message": "The Bluesound player returned an unexpected response: {error}"
+    }
+  }
+}

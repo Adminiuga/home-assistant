@@ -1,41 +1,50 @@
 """Test UniFi Network config flow."""
 
+import asyncio
+from collections.abc import Callable
+import json
 import socket
+from typing import Any
 from unittest.mock import patch
 
 import aiounifi
+import pytest
+from pytest_homeassistant.common import MockConfigEntry
 
-from homeassistant import config_entries, data_entry_flow
-from homeassistant.components import ssdp
+from homeassistant import config_entries
 from homeassistant.components.unifi.config_flow import _async_discover_unifi
 from homeassistant.components.unifi.const import (
     CONF_ALLOW_BANDWIDTH_SENSORS,
     CONF_ALLOW_UPTIME_SENSORS,
     CONF_BLOCK_CLIENT,
-    CONF_CONTROLLER,
+    CONF_CLIENT_SOURCE,
     CONF_DETECTION_TIME,
     CONF_DPI_RESTRICTIONS,
+    CONF_IGNORE_LOCAL_MAC,
     CONF_IGNORE_WIRED_BUG,
+    CONF_MORE_OPTIONS,
     CONF_SITE_ID,
     CONF_SSID_FILTER,
     CONF_TRACK_CLIENTS,
     CONF_TRACK_DEVICES,
     CONF_TRACK_WIRED_CLIENTS,
-    DOMAIN as UNIFI_DOMAIN,
+    DOMAIN,
 )
-from homeassistant.config_entries import SOURCE_REAUTH, SOURCE_USER
+from homeassistant.components.unifi.errors import (
+    AuthenticationRequired,
+    CannotConnect,
+    MfaRequired,
+)
 from homeassistant.const import (
     CONF_HOST,
     CONF_PASSWORD,
     CONF_PORT,
     CONF_USERNAME,
     CONF_VERIFY_SSL,
-    CONTENT_TYPE_JSON,
 )
-
-from .test_controller import setup_unifi_integration
-
-from tests.common import MockConfigEntry
+from homeassistant.core import HomeAssistant
+from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.helpers.device_registry import format_mac
 
 CLIENTS = [{"mac": "00:00:00:00:00:01"}]
 
@@ -74,8 +83,15 @@ DEVICES = [
 ]
 
 WLANS = [
-    {"name": "SSID 1"},
-    {"name": "SSID 2", "name_combine_enabled": False, "name_combine_suffix": "_IOT"},
+    {"_id": "1", "name": "SSID 1", "enabled": True},
+    {
+        "_id": "2",
+        "name": "SSID 2",
+        "name_combine_enabled": False,
+        "name_combine_suffix": "_IOT",
+        "enabled": True,
+    },
+    {"_id": "3", "name": "SSID 4", "name_combine_enabled": False, "enabled": True},
 ]
 
 DPI_GROUPS = [
@@ -87,41 +103,23 @@ DPI_GROUPS = [
 ]
 
 
-async def test_flow_works(hass, aioclient_mock, mock_discovery):
+@pytest.mark.usefixtures("mock_default_requests")
+async def test_flow_works(hass: HomeAssistant, mock_discovery) -> None:
     """Test config flow."""
     mock_discovery.return_value = "1"
     result = await hass.config_entries.flow.async_init(
-        UNIFI_DOMAIN, context={"source": config_entries.SOURCE_USER}
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
     )
 
-    assert result["type"] == data_entry_flow.FlowResultType.FORM
+    assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "user"
-    assert result["data_schema"]({CONF_USERNAME: "", CONF_PASSWORD: ""}) == {
-        CONF_HOST: "unifi",
+    assert result["data_schema"]({CONF_PASSWORD: ""}) == {
+        CONF_HOST: "1",
         CONF_USERNAME: "",
         CONF_PASSWORD: "",
         CONF_PORT: 443,
         CONF_VERIFY_SSL: False,
     }
-
-    aioclient_mock.get("https://1.2.3.4:1234", status=302)
-
-    aioclient_mock.post(
-        "https://1.2.3.4:1234/api/login",
-        json={"data": "login successful", "meta": {"rc": "ok"}},
-        headers={"content-type": CONTENT_TYPE_JSON},
-    )
-
-    aioclient_mock.get(
-        "https://1.2.3.4:1234/api/self/sites",
-        json={
-            "data": [
-                {"desc": "Site name", "name": "site_id", "role": "admin", "_id": "1"}
-            ],
-            "meta": {"rc": "ok"},
-        },
-        headers={"content-type": CONTENT_TYPE_JSON},
-    )
 
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"],
@@ -134,7 +132,7 @@ async def test_flow_works(hass, aioclient_mock, mock_discovery):
         },
     )
 
-    assert result["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
+    assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["title"] == "Site name"
     assert result["data"] == {
         CONF_HOST: "1.2.3.4",
@@ -143,27 +141,20 @@ async def test_flow_works(hass, aioclient_mock, mock_discovery):
         CONF_PORT: 1234,
         CONF_SITE_ID: "site_id",
         CONF_VERIFY_SSL: True,
-        CONF_CONTROLLER: {
-            CONF_HOST: "1.2.3.4",
-            CONF_USERNAME: "username",
-            CONF_PASSWORD: "password",
-            CONF_PORT: 1234,
-            CONF_SITE_ID: "site_id",
-            CONF_VERIFY_SSL: True,
-        },
     }
+    assert result["result"].unique_id == "1"
 
 
-async def test_flow_works_negative_discovery(hass, aioclient_mock, mock_discovery):
+async def test_flow_works_negative_discovery(hass: HomeAssistant) -> None:
     """Test config flow with a negative outcome of async_discovery_unifi."""
     result = await hass.config_entries.flow.async_init(
-        UNIFI_DOMAIN, context={"source": config_entries.SOURCE_USER}
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
     )
 
-    assert result["type"] == data_entry_flow.FlowResultType.FORM
+    assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "user"
-    assert result["data_schema"]({CONF_USERNAME: "", CONF_PASSWORD: ""}) == {
-        CONF_HOST: "",
+    assert result["data_schema"]({CONF_PASSWORD: ""}) == {
+        CONF_HOST: "unifi",
         CONF_USERNAME: "",
         CONF_PASSWORD: "",
         CONF_PORT: 443,
@@ -171,34 +162,24 @@ async def test_flow_works_negative_discovery(hass, aioclient_mock, mock_discover
     }
 
 
-async def test_flow_multiple_sites(hass, aioclient_mock):
+@pytest.mark.parametrize(
+    "site_payload",
+    [
+        [
+            {"name": "default", "role": "admin", "desc": "site name", "_id": "1"},
+            {"name": "site2", "role": "admin", "desc": "site2 name", "_id": "2"},
+        ]
+    ],
+)
+@pytest.mark.usefixtures("mock_default_requests")
+async def test_flow_multiple_sites(hass: HomeAssistant) -> None:
     """Test config flow works when finding multiple sites."""
     result = await hass.config_entries.flow.async_init(
-        UNIFI_DOMAIN, context={"source": config_entries.SOURCE_USER}
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
     )
 
-    assert result["type"] == data_entry_flow.FlowResultType.FORM
+    assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "user"
-
-    aioclient_mock.get("https://1.2.3.4:1234", status=302)
-
-    aioclient_mock.post(
-        "https://1.2.3.4:1234/api/login",
-        json={"data": "login successful", "meta": {"rc": "ok"}},
-        headers={"content-type": CONTENT_TYPE_JSON},
-    )
-
-    aioclient_mock.get(
-        "https://1.2.3.4:1234/api/self/sites",
-        json={
-            "data": [
-                {"name": "default", "role": "admin", "desc": "site name", "_id": "1"},
-                {"name": "site2", "role": "admin", "desc": "site2 name", "_id": "2"},
-            ],
-            "meta": {"rc": "ok"},
-        },
-        headers={"content-type": CONTENT_TYPE_JSON},
-    )
 
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"],
@@ -211,43 +192,21 @@ async def test_flow_multiple_sites(hass, aioclient_mock):
         },
     )
 
-    assert result["type"] == data_entry_flow.FlowResultType.FORM
+    assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "site"
     assert result["data_schema"]({"site": "1"})
     assert result["data_schema"]({"site": "2"})
 
 
-async def test_flow_raise_already_configured(hass, aioclient_mock):
+@pytest.mark.usefixtures("config_entry_setup")
+async def test_flow_raise_already_configured(hass: HomeAssistant) -> None:
     """Test config flow aborts since a connected config entry already exists."""
-    await setup_unifi_integration(hass, aioclient_mock)
-
     result = await hass.config_entries.flow.async_init(
-        UNIFI_DOMAIN, context={"source": config_entries.SOURCE_USER}
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
     )
 
-    assert result["type"] == data_entry_flow.FlowResultType.FORM
+    assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "user"
-
-    aioclient_mock.clear_requests()
-
-    aioclient_mock.get("https://1.2.3.4:1234", status=302)
-
-    aioclient_mock.post(
-        "https://1.2.3.4:1234/api/login",
-        json={"data": "login successful", "meta": {"rc": "ok"}},
-        headers={"content-type": CONTENT_TYPE_JSON},
-    )
-
-    aioclient_mock.get(
-        "https://1.2.3.4:1234/api/self/sites",
-        json={
-            "data": [
-                {"desc": "Site name", "name": "site_id", "role": "admin", "_id": "1"}
-            ],
-            "meta": {"rc": "ok"},
-        },
-        headers={"content-type": CONTENT_TYPE_JSON},
-    )
 
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"],
@@ -260,49 +219,95 @@ async def test_flow_raise_already_configured(hass, aioclient_mock):
         },
     )
 
-    assert result["type"] == data_entry_flow.FlowResultType.ABORT
+    assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "already_configured"
 
 
-async def test_flow_aborts_configuration_updated(hass, aioclient_mock):
-    """Test config flow aborts since a connected config entry already exists."""
-    entry = MockConfigEntry(
-        domain=UNIFI_DOMAIN, data={"host": "1.2.3.4", "site": "office"}, unique_id="2"
-    )
-    entry.add_to_hass(hass)
+GET_UNIFI_API = "homeassistant.components.unifi.config_flow.get_unifi_api"
+SITES_UPDATE = "aiounifi.interfaces.sites.Sites.update"
 
-    entry = MockConfigEntry(
-        domain=UNIFI_DOMAIN, data={"host": "1.2.3.4", "site": "site_id"}, unique_id="1"
-    )
-    entry.add_to_hass(hass)
 
+@pytest.mark.parametrize(
+    ("target", "side_effect", "error"),
+    [
+        pytest.param(
+            GET_UNIFI_API, AuthenticationRequired, "faulty_credentials", id="auth"
+        ),
+        pytest.param(GET_UNIFI_API, MfaRequired, "mfa_required", id="mfa"),
+        pytest.param(
+            GET_UNIFI_API, CannotConnect, "service_unavailable", id="cannot_connect"
+        ),
+        pytest.param(
+            SITES_UPDATE,
+            aiounifi.RequestError,
+            "service_unavailable",
+            id="sites_request_error",
+        ),
+        pytest.param(
+            SITES_UPDATE,
+            aiounifi.ResponseError,
+            "service_unavailable",
+            id="sites_response_error",
+        ),
+        pytest.param(
+            SITES_UPDATE, TimeoutError, "service_unavailable", id="sites_timeout"
+        ),
+        # Without a side effect the patched update leaves the site list empty
+        pytest.param(SITES_UPDATE, None, "service_unavailable", id="sites_empty"),
+        pytest.param(
+            SITES_UPDATE,
+            json.JSONDecodeError("", "", 0),
+            "service_unavailable",
+            id="sites_invalid_json",
+        ),
+        pytest.param(
+            SITES_UPDATE,
+            aiounifi.AiounifiException,
+            "service_unavailable",
+            id="sites_unknown_error",
+        ),
+        pytest.param(
+            SITES_UPDATE,
+            aiounifi.Forbidden,
+            "faulty_credentials",
+            id="sites_forbidden",
+        ),
+        pytest.param(
+            SITES_UPDATE,
+            aiounifi.LoginRequired,
+            "faulty_credentials",
+            id="sites_login_required",
+        ),
+        pytest.param(
+            SITES_UPDATE,
+            aiounifi.NoPermission,
+            "faulty_credentials",
+            id="sites_no_permission",
+        ),
+        pytest.param(
+            SITES_UPDATE,
+            aiounifi.Unauthorized,
+            "faulty_credentials",
+            id="sites_unauthorized",
+        ),
+    ],
+)
+@pytest.mark.usefixtures("mock_default_requests")
+async def test_flow_fails_and_recovers(
+    hass: HomeAssistant,
+    target: str,
+    side_effect: type[Exception],
+    error: str,
+) -> None:
+    """Test config flow recovers from errors."""
     result = await hass.config_entries.flow.async_init(
-        UNIFI_DOMAIN, context={"source": config_entries.SOURCE_USER}
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
     )
 
-    assert result["type"] == data_entry_flow.FlowResultType.FORM
+    assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "user"
 
-    aioclient_mock.get("https://1.2.3.4:1234", status=302)
-
-    aioclient_mock.post(
-        "https://1.2.3.4:1234/api/login",
-        json={"data": "login successful", "meta": {"rc": "ok"}},
-        headers={"content-type": CONTENT_TYPE_JSON},
-    )
-
-    aioclient_mock.get(
-        "https://1.2.3.4:1234/api/self/sites",
-        json={
-            "data": [
-                {"desc": "Site name", "name": "site_id", "role": "admin", "_id": "1"}
-            ],
-            "meta": {"rc": "ok"},
-        },
-        headers={"content-type": CONTENT_TYPE_JSON},
-    )
-
-    with patch("homeassistant.components.unifi.async_setup_entry"):
+    with patch(target, side_effect=side_effect):
         result = await hass.config_entries.flow.async_configure(
             result["flow_id"],
             user_input={
@@ -314,103 +319,150 @@ async def test_flow_aborts_configuration_updated(hass, aioclient_mock):
             },
         )
 
-    assert result["type"] == data_entry_flow.FlowResultType.ABORT
-    assert result["reason"] == "configuration_updated"
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": error}
 
-
-async def test_flow_fails_user_credentials_faulty(hass, aioclient_mock):
-    """Test config flow."""
-    result = await hass.config_entries.flow.async_init(
-        UNIFI_DOMAIN, context={"source": config_entries.SOURCE_USER}
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={
+            CONF_HOST: "1.2.3.4",
+            CONF_USERNAME: "username",
+            CONF_PASSWORD: "password",
+            CONF_PORT: 1234,
+            CONF_VERIFY_SSL: True,
+        },
     )
 
-    assert result["type"] == data_entry_flow.FlowResultType.FORM
-    assert result["step_id"] == "user"
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["title"] == "Site name"
+    assert result["data"] == {
+        CONF_HOST: "1.2.3.4",
+        CONF_USERNAME: "username",
+        CONF_PASSWORD: "password",
+        CONF_PORT: 1234,
+        CONF_SITE_ID: "site_id",
+        CONF_VERIFY_SSL: True,
+    }
+    assert result["result"].unique_id == "1"
 
-    aioclient_mock.get("https://1.2.3.4:1234", status=302)
 
-    with patch("aiounifi.Controller.login", side_effect=aiounifi.errors.Unauthorized):
+async def test_reauth_flow_update_configuration(
+    hass: HomeAssistant, config_entry_setup: MockConfigEntry
+) -> None:
+    """Verify reauth flow can update hub configuration."""
+    config_entry = config_entry_setup
+
+    result = await config_entry.start_reauth_flow(hass)
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "reconfigure"
+
+    context = next(
+        flow["context"]
+        for flow in hass.config_entries.flow.async_progress()
+        if flow["flow_id"] == result["flow_id"]
+    )
+    assert context["title_placeholders"] == {
+        "host": config_entry.data[CONF_HOST],
+        "name": config_entry.title,
+    }
+
+    with patch.object(hass.config_entries, "async_schedule_reload") as mock_reload:
         result = await hass.config_entries.flow.async_configure(
             result["flow_id"],
             user_input={
                 CONF_HOST: "1.2.3.4",
-                CONF_USERNAME: "username",
-                CONF_PASSWORD: "password",
+                CONF_USERNAME: "new_name",
+                CONF_PASSWORD: "new_pass",
+                CONF_PORT: 1234,
+                CONF_VERIFY_SSL: True,
+            },
+        )
+        await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reauth_successful"
+    mock_reload.assert_called_once_with(config_entry.entry_id)
+    assert config_entry.data[CONF_HOST] == "1.2.3.4"
+    assert config_entry.data[CONF_USERNAME] == "new_name"
+    assert config_entry.data[CONF_PASSWORD] == "new_pass"
+
+
+async def test_reauth_flow_reloads_not_loaded_entry(
+    hass: HomeAssistant,
+    config_entry: MockConfigEntry,
+    mock_requests: Callable[[str, str], None],
+) -> None:
+    """Verify reauth flow reloads an entry that is not loaded."""
+    mock_requests(config_entry.data[CONF_HOST], config_entry.data[CONF_SITE_ID])
+
+    result = await config_entry.start_reauth_flow(hass)
+
+    with patch.object(hass.config_entries, "async_schedule_reload") as mock_reload:
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            user_input={
+                CONF_HOST: "1.2.3.4",
+                CONF_USERNAME: "new_name",
+                CONF_PASSWORD: "new_pass",
                 CONF_PORT: 1234,
                 CONF_VERIFY_SSL: True,
             },
         )
 
-    assert result["type"] == data_entry_flow.FlowResultType.FORM
-    assert result["errors"] == {"base": "faulty_credentials"}
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reauth_successful"
+    mock_reload.assert_called_once_with(config_entry.entry_id)
 
 
-async def test_flow_fails_controller_unavailable(hass, aioclient_mock):
-    """Test config flow."""
-    result = await hass.config_entries.flow.async_init(
-        UNIFI_DOMAIN, context={"source": config_entries.SOURCE_USER}
-    )
+async def test_reauth_flow_reloads_loaded_entry_with_unchanged_data(
+    hass: HomeAssistant, config_entry_setup: MockConfigEntry
+) -> None:
+    """Verify reauth flow reloads a loaded entry when its data is unchanged."""
+    config_entry = config_entry_setup
+    data = dict(config_entry.data)
 
-    assert result["type"] == data_entry_flow.FlowResultType.FORM
-    assert result["step_id"] == "user"
+    result = await config_entry.start_reauth_flow(hass)
 
-    aioclient_mock.get("https://1.2.3.4:1234", status=302)
-
-    with patch("aiounifi.Controller.login", side_effect=aiounifi.errors.RequestError):
+    with patch.object(hass.config_entries, "async_schedule_reload") as mock_reload:
         result = await hass.config_entries.flow.async_configure(
             result["flow_id"],
             user_input={
-                CONF_HOST: "1.2.3.4",
-                CONF_USERNAME: "username",
-                CONF_PASSWORD: "password",
-                CONF_PORT: 1234,
-                CONF_VERIFY_SSL: True,
+                CONF_HOST: data[CONF_HOST],
+                CONF_USERNAME: data[CONF_USERNAME],
+                CONF_PASSWORD: data[CONF_PASSWORD],
+                CONF_PORT: data[CONF_PORT],
+                CONF_VERIFY_SSL: data[CONF_VERIFY_SSL],
             },
         )
+        await hass.async_block_till_done()
 
-    assert result["type"] == data_entry_flow.FlowResultType.FORM
-    assert result["errors"] == {"base": "service_unavailable"}
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reauth_successful"
+    mock_reload.assert_called_once_with(config_entry.entry_id)
+    assert config_entry.data == data
 
 
-async def test_reauth_flow_update_configuration(hass, aioclient_mock):
-    """Verify reauth flow can update controller configuration."""
-    config_entry = await setup_unifi_integration(hass, aioclient_mock)
-    controller = hass.data[UNIFI_DOMAIN][config_entry.entry_id]
-    controller.available = False
+@pytest.mark.parametrize(
+    "site_payload",
+    [
+        [
+            {"name": "site2", "role": "admin", "desc": "site2 name", "_id": "2"},
+        ]
+    ],
+)
+async def test_abort_reauth_flow_on_site_id_mismatch(
+    hass: HomeAssistant,
+    config_entry: MockConfigEntry,
+    mock_requests: Callable[[str, str], None],
+) -> None:
+    """Verify reauth flow aborts when original site can no longer be found."""
+    mock_requests(config_entry.data[CONF_HOST], config_entry.data[CONF_SITE_ID])
 
-    result = await hass.config_entries.flow.async_init(
-        UNIFI_DOMAIN,
-        context={
-            "source": SOURCE_REAUTH,
-            "unique_id": config_entry.unique_id,
-            "entry_id": config_entry.entry_id,
-        },
-        data=config_entry.data,
-    )
+    result = await config_entry.start_reauth_flow(hass)
 
-    assert result["type"] == data_entry_flow.FlowResultType.FORM
-    assert result["step_id"] == SOURCE_USER
-
-    aioclient_mock.clear_requests()
-
-    aioclient_mock.get("https://1.2.3.4:1234", status=302)
-
-    aioclient_mock.post(
-        "https://1.2.3.4:1234/api/login",
-        json={"data": "login successful", "meta": {"rc": "ok"}},
-        headers={"content-type": CONTENT_TYPE_JSON},
-    )
-
-    aioclient_mock.get(
-        "https://1.2.3.4:1234/api/self/sites",
-        json={
-            "data": [
-                {"desc": "Site name", "name": "site_id", "role": "admin", "_id": "1"}
-            ],
-            "meta": {"rc": "ok"},
-        },
-        headers={"content-type": CONTENT_TYPE_JSON},
-    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "reconfigure"
 
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"],
@@ -423,78 +475,249 @@ async def test_reauth_flow_update_configuration(hass, aioclient_mock):
         },
     )
 
-    assert result["type"] == data_entry_flow.FlowResultType.ABORT
-    assert result["reason"] == "reauth_successful"
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "unknown_site_id"
+    assert config_entry.data[CONF_SITE_ID] == "site_id"
+
+
+async def test_reconfigure_flow_update_configuration(
+    hass: HomeAssistant, config_entry_setup: MockConfigEntry
+) -> None:
+    """Verify reconfigure flow can update hub configuration."""
+    config_entry = config_entry_setup
+
+    result = await config_entry.start_reconfigure_flow(hass)
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "reconfigure"
+
+    with patch.object(hass.config_entries, "async_schedule_reload") as mock_reload:
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            user_input={
+                CONF_HOST: "1.2.3.4",
+                CONF_USERNAME: "new_name",
+                CONF_PASSWORD: "new_pass",
+                CONF_PORT: 1234,
+                CONF_VERIFY_SSL: True,
+            },
+        )
+        await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    mock_reload.assert_called_once_with(config_entry.entry_id)
     assert config_entry.data[CONF_HOST] == "1.2.3.4"
     assert config_entry.data[CONF_USERNAME] == "new_name"
     assert config_entry.data[CONF_PASSWORD] == "new_pass"
 
 
-async def test_advanced_option_flow(hass, aioclient_mock):
-    """Test advanced config flow options."""
-    config_entry = await setup_unifi_integration(
-        hass,
-        aioclient_mock,
-        clients_response=CLIENTS,
-        devices_response=DEVICES,
-        wlans_response=WLANS,
-        dpigroup_response=DPI_GROUPS,
-        dpiapp_response=[],
+@pytest.mark.usefixtures("mock_default_requests")
+async def test_flow_site_request_timeout(hass: HomeAssistant) -> None:
+    """Test config flow gives up on a site request that does not answer."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+    user_input = {
+        CONF_HOST: "1.2.3.4",
+        CONF_USERNAME: "username",
+        CONF_PASSWORD: "password",
+        CONF_PORT: 1234,
+        CONF_VERIFY_SSL: True,
+    }
+
+    async def hang() -> None:
+        await asyncio.Event().wait()
+
+    with (
+        patch("homeassistant.components.unifi.config_flow.SITE_REQUEST_TIMEOUT", 0),
+        patch(SITES_UPDATE, side_effect=hang),
+    ):
+        # Fail instead of hanging if the flow does not time out
+        async with asyncio.timeout(1):
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"], user_input=user_input
+            )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": "service_unavailable"}
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input=user_input
     )
 
-    result = await hass.config_entries.options.async_init(
-        config_entry.entry_id, context={"show_advanced_options": True}
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+
+
+async def test_reconfigure_flow_with_no_sites(
+    hass: HomeAssistant, config_entry_setup: MockConfigEntry
+) -> None:
+    """Verify an empty site list is an error that can be retried, not an abort."""
+    result = await config_entry_setup.start_reconfigure_flow(hass)
+    user_input = {
+        CONF_HOST: "1.2.3.4",
+        CONF_USERNAME: "new_name",
+        CONF_PASSWORD: "new_pass",
+        CONF_PORT: 1234,
+        CONF_VERIFY_SSL: True,
+    }
+
+    # Without a side effect the patched update leaves the site list empty
+    with patch(SITES_UPDATE):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], user_input=user_input
+        )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": "service_unavailable"}
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input=user_input
     )
+    await hass.async_block_till_done()
 
-    assert result["type"] == data_entry_flow.FlowResultType.FORM
-    assert result["step_id"] == "device_tracker"
-    assert not result["last_step"]
-    assert set(
-        result["data_schema"].schema[CONF_SSID_FILTER].options.keys()
-    ).intersection(("SSID 1", "SSID 2", "SSID 2_IOT", "SSID 3"))
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
 
-    result = await hass.config_entries.options.async_configure(
+
+@pytest.mark.parametrize(
+    ("side_effect", "error"),
+    [
+        (AuthenticationRequired, "faulty_credentials"),
+        (CannotConnect, "service_unavailable"),
+    ],
+)
+@pytest.mark.usefixtures("mock_default_requests")
+async def test_reconfigure_flow_retains_user_input_on_error(
+    hass: HomeAssistant,
+    config_entry_setup: MockConfigEntry,
+    side_effect: type[Exception],
+    error: str,
+) -> None:
+    """Verify reconfigure flow can update hub configuration."""
+    config_entry = config_entry_setup
+
+    result = await config_entry.start_reconfigure_flow(hass)
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "reconfigure"
+    user_input = {
+        CONF_HOST: "4.3.2.1",
+        CONF_USERNAME: "new_name",
+        CONF_PASSWORD: "new_pass",
+        CONF_PORT: 4321,
+        CONF_VERIFY_SSL: True,
+    }
+
+    with patch(
+        "homeassistant.components.unifi.config_flow.get_unifi_api",
+        side_effect=side_effect,
+    ):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            user_input=user_input,
+        )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": error}
+    assert result["data_schema"]({CONF_PASSWORD: ""}) == {
+        CONF_HOST: user_input[CONF_HOST],
+        CONF_USERNAME: user_input[CONF_USERNAME],
+        CONF_PASSWORD: "",
+        CONF_PORT: user_input[CONF_PORT],
+        CONF_VERIFY_SSL: user_input[CONF_VERIFY_SSL],
+    }
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={**user_input, CONF_HOST: "1.2.3.4", CONF_PORT: 1234},
+    )
+    await hass.async_block_till_done()
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+
+
+@pytest.mark.parametrize(
+    "site_payload",
+    [
+        [
+            {"name": "site2", "role": "admin", "desc": "site2 name", "_id": "2"},
+        ]
+    ],
+)
+async def test_abort_reconfigure_flow_on_site_id_mismatch(
+    hass: HomeAssistant,
+    config_entry: MockConfigEntry,
+    mock_requests: Callable[[str, str], None],
+) -> None:
+    """Verify reconfigure flow aborts when original site can no longer be found."""
+    mock_requests(config_entry.data[CONF_HOST], config_entry.data[CONF_SITE_ID])
+
+    result = await config_entry.start_reconfigure_flow(hass)
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "reconfigure"
+
+    result = await hass.config_entries.flow.async_configure(
         result["flow_id"],
         user_input={
-            CONF_TRACK_CLIENTS: False,
-            CONF_TRACK_WIRED_CLIENTS: False,
-            CONF_TRACK_DEVICES: False,
-            CONF_SSID_FILTER: ["SSID 1", "SSID 2_IOT", "SSID 3"],
-            CONF_DETECTION_TIME: 100,
+            CONF_HOST: "1.2.3.4",
+            CONF_USERNAME: "new_name",
+            CONF_PASSWORD: "new_pass",
+            CONF_PORT: 1234,
+            CONF_VERIFY_SSL: True,
         },
     )
 
-    assert result["type"] == data_entry_flow.FlowResultType.FORM
-    assert result["step_id"] == "client_control"
-    assert not result["last_step"]
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "unknown_site_id"
+    assert config_entry.data[CONF_SITE_ID] == "site_id"
 
-    result = await hass.config_entries.options.async_configure(
-        result["flow_id"],
-        user_input={
-            CONF_BLOCK_CLIENT: [CLIENTS[0]["mac"]],
-            CONF_DPI_RESTRICTIONS: False,
-        },
-    )
 
-    assert result["type"] == data_entry_flow.FlowResultType.FORM
-    assert result["step_id"] == "statistics_sensors"
+@pytest.mark.parametrize("client_payload", [CLIENTS])
+@pytest.mark.parametrize("device_payload", [DEVICES])
+@pytest.mark.parametrize("wlan_payload", [WLANS])
+@pytest.mark.parametrize("dpi_group_payload", [DPI_GROUPS])
+async def test_option_flow(
+    hass: HomeAssistant, config_entry_setup: MockConfigEntry
+) -> None:
+    """Test config flow options."""
+    config_entry = config_entry_setup
+
+    result = await hass.config_entries.options.async_init(config_entry.entry_id)
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "init"
     assert result["last_step"]
 
     result = await hass.config_entries.options.async_configure(
         result["flow_id"],
         user_input={
-            CONF_ALLOW_BANDWIDTH_SENSORS: True,
-            CONF_ALLOW_UPTIME_SENSORS: True,
+            CONF_TRACK_CLIENTS: False,
+            CONF_TRACK_DEVICES: False,
+            CONF_BLOCK_CLIENT: [CLIENTS[0]["mac"]],
+            CONF_MORE_OPTIONS: {
+                CONF_CLIENT_SOURCE: ["00:00:00:00:00:01"],
+                CONF_TRACK_WIRED_CLIENTS: False,
+                CONF_SSID_FILTER: ["SSID 1", "SSID 2_IOT", "SSID 3", "SSID 4"],
+                CONF_DETECTION_TIME: 100,
+                CONF_IGNORE_LOCAL_MAC: True,
+                CONF_DPI_RESTRICTIONS: False,
+                CONF_ALLOW_BANDWIDTH_SENSORS: True,
+                CONF_ALLOW_UPTIME_SENSORS: True,
+            },
         },
     )
 
-    assert result["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
+    assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["data"] == {
+        CONF_CLIENT_SOURCE: ["00:00:00:00:00:01"],
         CONF_TRACK_CLIENTS: False,
         CONF_TRACK_WIRED_CLIENTS: False,
         CONF_TRACK_DEVICES: False,
-        CONF_SSID_FILTER: ["SSID 1", "SSID 2_IOT", "SSID 3"],
+        CONF_SSID_FILTER: ["SSID 1", "SSID 2_IOT", "SSID 3", "SSID 4"],
         CONF_DETECTION_TIME: 100,
+        CONF_IGNORE_LOCAL_MAC: True,
         CONF_IGNORE_WIRED_BUG: False,
         CONF_DPI_RESTRICTIONS: False,
         CONF_BLOCK_CLIENT: [CLIENTS[0]["mac"]],
@@ -503,170 +726,323 @@ async def test_advanced_option_flow(hass, aioclient_mock):
     }
 
 
-async def test_simple_option_flow(hass, aioclient_mock):
-    """Test simple config flow options."""
-    config_entry = await setup_unifi_integration(
-        hass,
-        aioclient_mock,
-        clients_response=CLIENTS,
-        wlans_response=WLANS,
-        dpigroup_response=DPI_GROUPS,
-        dpiapp_response=[],
-    )
-
-    result = await hass.config_entries.options.async_init(
-        config_entry.entry_id, context={"show_advanced_options": False}
-    )
-
-    assert result["type"] == data_entry_flow.FlowResultType.FORM
-    assert result["step_id"] == "simple_options"
-    assert result["last_step"]
-
-    result = await hass.config_entries.options.async_configure(
-        result["flow_id"],
-        user_input={
-            CONF_TRACK_CLIENTS: False,
-            CONF_TRACK_DEVICES: False,
-            CONF_BLOCK_CLIENT: [CLIENTS[0]["mac"]],
-        },
-    )
-
-    assert result["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
-    assert result["data"] == {
-        CONF_TRACK_CLIENTS: False,
-        CONF_TRACK_DEVICES: False,
-        CONF_BLOCK_CLIENT: [CLIENTS[0]["mac"]],
-    }
+async def test_discover_unifi_positive(hass: HomeAssistant) -> None:
+    """Verify positive run of UniFi discovery."""
+    with patch("socket.gethostbyname", return_value="192.168.1.1"):
+        assert await _async_discover_unifi(hass) == "192.168.1.1"
 
 
-async def test_option_flow_integration_not_setup(hass, aioclient_mock):
-    """Test advanced config flow options."""
-    config_entry = await setup_unifi_integration(hass, aioclient_mock)
-
-    hass.data[UNIFI_DOMAIN].pop(config_entry.entry_id)
-    result = await hass.config_entries.options.async_init(config_entry.entry_id)
-
-    assert result["type"] == "abort"
-    assert result["reason"] == "integration_not_setup"
+async def test_discover_unifi_negative(hass: HomeAssistant) -> None:
+    """Verify negative run of UniFi discovery."""
+    with patch("socket.gethostbyname", side_effect=socket.gaierror):
+        assert await _async_discover_unifi(hass) is None
 
 
-async def test_form_ssdp(hass):
-    """Test we get the form with ssdp source."""
+INTEGRATION_DISCOVERY_INFO = {
+    "source_ip": "10.0.0.1",
+    "hw_addr": "e0:63:da:20:14:a9",
+    "name": "Dream Machine Pro",
+    "hostname": "UniFi-Dream-Machine",
+    "product_name": "UDMPRO",
+    "platform": "UCG-Ultra",
+    "direct_connect_domain": "x.ui.direct",
+}
 
+
+async def test_flow_integration_discovery(hass: HomeAssistant) -> None:
+    """Test we get the form with integration discovery source."""
     result = await hass.config_entries.flow.async_init(
-        UNIFI_DOMAIN,
-        context={"source": config_entries.SOURCE_SSDP},
-        data=ssdp.SsdpServiceInfo(
-            ssdp_usn="mock_usn",
-            ssdp_st="mock_st",
-            ssdp_location="http://192.168.208.1:41417/rootDesc.xml",
-            upnp={
-                "friendlyName": "UniFi Dream Machine",
-                "modelDescription": "UniFi Dream Machine Pro",
-                "serialNumber": "e0:63:da:20:14:a9",
-            },
-        ),
+        DOMAIN,
+        context={"source": config_entries.SOURCE_INTEGRATION_DISCOVERY},
+        data=INTEGRATION_DISCOVERY_INFO,
     )
-    assert result["type"] == "form"
+    assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "user"
     assert result["errors"] == {}
-
-    flows = hass.config_entries.flow.async_progress()
-    assert len(flows) == 1
-
-    assert (
-        flows[0].get("context", {}).get("configuration_url")
-        == "https://192.168.208.1:443"
-    )
 
     context = next(
         flow["context"]
         for flow in hass.config_entries.flow.async_progress()
         if flow["flow_id"] == result["flow_id"]
     )
+    assert context["configuration_url"] == "https://x.ui.direct"
+
+
+@pytest.mark.parametrize(
+    ("extra_info", "expected_name"),
+    [
+        (
+            {
+                "name": "Dream Machine Pro",
+                "hostname": "UniFi-Dream-Machine",
+                "product_name": "UDMPRO",
+            },
+            "Dream Machine Pro",
+        ),
+        (
+            {"hostname": "UniFi-Dream-Machine", "product_name": "UDMPRO"},
+            "UniFi-Dream-Machine",
+        ),
+        ({"product_name": "UDMPRO"}, "UDMPRO"),
+        ({}, "UniFi Network"),
+    ],
+    ids=["name", "hostname", "product_name", "fallback"],
+)
+async def test_flow_integration_discovery_title(
+    hass: HomeAssistant, extra_info: dict[str, str], expected_name: str
+) -> None:
+    """Test discovery title priority: name, hostname, product_name, then fallback."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": config_entries.SOURCE_INTEGRATION_DISCOVERY},
+        data={
+            "source_ip": "10.0.0.1",
+            "hw_addr": "e0:63:da:20:14:a9",
+            "direct_connect_domain": "x.ui.direct",
+            **extra_info,
+        },
+    )
+    context = next(
+        flow["context"]
+        for flow in hass.config_entries.flow.async_progress()
+        if flow["flow_id"] == result["flow_id"]
+    )
     assert context["title_placeholders"] == {
-        "host": "192.168.208.1",
-        "site": "default",
+        "host": "10.0.0.1",
+        "name": expected_name,
     }
 
 
-async def test_form_ssdp_aborts_if_host_already_exists(hass):
+@pytest.mark.usefixtures("config_entry")
+async def test_flow_integration_discovery_aborts_if_host_already_exists(
+    hass: HomeAssistant,
+) -> None:
     """Test we abort if the host is already configured."""
-
-    entry = MockConfigEntry(
-        domain=UNIFI_DOMAIN,
-        data={"host": "192.168.208.1", "site": "site_id"},
-    )
-    entry.add_to_hass(hass)
     result = await hass.config_entries.flow.async_init(
-        UNIFI_DOMAIN,
-        context={"source": config_entries.SOURCE_SSDP},
-        data=ssdp.SsdpServiceInfo(
-            ssdp_usn="mock_usn",
-            ssdp_st="mock_st",
-            ssdp_location="http://192.168.208.1:41417/rootDesc.xml",
-            upnp={
-                "friendlyName": "UniFi Dream Machine",
-                "modelDescription": "UniFi Dream Machine Pro",
-                "serialNumber": "e0:63:da:20:14:a9",
-            },
-        ),
+        DOMAIN,
+        context={"source": config_entries.SOURCE_INTEGRATION_DISCOVERY},
+        data={
+            **INTEGRATION_DISCOVERY_INFO,
+            "source_ip": "1.2.3.4",
+        },
     )
-    assert result["type"] == "abort"
+    assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "already_configured"
 
 
-async def test_form_ssdp_aborts_if_serial_already_exists(hass):
-    """Test we abort if the serial is already configured."""
-
-    entry = MockConfigEntry(
-        domain=UNIFI_DOMAIN,
-        data={"controller": {"host": "1.2.3.4", "site": "site_id"}},
-        unique_id="e0:63:da:20:14:a9",
-    )
-    entry.add_to_hass(hass)
+@pytest.mark.usefixtures("config_entry")
+async def test_flow_integration_discovery_aborts_on_other_announced_address(
+    hass: HomeAssistant,
+) -> None:
+    """Test we abort when the entry uses another interface of the same console."""
     result = await hass.config_entries.flow.async_init(
-        UNIFI_DOMAIN,
-        context={"source": config_entries.SOURCE_SSDP},
-        data=ssdp.SsdpServiceInfo(
-            ssdp_usn="mock_usn",
-            ssdp_st="mock_st",
-            ssdp_location="http://192.168.208.1:41417/rootDesc.xml",
-            upnp={
-                "friendlyName": "UniFi Dream Machine",
-                "modelDescription": "UniFi Dream Machine Pro",
-                "serialNumber": "e0:63:da:20:14:a9",
-            },
-        ),
+        DOMAIN,
+        context={"source": config_entries.SOURCE_INTEGRATION_DISCOVERY},
+        data={
+            **INTEGRATION_DISCOVERY_INFO,
+            "source_ip": "10.0.0.1",
+            "direct_connect_domain": None,
+            "announced_ips": ["10.0.0.1", "1.2.3.4"],
+        },
     )
-    assert result["type"] == "abort"
+    assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "already_configured"
 
 
-async def test_form_ssdp_gets_form_with_ignored_entry(hass):
-    """Test we can still setup if there is an ignored entry."""
+@pytest.mark.parametrize(
+    ("device_payload", "client_payload", "expected_type", "expected_reason"),
+    [
+        pytest.param(
+            [
+                {
+                    "board_rev": 3,
+                    "device_id": "console-id",
+                    "ip": "192.168.0.1",
+                    "last_seen": 0,
+                    "mac": INTEGRATION_DISCOVERY_INFO["hw_addr"],
+                    "model": "UDMPROMAX",
+                    "name": "Dream Machine Pro Max",
+                    "state": 1,
+                    "type": "udm",
+                    "version": "5.0.16",
+                }
+            ],
+            [],
+            FlowResultType.ABORT,
+            "already_configured",
+            id="managed_console",
+        ),
+        pytest.param(
+            [],
+            [
+                {
+                    "hostname": "cloudkey",
+                    "is_wired": True,
+                    "last_seen": 0,
+                    "mac": INTEGRATION_DISCOVERY_INFO["hw_addr"],
+                    "oui": "Ubiquiti",
+                    "wired_rate_mbps": 1000,
+                }
+            ],
+            FlowResultType.FORM,
+            None,
+            id="console_as_client",
+        ),
+        pytest.param(
+            [{**DEVICES[0], "mac": "e0:63:da:00:00:01"}],
+            [],
+            FlowResultType.FORM,
+            None,
+            id="other_device_same_oui",
+        ),
+    ],
+)
+@pytest.mark.usefixtures("config_entry_setup")
+async def test_flow_integration_discovery_matches_managed_console(
+    hass: HomeAssistant, expected_type: FlowResultType, expected_reason: str | None
+) -> None:
+    """Test discovery matches a managed console but not clients or other devices."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": config_entries.SOURCE_INTEGRATION_DISCOVERY},
+        data={
+            **INTEGRATION_DISCOVERY_INFO,
+            "source_ip": "192.168.80.1",
+            "announced_ips": [],
+        },
+    )
+    assert result["type"] is expected_type
+    assert result.get("reason") == expected_reason
 
+
+async def test_flow_integration_discovery_ignores_entry_without_host(
+    hass: HomeAssistant,
+) -> None:
+    """Test an entry carrying no host does not match a missing direct connect."""
+    MockConfigEntry(domain=DOMAIN, unique_id="site-id", data={}).add_to_hass(hass)
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": config_entries.SOURCE_INTEGRATION_DISCOVERY},
+        data={**INTEGRATION_DISCOVERY_INFO, "direct_connect_domain": None},
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "user"
+
+
+async def test_flow_integration_discovery_uses_direct_connect_domain(
+    hass: HomeAssistant,
+) -> None:
+    """Test discovery prefers direct_connect_domain over source_ip."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": config_entries.SOURCE_INTEGRATION_DISCOVERY},
+        data=INTEGRATION_DISCOVERY_INFO,
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "user"
+
+    schema_defaults = {
+        marker.schema: marker.default()
+        for marker in result["data_schema"].schema
+        if hasattr(marker, "default") and callable(marker.default)
+    }
+    assert schema_defaults[CONF_HOST] == "x.ui.direct"
+    assert schema_defaults[CONF_VERIFY_SSL] is True
+
+
+@pytest.mark.usefixtures("config_entry")
+async def test_flow_integration_discovery_aborts_on_direct_connect_host(
+    hass: HomeAssistant,
+) -> None:
+    """Test we abort if the direct connect domain matches a configured host."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": config_entries.SOURCE_INTEGRATION_DISCOVERY},
+        data={
+            **INTEGRATION_DISCOVERY_INFO,
+            "source_ip": "10.0.0.1",
+            "direct_connect_domain": "1.2.3.4",
+        },
+    )
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "already_configured"
+
+
+@pytest.mark.parametrize(
+    ("entry_host", "extra_info"),
+    [
+        pytest.param("old.host", {}, id="stale_host"),
+        pytest.param(
+            "10.0.0.99",
+            {"announced_ips": ["10.0.0.99"]},
+            id="other_announced_interface",
+        ),
+    ],
+)
+async def test_flow_integration_discovery_updates_existing_entry_on_rediscovery(
+    hass: HomeAssistant,
+    entry_host: str,
+    extra_info: dict[str, Any],
+) -> None:
+    """Test existing entry's host is refreshed when rediscovered with same MAC.
+
+    This also holds when the entry sits on another interface the console
+    announces, which the host match must not abort on first.
+    """
+    old_entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id=format_mac(INTEGRATION_DISCOVERY_INFO["hw_addr"]),
+        data={
+            CONF_HOST: entry_host,
+            CONF_VERIFY_SSL: False,
+        },
+    )
+    old_entry.add_to_hass(hass)
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": config_entries.SOURCE_INTEGRATION_DISCOVERY},
+        data={**INTEGRATION_DISCOVERY_INFO, **extra_info},
+    )
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "already_configured"
+    assert old_entry.data[CONF_HOST] == "x.ui.direct"
+    assert old_entry.data[CONF_VERIFY_SSL] is True
+
+
+async def test_flow_integration_discovery_aborts_without_source_ip(
+    hass: HomeAssistant,
+) -> None:
+    """Test we abort discovery when source_ip is missing."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": config_entries.SOURCE_INTEGRATION_DISCOVERY},
+        data={
+            **INTEGRATION_DISCOVERY_INFO,
+            "source_ip": None,
+        },
+    )
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "cannot_connect"
+
+
+async def test_flow_integration_discovery_gets_form_with_ignored_entry(
+    hass: HomeAssistant,
+) -> None:
+    """Test we can still set up if there is an ignored never configured entry."""
     entry = MockConfigEntry(
-        domain=UNIFI_DOMAIN,
+        domain=DOMAIN,
         data={"not_controller_key": None},
         source=config_entries.SOURCE_IGNORE,
     )
     entry.add_to_hass(hass)
     result = await hass.config_entries.flow.async_init(
-        UNIFI_DOMAIN,
-        context={"source": config_entries.SOURCE_SSDP},
-        data=ssdp.SsdpServiceInfo(
-            ssdp_usn="mock_usn",
-            ssdp_st="mock_st",
-            ssdp_location="http://1.2.3.4:41417/rootDesc.xml",
-            upnp={
-                "friendlyName": "UniFi Dream Machine New",
-                "modelDescription": "UniFi Dream Machine Pro",
-                "serialNumber": "e0:63:da:20:14:a9",
-            },
-        ),
+        DOMAIN,
+        context={"source": config_entries.SOURCE_INTEGRATION_DISCOVERY},
+        data=INTEGRATION_DISCOVERY_INFO,
     )
-    assert result["type"] == "form"
+    assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "user"
     assert result["errors"] == {}
     context = next(
@@ -675,18 +1051,6 @@ async def test_form_ssdp_gets_form_with_ignored_entry(hass):
         if flow["flow_id"] == result["flow_id"]
     )
     assert context["title_placeholders"] == {
-        "host": "1.2.3.4",
-        "site": "default",
+        "host": "10.0.0.1",
+        "name": "Dream Machine Pro",
     }
-
-
-async def test_discover_unifi_positive(hass):
-    """Verify positive run of UniFi discovery."""
-    with patch("socket.gethostbyname", return_value=True):
-        assert await _async_discover_unifi(hass)
-
-
-async def test_discover_unifi_negative(hass):
-    """Verify negative run of UniFi discovery."""
-    with patch("socket.gethostbyname", side_effect=socket.gaierror):
-        assert await _async_discover_unifi(hass) is None

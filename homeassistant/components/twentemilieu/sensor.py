@@ -1,8 +1,8 @@
 """Support for Twente Milieu sensors."""
-from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
+from typing import override
 
 from twentemilieu import WasteType
 
@@ -11,64 +11,49 @@ from homeassistant.components.sensor import (
     SensorEntity,
     SensorEntityDescription,
 )
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_ID
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .const import DOMAIN, WASTE_TYPE_TO_DESCRIPTION
+from .coordinator import TwenteMilieuConfigEntry
 from .entity import TwenteMilieuEntity
 
 
-@dataclass
-class TwenteMilieuSensorDescriptionMixin:
-    """Define an entity description mixin."""
+@dataclass(frozen=True, kw_only=True)
+class TwenteMilieuSensorDescription(SensorEntityDescription):
+    """Describe an Twente Milieu sensor."""
 
     waste_type: WasteType
-
-
-@dataclass
-class TwenteMilieuSensorDescription(
-    SensorEntityDescription, TwenteMilieuSensorDescriptionMixin
-):
-    """Describe an Ambient PWS binary sensor."""
 
 
 SENSORS: tuple[TwenteMilieuSensorDescription, ...] = (
     TwenteMilieuSensorDescription(
         key="tree",
+        translation_key="christmas_tree_pickup",
         waste_type=WasteType.TREE,
-        name=WASTE_TYPE_TO_DESCRIPTION[WasteType.TREE],
-        icon="mdi:pine-tree",
         device_class=SensorDeviceClass.DATE,
     ),
     TwenteMilieuSensorDescription(
-        key="Non-recyclable",
+        key="non_recyclable",
+        translation_key="non_recyclable_waste_pickup",
         waste_type=WasteType.NON_RECYCLABLE,
-        name=WASTE_TYPE_TO_DESCRIPTION[WasteType.NON_RECYCLABLE],
-        icon="mdi:delete-empty",
         device_class=SensorDeviceClass.DATE,
     ),
     TwenteMilieuSensorDescription(
-        key="Organic",
+        key="organic",
+        translation_key="organic_waste_pickup",
         waste_type=WasteType.ORGANIC,
-        name=WASTE_TYPE_TO_DESCRIPTION[WasteType.ORGANIC],
-        icon="mdi:delete-empty",
         device_class=SensorDeviceClass.DATE,
     ),
     TwenteMilieuSensorDescription(
-        key="Paper",
+        key="paper",
+        translation_key="paper_waste_pickup",
         waste_type=WasteType.PAPER,
-        name=WASTE_TYPE_TO_DESCRIPTION[WasteType.PAPER],
-        icon="mdi:delete-empty",
         device_class=SensorDeviceClass.DATE,
     ),
     TwenteMilieuSensorDescription(
-        key="Plastic",
+        key="packages",
+        translation_key="packages_waste_pickup",
         waste_type=WasteType.PACKAGES,
-        name=WASTE_TYPE_TO_DESCRIPTION[WasteType.PACKAGES],
-        icon="mdi:delete-empty",
         device_class=SensorDeviceClass.DATE,
     ),
 )
@@ -76,13 +61,12 @@ SENSORS: tuple[TwenteMilieuSensorDescription, ...] = (
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    entry: TwenteMilieuConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up Twente Milieu sensor based on a config entry."""
-    coordinator = hass.data[DOMAIN][entry.data[CONF_ID]]
     async_add_entities(
-        TwenteMilieuSensor(coordinator, description, entry) for description in SENSORS
+        TwenteMilieuSensor(entry, description) for description in SENSORS
     )
 
 
@@ -93,16 +77,16 @@ class TwenteMilieuSensor(TwenteMilieuEntity, SensorEntity):
 
     def __init__(
         self,
-        coordinator: DataUpdateCoordinator,
+        entry: TwenteMilieuConfigEntry,
         description: TwenteMilieuSensorDescription,
-        entry: ConfigEntry,
     ) -> None:
         """Initialize the Twente Milieu entity."""
-        super().__init__(coordinator, entry)
+        super().__init__(entry)
         self.entity_description = description
-        self._attr_unique_id = f"{DOMAIN}_{entry.data[CONF_ID]}_{description.key}"
+        self._attr_unique_id = f"{entry.unique_id}_{description.key}"
 
     @property
+    @override
     def native_value(self) -> date | None:
         """Return the state of the sensor."""
         if not (dates := self.coordinator.data[self.entity_description.waste_type]):

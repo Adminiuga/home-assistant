@@ -1,11 +1,14 @@
 """Test the Yeelight light."""
-import asyncio
+
 from datetime import timedelta
 import logging
 import socket
+from typing import Any
 from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 
 import pytest
+from pytest_homeassistant.common import MockConfigEntry, async_fire_time_changed
+from syrupy.assertion import SnapshotAssertion
 from yeelight import (
     BulbException,
     BulbType,
@@ -21,20 +24,25 @@ from yeelight import (
 from yeelight.flow import Action, Flow
 from yeelight.main import _MODEL_SPECS
 
+from homeassistant.components.homeassistant import (
+    DOMAIN as HOMEASSISTANT_DOMAIN,
+    SERVICE_UPDATE_ENTITY,
+)
 from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
     ATTR_BRIGHTNESS_PCT,
-    ATTR_COLOR_TEMP,
+    ATTR_COLOR_MODE,
+    ATTR_COLOR_TEMP_KELVIN,
     ATTR_EFFECT,
     ATTR_FLASH,
     ATTR_HS_COLOR,
-    ATTR_KELVIN,
     ATTR_RGB_COLOR,
     ATTR_TRANSITION,
     FLASH_LONG,
     FLASH_SHORT,
     SERVICE_TURN_OFF,
     SERVICE_TURN_ON,
+    ColorMode,
     LightEntityFeature,
 )
 from homeassistant.components.yeelight.const import (
@@ -52,14 +60,13 @@ from homeassistant.components.yeelight.const import (
     DEFAULT_SAVE_ON_CHANGE,
     DEFAULT_TRANSITION,
     DOMAIN,
+    UPDATE_REQUEST_PROPERTIES,
     YEELIGHT_HSV_TRANSACTION,
     YEELIGHT_RGB_TRANSITION,
     YEELIGHT_SLEEP_TRANSACTION,
     YEELIGHT_TEMPERATURE_TRANSACTION,
 )
 from homeassistant.components.yeelight.light import (
-    ATTR_MINUTES,
-    ATTR_MODE,
     EFFECT_CANDLE_FLICKER,
     EFFECT_DATE_NIGHT,
     EFFECT_DISCO,
@@ -75,6 +82,11 @@ from homeassistant.components.yeelight.light import (
     EFFECT_SUNSET,
     EFFECT_TWITTER,
     EFFECT_WHATSAPP,
+    YEELIGHT_COLOR_EFFECT_LIST,
+)
+from homeassistant.components.yeelight.services import (
+    ATTR_KELVIN,
+    ATTR_MINUTES,
     SERVICE_SET_AUTO_DELAY_OFF_SCENE,
     SERVICE_SET_COLOR_FLOW_SCENE,
     SERVICE_SET_COLOR_SCENE,
@@ -83,12 +95,10 @@ from homeassistant.components.yeelight.light import (
     SERVICE_SET_MODE,
     SERVICE_SET_MUSIC_MODE,
     SERVICE_START_FLOW,
-    YEELIGHT_COLOR_EFFECT_LIST,
-    YEELIGHT_MONO_EFFECT_LIST,
-    YEELIGHT_TEMP_ONLY_EFFECT_LIST,
 )
 from homeassistant.const import (
     ATTR_ENTITY_ID,
+    ATTR_MODE,
     CONF_HOST,
     CONF_NAME,
     STATE_OFF,
@@ -100,14 +110,6 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
 from homeassistant.setup import async_setup_component
 from homeassistant.util import dt as dt_util
-from homeassistant.util.color import (
-    color_hs_to_RGB,
-    color_hs_to_xy,
-    color_RGB_to_hs,
-    color_RGB_to_xy,
-    color_temperature_kelvin_to_mired,
-    color_temperature_mired_to_kelvin,
-)
 
 from . import (
     CAPABILITIES,
@@ -115,15 +117,12 @@ from . import (
     ENTITY_NIGHTLIGHT,
     IP_ADDRESS,
     MODULE,
-    NAME,
     PROPERTIES,
     UNIQUE_FRIENDLY_NAME,
     _mocked_bulb,
     _patch_discovery,
     _patch_discovery_interval,
 )
-
-from tests.common import MockConfigEntry, async_fire_time_changed
 
 CONFIG_ENTRY_DATA = {
     CONF_HOST: IP_ADDRESS,
@@ -138,9 +137,9 @@ SUPPORT_YEELIGHT = (
 )
 
 
-async def test_services(hass: HomeAssistant, caplog):
+async def test_services(hass: HomeAssistant, caplog: pytest.LogCaptureFixture) -> None:
     """Test Yeelight services."""
-    assert await async_setup_component(hass, "homeassistant", {})
+    assert await async_setup_component(hass, HOMEASSISTANT_DOMAIN, {})
     config_entry = MockConfigEntry(
         domain=DOMAIN,
         data={
@@ -153,8 +152,10 @@ async def test_services(hass: HomeAssistant, caplog):
     config_entry.add_to_hass(hass)
 
     mocked_bulb = _mocked_bulb()
-    with _patch_discovery(), _patch_discovery_interval(), patch(
-        f"{MODULE}.AsyncBulb", return_value=mocked_bulb
+    with (
+        _patch_discovery(),
+        _patch_discovery_interval(),
+        patch(f"{MODULE}.AsyncBulb", return_value=mocked_bulb),
     ):
         assert await hass.config_entries.async_setup(config_entry.entry_id)
         await hass.async_block_till_done()
@@ -181,7 +182,7 @@ async def test_services(hass: HomeAssistant, caplog):
         await hass.services.async_call(domain, service, data, blocking=True)
         if payload is None:
             mocked_method.assert_called_once()
-        elif type(payload) == list:
+        elif isinstance(payload, list):
             mocked_method.assert_called_once_with(*payload)
         else:
             mocked_method.assert_called_once_with(**payload)
@@ -286,7 +287,7 @@ async def test_services(hass: HomeAssistant, caplog):
 
     # turn_on color_temp
     brightness = 100
-    color_temp = 200
+    color_temp = 5000
     transition = 1
     mocked_bulb.last_properties["power"] = "off"
     await hass.services.async_call(
@@ -295,7 +296,7 @@ async def test_services(hass: HomeAssistant, caplog):
         {
             ATTR_ENTITY_ID: ENTITY_LIGHT,
             ATTR_BRIGHTNESS: brightness,
-            ATTR_COLOR_TEMP: color_temp,
+            ATTR_COLOR_TEMP_KELVIN: color_temp,
             ATTR_FLASH: FLASH_LONG,
             ATTR_EFFECT: EFFECT_STOP,
             ATTR_TRANSITION: transition,
@@ -313,7 +314,7 @@ async def test_services(hass: HomeAssistant, caplog):
         brightness / 255 * 100, duration=transition * 1000, light_type=LightType.Main
     )
     mocked_bulb.async_set_color_temp.assert_called_once_with(
-        color_temperature_mired_to_kelvin(color_temp),
+        color_temp,
         duration=transition * 1000,
         light_type=LightType.Main,
     )
@@ -324,7 +325,7 @@ async def test_services(hass: HomeAssistant, caplog):
 
     # turn_on color_temp - flash short
     brightness = 100
-    color_temp = 200
+    color_temp = 5000
     transition = 1
     mocked_bulb.async_start_music.reset_mock()
     mocked_bulb.async_set_brightness.reset_mock()
@@ -339,7 +340,7 @@ async def test_services(hass: HomeAssistant, caplog):
         {
             ATTR_ENTITY_ID: ENTITY_LIGHT,
             ATTR_BRIGHTNESS: brightness,
-            ATTR_COLOR_TEMP: color_temp,
+            ATTR_COLOR_TEMP_KELVIN: color_temp,
             ATTR_FLASH: FLASH_SHORT,
             ATTR_EFFECT: EFFECT_STOP,
             ATTR_TRANSITION: transition,
@@ -357,7 +358,7 @@ async def test_services(hass: HomeAssistant, caplog):
         brightness / 255 * 100, duration=transition * 1000, light_type=LightType.Main
     )
     mocked_bulb.async_set_color_temp.assert_called_once_with(
-        color_temperature_mired_to_kelvin(color_temp),
+        color_temp,
         duration=transition * 1000,
         light_type=LightType.Main,
     )
@@ -457,15 +458,16 @@ async def test_services(hass: HomeAssistant, caplog):
 
     # set_music_mode failure enable
     mocked_bulb.async_start_music = MagicMock(side_effect=AssertionError)
-    assert "Unable to turn on music mode, consider disabling it" not in caplog.text
-    await hass.services.async_call(
-        DOMAIN,
-        SERVICE_SET_MUSIC_MODE,
-        {ATTR_ENTITY_ID: ENTITY_LIGHT, ATTR_MODE_MUSIC: "true"},
-        blocking=True,
-    )
+    with pytest.raises(HomeAssistantError) as err:
+        await hass.services.async_call(
+            DOMAIN,
+            SERVICE_SET_MUSIC_MODE,
+            {ATTR_ENTITY_ID: ENTITY_LIGHT, ATTR_MODE_MUSIC: "true"},
+            blocking=True,
+        )
     assert mocked_bulb.async_start_music.mock_calls == [call()]
-    assert "Unable to turn on music mode, consider disabling it" in caplog.text
+    assert err.value.translation_domain == DOMAIN
+    assert err.value.translation_key == "set_music_mode_failed"
 
     # set_music_mode disable
     await _async_test_service(
@@ -486,8 +488,8 @@ async def test_services(hass: HomeAssistant, caplog):
     mocked_bulb.last_properties["power"] = "off"
     mocked_bulb.available = True
     await hass.services.async_call(
-        "homeassistant",
-        "update_entity",
+        HOMEASSISTANT_DOMAIN,
+        SERVICE_UPDATE_ENTITY,
         {ATTR_ENTITY_ID: ENTITY_LIGHT},
         blocking=True,
     )
@@ -504,7 +506,7 @@ async def test_services(hass: HomeAssistant, caplog):
         )
     assert hass.states.get(ENTITY_LIGHT).state == STATE_OFF
 
-    mocked_bulb.async_set_brightness = AsyncMock(side_effect=asyncio.TimeoutError)
+    mocked_bulb.async_set_brightness = AsyncMock(side_effect=TimeoutError)
     with pytest.raises(HomeAssistantError):
         await hass.services.async_call(
             "light",
@@ -525,7 +527,9 @@ async def test_services(hass: HomeAssistant, caplog):
     assert hass.states.get(ENTITY_LIGHT).state == STATE_UNAVAILABLE
 
 
-async def test_update_errors(hass: HomeAssistant, caplog):
+async def test_update_errors(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
     """Test update errors."""
     assert await async_setup_component(hass, "homeassistant", {})
     config_entry = MockConfigEntry(
@@ -540,8 +544,10 @@ async def test_update_errors(hass: HomeAssistant, caplog):
     config_entry.add_to_hass(hass)
 
     mocked_bulb = _mocked_bulb()
-    with _patch_discovery(), _patch_discovery_interval(), patch(
-        f"{MODULE}.AsyncBulb", return_value=mocked_bulb
+    with (
+        _patch_discovery(),
+        _patch_discovery_interval(),
+        patch(f"{MODULE}.AsyncBulb", return_value=mocked_bulb),
     ):
         assert await hass.config_entries.async_setup(config_entry.entry_id)
         await hass.async_block_till_done()
@@ -551,7 +557,7 @@ async def test_update_errors(hass: HomeAssistant, caplog):
 
     # Timeout usually means the bulb is overloaded with commands
     # but will still respond eventually.
-    mocked_bulb.async_turn_off = AsyncMock(side_effect=asyncio.TimeoutError)
+    mocked_bulb.async_turn_off = AsyncMock(side_effect=TimeoutError)
     with pytest.raises(HomeAssistantError):
         await hass.services.async_call(
             "light",
@@ -575,8 +581,8 @@ async def test_update_errors(hass: HomeAssistant, caplog):
     assert hass.states.get(ENTITY_LIGHT).state == STATE_UNAVAILABLE
 
 
-async def test_state_already_set_avoid_ratelimit(hass: HomeAssistant):
-    """Ensure we suppress state changes that will increase the rate limit when there is no change."""
+async def test_state_already_set_avoid_ratelimit(hass: HomeAssistant) -> None:
+    """Ensure we suppress no-op state changes to avoid rate limit."""
     mocked_bulb = _mocked_bulb()
     properties = {**PROPERTIES}
     properties.pop("active_mode")
@@ -588,8 +594,10 @@ async def test_state_already_set_avoid_ratelimit(hass: HomeAssistant):
         domain=DOMAIN, data={**CONFIG_ENTRY_DATA, CONF_NIGHTLIGHT_SWITCH: False}
     )
     config_entry.add_to_hass(hass)
-    with _patch_discovery(), _patch_discovery_interval(), patch(
-        f"{MODULE}.AsyncBulb", return_value=mocked_bulb
+    with (
+        _patch_discovery(),
+        _patch_discovery_interval(),
+        patch(f"{MODULE}.AsyncBulb", return_value=mocked_bulb),
     ):
         assert await hass.config_entries.async_setup(config_entry.entry_id)
         await hass.async_block_till_done()
@@ -645,7 +653,8 @@ async def test_state_already_set_avoid_ratelimit(hass: HomeAssistant):
     mocked_bulb.async_set_rgb.reset_mock()
     mocked_bulb.last_properties["flowing"] = "0"
 
-    mocked_bulb.model = "color"  # color model needs a workaround (see MODELS_WITH_DELAYED_ON_TRANSITION)
+    # color model needs a workaround (see MODELS_WITH_DELAYED_ON_TRANSITION)
+    mocked_bulb.model = "color"
     await hass.services.async_call(
         "light",
         SERVICE_TURN_ON,
@@ -681,7 +690,7 @@ async def test_state_already_set_avoid_ratelimit(hass: HomeAssistant):
     await hass.services.async_call(
         "light",
         SERVICE_TURN_ON,
-        {ATTR_ENTITY_ID: ENTITY_LIGHT, ATTR_COLOR_TEMP: 250},
+        {ATTR_ENTITY_ID: ENTITY_LIGHT, ATTR_COLOR_TEMP_KELVIN: 4000},
         blocking=True,
     )
     assert mocked_bulb.async_set_hsv.mock_calls == []
@@ -697,7 +706,7 @@ async def test_state_already_set_avoid_ratelimit(hass: HomeAssistant):
     await hass.services.async_call(
         "light",
         SERVICE_TURN_ON,
-        {ATTR_ENTITY_ID: ENTITY_LIGHT, ATTR_COLOR_TEMP: 250},
+        {ATTR_ENTITY_ID: ENTITY_LIGHT, ATTR_COLOR_TEMP_KELVIN: 4000},
         blocking=True,
     )
     assert mocked_bulb.async_set_hsv.mock_calls == []
@@ -710,7 +719,7 @@ async def test_state_already_set_avoid_ratelimit(hass: HomeAssistant):
     await hass.services.async_call(
         "light",
         SERVICE_TURN_ON,
-        {ATTR_ENTITY_ID: ENTITY_LIGHT, ATTR_COLOR_TEMP: 250},
+        {ATTR_ENTITY_ID: ENTITY_LIGHT, ATTR_COLOR_TEMP_KELVIN: 4000},
         blocking=True,
     )
     assert mocked_bulb.async_set_hsv.mock_calls == []
@@ -766,15 +775,185 @@ async def test_state_already_set_avoid_ratelimit(hass: HomeAssistant):
     mocked_bulb.last_properties["flowing"] = "0"
 
 
-async def test_device_types(hass: HomeAssistant, caplog):
+@pytest.mark.parametrize(
+    (
+        "bulb_type",
+        "model",
+        "name",
+        "entity_id",
+        "extra_properties",
+        "nightlight_entity",
+        "nightlight_mode",
+    ),
+    [
+        # Default
+        pytest.param(
+            None,
+            "mono",
+            UNIQUE_FRIENDLY_NAME,
+            ENTITY_LIGHT,
+            {"power": "on", "color_mode": "3"},  # HSV
+            False,
+            False,
+            id="default",
+        ),
+        # White
+        pytest.param(
+            BulbType.White,
+            "mono",
+            UNIQUE_FRIENDLY_NAME,
+            ENTITY_LIGHT,
+            {"power": "on", "color_mode": "3"},  # HSV
+            False,
+            False,
+            id="white",
+        ),
+        # Color - color mode CT
+        pytest.param(
+            BulbType.Color,
+            "color",
+            UNIQUE_FRIENDLY_NAME,
+            ENTITY_LIGHT,
+            {"power": "on", "color_mode": "2"},  # CT
+            True,
+            True,
+            id="color_ct",
+        ),
+        # Color - color mode HS
+        pytest.param(
+            BulbType.Color,
+            "color",
+            UNIQUE_FRIENDLY_NAME,
+            ENTITY_LIGHT,
+            {"power": "on", "color_mode": "3"},  # HSV
+            True,
+            False,
+            id="color_hsv",
+        ),
+        # Color - color mode RGB
+        pytest.param(
+            BulbType.Color,
+            "color",
+            UNIQUE_FRIENDLY_NAME,
+            ENTITY_LIGHT,
+            {"power": "on", "color_mode": "1"},  # RGB
+            True,
+            False,
+            id="color_rgb",
+        ),
+        # Color - color mode HS but no hue
+        pytest.param(
+            BulbType.Color,
+            "color",
+            UNIQUE_FRIENDLY_NAME,
+            ENTITY_LIGHT,
+            {"power": "on", "color_mode": "3", "hue": None},  # HSV
+            True,
+            False,
+            id="color_hsv_no_hue",
+        ),
+        # Color - color mode RGB but no color
+        pytest.param(
+            BulbType.Color,
+            "color",
+            UNIQUE_FRIENDLY_NAME,
+            ENTITY_LIGHT,
+            {"power": "on", "color_mode": "1", "rgb": None},  # RGB
+            True,
+            False,
+            id="color_rgb_no_color",
+        ),
+        # Color - unsupported color_mode
+        pytest.param(
+            BulbType.Color,
+            "color",
+            UNIQUE_FRIENDLY_NAME,
+            ENTITY_LIGHT,
+            {"power": "on", "color_mode": "4"},  # Unsupported
+            True,
+            False,
+            id="color_unsupported",
+        ),
+        # WhiteTemp
+        pytest.param(
+            BulbType.WhiteTemp,
+            "ceiling1",
+            UNIQUE_FRIENDLY_NAME,
+            ENTITY_LIGHT,
+            {"power": "on"},
+            True,
+            True,
+            id="whitetemp",
+        ),
+        # WhiteTempMood
+        pytest.param(
+            BulbType.WhiteTempMood,
+            "ceiling4",
+            UNIQUE_FRIENDLY_NAME,
+            ENTITY_LIGHT,
+            {},
+            True,
+            True,
+            id="whitetempmood",
+        ),
+        # Background light - color mode CT
+        pytest.param(
+            BulbType.WhiteTempMood,
+            "ceiling4",
+            f"{UNIQUE_FRIENDLY_NAME} Ambilight",
+            f"{ENTITY_LIGHT}_ambilight",
+            {"bg_lmode": "2"},  # CT
+            False,
+            False,
+            id="backgroundlight_ct",
+        ),
+        # Background light - color mode HS
+        pytest.param(
+            BulbType.WhiteTempMood,
+            "ceiling4",
+            f"{UNIQUE_FRIENDLY_NAME} Ambilight",
+            f"{ENTITY_LIGHT}_ambilight",
+            {"bg_lmode": "3"},  # HS
+            False,
+            False,
+            id="backgroundlight_hs",
+        ),
+        # Background light - color mode RGB
+        pytest.param(
+            BulbType.WhiteTempMood,
+            "ceiling4",
+            f"{UNIQUE_FRIENDLY_NAME} Ambilight",
+            f"{ENTITY_LIGHT}_ambilight",
+            {"bg_lmode": "1"},  # RGB
+            False,
+            False,
+            id="backgroundlight_rgb",
+        ),
+    ],
+)
+async def test_device_types(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    caplog: pytest.LogCaptureFixture,
+    snapshot: SnapshotAssertion,
+    bulb_type: BulbType | None,
+    model: str,
+    name: str,
+    entity_id: str,
+    extra_properties: dict[str, Any],
+    nightlight_entity: bool,
+    nightlight_mode: bool,
+    request: pytest.FixtureRequest,
+) -> None:
     """Test different device types."""
     mocked_bulb = _mocked_bulb()
     properties = {**PROPERTIES}
     properties.pop("active_mode")
-    properties["color_mode"] = "3"  # HSV
+    properties.pop("power")
+    properties.update(extra_properties)
     mocked_bulb.last_properties = properties
 
-    async def _async_setup(config_entry):
+    async def _async_setup(config_entry: MockConfigEntry) -> None:
         with _patch_discovery(), patch(f"{MODULE}.AsyncBulb", return_value=mocked_bulb):
             assert await hass.config_entries.async_setup(config_entry.entry_id)
             await hass.async_block_till_done()
@@ -783,14 +962,14 @@ async def test_device_types(hass: HomeAssistant, caplog):
             await hass.async_block_till_done()
 
     async def _async_test(
-        bulb_type,
-        model,
-        target_properties,
-        nightlight_entity_properties=None,
-        name=UNIQUE_FRIENDLY_NAME,
-        entity_id=ENTITY_LIGHT,
-        nightlight_mode_properties=None,
-    ):
+        bulb_type: BulbType | None,
+        model: str,
+        *,
+        nightlight_entity_properties: bool,
+        name: str,
+        entity_id: str,
+        nightlight_mode_properties: bool,
+    ) -> None:
         config_entry = MockConfigEntry(
             domain=DOMAIN, data={**CONFIG_ENTRY_DATA, CONF_NIGHTLIGHT_SWITCH: False}
         )
@@ -807,38 +986,34 @@ async def test_device_types(hass: HomeAssistant, caplog):
         state = hass.states.get(entity_id)
 
         assert state.state == "on"
-        target_properties["friendly_name"] = name
-        target_properties["flowing"] = False
-        target_properties["night_light"] = False
-        target_properties["music_mode"] = False
-        assert dict(state.attributes) == target_properties
+        assert state.attributes == snapshot
         await hass.config_entries.async_unload(config_entry.entry_id)
-        await config_entry.async_remove(hass)
-        registry = er.async_get(hass)
-        registry.async_clear_config_entry(config_entry.entry_id)
+        await hass.config_entries.async_remove(config_entry.entry_id)
+        entity_registry.async_clear_config_entry(config_entry.entry_id)
         mocked_bulb.last_properties["nl_br"] = original_nightlight_brightness
 
         # nightlight as a setting of the main entity
-        if nightlight_mode_properties is not None:
+        if nightlight_mode_properties:
             mocked_bulb.last_properties["active_mode"] = True
+            config_entry = MockConfigEntry(
+                domain=DOMAIN, data={**CONFIG_ENTRY_DATA, CONF_NIGHTLIGHT_SWITCH: False}
+            )
             config_entry.add_to_hass(hass)
             await _async_setup(config_entry)
             state = hass.states.get(entity_id)
             assert state.state == "on"
-            nightlight_mode_properties["friendly_name"] = name
-            nightlight_mode_properties["flowing"] = False
-            nightlight_mode_properties["night_light"] = True
-            nightlight_mode_properties["music_mode"] = False
-            assert dict(state.attributes) == nightlight_mode_properties
+            assert state.attributes == snapshot(
+                name=f"{request.node.callspec.id}_nightlight_mode"
+            )
 
             await hass.config_entries.async_unload(config_entry.entry_id)
-            await config_entry.async_remove(hass)
-            registry.async_clear_config_entry(config_entry.entry_id)
+            await hass.config_entries.async_remove(config_entry.entry_id)
+            entity_registry.async_clear_config_entry(config_entry.entry_id)
             await hass.async_block_till_done()
             mocked_bulb.last_properties.pop("active_mode")
 
         # nightlight as a separate entity
-        if nightlight_entity_properties is not None:
+        if nightlight_entity_properties:
             config_entry = MockConfigEntry(
                 domain=DOMAIN, data={**CONFIG_ENTRY_DATA, CONF_NIGHTLIGHT_SWITCH: True}
             )
@@ -848,495 +1023,29 @@ async def test_device_types(hass: HomeAssistant, caplog):
             assert hass.states.get(entity_id).state == "off"
             state = hass.states.get(f"{entity_id}_nightlight")
             assert state.state == "on"
-            nightlight_entity_properties["friendly_name"] = f"{name} Nightlight"
-            nightlight_entity_properties["icon"] = "mdi:weather-night"
-            nightlight_entity_properties["flowing"] = False
-            nightlight_entity_properties["night_light"] = True
-            nightlight_entity_properties["music_mode"] = False
-            assert dict(state.attributes) == nightlight_entity_properties
+            assert state.attributes == snapshot(
+                name=f"{request.node.callspec.id}_nightlight_entity"
+            )
 
             await hass.config_entries.async_unload(config_entry.entry_id)
-            await config_entry.async_remove(hass)
-            registry.async_clear_config_entry(config_entry.entry_id)
+            await hass.config_entries.async_remove(config_entry.entry_id)
+            entity_registry.async_clear_config_entry(config_entry.entry_id)
             await hass.async_block_till_done()
 
-    bright = round(255 * int(PROPERTIES["bright"]) / 100)
-    ct = int(PROPERTIES["ct"])
-    ct_mired = color_temperature_kelvin_to_mired(int(PROPERTIES["ct"]))
-    hue = int(PROPERTIES["hue"])
-    sat = int(PROPERTIES["sat"])
-    rgb = int(PROPERTIES["rgb"])
-    rgb_color = ((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF)
-    hs_color = (hue, sat)
-    bg_bright = round(255 * int(PROPERTIES["bg_bright"]) / 100)
-    bg_ct = int(PROPERTIES["bg_ct"])
-    bg_ct_kelvin = color_temperature_kelvin_to_mired(int(PROPERTIES["bg_ct"]))
-    bg_hue = int(PROPERTIES["bg_hue"])
-    bg_sat = int(PROPERTIES["bg_sat"])
-    bg_rgb = int(PROPERTIES["bg_rgb"])
-    bg_hs_color = (bg_hue, bg_sat)
-    bg_rgb_color = ((bg_rgb >> 16) & 0xFF, (bg_rgb >> 8) & 0xFF, bg_rgb & 0xFF)
-    nl_br = round(255 * int(PROPERTIES["nl_br"]) / 100)
-
-    # Default
     await _async_test(
-        None,
-        "mono",
-        {
-            "effect_list": YEELIGHT_MONO_EFFECT_LIST,
-            "supported_features": SUPPORT_YEELIGHT,
-            "brightness": bright,
-            "color_mode": "brightness",
-            "supported_color_modes": ["brightness"],
-        },
+        bulb_type,
+        model,
+        name=name,
+        entity_id=entity_id,
+        nightlight_entity_properties=nightlight_entity,
+        nightlight_mode_properties=nightlight_mode,
     )
-
-    # White
-    await _async_test(
-        BulbType.White,
-        "mono",
-        {
-            "effect_list": YEELIGHT_MONO_EFFECT_LIST,
-            "supported_features": SUPPORT_YEELIGHT,
-            "brightness": bright,
-            "color_mode": "brightness",
-            "supported_color_modes": ["brightness"],
-        },
-    )
-
-    # Color - color mode CT
-    mocked_bulb.last_properties["color_mode"] = "2"  # CT
-    model_specs = _MODEL_SPECS["color"]
-    await _async_test(
-        BulbType.Color,
-        "color",
-        {
-            "effect_list": YEELIGHT_COLOR_EFFECT_LIST,
-            "supported_features": SUPPORT_YEELIGHT,
-            "min_color_temp_kelvin": model_specs["color_temp"]["min"],
-            "max_color_temp_kelvin": color_temperature_mired_to_kelvin(
-                color_temperature_kelvin_to_mired(model_specs["color_temp"]["max"])
-            ),
-            "min_mireds": color_temperature_kelvin_to_mired(
-                model_specs["color_temp"]["max"]
-            ),
-            "max_mireds": color_temperature_kelvin_to_mired(
-                model_specs["color_temp"]["min"]
-            ),
-            "brightness": bright,
-            "color_temp_kelvin": ct,
-            "color_temp": ct_mired,
-            "color_mode": "color_temp",
-            "supported_color_modes": ["color_temp", "hs", "rgb"],
-            "hs_color": (26.812, 34.87),
-            "rgb_color": (255, 205, 166),
-            "xy_color": (0.421, 0.364),
-        },
-        nightlight_entity_properties={
-            "supported_features": 0,
-            "color_mode": "onoff",
-            "supported_color_modes": ["onoff"],
-        },
-        nightlight_mode_properties={
-            "effect_list": YEELIGHT_COLOR_EFFECT_LIST,
-            "supported_features": SUPPORT_YEELIGHT,
-            "hs_color": (28.401, 100.0),
-            "rgb_color": (255, 120, 0),
-            "xy_color": (0.621, 0.367),
-            "min_color_temp_kelvin": model_specs["color_temp"]["min"],
-            "max_color_temp_kelvin": color_temperature_mired_to_kelvin(
-                color_temperature_kelvin_to_mired(model_specs["color_temp"]["max"])
-            ),
-            "min_mireds": color_temperature_kelvin_to_mired(
-                model_specs["color_temp"]["max"]
-            ),
-            "max_mireds": color_temperature_kelvin_to_mired(
-                model_specs["color_temp"]["min"]
-            ),
-            "brightness": nl_br,
-            "color_mode": "color_temp",
-            "supported_color_modes": ["color_temp", "hs", "rgb"],
-            "color_temp_kelvin": model_specs["color_temp"]["min"],
-            "color_temp": color_temperature_kelvin_to_mired(
-                model_specs["color_temp"]["min"]
-            ),
-        },
-    )
-
-    # Color - color mode HS
-    mocked_bulb.last_properties["color_mode"] = "3"  # HSV
-    model_specs = _MODEL_SPECS["color"]
-    await _async_test(
-        BulbType.Color,
-        "color",
-        {
-            "effect_list": YEELIGHT_COLOR_EFFECT_LIST,
-            "supported_features": SUPPORT_YEELIGHT,
-            "min_color_temp_kelvin": model_specs["color_temp"]["min"],
-            "max_color_temp_kelvin": color_temperature_mired_to_kelvin(
-                color_temperature_kelvin_to_mired(model_specs["color_temp"]["max"])
-            ),
-            "min_mireds": color_temperature_kelvin_to_mired(
-                model_specs["color_temp"]["max"]
-            ),
-            "max_mireds": color_temperature_kelvin_to_mired(
-                model_specs["color_temp"]["min"]
-            ),
-            "brightness": bright,
-            "hs_color": hs_color,
-            "rgb_color": color_hs_to_RGB(*hs_color),
-            "xy_color": color_hs_to_xy(*hs_color),
-            "color_mode": "hs",
-            "supported_color_modes": ["color_temp", "hs", "rgb"],
-        },
-        nightlight_entity_properties={
-            "supported_features": 0,
-            "color_mode": "onoff",
-            "supported_color_modes": ["onoff"],
-        },
-    )
-
-    # Color - color mode RGB
-    mocked_bulb.last_properties["color_mode"] = "1"  # RGB
-    model_specs = _MODEL_SPECS["color"]
-    await _async_test(
-        BulbType.Color,
-        "color",
-        {
-            "effect_list": YEELIGHT_COLOR_EFFECT_LIST,
-            "supported_features": SUPPORT_YEELIGHT,
-            "min_color_temp_kelvin": model_specs["color_temp"]["min"],
-            "max_color_temp_kelvin": color_temperature_mired_to_kelvin(
-                color_temperature_kelvin_to_mired(model_specs["color_temp"]["max"])
-            ),
-            "min_mireds": color_temperature_kelvin_to_mired(
-                model_specs["color_temp"]["max"]
-            ),
-            "max_mireds": color_temperature_kelvin_to_mired(
-                model_specs["color_temp"]["min"]
-            ),
-            "brightness": bright,
-            "hs_color": color_RGB_to_hs(*rgb_color),
-            "rgb_color": rgb_color,
-            "xy_color": color_RGB_to_xy(*rgb_color),
-            "color_mode": "rgb",
-            "supported_color_modes": ["color_temp", "hs", "rgb"],
-        },
-        nightlight_entity_properties={
-            "supported_features": 0,
-            "color_mode": "onoff",
-            "supported_color_modes": ["onoff"],
-        },
-    )
-
-    # Color - color mode HS but no hue
-    mocked_bulb.last_properties["color_mode"] = "3"  # HSV
-    mocked_bulb.last_properties["hue"] = None
-    model_specs = _MODEL_SPECS["color"]
-    await _async_test(
-        BulbType.Color,
-        "color",
-        {
-            "effect_list": YEELIGHT_COLOR_EFFECT_LIST,
-            "supported_features": SUPPORT_YEELIGHT,
-            "min_color_temp_kelvin": model_specs["color_temp"]["min"],
-            "max_color_temp_kelvin": color_temperature_mired_to_kelvin(
-                color_temperature_kelvin_to_mired(model_specs["color_temp"]["max"])
-            ),
-            "min_mireds": color_temperature_kelvin_to_mired(
-                model_specs["color_temp"]["max"]
-            ),
-            "max_mireds": color_temperature_kelvin_to_mired(
-                model_specs["color_temp"]["min"]
-            ),
-            "brightness": bright,
-            "color_mode": "hs",
-            "supported_color_modes": ["color_temp", "hs", "rgb"],
-        },
-        nightlight_entity_properties={
-            "supported_features": 0,
-            "color_mode": "onoff",
-            "supported_color_modes": ["onoff"],
-        },
-    )
-
-    # Color - color mode RGB but no color
-    mocked_bulb.last_properties["color_mode"] = "1"  # RGB
-    mocked_bulb.last_properties["rgb"] = None
-    model_specs = _MODEL_SPECS["color"]
-    await _async_test(
-        BulbType.Color,
-        "color",
-        {
-            "effect_list": YEELIGHT_COLOR_EFFECT_LIST,
-            "supported_features": SUPPORT_YEELIGHT,
-            "min_color_temp_kelvin": model_specs["color_temp"]["min"],
-            "max_color_temp_kelvin": color_temperature_mired_to_kelvin(
-                color_temperature_kelvin_to_mired(model_specs["color_temp"]["max"])
-            ),
-            "min_mireds": color_temperature_kelvin_to_mired(
-                model_specs["color_temp"]["max"]
-            ),
-            "max_mireds": color_temperature_kelvin_to_mired(
-                model_specs["color_temp"]["min"]
-            ),
-            "brightness": bright,
-            "color_mode": "rgb",
-            "supported_color_modes": ["color_temp", "hs", "rgb"],
-        },
-        nightlight_entity_properties={
-            "supported_features": 0,
-            "color_mode": "onoff",
-            "supported_color_modes": ["onoff"],
-        },
-    )
-
-    # Color - unsupported color_mode
-    mocked_bulb.last_properties["color_mode"] = 4  # Unsupported
-    model_specs = _MODEL_SPECS["color"]
-    await _async_test(
-        BulbType.Color,
-        "color",
-        {
-            "effect_list": YEELIGHT_COLOR_EFFECT_LIST,
-            "supported_features": SUPPORT_YEELIGHT,
-            "min_color_temp_kelvin": model_specs["color_temp"]["min"],
-            "max_color_temp_kelvin": color_temperature_mired_to_kelvin(
-                color_temperature_kelvin_to_mired(model_specs["color_temp"]["max"])
-            ),
-            "min_mireds": color_temperature_kelvin_to_mired(
-                model_specs["color_temp"]["max"]
-            ),
-            "max_mireds": color_temperature_kelvin_to_mired(
-                model_specs["color_temp"]["min"]
-            ),
-            "color_mode": "unknown",
-            "supported_color_modes": ["color_temp", "hs", "rgb"],
-        },
-        {
-            "supported_features": 0,
-            "color_mode": "onoff",
-            "supported_color_modes": ["onoff"],
-        },
-    )
-    assert "Light reported unknown color mode: 4" in caplog.text
-
-    # WhiteTemp
-    model_specs = _MODEL_SPECS["ceiling1"]
-    await _async_test(
-        BulbType.WhiteTemp,
-        "ceiling1",
-        {
-            "effect_list": YEELIGHT_TEMP_ONLY_EFFECT_LIST,
-            "supported_features": SUPPORT_YEELIGHT,
-            "min_color_temp_kelvin": color_temperature_mired_to_kelvin(
-                color_temperature_kelvin_to_mired(model_specs["color_temp"]["min"])
-            ),
-            "max_color_temp_kelvin": color_temperature_mired_to_kelvin(
-                color_temperature_kelvin_to_mired(model_specs["color_temp"]["max"])
-            ),
-            "min_mireds": color_temperature_kelvin_to_mired(
-                model_specs["color_temp"]["max"]
-            ),
-            "max_mireds": color_temperature_kelvin_to_mired(
-                model_specs["color_temp"]["min"]
-            ),
-            "brightness": bright,
-            "color_temp_kelvin": ct,
-            "color_temp": ct_mired,
-            "color_mode": "color_temp",
-            "supported_color_modes": ["color_temp"],
-            "hs_color": (26.812, 34.87),
-            "rgb_color": (255, 205, 166),
-            "xy_color": (0.421, 0.364),
-        },
-        nightlight_entity_properties={
-            "supported_features": 0,
-            "brightness": nl_br,
-            "color_mode": "brightness",
-            "supported_color_modes": ["brightness"],
-        },
-        nightlight_mode_properties={
-            "effect_list": YEELIGHT_TEMP_ONLY_EFFECT_LIST,
-            "supported_features": SUPPORT_YEELIGHT,
-            "min_color_temp_kelvin": color_temperature_mired_to_kelvin(
-                color_temperature_kelvin_to_mired(model_specs["color_temp"]["min"])
-            ),
-            "max_color_temp_kelvin": color_temperature_mired_to_kelvin(
-                color_temperature_kelvin_to_mired(model_specs["color_temp"]["max"])
-            ),
-            "min_mireds": color_temperature_kelvin_to_mired(
-                model_specs["color_temp"]["max"]
-            ),
-            "max_mireds": color_temperature_kelvin_to_mired(
-                model_specs["color_temp"]["min"]
-            ),
-            "brightness": nl_br,
-            "color_temp_kelvin": color_temperature_mired_to_kelvin(
-                color_temperature_kelvin_to_mired(model_specs["color_temp"]["min"])
-            ),
-            "color_temp": color_temperature_kelvin_to_mired(
-                model_specs["color_temp"]["min"]
-            ),
-            "color_mode": "color_temp",
-            "supported_color_modes": ["color_temp"],
-            "hs_color": (28.391, 65.659),
-            "rgb_color": (255, 166, 87),
-            "xy_color": (0.526, 0.387),
-        },
-    )
-
-    # WhiteTempMood
-    properties.pop("power")
-    properties["main_power"] = "on"
-    model_specs = _MODEL_SPECS["ceiling4"]
-    await _async_test(
-        BulbType.WhiteTempMood,
-        "ceiling4",
-        {
-            "friendly_name": NAME,
-            "effect_list": YEELIGHT_TEMP_ONLY_EFFECT_LIST,
-            "flowing": False,
-            "night_light": True,
-            "supported_features": SUPPORT_YEELIGHT,
-            "min_color_temp_kelvin": color_temperature_mired_to_kelvin(
-                color_temperature_kelvin_to_mired(model_specs["color_temp"]["min"])
-            ),
-            "max_color_temp_kelvin": color_temperature_mired_to_kelvin(
-                color_temperature_kelvin_to_mired(model_specs["color_temp"]["max"])
-            ),
-            "min_mireds": color_temperature_kelvin_to_mired(
-                model_specs["color_temp"]["max"]
-            ),
-            "max_mireds": color_temperature_kelvin_to_mired(
-                model_specs["color_temp"]["min"]
-            ),
-            "brightness": bright,
-            "color_temp_kelvin": ct,
-            "color_temp": ct_mired,
-            "color_mode": "color_temp",
-            "supported_color_modes": ["color_temp"],
-            "hs_color": (26.812, 34.87),
-            "rgb_color": (255, 205, 166),
-            "xy_color": (0.421, 0.364),
-        },
-        nightlight_entity_properties={
-            "supported_features": 0,
-            "brightness": nl_br,
-            "color_mode": "brightness",
-            "supported_color_modes": ["brightness"],
-        },
-        nightlight_mode_properties={
-            "friendly_name": NAME,
-            "effect_list": YEELIGHT_TEMP_ONLY_EFFECT_LIST,
-            "flowing": False,
-            "night_light": True,
-            "supported_features": SUPPORT_YEELIGHT,
-            "min_color_temp_kelvin": color_temperature_mired_to_kelvin(
-                color_temperature_kelvin_to_mired(model_specs["color_temp"]["min"])
-            ),
-            "max_color_temp_kelvin": color_temperature_mired_to_kelvin(
-                color_temperature_kelvin_to_mired(model_specs["color_temp"]["max"])
-            ),
-            "min_mireds": color_temperature_kelvin_to_mired(
-                model_specs["color_temp"]["max"]
-            ),
-            "max_mireds": color_temperature_kelvin_to_mired(
-                model_specs["color_temp"]["min"]
-            ),
-            "brightness": nl_br,
-            "color_temp_kelvin": color_temperature_mired_to_kelvin(
-                color_temperature_kelvin_to_mired(model_specs["color_temp"]["min"])
-            ),
-            "color_temp": color_temperature_kelvin_to_mired(
-                model_specs["color_temp"]["min"]
-            ),
-            "color_mode": "color_temp",
-            "supported_color_modes": ["color_temp"],
-            "hs_color": (28.391, 65.659),
-            "rgb_color": (255, 166, 87),
-            "xy_color": (0.526, 0.387),
-        },
-    )
-    # Background light - color mode CT
-    mocked_bulb.last_properties["bg_lmode"] = "2"  # CT
-    await _async_test(
-        BulbType.WhiteTempMood,
-        "ceiling4",
-        {
-            "effect_list": YEELIGHT_COLOR_EFFECT_LIST,
-            "supported_features": SUPPORT_YEELIGHT,
-            "min_color_temp_kelvin": 1700,
-            "max_color_temp_kelvin": color_temperature_mired_to_kelvin(
-                color_temperature_kelvin_to_mired(6500)
-            ),
-            "min_mireds": color_temperature_kelvin_to_mired(6500),
-            "max_mireds": color_temperature_kelvin_to_mired(1700),
-            "brightness": bg_bright,
-            "color_temp_kelvin": bg_ct,
-            "color_temp": bg_ct_kelvin,
-            "color_mode": "color_temp",
-            "supported_color_modes": ["color_temp", "hs", "rgb"],
-            "hs_color": (27.001, 19.243),
-            "rgb_color": (255, 228, 205),
-            "xy_color": (0.372, 0.35),
-        },
-        name=f"{UNIQUE_FRIENDLY_NAME} Ambilight",
-        entity_id=f"{ENTITY_LIGHT}_ambilight",
-    )
-
-    # Background light - color mode HS
-    mocked_bulb.last_properties["bg_lmode"] = "3"  # HS
-    await _async_test(
-        BulbType.WhiteTempMood,
-        "ceiling4",
-        {
-            "effect_list": YEELIGHT_COLOR_EFFECT_LIST,
-            "supported_features": SUPPORT_YEELIGHT,
-            "min_color_temp_kelvin": 1700,
-            "max_color_temp_kelvin": color_temperature_mired_to_kelvin(
-                color_temperature_kelvin_to_mired(6500)
-            ),
-            "min_mireds": color_temperature_kelvin_to_mired(6500),
-            "max_mireds": color_temperature_kelvin_to_mired(1700),
-            "brightness": bg_bright,
-            "hs_color": bg_hs_color,
-            "rgb_color": color_hs_to_RGB(*bg_hs_color),
-            "xy_color": color_hs_to_xy(*bg_hs_color),
-            "color_mode": "hs",
-            "supported_color_modes": ["color_temp", "hs", "rgb"],
-        },
-        name=f"{UNIQUE_FRIENDLY_NAME} Ambilight",
-        entity_id=f"{ENTITY_LIGHT}_ambilight",
-    )
-
-    # Background light - color mode RGB
-    mocked_bulb.last_properties["bg_lmode"] = "1"  # RGB
-    await _async_test(
-        BulbType.WhiteTempMood,
-        "ceiling4",
-        {
-            "effect_list": YEELIGHT_COLOR_EFFECT_LIST,
-            "supported_features": SUPPORT_YEELIGHT,
-            "min_color_temp_kelvin": 1700,
-            "max_color_temp_kelvin": color_temperature_mired_to_kelvin(
-                color_temperature_kelvin_to_mired(6500)
-            ),
-            "min_mireds": color_temperature_kelvin_to_mired(6500),
-            "max_mireds": color_temperature_kelvin_to_mired(1700),
-            "brightness": bg_bright,
-            "hs_color": color_RGB_to_hs(*bg_rgb_color),
-            "rgb_color": bg_rgb_color,
-            "xy_color": color_RGB_to_xy(*bg_rgb_color),
-            "color_mode": "rgb",
-            "supported_color_modes": ["color_temp", "hs", "rgb"],
-        },
-        name=f"{UNIQUE_FRIENDLY_NAME} Ambilight",
-        entity_id=f"{ENTITY_LIGHT}_ambilight",
+    assert ("Light reported unknown color mode: 4" in caplog.text) == (
+        request.node.callspec.id == "color_unsupported"
     )
 
 
-async def test_effects(hass: HomeAssistant):
+async def test_effects(hass: HomeAssistant) -> None:
     """Test effects."""
     assert await async_setup_component(
         hass,
@@ -1360,20 +1069,24 @@ async def test_effects(hass: HomeAssistant):
             }
         },
     )
+    await hass.async_block_till_done()
 
     config_entry = MockConfigEntry(domain=DOMAIN, data=CONFIG_ENTRY_DATA)
     config_entry.add_to_hass(hass)
 
     mocked_bulb = _mocked_bulb()
-    with _patch_discovery(), _patch_discovery_interval(), patch(
-        f"{MODULE}.AsyncBulb", return_value=mocked_bulb
+    with (
+        _patch_discovery(),
+        _patch_discovery_interval(),
+        patch(f"{MODULE}.AsyncBulb", return_value=mocked_bulb),
     ):
         assert await hass.config_entries.async_setup(config_entry.entry_id)
         await hass.async_block_till_done()
 
-    assert hass.states.get(ENTITY_LIGHT).attributes.get(
-        "effect_list"
-    ) == YEELIGHT_COLOR_EFFECT_LIST + ["mock_effect"]
+    assert hass.states.get(ENTITY_LIGHT).attributes.get("effect_list") == [
+        *YEELIGHT_COLOR_EFFECT_LIST,
+        "mock_effect",
+    ]
 
     async def _async_test_effect(name, target=None, called=True):
         async_mocked_start_flow = AsyncMock()
@@ -1507,8 +1220,8 @@ async def test_effects(hass: HomeAssistant):
     await _async_test_effect("not_existed", called=False)
 
 
-async def test_ambilight_with_nightlight_disabled(hass: HomeAssistant):
-    """Test that main light on ambilights with the nightlight disabled shows the correct brightness."""
+async def test_ambilight_with_nightlight_disabled(hass: HomeAssistant) -> None:
+    """Test ambilight main light brightness with nightlight off."""
     mocked_bulb = _mocked_bulb()
     properties = {**PROPERTIES}
     capabilities = {**CAPABILITIES}
@@ -1526,8 +1239,9 @@ async def test_ambilight_with_nightlight_disabled(hass: HomeAssistant):
         options={**CONFIG_ENTRY_DATA, CONF_NIGHTLIGHT_SWITCH: False},
     )
     config_entry.add_to_hass(hass)
-    with _patch_discovery(capabilities=capabilities), patch(
-        f"{MODULE}.AsyncBulb", return_value=mocked_bulb
+    with (
+        _patch_discovery(capabilities=capabilities),
+        patch(f"{MODULE}.AsyncBulb", return_value=mocked_bulb),
     ):
         assert await hass.config_entries.async_setup(config_entry.entry_id)
         await hass.async_block_till_done()
@@ -1541,8 +1255,141 @@ async def test_ambilight_with_nightlight_disabled(hass: HomeAssistant):
     assert state.attributes[ATTR_BRIGHTNESS] == 128
 
 
-async def test_state_fails_to_update_triggers_update(hass: HomeAssistant):
-    """Ensure we call async_get_properties if the turn on/off fails to update the state."""
+async def test_ambilight_effect(hass: HomeAssistant) -> None:
+    """Test an effect on the ambilight is tracked separately from the main light."""
+    mocked_bulb = _mocked_bulb()
+    capabilities = {**CAPABILITIES, "model": "ceiling10"}
+    mocked_bulb.last_properties = {
+        **PROPERTIES,
+        "flowing": "0",
+        "bg_flowing": "0",
+    }
+    mocked_bulb.bulb_type = BulbType.WhiteTempMood
+
+    config_entry = MockConfigEntry(domain=DOMAIN, data=CONFIG_ENTRY_DATA)
+    config_entry.add_to_hass(hass)
+    with (
+        _patch_discovery(capabilities=capabilities),
+        _patch_discovery_interval(),
+        patch(f"{MODULE}.AsyncBulb", return_value=mocked_bulb),
+    ):
+        assert await hass.config_entries.async_setup(config_entry.entry_id)
+        await hass.async_block_till_done()
+
+    main_light_entity_id = "light.yeelight_ceiling10_0x15243f"
+    ambilight_entity_id = f"{main_light_entity_id}_ambilight"
+    mocked_bulb.async_get_properties.reset_mock()
+
+    async def _async_get_properties(properties: list[str]) -> None:
+        assert properties == UPDATE_REQUEST_PROPERTIES
+        assert mocked_bulb.async_start_flow.await_count > 0
+        mocked_bulb.last_properties["bg_flowing"] = "1"
+
+    mocked_bulb.async_get_properties.side_effect = _async_get_properties
+
+    await hass.services.async_call(
+        "light",
+        SERVICE_TURN_ON,
+        {ATTR_ENTITY_ID: ambilight_entity_id, ATTR_EFFECT: EFFECT_DISCO},
+        blocking=True,
+    )
+
+    mocked_bulb.async_start_flow.assert_awaited_once_with(
+        ANY, light_type=LightType.Ambient
+    )
+    mocked_bulb.async_get_properties.assert_awaited_once_with(UPDATE_REQUEST_PROPERTIES)
+
+    assert hass.states.get(main_light_entity_id).attributes.get(ATTR_EFFECT) is None
+    ambilight_state = hass.states.get(ambilight_entity_id)
+    assert ambilight_state.attributes[ATTR_EFFECT] == EFFECT_DISCO
+    assert ambilight_state.attributes["flowing"] is True
+
+    await hass.services.async_call(
+        "light",
+        SERVICE_TURN_ON,
+        {ATTR_ENTITY_ID: ambilight_entity_id, ATTR_EFFECT: EFFECT_WHATSAPP},
+        blocking=True,
+    )
+
+    assert mocked_bulb.async_get_properties.await_count == 2
+    assert (
+        hass.states.get(ambilight_entity_id).attributes[ATTR_EFFECT] == EFFECT_WHATSAPP
+    )
+
+    async def _async_get_stopped_properties(properties: list[str]) -> None:
+        assert properties == UPDATE_REQUEST_PROPERTIES
+        assert mocked_bulb.async_stop_flow.await_count > 0
+        mocked_bulb.last_properties["bg_flowing"] = "0"
+
+    mocked_bulb.async_get_properties.side_effect = _async_get_stopped_properties
+    await hass.services.async_call(
+        "light",
+        SERVICE_TURN_ON,
+        {ATTR_ENTITY_ID: ambilight_entity_id, ATTR_EFFECT: EFFECT_STOP},
+        blocking=True,
+    )
+
+    mocked_bulb.async_stop_flow.assert_awaited_once_with(light_type=LightType.Ambient)
+    assert mocked_bulb.async_get_properties.await_count == 3
+    ambilight_state = hass.states.get(ambilight_entity_id)
+    assert ambilight_state.attributes.get(ATTR_EFFECT) is None
+    assert ambilight_state.attributes["flowing"] is False
+
+
+async def test_ambilight_without_color_mode(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Test the ambilight keeps updating while the bulb does not report its mode.
+
+    A ceiling light stops reporting `bg_lmode` while its main light is off.
+    """
+    assert await async_setup_component(hass, HOMEASSISTANT_DOMAIN, {})
+    mocked_bulb = _mocked_bulb()
+    capabilities = {**CAPABILITIES, "model": "ceiling10"}
+    properties = {**PROPERTIES}
+    properties.pop("bg_lmode")
+    mocked_bulb.last_properties = properties
+    mocked_bulb.bulb_type = BulbType.WhiteTempMood
+
+    config_entry = MockConfigEntry(domain=DOMAIN, data=CONFIG_ENTRY_DATA)
+    config_entry.add_to_hass(hass)
+    with (
+        _patch_discovery(capabilities=capabilities),
+        _patch_discovery_interval(),
+        patch(f"{MODULE}.AsyncBulb", return_value=mocked_bulb),
+    ):
+        assert await hass.config_entries.async_setup(config_entry.entry_id)
+        await hass.async_block_till_done()
+
+    ambilight_entity_id = "light.yeelight_ceiling10_0x15243f_ambilight"
+    state = hass.states.get(ambilight_entity_id)
+    assert state.state == STATE_ON
+    assert state.attributes[ATTR_COLOR_MODE] == ColorMode.UNKNOWN
+
+    # flash needs the mode, so it is refused instead of raising
+    await hass.services.async_call(
+        "light",
+        SERVICE_TURN_ON,
+        {ATTR_ENTITY_ID: ambilight_entity_id, ATTR_FLASH: FLASH_LONG},
+        blocking=True,
+    )
+    mocked_bulb.async_start_flow.assert_not_called()
+    assert "Flash supported currently only in RGB mode" in caplog.text
+
+    # the mode is reported again once the main light is back on
+    mocked_bulb.last_properties["bg_lmode"] = "2"
+    await hass.services.async_call(
+        HOMEASSISTANT_DOMAIN,
+        SERVICE_UPDATE_ENTITY,
+        {ATTR_ENTITY_ID: ambilight_entity_id},
+        blocking=True,
+    )
+    state = hass.states.get(ambilight_entity_id)
+    assert state.attributes[ATTR_COLOR_MODE] == ColorMode.COLOR_TEMP
+
+
+async def test_state_fails_to_update_triggers_update(hass: HomeAssistant) -> None:
+    """Ensure async_get_properties is called on failed state update."""
     mocked_bulb = _mocked_bulb()
     properties = {**PROPERTIES}
     properties.pop("active_mode")
@@ -1553,8 +1400,10 @@ async def test_state_fails_to_update_triggers_update(hass: HomeAssistant):
         domain=DOMAIN, data={**CONFIG_ENTRY_DATA, CONF_NIGHTLIGHT_SWITCH: False}
     )
     config_entry.add_to_hass(hass)
-    with _patch_discovery(), _patch_discovery_interval(), patch(
-        f"{MODULE}.AsyncBulb", return_value=mocked_bulb
+    with (
+        _patch_discovery(),
+        _patch_discovery_interval(),
+        patch(f"{MODULE}.AsyncBulb", return_value=mocked_bulb),
     ):
         assert await hass.config_entries.async_setup(config_entry.entry_id)
         await hass.async_block_till_done()

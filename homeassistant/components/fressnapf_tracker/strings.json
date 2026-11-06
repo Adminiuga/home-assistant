@@ -1,0 +1,129 @@
+{
+  "config": {
+    "abort": {
+      "account_change_not_allowed": "Switching to a different account is not allowed. Please create a new entry instead.",
+      "already_configured": "[%key:common::config_flow::abort::already_configured_device%]"
+    },
+    "error": {
+      "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]",
+      "invalid_auth": "[%key:common::config_flow::error::invalid_auth%]",
+      "invalid_phone_number": "Please enter a valid phone number.",
+      "invalid_sms_code": "The SMS code you entered is invalid.",
+      "magic_link_timeout": "The sign-in link was not opened within five minutes. Please try again.",
+      "unknown": "[%key:common::config_flow::error::unknown%]"
+    },
+    "progress": {
+      "wait_for_magic_link": "Open the sign-in link sent to {email}. Home Assistant will continue automatically once the link has been opened. Home Assistant will wait for up to five minutes."
+    },
+    "step": {
+      "email": {
+        "data": {
+          "email": "[%key:common::config_flow::data::email%]",
+          "password": "[%key:common::config_flow::data::password%]"
+        },
+        "data_description": {
+          "email": "The email address for your Fressnapf account.",
+          "password": "The password for your Fressnapf account. It is only used to request the sign-in link and is not stored."
+        },
+        "title": "Sign in with email"
+      },
+      "reauth_confirm": {
+        "data": {
+          "email": "[%key:common::config_flow::data::email%]",
+          "password": "[%key:common::config_flow::data::password%]",
+          "phone_number": "[%key:component::fressnapf_tracker::config::step::sms::data::phone_number%]"
+        },
+        "data_description": {
+          "email": "[%key:component::fressnapf_tracker::config::step::email::data_description::email%]",
+          "password": "[%key:component::fressnapf_tracker::config::step::email::data_description::password%]",
+          "phone_number": "[%key:component::fressnapf_tracker::config::step::sms::data_description::phone_number%]"
+        },
+        "description": "Re-authenticate with your Fressnapf Tracker account to refresh your credentials."
+      },
+      "reauth_sms_code": {
+        "data": {
+          "sms_code": "[%key:component::fressnapf_tracker::config::step::sms_code::data::sms_code%]"
+        },
+        "data_description": {
+          "sms_code": "[%key:component::fressnapf_tracker::config::step::sms_code::data_description::sms_code%]"
+        }
+      },
+      "reconfigure": {
+        "description": "Choose how to authenticate with your Fressnapf Tracker account.",
+        "menu_options": {
+          "email": "Email address and password",
+          "sms": "Phone number and SMS code"
+        },
+        "title": "Choose authentication method"
+      },
+      "reconfigure_sms_code": {
+        "data": {
+          "sms_code": "[%key:component::fressnapf_tracker::config::step::sms_code::data::sms_code%]"
+        },
+        "data_description": {
+          "sms_code": "[%key:component::fressnapf_tracker::config::step::sms_code::data_description::sms_code%]"
+        }
+      },
+      "sms": {
+        "data": {
+          "phone_number": "Phone number"
+        },
+        "data_description": {
+          "phone_number": "Enter your phone number in international format (e.g., +4917612345678)."
+        },
+        "title": "Sign in with SMS"
+      },
+      "sms_code": {
+        "data": {
+          "sms_code": "SMS code"
+        },
+        "data_description": {
+          "sms_code": "Enter the SMS code you received on your phone."
+        }
+      },
+      "user": {
+        "description": "Choose the login method supported by your Fressnapf Tracker account.",
+        "menu_options": {
+          "email": "Email address and password",
+          "sms": "Phone number and SMS code"
+        },
+        "title": "Choose authentication method"
+      }
+    }
+  },
+  "entity": {
+    "light": {
+      "led": {
+        "name": "Flashlight"
+      }
+    },
+    "switch": {
+      "energy_saving": {
+        "name": "Sleep mode"
+      }
+    }
+  },
+  "exceptions": {
+    "api_error": {
+      "message": "An error occurred while communicating with the Fressnapf Tracker API: {error_message}"
+    },
+    "charging": {
+      "message": "The flashlight cannot be activated while charging."
+    },
+    "invalid_auth": {
+      "message": "Your authentication with the Fressnapf Tracker API expired. Please re-authenticate to refresh your credentials."
+    },
+    "low_battery": {
+      "message": "The flashlight cannot be activated due to low battery."
+    },
+    "not_seen_recently": {
+      "message": "The flashlight cannot be activated when the tracker has not moved recently."
+    }
+  },
+  "issues": {
+    "invalid_fressnapf_tracker": {
+      "description": "The Fressnapf GPS tracker with the serial number `{tracker_id}` is sending invalid data. This most likely indicates the tracker is broken or hasn't been properly registered with the app. Please remove the tracker via the Fressnapf app. You can then close this issue.",
+      "title": "Invalid Fressnapf GPS tracker detected"
+    }
+  }
+}

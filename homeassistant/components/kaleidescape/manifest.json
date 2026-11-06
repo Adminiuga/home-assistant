@@ -1,15 +1,18 @@
 {
   "domain": "kaleidescape",
   "name": "Kaleidescape",
+  "categories": ["media_entertainment.tv_streaming"],
+  "codeowners": ["@SteveEasley"],
   "config_flow": true,
+  "connectivity": ["network"],
+  "documentation": "https://www.home-assistant.io/integrations/kaleidescape",
+  "integration_type": "device",
+  "iot_class": "local_push",
+  "requirements": ["pykaleidescape==1.2.0"],
   "ssdp": [
     {
-      "manufacturer": "Kaleidescape, Inc.",
-      "deviceType": "schemas-upnp-org:device:Basic:1"
+      "deviceType": "schemas-upnp-org:device:Basic:1",
+      "manufacturer": "Kaleidescape, Inc."
     }
-  ],
-  "documentation": "https://www.home-assistant.io/integrations/kaleidescape",
-  "requirements": ["pykaleidescape==1.0.1"],
-  "codeowners": ["@SteveEasley"],
-  "iot_class": "local_push"
+  ]
 }

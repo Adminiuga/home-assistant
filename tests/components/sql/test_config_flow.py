@@ -1,237 +1,516 @@
 """Test the SQL config flow."""
-from __future__ import annotations
 
+from pathlib import Path
+import re
+from typing import Any
 from unittest.mock import patch
 
+import pytest
+from pytest_homeassistant.common import MockConfigEntry
+from sqlalchemy import make_url
 from sqlalchemy.exc import SQLAlchemyError
 
 from homeassistant import config_entries
-from homeassistant.components.recorder import DEFAULT_DB_FILE, DEFAULT_URL
-from homeassistant.components.sql.const import DOMAIN
+from homeassistant.components.recorder import CONF_DB_URL, Recorder
+from homeassistant.components.sensor import (
+    CONF_STATE_CLASS,
+    SensorDeviceClass,
+    SensorStateClass,
+)
+from homeassistant.components.sql.const import (
+    CONF_ADDITIONAL_OPTIONS,
+    CONF_COLUMN_NAME,
+    CONF_QUERY,
+    DOMAIN,
+)
+from homeassistant.const import (
+    CONF_DEVICE_CLASS,
+    CONF_NAME,
+    CONF_UNIT_OF_MEASUREMENT,
+    CONF_VALUE_TEMPLATE,
+)
 from homeassistant.core import HomeAssistant
-from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.data_entry_flow import FlowResultType, InvalidData
 
 from . import (
     ENTRY_CONFIG,
+    ENTRY_CONFIG_INVALID_COLUMN_NAME,
+    ENTRY_CONFIG_INVALID_COLUMN_NAME_OPT,
     ENTRY_CONFIG_INVALID_QUERY,
+    ENTRY_CONFIG_INVALID_QUERY_2,
+    ENTRY_CONFIG_INVALID_QUERY_2_OPT,
+    ENTRY_CONFIG_INVALID_QUERY_3,
+    ENTRY_CONFIG_INVALID_QUERY_3_OPT,
     ENTRY_CONFIG_INVALID_QUERY_OPT,
+    ENTRY_CONFIG_MULTIPLE_QUERIES,
+    ENTRY_CONFIG_MULTIPLE_QUERIES_OPT,
     ENTRY_CONFIG_NO_RESULTS,
+    ENTRY_CONFIG_QUERY_NO_READ_ONLY,
+    ENTRY_CONFIG_QUERY_NO_READ_ONLY_CTE,
+    ENTRY_CONFIG_QUERY_NO_READ_ONLY_CTE_OPT,
+    ENTRY_CONFIG_QUERY_NO_READ_ONLY_OPT,
+    ENTRY_CONFIG_WITH_BROKEN_QUERY_TEMPLATE,
+    ENTRY_CONFIG_WITH_BROKEN_QUERY_TEMPLATE_OPT,
+    ENTRY_CONFIG_WITH_QUERY_TEMPLATE,
+    ENTRY_CONFIG_WITH_VALUE_TEMPLATE,
 )
 
-from tests.common import MockConfigEntry
+pytestmark = pytest.mark.usefixtures("mock_setup_entry", "recorder_mock")
+
+DATA_CONFIG = {CONF_NAME: "Get Value"}
+DATA_CONFIG_DB = {CONF_NAME: "Get Value", CONF_DB_URL: "sqlite://"}
+OPTIONS_DATA_CONFIG = {}
 
 
-async def test_form(recorder_mock, hass: HomeAssistant) -> None:
+@pytest.mark.parametrize(
+    ("data_config", "result_config"),
+    [
+        (DATA_CONFIG, OPTIONS_DATA_CONFIG),
+        (DATA_CONFIG_DB, OPTIONS_DATA_CONFIG),
+    ],
+)
+async def test_form_simple(
+    hass: HomeAssistant,
+    data_config: dict[str, Any],
+    result_config: dict[str, Any],
+) -> None:
     """Test we get the form."""
 
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": config_entries.SOURCE_USER}
     )
-    assert result["type"] == FlowResultType.FORM
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {}
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        data_config,
+    )
+    await hass.async_block_till_done()
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        ENTRY_CONFIG,
+    )
+    await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["title"] == "Get Value"
+    assert result["data"] == result_config
+    assert result["options"] == {
+        CONF_QUERY: "SELECT 5 as value",
+        CONF_COLUMN_NAME: "value",
+        CONF_ADDITIONAL_OPTIONS: {
+            CONF_UNIT_OF_MEASUREMENT: "MiB",
+            CONF_DEVICE_CLASS: SensorDeviceClass.DATA_SIZE,
+            CONF_STATE_CLASS: SensorStateClass.TOTAL,
+        },
+    }
+
+
+async def test_form_with_query_template(
+    recorder_mock: Recorder, hass: HomeAssistant
+) -> None:
+    """Test for with query template."""
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+    assert result["type"] is FlowResultType.FORM
     assert result["errors"] == {}
 
     with patch(
         "homeassistant.components.sql.async_setup_entry",
-        return_value=True,
+        return_value=None,
     ) as mock_setup_entry:
-        result2 = await hass.config_entries.flow.async_configure(
+        result = await hass.config_entries.flow.async_configure(
             result["flow_id"],
-            ENTRY_CONFIG,
+            DATA_CONFIG,
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            ENTRY_CONFIG_WITH_QUERY_TEMPLATE,
         )
         await hass.async_block_till_done()
 
-    assert result2["type"] == FlowResultType.CREATE_ENTRY
-    assert result2["title"] == "Get Value"
-    assert result2["options"] == {
-        "db_url": "sqlite://",
-        "name": "Get Value",
-        "query": "SELECT 5 as value",
-        "column": "value",
-        "unit_of_measurement": "MiB",
-        "value_template": None,
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["title"] == "Get Value"
+    assert result["options"] == {
+        CONF_QUERY: (
+            "SELECT {% if states('sensor.input1')=='on' %}"
+            " 5 {% else %} 6 {% endif %} as value"
+        ),
+        CONF_COLUMN_NAME: "value",
+        CONF_ADDITIONAL_OPTIONS: {
+            CONF_UNIT_OF_MEASUREMENT: "MiB",
+            CONF_VALUE_TEMPLATE: "{{ value }}",
+        },
     }
     assert len(mock_setup_entry.mock_calls) == 1
 
 
-async def test_import_flow_success(recorder_mock, hass: HomeAssistant) -> None:
-    """Test a successful import of yaml."""
+async def test_form_with_broken_query_template(
+    recorder_mock: Recorder, hass: HomeAssistant
+) -> None:
+    """Test form with broken query template."""
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {}
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        DATA_CONFIG,
+    )
+    message = re.escape("Schema validation failed at 'query'")
+    with pytest.raises(InvalidData, match=message):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            ENTRY_CONFIG_WITH_BROKEN_QUERY_TEMPLATE,
+        )
 
     with patch(
         "homeassistant.components.sql.async_setup_entry",
-        return_value=True,
+        return_value=None,
     ) as mock_setup_entry:
-        result2 = await hass.config_entries.flow.async_init(
-            DOMAIN,
-            context={"source": config_entries.SOURCE_IMPORT},
-            data=ENTRY_CONFIG,
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            ENTRY_CONFIG_WITH_QUERY_TEMPLATE,
         )
-        await hass.async_block_till_done()
 
-    assert result2["type"] == FlowResultType.CREATE_ENTRY
-    assert result2["title"] == "Get Value"
-    assert result2["options"] == {
-        "db_url": "sqlite://",
-        "name": "Get Value",
-        "query": "SELECT 5 as value",
-        "column": "value",
-        "unit_of_measurement": "MiB",
-        "value_template": None,
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["title"] == "Get Value"
+    assert result["options"] == {
+        CONF_QUERY: (
+            "SELECT {% if states('sensor.input1')=='on' %}"
+            " 5 {% else %} 6 {% endif %} as value"
+        ),
+        CONF_COLUMN_NAME: "value",
+        CONF_ADDITIONAL_OPTIONS: {
+            CONF_UNIT_OF_MEASUREMENT: "MiB",
+            CONF_VALUE_TEMPLATE: "{{ value }}",
+        },
     }
     assert len(mock_setup_entry.mock_calls) == 1
 
 
-async def test_import_flow_already_exist(recorder_mock, hass: HomeAssistant) -> None:
-    """Test import of yaml already exist."""
+async def test_form_with_value_template(
+    recorder_mock: Recorder, hass: HomeAssistant
+) -> None:
+    """Test for with value template."""
 
-    MockConfigEntry(
-        domain=DOMAIN,
-        data=ENTRY_CONFIG,
-    ).add_to_hass(hass)
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {}
 
-    with patch(
-        "homeassistant.components.sql.async_setup_entry",
-        return_value=True,
-    ):
-        result3 = await hass.config_entries.flow.async_init(
-            DOMAIN,
-            context={"source": config_entries.SOURCE_IMPORT},
-            data=ENTRY_CONFIG,
-        )
-        await hass.async_block_till_done()
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        DATA_CONFIG,
+    )
+    await hass.async_block_till_done()
 
-    assert result3["type"] == FlowResultType.ABORT
-    assert result3["reason"] == "already_configured"
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        ENTRY_CONFIG_WITH_VALUE_TEMPLATE,
+    )
+    await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["title"] == "Get Value"
+    assert result["data"] == {}
+    assert result["options"] == {
+        CONF_QUERY: "SELECT 5 as value",
+        CONF_COLUMN_NAME: "value",
+        CONF_ADDITIONAL_OPTIONS: {
+            CONF_UNIT_OF_MEASUREMENT: "MiB",
+            CONF_VALUE_TEMPLATE: "{{ value }}",
+        },
+    }
 
 
-async def test_flow_fails_db_url(recorder_mock, hass: HomeAssistant) -> None:
+async def test_flow_fails_db_url(hass: HomeAssistant) -> None:
     """Test config flow fails incorrect db url."""
-    result4 = await hass.config_entries.flow.async_init(
+    result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": config_entries.SOURCE_USER}
     )
 
-    assert result4["type"] == FlowResultType.FORM
-    assert result4["step_id"] == config_entries.SOURCE_USER
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == config_entries.SOURCE_USER
 
     with patch(
         "homeassistant.components.sql.config_flow.sqlalchemy.create_engine",
         side_effect=SQLAlchemyError("error_message"),
     ):
-        result4 = await hass.config_entries.flow.async_configure(
-            result4["flow_id"],
-            user_input=ENTRY_CONFIG,
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            user_input=DATA_CONFIG,
         )
 
-    assert result4["errors"] == {"db_url": "db_url_invalid"}
+    assert result["errors"] == {CONF_DB_URL: "db_url_invalid"}
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input=DATA_CONFIG,
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        ENTRY_CONFIG,
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
 
 
-async def test_flow_fails_invalid_query(recorder_mock, hass: HomeAssistant) -> None:
-    """Test config flow fails incorrect db url."""
-    result4 = await hass.config_entries.flow.async_init(
+async def test_flow_postgresql_url_uses_psycopg2(hass: HomeAssistant) -> None:
+    """Test the db url is validated with psycopg2 for driverless PostgreSQL URLs."""
+    result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": config_entries.SOURCE_USER}
     )
 
-    assert result4["type"] == FlowResultType.FORM
-    assert result4["step_id"] == config_entries.SOURCE_USER
+    with patch(
+        "homeassistant.components.sql.config_flow.sqlalchemy.create_engine",
+        side_effect=SQLAlchemyError("error_message"),
+    ) as create_engine_mock:
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            user_input={
+                CONF_NAME: "Get Value",
+                CONF_DB_URL: "postgresql://user:pass@host/db",
+            },
+        )
 
-    result5 = await hass.config_entries.flow.async_configure(
-        result4["flow_id"],
+    assert result["errors"] == {CONF_DB_URL: "db_url_invalid"}
+    assert create_engine_mock.mock_calls[0].args[0] == make_url(
+        "postgresql+psycopg2://user:pass@host/db"
+    )
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input=DATA_CONFIG,
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        ENTRY_CONFIG,
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+
+
+async def test_flow_fails_invalid_query(hass: HomeAssistant) -> None:
+    """Test config flow fails incorrect db url."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == config_entries.SOURCE_USER
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input=DATA_CONFIG,
+    )
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
         user_input=ENTRY_CONFIG_INVALID_QUERY,
     )
 
-    assert result5["type"] == FlowResultType.FORM
-    assert result5["errors"] == {
-        "query": "query_invalid",
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {
+        CONF_QUERY: "query_invalid",
     }
 
-    result5 = await hass.config_entries.flow.async_configure(
-        result4["flow_id"],
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input=ENTRY_CONFIG_INVALID_QUERY_2,
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {
+        CONF_QUERY: "query_no_read_only",
+    }
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input=ENTRY_CONFIG_INVALID_QUERY_3,
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {
+        CONF_QUERY: "query_no_read_only",
+    }
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input=ENTRY_CONFIG_QUERY_NO_READ_ONLY,
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {
+        CONF_QUERY: "query_no_read_only",
+    }
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input=ENTRY_CONFIG_QUERY_NO_READ_ONLY_CTE,
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {
+        CONF_QUERY: "query_no_read_only",
+    }
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input=ENTRY_CONFIG_MULTIPLE_QUERIES,
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {
+        CONF_QUERY: "multiple_queries",
+    }
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
         user_input=ENTRY_CONFIG_NO_RESULTS,
     )
 
-    assert result5["type"] == FlowResultType.FORM
-    assert result5["errors"] == {
-        "query": "query_invalid",
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {
+        CONF_QUERY: "query_invalid",
     }
 
-    result5 = await hass.config_entries.flow.async_configure(
-        result4["flow_id"],
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
         user_input=ENTRY_CONFIG,
     )
 
-    assert result5["type"] == FlowResultType.CREATE_ENTRY
-    assert result5["title"] == "Get Value"
-    assert result5["options"] == {
-        "db_url": "sqlite://",
-        "name": "Get Value",
-        "query": "SELECT 5 as value",
-        "column": "value",
-        "unit_of_measurement": "MiB",
-        "value_template": None,
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["title"] == "Get Value"
+    assert result["data"] == {}
+    assert result["options"] == {
+        CONF_QUERY: "SELECT 5 as value",
+        CONF_COLUMN_NAME: "value",
+        CONF_ADDITIONAL_OPTIONS: {
+            CONF_UNIT_OF_MEASUREMENT: "MiB",
+            CONF_DEVICE_CLASS: SensorDeviceClass.DATA_SIZE,
+            CONF_STATE_CLASS: SensorStateClass.TOTAL,
+        },
     }
 
 
-async def test_options_flow(recorder_mock, hass: HomeAssistant) -> None:
+async def test_flow_fails_invalid_column_name(hass: HomeAssistant) -> None:
+    """Test config flow fails invalid column name."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "user"
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input=DATA_CONFIG,
+    )
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input=ENTRY_CONFIG_INVALID_COLUMN_NAME,
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {
+        CONF_COLUMN_NAME: "column_invalid",
+    }
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input=ENTRY_CONFIG,
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["title"] == "Get Value"
+    assert result["data"] == {}
+    assert result["options"] == {
+        CONF_QUERY: "SELECT 5 as value",
+        CONF_COLUMN_NAME: "value",
+        CONF_ADDITIONAL_OPTIONS: {
+            CONF_UNIT_OF_MEASUREMENT: "MiB",
+            CONF_DEVICE_CLASS: SensorDeviceClass.DATA_SIZE,
+            CONF_STATE_CLASS: SensorStateClass.TOTAL,
+        },
+    }
+
+
+async def test_options_flow(hass: HomeAssistant) -> None:
     """Test options config flow."""
     entry = MockConfigEntry(
         domain=DOMAIN,
-        data={},
+        data=OPTIONS_DATA_CONFIG,
         options={
-            "db_url": "sqlite://",
-            "name": "Get Value",
-            "query": "SELECT 5 as value",
-            "column": "value",
-            "unit_of_measurement": "MiB",
-            "value_template": None,
+            CONF_QUERY: "SELECT 5 as value",
+            CONF_COLUMN_NAME: "value",
+            CONF_ADDITIONAL_OPTIONS: {
+                CONF_UNIT_OF_MEASUREMENT: "MiB",
+                CONF_DEVICE_CLASS: SensorDeviceClass.DATA_SIZE,
+                CONF_STATE_CLASS: SensorStateClass.TOTAL,
+            },
         },
+        version=2,
     )
     entry.add_to_hass(hass)
 
-    with patch(
-        "homeassistant.components.sql.async_setup_entry",
-        return_value=True,
-    ):
-        assert await hass.config_entries.async_setup(entry.entry_id)
-        await hass.async_block_till_done()
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
 
     result = await hass.config_entries.options.async_init(entry.entry_id)
 
-    assert result["type"] == FlowResultType.FORM
+    assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "init"
 
     result = await hass.config_entries.options.async_configure(
         result["flow_id"],
         user_input={
-            "db_url": "sqlite://",
-            "query": "SELECT 5 as size",
-            "column": "size",
-            "unit_of_measurement": "MiB",
+            CONF_QUERY: "SELECT 5 as size",
+            CONF_COLUMN_NAME: "size",
+            CONF_ADDITIONAL_OPTIONS: {
+                CONF_UNIT_OF_MEASUREMENT: "MiB",
+                CONF_VALUE_TEMPLATE: "{{ value }}",
+                CONF_DEVICE_CLASS: SensorDeviceClass.DATA_SIZE,
+                CONF_STATE_CLASS: SensorStateClass.TOTAL,
+            },
         },
     )
 
-    assert result["type"] == FlowResultType.CREATE_ENTRY
+    assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["data"] == {
-        "name": "Get Value",
-        "db_url": "sqlite://",
-        "query": "SELECT 5 as size",
-        "column": "size",
-        "unit_of_measurement": "MiB",
+        CONF_QUERY: "SELECT 5 as size",
+        CONF_COLUMN_NAME: "size",
+        CONF_ADDITIONAL_OPTIONS: {
+            CONF_UNIT_OF_MEASUREMENT: "MiB",
+            CONF_VALUE_TEMPLATE: "{{ value }}",
+            CONF_DEVICE_CLASS: SensorDeviceClass.DATA_SIZE,
+            CONF_STATE_CLASS: SensorStateClass.TOTAL,
+        },
     }
 
 
-async def test_options_flow_name_previously_removed(
-    recorder_mock, hass: HomeAssistant
-) -> None:
+async def test_options_flow_name_previously_removed(hass: HomeAssistant) -> None:
     """Test options config flow where the name was missing."""
     entry = MockConfigEntry(
         domain=DOMAIN,
-        data={},
+        data=OPTIONS_DATA_CONFIG,
         options={
-            "db_url": "sqlite://",
-            "query": "SELECT 5 as value",
-            "column": "value",
-            "unit_of_measurement": "MiB",
-            "value_template": None,
+            CONF_QUERY: "SELECT 5 as value",
+            CONF_COLUMN_NAME: "value",
+            CONF_ADDITIONAL_OPTIONS: {
+                CONF_UNIT_OF_MEASUREMENT: "MiB",
+            },
         },
+        version=2,
         title="Get Value Title",
     )
     entry.add_to_hass(hass)
@@ -241,57 +520,49 @@ async def test_options_flow_name_previously_removed(
 
     result = await hass.config_entries.options.async_init(entry.entry_id)
 
-    assert result["type"] == FlowResultType.FORM
+    assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "init"
 
-    with patch(
-        "homeassistant.components.sql.async_setup_entry",
-        return_value=True,
-    ) as mock_setup_entry:
-        result = await hass.config_entries.options.async_configure(
-            result["flow_id"],
-            user_input={
-                "db_url": "sqlite://",
-                "query": "SELECT 5 as size",
-                "column": "size",
-                "unit_of_measurement": "MiB",
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={
+            CONF_QUERY: "SELECT 5 as size",
+            CONF_COLUMN_NAME: "size",
+            CONF_ADDITIONAL_OPTIONS: {
+                CONF_UNIT_OF_MEASUREMENT: "MiB",
             },
-        )
-        await hass.async_block_till_done()
+        },
+    )
+    await hass.async_block_till_done()
 
-    assert len(mock_setup_entry.mock_calls) == 1
-    assert result["type"] == FlowResultType.CREATE_ENTRY
+    assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["data"] == {
-        "name": "Get Value Title",
-        "db_url": "sqlite://",
-        "query": "SELECT 5 as size",
-        "column": "size",
-        "unit_of_measurement": "MiB",
+        CONF_QUERY: "SELECT 5 as size",
+        CONF_COLUMN_NAME: "size",
+        CONF_ADDITIONAL_OPTIONS: {
+            CONF_UNIT_OF_MEASUREMENT: "MiB",
+        },
     }
 
 
-async def test_options_flow_fails_db_url(recorder_mock, hass: HomeAssistant) -> None:
+async def test_options_flow_fails_db_url(hass: HomeAssistant) -> None:
     """Test options flow fails incorrect db url."""
     entry = MockConfigEntry(
         domain=DOMAIN,
-        data={},
+        data=OPTIONS_DATA_CONFIG,
         options={
-            "db_url": "sqlite://",
-            "name": "Get Value",
-            "query": "SELECT 5 as value",
-            "column": "value",
-            "unit_of_measurement": "MiB",
-            "value_template": None,
+            CONF_QUERY: "SELECT 5 as value",
+            CONF_COLUMN_NAME: "value",
+            CONF_ADDITIONAL_OPTIONS: {
+                CONF_UNIT_OF_MEASUREMENT: "MiB",
+            },
         },
+        version=2,
     )
     entry.add_to_hass(hass)
 
-    with patch(
-        "homeassistant.components.sql.async_setup_entry",
-        return_value=True,
-    ):
-        assert await hass.config_entries.async_setup(entry.entry_id)
-        await hass.async_block_till_done()
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
 
     result = await hass.config_entries.options.async_init(entry.entry_id)
 
@@ -299,127 +570,377 @@ async def test_options_flow_fails_db_url(recorder_mock, hass: HomeAssistant) -> 
         "homeassistant.components.sql.config_flow.sqlalchemy.create_engine",
         side_effect=SQLAlchemyError("error_message"),
     ):
-        result2 = await hass.config_entries.options.async_configure(
+        result = await hass.config_entries.options.async_configure(
             result["flow_id"],
             user_input={
-                "db_url": "sqlite://",
-                "query": "SELECT 5 as size",
-                "column": "size",
-                "unit_of_measurement": "MiB",
+                CONF_QUERY: "SELECT 5 as size",
+                CONF_COLUMN_NAME: "size",
+                CONF_ADDITIONAL_OPTIONS: {
+                    CONF_UNIT_OF_MEASUREMENT: "MiB",
+                },
             },
         )
 
-    assert result2["errors"] == {"db_url": "db_url_invalid"}
+    assert result["errors"] == {CONF_DB_URL: "db_url_invalid"}
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={
+            CONF_QUERY: "SELECT 5 as size",
+            CONF_COLUMN_NAME: "size",
+            CONF_ADDITIONAL_OPTIONS: {
+                CONF_UNIT_OF_MEASUREMENT: "MiB",
+            },
+        },
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
 
 
-async def test_options_flow_fails_invalid_query(
-    recorder_mock, hass: HomeAssistant
-) -> None:
+async def test_options_flow_fails_invalid_query(hass: HomeAssistant) -> None:
     """Test options flow fails incorrect query and template."""
     entry = MockConfigEntry(
         domain=DOMAIN,
-        data={},
+        data=OPTIONS_DATA_CONFIG,
         options={
-            "db_url": "sqlite://",
-            "name": "Get Value",
-            "query": "SELECT 5 as value",
-            "column": "value",
-            "unit_of_measurement": "MiB",
-            "value_template": None,
+            CONF_QUERY: "SELECT 5 as value",
+            CONF_COLUMN_NAME: "value",
+            CONF_ADDITIONAL_OPTIONS: {
+                CONF_UNIT_OF_MEASUREMENT: "MiB",
+            },
         },
+        version=2,
     )
     entry.add_to_hass(hass)
 
-    with patch(
-        "homeassistant.components.sql.async_setup_entry",
-        return_value=True,
-    ):
-        assert await hass.config_entries.async_setup(entry.entry_id)
-        await hass.async_block_till_done()
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
 
     result = await hass.config_entries.options.async_init(entry.entry_id)
 
-    result2 = await hass.config_entries.options.async_configure(
+    result = await hass.config_entries.options.async_configure(
         result["flow_id"],
         user_input=ENTRY_CONFIG_INVALID_QUERY_OPT,
     )
 
-    assert result2["type"] == FlowResultType.FORM
-    assert result2["errors"] == {
-        "query": "query_invalid",
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {
+        CONF_QUERY: "query_invalid",
     }
 
-    result4 = await hass.config_entries.options.async_configure(
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input=ENTRY_CONFIG_INVALID_QUERY_2_OPT,
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {
+        CONF_QUERY: "query_no_read_only",
+    }
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input=ENTRY_CONFIG_INVALID_QUERY_3_OPT,
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {
+        CONF_QUERY: "query_no_read_only",
+    }
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input=ENTRY_CONFIG_QUERY_NO_READ_ONLY_OPT,
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {
+        CONF_QUERY: "query_no_read_only",
+    }
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input=ENTRY_CONFIG_QUERY_NO_READ_ONLY_CTE_OPT,
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {
+        CONF_QUERY: "query_no_read_only",
+    }
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input=ENTRY_CONFIG_MULTIPLE_QUERIES_OPT,
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {
+        CONF_QUERY: "multiple_queries",
+    }
+
+    message = re.escape("Schema validation failed at 'query'")
+    with pytest.raises(InvalidData, match=message):
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"],
+            user_input=ENTRY_CONFIG_WITH_BROKEN_QUERY_TEMPLATE_OPT,
+        )
+
+    result = await hass.config_entries.options.async_configure(
         result["flow_id"],
         user_input={
-            "db_url": "sqlite://",
-            "query": "SELECT 5 as size",
-            "column": "size",
-            "unit_of_measurement": "MiB",
+            CONF_QUERY: "SELECT 5 as size",
+            CONF_COLUMN_NAME: "size",
+            CONF_ADDITIONAL_OPTIONS: {
+                CONF_UNIT_OF_MEASUREMENT: "MiB",
+            },
         },
     )
 
-    assert result4["type"] == FlowResultType.CREATE_ENTRY
-    assert result4["data"] == {
-        "name": "Get Value",
-        "db_url": "sqlite://",
-        "query": "SELECT 5 as size",
-        "column": "size",
-        "unit_of_measurement": "MiB",
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["data"] == {
+        CONF_QUERY: "SELECT 5 as size",
+        CONF_COLUMN_NAME: "size",
+        CONF_ADDITIONAL_OPTIONS: {
+            CONF_UNIT_OF_MEASUREMENT: "MiB",
+        },
     }
 
 
-async def test_options_flow_db_url_empty(recorder_mock, hass: HomeAssistant) -> None:
-    """Test options config flow with leaving db_url empty."""
+async def test_options_flow_fails_invalid_column_name(hass: HomeAssistant) -> None:
+    """Test options flow fails invalid column name."""
     entry = MockConfigEntry(
         domain=DOMAIN,
-        data={},
+        data=OPTIONS_DATA_CONFIG,
         options={
-            "db_url": "sqlite://",
-            "name": "Get Value",
-            "query": "SELECT 5 as value",
-            "column": "value",
-            "unit_of_measurement": "MiB",
-            "value_template": None,
+            CONF_QUERY: "SELECT 5 as value",
+            CONF_COLUMN_NAME: "value",
+            CONF_ADDITIONAL_OPTIONS: {
+                CONF_UNIT_OF_MEASUREMENT: "MiB",
+            },
         },
+        version=2,
     )
     entry.add_to_hass(hass)
 
-    with patch(
-        "homeassistant.components.sql.async_setup_entry",
-        return_value=True,
-    ):
-        assert await hass.config_entries.async_setup(entry.entry_id)
-        await hass.async_block_till_done()
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
 
     result = await hass.config_entries.options.async_init(entry.entry_id)
 
-    assert result["type"] == FlowResultType.FORM
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input=ENTRY_CONFIG_INVALID_COLUMN_NAME_OPT,
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {
+        CONF_COLUMN_NAME: "column_invalid",
+    }
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={
+            CONF_QUERY: "SELECT 5 as value",
+            CONF_COLUMN_NAME: "value",
+            CONF_ADDITIONAL_OPTIONS: {
+                CONF_UNIT_OF_MEASUREMENT: "MiB",
+            },
+        },
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["data"] == {
+        CONF_QUERY: "SELECT 5 as value",
+        CONF_COLUMN_NAME: "value",
+        CONF_ADDITIONAL_OPTIONS: {
+            CONF_UNIT_OF_MEASUREMENT: "MiB",
+        },
+    }
+
+
+async def test_options_flow_db_url_empty(hass: HomeAssistant) -> None:
+    """Test options config flow with leaving db_url empty."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data=OPTIONS_DATA_CONFIG,
+        options={
+            CONF_QUERY: "SELECT 5 as value",
+            CONF_COLUMN_NAME: "value",
+            CONF_ADDITIONAL_OPTIONS: {
+                CONF_UNIT_OF_MEASUREMENT: "MiB",
+            },
+        },
+        version=2,
+    )
+    entry.add_to_hass(hass)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+
+    assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "init"
 
-    with patch(
-        "homeassistant.components.sql.async_setup_entry",
-        return_value=True,
-    ), patch(
-        "homeassistant.components.sql.config_flow.sqlalchemy.create_engine",
-    ):
-        result = await hass.config_entries.options.async_configure(
-            result["flow_id"],
-            user_input={
-                "query": "SELECT 5 as size",
-                "column": "size",
-                "unit_of_measurement": "MiB",
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={
+            CONF_QUERY: "SELECT 5 as size",
+            CONF_COLUMN_NAME: "size",
+            CONF_ADDITIONAL_OPTIONS: {
+                CONF_UNIT_OF_MEASUREMENT: "MiB",
             },
-        )
-        await hass.async_block_till_done()
+        },
+    )
+    await hass.async_block_till_done()
 
-    db_url = DEFAULT_URL.format(hass_config_path=hass.config.path(DEFAULT_DB_FILE))
-
-    assert result["type"] == FlowResultType.CREATE_ENTRY
+    assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["data"] == {
-        "name": "Get Value",
-        "db_url": db_url,
-        "query": "SELECT 5 as size",
-        "column": "size",
-        "unit_of_measurement": "MiB",
+        CONF_QUERY: "SELECT 5 as size",
+        CONF_COLUMN_NAME: "size",
+        CONF_ADDITIONAL_OPTIONS: {
+            CONF_UNIT_OF_MEASUREMENT: "MiB",
+        },
+    }
+
+
+async def test_full_flow_not_recorder_db(
+    hass: HomeAssistant,
+    tmp_path: Path,
+) -> None:
+    """Test full config flow with not using recorder db."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {}
+    db_path = tmp_path / "db.db"
+    db_path_str = f"sqlite:///{db_path}"
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {
+            CONF_DB_URL: db_path_str,
+            CONF_NAME: "Get Value",
+        },
+    )
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {
+            CONF_QUERY: "SELECT 5 as value",
+            CONF_COLUMN_NAME: "value",
+            CONF_ADDITIONAL_OPTIONS: {},
+        },
+    )
+    await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["title"] == "Get Value"
+    assert result["data"] == {CONF_DB_URL: db_path_str}
+    assert result["options"] == {
+        CONF_QUERY: "SELECT 5 as value",
+        CONF_COLUMN_NAME: "value",
+        CONF_ADDITIONAL_OPTIONS: {},
+    }
+
+    entry = hass.config_entries.async_entries(DOMAIN)[0]
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "init"
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={
+            CONF_QUERY: "SELECT 5 as value",
+            CONF_COLUMN_NAME: "value",
+            CONF_ADDITIONAL_OPTIONS: {
+                CONF_UNIT_OF_MEASUREMENT: "MiB",
+            },
+        },
+    )
+    await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["data"] == {
+        CONF_QUERY: "SELECT 5 as value",
+        CONF_COLUMN_NAME: "value",
+        CONF_ADDITIONAL_OPTIONS: {
+            CONF_UNIT_OF_MEASUREMENT: "MiB",
+        },
+    }
+
+
+async def test_device_state_class(hass: HomeAssistant) -> None:
+    """Test we get the form."""
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data=OPTIONS_DATA_CONFIG,
+        options={
+            CONF_QUERY: "SELECT 5 as value",
+            CONF_COLUMN_NAME: "value",
+            CONF_ADDITIONAL_OPTIONS: {
+                CONF_UNIT_OF_MEASUREMENT: "MiB",
+            },
+        },
+        version=2,
+    )
+    entry.add_to_hass(hass)
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "init"
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={
+            CONF_QUERY: "SELECT 5 as value",
+            CONF_COLUMN_NAME: "value",
+            CONF_ADDITIONAL_OPTIONS: {
+                CONF_UNIT_OF_MEASUREMENT: "MiB",
+                CONF_DEVICE_CLASS: SensorDeviceClass.DATA_SIZE,
+                CONF_STATE_CLASS: SensorStateClass.TOTAL,
+            },
+        },
+    )
+    await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["data"] == {
+        CONF_QUERY: "SELECT 5 as value",
+        CONF_COLUMN_NAME: "value",
+        CONF_ADDITIONAL_OPTIONS: {
+            CONF_UNIT_OF_MEASUREMENT: "MiB",
+            CONF_DEVICE_CLASS: SensorDeviceClass.DATA_SIZE,
+            CONF_STATE_CLASS: SensorStateClass.TOTAL,
+        },
+    }
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "init"
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={
+            CONF_QUERY: "SELECT 5 as value",
+            CONF_COLUMN_NAME: "value",
+            CONF_ADDITIONAL_OPTIONS: {
+                CONF_UNIT_OF_MEASUREMENT: "MiB",
+            },
+        },
+    )
+    await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert CONF_DEVICE_CLASS not in result["data"]
+    assert CONF_STATE_CLASS not in result["data"]
+    assert result["data"] == {
+        CONF_QUERY: "SELECT 5 as value",
+        CONF_COLUMN_NAME: "value",
+        CONF_ADDITIONAL_OPTIONS: {
+            CONF_UNIT_OF_MEASUREMENT: "MiB",
+        },
     }

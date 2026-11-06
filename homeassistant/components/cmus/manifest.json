@@ -1,9 +1,12 @@
 {
   "domain": "cmus",
   "name": "cmus",
-  "documentation": "https://www.home-assistant.io/integrations/cmus",
-  "requirements": ["pycmus==0.1.1"],
+  "categories": ["media_entertainment.music_radio_services"],
   "codeowners": [],
+  "connectivity": ["host", "network"],
+  "documentation": "https://www.home-assistant.io/integrations/cmus",
   "iot_class": "local_polling",
-  "loggers": ["pbr", "pycmus"]
+  "loggers": ["pbr", "pycmus"],
+  "quality_scale": "legacy",
+  "requirements": ["pycmus==0.1.1"]
 }

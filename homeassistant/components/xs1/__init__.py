@@ -1,8 +1,8 @@
 """Support for the EZcontrol XS1 gateway."""
-import asyncio
+
 import logging
 
-import voluptuous as vol
+import probatio
 import xs1_api_client
 
 from homeassistant.const import (
@@ -14,9 +14,7 @@ from homeassistant.const import (
     Platform,
 )
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers import discovery
-import homeassistant.helpers.config_validation as cv
-from homeassistant.helpers.entity import Entity
+from homeassistant.helpers import config_validation as cv, discovery
 from homeassistant.helpers.typing import ConfigType
 
 _LOGGER = logging.getLogger(__name__)
@@ -26,27 +24,22 @@ ACTUATORS = "actuators"
 SENSORS = "sensors"
 
 # define configuration parameters
-CONFIG_SCHEMA = vol.Schema(
+CONFIG_SCHEMA = probatio.Schema(
     {
-        DOMAIN: vol.Schema(
+        DOMAIN: probatio.Schema(
             {
-                vol.Required(CONF_HOST): cv.string,
-                vol.Optional(CONF_PASSWORD): cv.string,
-                vol.Optional(CONF_PORT, default=80): cv.string,
-                vol.Optional(CONF_SSL, default=False): cv.boolean,
-                vol.Optional(CONF_USERNAME): cv.string,
+                probatio.Required(CONF_HOST): cv.string,
+                probatio.Optional(probatio.Secret(CONF_PASSWORD)): cv.string,
+                probatio.Optional(CONF_PORT, default=80): cv.string,
+                probatio.Optional(CONF_SSL, default=False): cv.boolean,
+                probatio.Optional(CONF_USERNAME): cv.string,
             }
         )
     },
-    extra=vol.ALLOW_EXTRA,
+    extra=probatio.ALLOW_EXTRA,
 )
 
 PLATFORMS = [Platform.CLIMATE, Platform.SENSOR, Platform.SWITCH]
-
-# Lock used to limit the amount of concurrent update requests
-# as the XS1 Gateway can only handle a very
-# small amount of concurrent requests
-UPDATE_LOCK = asyncio.Lock()
 
 
 def setup(hass: HomeAssistant, config: ConfigType) -> bool:
@@ -87,16 +80,3 @@ def setup(hass: HomeAssistant, config: ConfigType) -> bool:
         discovery.load_platform(hass, platform, DOMAIN, {}, config)
 
     return True
-
-
-class XS1DeviceEntity(Entity):
-    """Representation of a base XS1 device."""
-
-    def __init__(self, device):
-        """Initialize the XS1 device."""
-        self.device = device
-
-    async def async_update(self):
-        """Retrieve latest device state."""
-        async with UPDATE_LOCK:
-            await self.hass.async_add_executor_job(self.device.update)

@@ -1,26 +1,19 @@
 """UniFi Protect media sources."""
 
-from __future__ import annotations
-
 import asyncio
+from calendar import monthrange
 from datetime import date, datetime, timedelta
-from enum import Enum
-from typing import Any, cast
+from enum import StrEnum
+from typing import Any, NoReturn, cast, override
 
-from pyunifiprotect.data import (
-    Camera,
-    Event,
-    EventType,
-    ModelType,
-    SmartDetectObjectType,
-)
-from pyunifiprotect.exceptions import NvrError
-from pyunifiprotect.utils import from_js_time
+from uiprotect.data import Camera, Event, EventType, SmartDetectObjectType
+from uiprotect.exceptions import NvrError
+from uiprotect.utils import from_js_time
 from yarl import URL
 
 from homeassistant.components.camera import CameraImageView
 from homeassistant.components.media_player import BrowseError, MediaClass
-from homeassistant.components.media_source.models import (
+from homeassistant.components.media_source import (
     BrowseMediaSource,
     MediaSource,
     MediaSourceItem,
@@ -32,7 +25,7 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN
-from .data import ProtectData
+from .data import ProtectData, async_get_ufp_entries
 from .views import async_generate_event_video_url, async_generate_thumbnail_url
 
 VIDEO_FORMAT = "video/mp4"
@@ -40,16 +33,17 @@ THUMBNAIL_WIDTH = 185
 THUMBNAIL_HEIGHT = 185
 
 
-class SimpleEventType(str, Enum):
+class SimpleEventType(StrEnum):
     """Enum to Camera Video events."""
 
     ALL = "all"
     RING = "ring"
     MOTION = "motion"
     SMART = "smart"
+    AUDIO = "audio"
 
 
-class IdentifierType(str, Enum):
+class IdentifierType(StrEnum):
     """UniFi Protect identifier type."""
 
     EVENT = "event"
@@ -57,84 +51,133 @@ class IdentifierType(str, Enum):
     BROWSE = "browse"
 
 
-class IdentifierTimeType(str, Enum):
+class IdentifierTimeType(StrEnum):
     """UniFi Protect identifier subtype."""
 
     RECENT = "recent"
     RANGE = "range"
 
 
-EVENT_MAP = {
-    SimpleEventType.ALL: None,
-    SimpleEventType.RING: EventType.RING,
-    SimpleEventType.MOTION: EventType.MOTION,
-    SimpleEventType.SMART: EventType.SMART_DETECT,
+EVENT_MAP: dict[SimpleEventType, set[EventType]] = {
+    SimpleEventType.ALL: {
+        EventType.RING,
+        EventType.MOTION,
+        EventType.SMART_DETECT,
+        EventType.SMART_DETECT_LINE,
+        EventType.SMART_AUDIO_DETECT,
+    },
+    SimpleEventType.RING: {EventType.RING},
+    SimpleEventType.MOTION: {EventType.MOTION},
+    SimpleEventType.SMART: {EventType.SMART_DETECT, EventType.SMART_DETECT_LINE},
+    SimpleEventType.AUDIO: {EventType.SMART_AUDIO_DETECT},
 }
 EVENT_NAME_MAP = {
     SimpleEventType.ALL: "All Events",
     SimpleEventType.RING: "Ring Events",
     SimpleEventType.MOTION: "Motion Events",
-    SimpleEventType.SMART: "Smart Detections",
+    SimpleEventType.SMART: "Object Detections",
+    SimpleEventType.AUDIO: "Audio Detections",
 }
-
-
-def get_ufp_event(event_type: SimpleEventType) -> EventType | None:
-    """Get UniFi Protect event type from SimpleEventType."""
-
-    return EVENT_MAP[event_type]
 
 
 async def async_get_media_source(hass: HomeAssistant) -> MediaSource:
     """Set up UniFi Protect media source."""
-
-    data_sources: dict[str, ProtectData] = {}
-    for data in hass.data.get(DOMAIN, {}).values():
-        if isinstance(data, ProtectData):
-            data_sources[data.api.bootstrap.nvr.id] = data
-
-    return ProtectMediaSource(hass, data_sources)
+    # Public-only entries carry no private bootstrap and the public API has
+    # no event media; include only full-access entries.
+    return ProtectMediaSource(
+        hass,
+        {
+            entry.runtime_data.api.bootstrap.nvr.id: entry.runtime_data
+            for entry in async_get_ufp_entries(hass)
+            if not entry.runtime_data.api.is_public_only
+        },
+    )
 
 
 @callback
 def _get_month_start_end(start: datetime) -> tuple[datetime, datetime]:
+    """Get the first day of the month for start and current time."""
     start = dt_util.as_local(start)
     end = dt_util.now()
 
-    start = start.replace(day=1, hour=0, minute=0, second=1, microsecond=0)
-    end = end.replace(day=1, hour=0, minute=0, second=2, microsecond=0)
+    start = start.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    end = end.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
     return start, end
 
 
 @callback
-def _bad_identifier(identifier: str, err: Exception | None = None) -> BrowseMediaSource:
-    msg = f"Unexpected identifier: {identifier}"
+def _bad_identifier(identifier: str, err: Exception | None = None) -> NoReturn:
+    exc = BrowseError(
+        translation_domain=DOMAIN,
+        translation_key="unexpected_identifier",
+        translation_placeholders={"identifier": identifier},
+    )
     if err is None:
-        raise BrowseError(msg)
-    raise BrowseError(msg) from err
-
-
-@callback
-def _bad_identifier_media(identifier: str, err: Exception | None = None) -> PlayMedia:
-    return cast(PlayMedia, _bad_identifier(identifier, err))
+        raise exc
+    raise exc from err
 
 
 @callback
 def _format_duration(duration: timedelta) -> str:
-    formatted = ""
     seconds = int(duration.total_seconds())
-    if seconds > 3600:
-        hours = seconds // 3600
-        formatted += f"{hours}h "
-        seconds -= hours * 3600
-    if seconds > 60:
-        minutes = seconds // 60
-        formatted += f"{minutes}m "
-        seconds -= minutes * 60
-    if seconds > 0:
-        formatted += f"{seconds}s "
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
 
-    return formatted.strip()
+    parts = []
+    if hours > 0:
+        parts.append(f"{hours}h")
+    if minutes > 0:
+        parts.append(f"{minutes}m")
+    if seconds > 0:
+        parts.append(f"{seconds}s")
+
+    return " ".join(parts) if parts else "0s"
+
+
+@callback
+def _get_object_name(event: Event | dict[str, Any]) -> str:
+    if isinstance(event, Event):
+        event = event.unifi_dict()
+
+    names = []
+    types = set(event["smartDetectTypes"])
+    metadata = event.get("metadata") or {}
+    for thumb in metadata.get("detectedThumbnails", []):
+        thumb_type = thumb.get("type")
+        if thumb_type not in types:
+            continue
+
+        types.remove(thumb_type)
+        if thumb_type == SmartDetectObjectType.VEHICLE.value:
+            attributes = thumb.get("attributes") or {}
+            color = attributes.get("color", {}).get("val", "")
+            vehicle_type = attributes.get("vehicleType", {}).get("val", "vehicle")
+            license_plate = metadata.get("licensePlate", {}).get("name")
+
+            name = f"{color} {vehicle_type}".strip().title()
+            if license_plate:
+                types.remove(SmartDetectObjectType.LICENSE_PLATE.value)
+                name = f"{name}: {license_plate}"
+            names.append(name)
+        else:
+            smart_type = SmartDetectObjectType(thumb_type)
+            names.append(smart_type.name.title().replace("_", " "))
+
+    for raw in types:
+        smart_type = SmartDetectObjectType(raw)
+        names.append(smart_type.name.title().replace("_", " "))
+
+    return ", ".join(sorted(names))
+
+
+@callback
+def _get_audio_name(event: Event | dict[str, Any]) -> str:
+    if isinstance(event, Event):
+        event = event.unifi_dict()
+
+    smart_types = [SmartDetectObjectType(e) for e in event["smartDetectTypes"]]
+    return ", ".join([s.name.title().replace("_", " ") for s in smart_types])
 
 
 class ProtectMediaSource(MediaSource):
@@ -153,6 +196,7 @@ class ProtectMediaSource(MediaSource):
         self.data_sources = data_sources
         self._registry = None
 
+    @override
     async def async_resolve_media(self, item: MediaSourceItem) -> PlayMedia:
         """Return a streamable URL and associated mime type for a UniFi Protect event.
 
@@ -164,20 +208,20 @@ class ProtectMediaSource(MediaSource):
 
         parts = item.identifier.split(":")
         if len(parts) != 3 or parts[1] not in ("event", "eventthumb"):
-            return _bad_identifier_media(item.identifier)
+            _bad_identifier(item.identifier)
 
         thumbnail_only = parts[1] == "eventthumb"
         try:
             data = self.data_sources[parts[0]]
         except (KeyError, IndexError) as err:
-            return _bad_identifier_media(item.identifier, err)
+            _bad_identifier(item.identifier, err)
 
         event = data.api.bootstrap.events.get(parts[2])
         if event is None:
             try:
                 event = await data.api.get_event(parts[2])
             except NvrError as err:
-                return _bad_identifier_media(item.identifier, err)
+                _bad_identifier(item.identifier, err)
             else:
                 # cache the event for later
                 data.api.bootstrap.events[event.id] = event
@@ -189,6 +233,7 @@ class ProtectMediaSource(MediaSource):
             )
         return PlayMedia(async_generate_event_video_url(event), "video/mp4")
 
+    @override
     async def async_browse_media(self, item: MediaSourceItem) -> BrowseMediaSource:
         """Return a browsable UniFi Protect media source.
 
@@ -226,11 +271,13 @@ class ProtectMediaSource(MediaSource):
         * {nvr_id}:browse:all|{camera_id}:all|{event_type}
             Root Camera(s) Event Type(s) browse source
         * {nvr_id}:browse:all|{camera_id}:all|{event_type}:recent:{day_count}
-            Listing of all events in last {day_count}, sorted in reverse chronological order
+            Listing of all events in last {day_count},
+            sorted in reverse chronological order
         * {nvr_id}:browse:all|{camera_id}:all|{event_type}:range:{year}:{month}
             List of folders for each day in month + all events for month
         * {nvr_id}:browse:all|{camera_id}:all|{event_type}:range:{year}:{month}:all|{day}
-            Listing of all events for give {day} + {month} + {year} combination in chronological order
+            All events for given day/month/year
+            in chronological order
         """
 
         if not item.identifier:
@@ -241,15 +288,15 @@ class ProtectMediaSource(MediaSource):
         try:
             data = self.data_sources[parts[0]]
         except (KeyError, IndexError) as err:
-            return _bad_identifier(item.identifier, err)
+            _bad_identifier(item.identifier, err)
 
         if len(parts) < 2:
-            return _bad_identifier(item.identifier)
+            _bad_identifier(item.identifier)
 
         try:
             identifier_type = IdentifierType(parts[1])
         except ValueError as err:
-            return _bad_identifier(item.identifier, err)
+            _bad_identifier(item.identifier, err)
 
         if identifier_type in (IdentifierType.EVENT, IdentifierType.EVENT_THUMB):
             thumbnail_only = identifier_type == IdentifierType.EVENT_THUMB
@@ -271,7 +318,7 @@ class ProtectMediaSource(MediaSource):
         try:
             event_type = SimpleEventType(parts.pop(0).lower())
         except (IndexError, ValueError) as err:
-            return _bad_identifier(item.identifier, err)
+            _bad_identifier(item.identifier, err)
 
         if len(parts) == 0:
             return await self._build_events_type(
@@ -281,17 +328,17 @@ class ProtectMediaSource(MediaSource):
         try:
             time_type = IdentifierTimeType(parts.pop(0))
         except ValueError as err:
-            return _bad_identifier(item.identifier, err)
+            _bad_identifier(item.identifier, err)
 
         if len(parts) == 0:
-            return _bad_identifier(item.identifier)
+            _bad_identifier(item.identifier)
 
         # {nvr_id}:browse:all|{camera_id}:all|{event_type}:recent:{day_count}
         if time_type == IdentifierTimeType.RECENT:
             try:
                 days = int(parts.pop(0))
             except (IndexError, ValueError) as err:
-                return _bad_identifier(item.identifier, err)
+                _bad_identifier(item.identifier, err)
 
             return await self._build_recent(
                 data, camera_id, event_type, days, build_children=True
@@ -302,7 +349,7 @@ class ProtectMediaSource(MediaSource):
         try:
             start, is_month, is_all = self._parse_range(parts)
         except (IndexError, ValueError) as err:
-            return _bad_identifier(item.identifier, err)
+            _bad_identifier(item.identifier, err)
 
         if is_month:
             return await self._build_month(
@@ -336,12 +383,13 @@ class ProtectMediaSource(MediaSource):
         try:
             event = await data.api.get_event(event_id)
         except NvrError as err:
-            return _bad_identifier(
-                f"{data.api.bootstrap.nvr.id}:{subtype}:{event_id}", err
-            )
+            _bad_identifier(f"{data.api.bootstrap.nvr.id}:{subtype}:{event_id}", err)
 
         if event.start is None or event.end is None:
-            raise BrowseError("Event is still ongoing")
+            raise BrowseError(
+                translation_domain=DOMAIN,
+                translation_key="event_ongoing",
+            )
 
         return await self._build_event(data, event, thumbnail_only)
 
@@ -372,9 +420,7 @@ class ProtectMediaSource(MediaSource):
 
         if camera is not None:
             title = f"{camera.display_name} > {title}"
-        title = f"{data.api.bootstrap.nvr.display_name} > {title}"
-
-        return title
+        return f"{data.api.bootstrap.nvr.display_name} > {title}"
 
     async def _build_event(
         self,
@@ -391,7 +437,7 @@ class ProtectMediaSource(MediaSource):
             end = event.end
         else:
             event_id = event["id"]
-            event_type = event["type"]
+            event_type = EventType(event["type"])
             start = from_js_time(event["start"])
             end = from_js_time(event["end"])
 
@@ -400,16 +446,14 @@ class ProtectMediaSource(MediaSource):
         title = dt_util.as_local(start).strftime("%x %X")
         duration = end - start
         title += f" {_format_duration(duration)}"
-        if event_type == EventType.RING.value:
+        if event_type in EVENT_MAP[SimpleEventType.RING]:
             event_text = "Ring Event"
-        elif event_type == EventType.MOTION.value:
+        elif event_type in EVENT_MAP[SimpleEventType.MOTION]:
             event_text = "Motion Event"
-        elif event_type == EventType.SMART_DETECT.value:
-            if isinstance(event, Event):
-                smart_type = event.smart_detect_types[0]
-            else:
-                smart_type = SmartDetectObjectType(event["smartDetectTypes"][0])
-            event_text = f"Smart Detection - {smart_type.name.title()}"
+        elif event_type in EVENT_MAP[SimpleEventType.SMART]:
+            event_text = f"Object Detection - {_get_object_name(event)}"
+        elif event_type in EVENT_MAP[SimpleEventType.AUDIO]:
+            event_text = f"Audio Detection - {_get_audio_name(event)}"
         title += f" {event_text}"
 
         nvr = data.api.bootstrap.nvr
@@ -446,20 +490,13 @@ class ProtectMediaSource(MediaSource):
         start: datetime,
         end: datetime,
         camera_id: str | None = None,
-        event_type: EventType | None = None,
+        event_types: set[EventType] | None = None,
         reserve: bool = False,
     ) -> list[BrowseMediaSource]:
         """Build media source for a given range of time and event type."""
 
-        if event_type is None:
-            types = [
-                EventType.RING,
-                EventType.MOTION,
-                EventType.SMART_DETECT,
-            ]
-        else:
-            types = [event_type]
-
+        event_types = event_types or EVENT_MAP[SimpleEventType.ALL]
+        types = list(event_types)
         sources: list[BrowseMediaSource] = []
         events = await data.api.get_events_raw(
             start=start, end=end, types=types, limit=data.max_events
@@ -513,22 +550,20 @@ class ProtectMediaSource(MediaSource):
             return source
 
         now = dt_util.now()
-
-        args = {
-            "data": data,
-            "start": now - timedelta(days=days),
-            "end": now,
-            "reserve": True,
-        }
-        if event_type != SimpleEventType.ALL:
-            args["event_type"] = get_ufp_event(event_type)
-
         camera: Camera | None = None
+        event_camera_id: str | None = None
         if camera_id != "all":
             camera = data.api.bootstrap.cameras.get(camera_id)
-            args["camera_id"] = camera_id
+            event_camera_id = camera_id
 
-        events = await self._build_events(**args)  # type: ignore[arg-type]
+        events = await self._build_events(
+            data=data,
+            start=now - timedelta(days=days),
+            end=now,
+            camera_id=event_camera_id,
+            event_types=EVENT_MAP[event_type],
+            reserve=True,
+        )
         source.children = events
         source.title = self._breadcrumb(
             data,
@@ -566,20 +601,23 @@ class ProtectMediaSource(MediaSource):
         if not build_children:
             return source
 
-        if data.api.bootstrap.recording_start is not None:
-            recording_start = data.api.bootstrap.recording_start.date()
-        start = max(recording_start, start)
-
-        recording_end = dt_util.now().date()
-        end = start.replace(month=start.month + 1) - timedelta(days=1)
-        end = min(recording_end, end)
+        # The requested month bounds the days offered: recording may have
+        # started partway into it, and it cannot reach past today. Keep those
+        # bounds off `start` so every child stays within the month asked for.
+        end = min(
+            dt_util.now().date(),
+            start.replace(day=monthrange(start.year, start.month)[1]),
+        )
+        day = start
+        if (recording_start := data.api.bootstrap.recording_start) is not None:
+            day = max(dt_util.as_local(recording_start).date(), day)
 
         children = [self._build_days(data, camera_id, event_type, start, is_all=True)]
-        while start <= end:
+        while day <= end:
             children.append(
-                self._build_days(data, camera_id, event_type, start, is_all=False)
+                self._build_days(data, camera_id, event_type, day, is_all=False)
             )
-            start = start + timedelta(hours=24)
+            day = day + timedelta(days=1)
 
         camera: Camera | None = None
         if camera_id != "all":
@@ -635,32 +673,30 @@ class ProtectMediaSource(MediaSource):
             hour=0,
             minute=0,
             second=0,
-            tzinfo=dt_util.DEFAULT_TIME_ZONE,
+            tzinfo=dt_util.get_default_time_zone(),
         )
         if is_all:
-            if start_dt.month < 12:
-                end_dt = start_dt.replace(month=start_dt.month + 1)
-            else:
-                end_dt = start_dt.replace(year=start_dt.year + 1, month=1)
+            # Move to first day of next month
+            days_in_month = monthrange(start_dt.year, start_dt.month)[1]
+            end_dt = start_dt + timedelta(days=days_in_month)
         else:
             end_dt = start_dt + timedelta(hours=24)
 
-        args = {
-            "data": data,
-            "start": start_dt,
-            "end": end_dt,
-            "reserve": False,
-        }
-        if event_type != SimpleEventType.ALL:
-            args["event_type"] = get_ufp_event(event_type)
-
         camera: Camera | None = None
+        event_camera_id: str | None = None
         if camera_id != "all":
             camera = data.api.bootstrap.cameras.get(camera_id)
-            args["camera_id"] = camera_id
+            event_camera_id = camera_id
 
         title = f"{start.strftime('%B %Y')} > {title}"
-        events = await self._build_events(**args)  # type: ignore[arg-type]
+        events = await self._build_events(
+            data=data,
+            start=start_dt,
+            end=end_dt,
+            camera_id=event_camera_id,
+            reserve=False,
+            event_types=EVENT_MAP[event_type],
+        )
         source.children = events
         source.title = self._breadcrumb(
             data,
@@ -705,7 +741,7 @@ class ProtectMediaSource(MediaSource):
         ]
 
         start, end = _get_month_start_end(data.api.bootstrap.recording_start)
-        while end > start:
+        while end >= start:
             children.append(self._build_month(data, camera_id, event_type, end.date()))
             end = (end - timedelta(days=1)).replace(day=1)
 
@@ -734,10 +770,6 @@ class ProtectMediaSource(MediaSource):
             entity_id = entity_registry.async_get_entity_id(
                 Platform.CAMERA, DOMAIN, base_id
             )
-            if entity_id is None:
-                entity_id = entity_registry.async_get_entity_id(
-                    Platform.CAMERA, DOMAIN, f"{base_id}_insecure"
-                )
 
             if entity_id:
                 # verify entity is available
@@ -765,9 +797,13 @@ class ProtectMediaSource(MediaSource):
         if camera_id != "all":
             camera = data.api.bootstrap.cameras.get(camera_id)
             if camera is None:
-                raise BrowseError(f"Unknown Camera ID: {camera_id}")
+                raise BrowseError(
+                    translation_domain=DOMAIN,
+                    translation_key="unknown_camera_id",
+                    translation_placeholders={"camera_id": camera_id},
+                )
             name = camera.name or camera.market_name or camera.type
-            is_doorbell = camera.feature_flags.has_chime
+            is_doorbell = camera.feature_flags.is_doorbell
             has_smart = camera.feature_flags.has_smart_detect
 
         thumbnail_url: str | None = None
@@ -802,6 +838,9 @@ class ProtectMediaSource(MediaSource):
             source.children.append(
                 await self._build_events_type(data, camera_id, SimpleEventType.SMART)
             )
+            source.children.append(
+                await self._build_events_type(data, camera_id, SimpleEventType.AUDIO)
+            )
 
         if is_doorbell or has_smart:
             source.children.insert(
@@ -818,8 +857,7 @@ class ProtectMediaSource(MediaSource):
 
         cameras: list[BrowseMediaSource] = [await self._build_camera(data, "all")]
 
-        for camera in data.get_by_types({ModelType.CAMERA}):
-            camera = cast(Camera, camera)
+        for camera in data.get_cameras():
             if not camera.can_read_media(data.api.bootstrap.auth_user):
                 continue
             cameras.append(await self._build_camera(data, camera.id))
@@ -829,7 +867,7 @@ class ProtectMediaSource(MediaSource):
     async def _build_console(self, data: ProtectData) -> BrowseMediaSource:
         """Build media source for a single UniFi Protect NVR."""
 
-        base = BrowseMediaSource(
+        return BrowseMediaSource(
             domain=DOMAIN,
             identifier=f"{data.api.bootstrap.nvr.id}:browse",
             media_class=MediaClass.DIRECTORY,
@@ -840,8 +878,6 @@ class ProtectMediaSource(MediaSource):
             children_media_class=MediaClass.VIDEO,
             children=await self._build_cameras(data),
         )
-
-        return base
 
     async def _build_sources(self) -> BrowseMediaSource:
         """Return all media source for all UniFi Protect NVRs."""

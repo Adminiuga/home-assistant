@@ -1,10 +1,14 @@
 {
   "domain": "fitbit",
   "name": "Fitbit",
+  "categories": ["health_wellbeing"],
+  "codeowners": ["@allenporter"],
+  "config_flow": true,
+  "connectivity": ["cloud"],
+  "dependencies": ["application_credentials", "http"],
   "documentation": "https://www.home-assistant.io/integrations/fitbit",
-  "requirements": ["fitbit==0.3.1"],
-  "dependencies": ["configurator", "http"],
-  "codeowners": [],
+  "integration_type": "service",
   "iot_class": "cloud_polling",
-  "loggers": ["fitbit"]
+  "loggers": ["fitbit", "fitbit_web_api"],
+  "requirements": ["fitbit==0.3.1", "fitbit-web-api==2.13.5"]
 }

@@ -1,28 +1,52 @@
 """The pushover component."""
-from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from pushover_complete import BadAPIRequestError, PushoverAPI
+from requests.exceptions import RequestException
+from urllib3.exceptions import HTTPError
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_API_KEY, CONF_NAME, Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
-from homeassistant.helpers import discovery
+from homeassistant.helpers import config_validation as cv, discovery
 from homeassistant.helpers.typing import ConfigType
 
 from .const import CONF_USER_KEY, DATA_HASS_CONFIG, DOMAIN
+from .services import async_setup_services
+
+if TYPE_CHECKING:
+    from .notify import PushoverNotificationService
 
 PLATFORMS = [Platform.NOTIFY]
+
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+
+
+@dataclass
+class PushoverRuntimeData:
+    """Runtime data for a pushover config entry."""
+
+    api: PushoverAPI
+    notify_service: PushoverNotificationService | None = None
+
+
+type PushoverConfigEntry = ConfigEntry[PushoverRuntimeData]
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the pushover component."""
 
     hass.data[DATA_HASS_CONFIG] = config
+
+    async_setup_services(hass)
+
     return True
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_setup_entry(hass: HomeAssistant, entry: PushoverConfigEntry) -> None:
     """Set up pushover from a config entry."""
 
     # remove unique_id for beta users
@@ -35,12 +59,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             pushover_api.validate, entry.data[CONF_USER_KEY]
         )
 
-    except (BadAPIRequestError, ValueError) as err:
+    except (BadAPIRequestError, ValueError, RequestException, HTTPError) as err:
         if "application token is invalid" in str(err):
             raise ConfigEntryAuthFailed(err) from err
         raise ConfigEntryNotReady(err) from err
 
-    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = pushover_api
+    entry.runtime_data = PushoverRuntimeData(api=pushover_api)
 
     hass.async_create_task(
         discovery.async_load_platform(
@@ -55,5 +79,3 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             hass.data[DATA_HASS_CONFIG],
         )
     )
-
-    return True

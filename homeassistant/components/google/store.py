@@ -1,12 +1,13 @@
 """Google Calendar local storage."""
 
-from __future__ import annotations
-
+from dataclasses import dataclass
 import logging
-from typing import Any
+from typing import Any, override
 
+from gcal_sync.api import GoogleCalendarService
 from gcal_sync.store import CalendarStore
 
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
 
@@ -18,6 +19,16 @@ STORAGE_KEY_FORMAT = "{domain}.{entry_id}"
 STORAGE_VERSION = 1
 # Buffer writes every few minutes (plus guaranteed to be written at shutdown)
 STORAGE_SAVE_DELAY_SECONDS = 120
+
+type GoogleConfigEntry = ConfigEntry[GoogleRuntimeData]
+
+
+@dataclass
+class GoogleRuntimeData:
+    """Google runtime data."""
+
+    service: GoogleCalendarService
+    store: LocalCalendarStore
 
 
 class LocalCalendarStore(CalendarStore):
@@ -33,12 +44,14 @@ class LocalCalendarStore(CalendarStore):
         )
         self._data: dict[str, Any] | None = None
 
+    @override
     async def async_load(self) -> dict[str, Any] | None:
         """Load data."""
         if self._data is None:
             self._data = await self._store.async_load() or {}
         return self._data
 
+    @override
     async def async_save(self, data: dict[str, Any]) -> None:
         """Save data."""
         self._data = data
@@ -48,6 +61,14 @@ class LocalCalendarStore(CalendarStore):
 
         self._store.async_delay_save(provide_data, STORAGE_SAVE_DELAY_SECONDS)
 
+    async def async_flush(self) -> None:
+        """Write cached data and finish pending saves before unloading."""
+        if self._data is not None:
+            await self._store.async_save(self._data)
+
     async def async_remove(self) -> None:
-        """Remove data."""
+        """Remove persisted data and prevent further writes."""
+        self._store.make_read_only()
+        # Wait for active writes before removing the file.
+        await self.async_flush()
         await self._store.async_remove()

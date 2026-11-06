@@ -1,5 +1,9 @@
 """Offer time listening automation rules."""
-import voluptuous as vol
+
+from datetime import datetime
+from typing import Any
+
+import probatio
 
 from homeassistant.const import CONF_PLATFORM
 from homeassistant.core import CALLBACK_TYPE, HassJob, HomeAssistant, callback
@@ -19,39 +23,43 @@ class TimePattern:
     :raises Invalid: If the value has a wrong format or is outside the range.
     """
 
-    def __init__(self, maximum):
+    def __init__(self, maximum: int) -> None:
         """Initialize time pattern."""
         self.maximum = maximum
 
-    def __call__(self, value):
+    def __call__(self, value: Any) -> str | int:
         """Validate input."""
         try:
             if value == "*":
-                return value
+                return value  # type: ignore[no-any-return]
 
             if isinstance(value, str) and value.startswith("/"):
                 number = int(value[1:])
+                if number == 0:
+                    raise probatio.Invalid(
+                        f"must be a value between 1 and {self.maximum}"
+                    )
             else:
                 value = number = int(value)
 
             if not (0 <= number <= self.maximum):
-                raise vol.Invalid(f"must be a value between 0 and {self.maximum}")
+                raise probatio.Invalid(f"must be a value between 0 and {self.maximum}")
         except ValueError as err:
-            raise vol.Invalid("invalid time_pattern value") from err
+            raise probatio.Invalid("invalid time_pattern value") from err
 
-        return value
+        return value  # type: ignore[no-any-return]
 
 
-TRIGGER_SCHEMA = vol.All(
+TRIGGER_SCHEMA = probatio.All(
     cv.TRIGGER_BASE_SCHEMA.extend(
         {
-            vol.Required(CONF_PLATFORM): "time_pattern",
+            probatio.Required(CONF_PLATFORM): "time_pattern",
             CONF_HOURS: TimePattern(maximum=23),
             CONF_MINUTES: TimePattern(maximum=59),
             CONF_SECONDS: TimePattern(maximum=59),
         }
     ),
-    cv.has_at_least_one_key(CONF_HOURS, CONF_MINUTES, CONF_SECONDS),
+    probatio.AtLeastOne(CONF_HOURS, CONF_MINUTES, CONF_SECONDS),
 )
 
 
@@ -66,7 +74,7 @@ async def async_attach_trigger(
     hours = config.get(CONF_HOURS)
     minutes = config.get(CONF_MINUTES)
     seconds = config.get(CONF_SECONDS)
-    job = HassJob(action)
+    job = HassJob(action, f"time pattern trigger {trigger_info}")
 
     # If larger units are specified, default the smaller units to zero
     if minutes is None and hours is not None:
@@ -75,7 +83,7 @@ async def async_attach_trigger(
         seconds = 0
 
     @callback
-    def time_automation_listener(now):
+    def time_automation_listener(now: datetime) -> None:
         """Listen for time changes and calls action."""
         hass.async_run_hass_job(
             job,

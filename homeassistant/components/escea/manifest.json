@@ -1,12 +1,15 @@
 {
   "domain": "escea",
   "name": "Escea",
-  "documentation": "https://www.home-assistant.io/integrations/escea",
+  "categories": ["climate.thermostats_heating"],
   "codeowners": ["@lazdavila"],
-  "requirements": ["pescea==1.0.12"],
   "config_flow": true,
+  "connectivity": ["network"],
+  "documentation": "https://www.home-assistant.io/integrations/escea",
   "homekit": {
     "models": ["Escea"]
   },
-  "iot_class": "local_push"
+  "integration_type": "device",
+  "iot_class": "local_push",
+  "requirements": ["pescea==1.0.12"]
 }

@@ -1,38 +1,34 @@
 """Support for IKEA Tradfri switches."""
-from __future__ import annotations
 
-from collections.abc import Callable
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, override
 
-from pytradfri.command import Command
+from pytradfri.api.aiocoap_api import APIRequestProtocol
 
 from homeassistant.components.switch import SwitchEntity
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .base_class import TradfriBaseEntity
-from .const import CONF_GATEWAY_ID, COORDINATOR, COORDINATOR_LIST, DOMAIN, KEY_API
-from .coordinator import TradfriDeviceDataUpdateCoordinator
+from .const import CONF_GATEWAY_ID
+from .coordinator import TradfriConfigEntry, TradfriDeviceDataUpdateCoordinator
+from .entity import TradfriBaseEntity
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    config_entry: TradfriConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Load Tradfri switches based on a config entry."""
     gateway_id = config_entry.data[CONF_GATEWAY_ID]
-    coordinator_data = hass.data[DOMAIN][config_entry.entry_id][COORDINATOR]
-    api = coordinator_data[KEY_API]
+    tradfri_data = config_entry.runtime_data
 
     async_add_entities(
         TradfriSwitch(
             device_coordinator,
-            api,
+            tradfri_data.api,
             gateway_id,
         )
-        for device_coordinator in coordinator_data[COORDINATOR_LIST]
+        for device_coordinator in tradfri_data.coordinator_list
         if device_coordinator.device.has_socket_control
     )
 
@@ -40,10 +36,12 @@ async def async_setup_entry(
 class TradfriSwitch(TradfriBaseEntity, SwitchEntity):
     """The platform class required by Home Assistant."""
 
+    _attr_name = None
+
     def __init__(
         self,
         device_coordinator: TradfriDeviceDataUpdateCoordinator,
-        api: Callable[[Command | list[Command]], Any],
+        api: APIRequestProtocol,
         gateway_id: str,
     ) -> None:
         """Initialize a switch."""
@@ -53,28 +51,34 @@ class TradfriSwitch(TradfriBaseEntity, SwitchEntity):
             gateway_id=gateway_id,
         )
 
+        if TYPE_CHECKING:
+            assert self._device.socket_control is not None
         self._device_control = self._device.socket_control
         self._device_data = self._device_control.sockets[0]
 
+    @override
     def _refresh(self) -> None:
         """Refresh the device."""
-        self._device_data = self.coordinator.data.socket_control.sockets[0]
+        self._device_data = self._device_control.sockets[0]
 
     @property
+    @override
     def is_on(self) -> bool:
         """Return true if switch is on."""
         if not self._device_data:
             return False
-        return cast(bool, self._device_data.state)
+        return self._device_data.state
 
+    @override
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Instruct the switch to turn off."""
         if not self._device_control:
-            return None
+            return
         await self._api(self._device_control.set_state(False))
 
+    @override
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Instruct the switch to turn on."""
         if not self._device_control:
-            return None
+            return
         await self._api(self._device_control.set_state(True))

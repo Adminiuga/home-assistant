@@ -1,5 +1,4 @@
 """Support for the for Danfoss Air HRV sensors."""
-from __future__ import annotations
 
 import logging
 
@@ -10,12 +9,12 @@ from homeassistant.components.sensor import (
     SensorEntity,
     SensorStateClass,
 )
-from homeassistant.const import PERCENTAGE, REVOLUTIONS_PER_MINUTE, TEMP_CELSIUS
+from homeassistant.const import PERCENTAGE, REVOLUTIONS_PER_MINUTE, UnitOfTemperature
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
-from . import DOMAIN as DANFOSS_AIR_DOMAIN
+from . import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -27,33 +26,33 @@ def setup_platform(
     discovery_info: DiscoveryInfoType | None = None,
 ) -> None:
     """Set up the available Danfoss Air sensors etc."""
-    data = hass.data[DANFOSS_AIR_DOMAIN]
+    data = hass.data[DOMAIN]
 
     sensors = [
         [
             "Danfoss Air Exhaust Temperature",
-            TEMP_CELSIUS,
+            UnitOfTemperature.CELSIUS,
             ReadCommand.exhaustTemperature,
             SensorDeviceClass.TEMPERATURE,
             SensorStateClass.MEASUREMENT,
         ],
         [
             "Danfoss Air Outdoor Temperature",
-            TEMP_CELSIUS,
+            UnitOfTemperature.CELSIUS,
             ReadCommand.outdoorTemperature,
             SensorDeviceClass.TEMPERATURE,
             SensorStateClass.MEASUREMENT,
         ],
         [
             "Danfoss Air Supply Temperature",
-            TEMP_CELSIUS,
+            UnitOfTemperature.CELSIUS,
             ReadCommand.supplyTemperature,
             SensorDeviceClass.TEMPERATURE,
             SensorStateClass.MEASUREMENT,
         ],
         [
             "Danfoss Air Extract Temperature",
-            TEMP_CELSIUS,
+            UnitOfTemperature.CELSIUS,
             ReadCommand.extractTemperature,
             SensorDeviceClass.TEMPERATURE,
             SensorStateClass.MEASUREMENT,
@@ -72,7 +71,13 @@ def setup_platform(
             SensorDeviceClass.HUMIDITY,
             SensorStateClass.MEASUREMENT,
         ],
-        ["Danfoss Air Fan Step", PERCENTAGE, ReadCommand.fan_step, None, None],
+        [
+            "Danfoss Air Fan Step",
+            PERCENTAGE,
+            ReadCommand.fan_speed_percent,
+            None,
+            None,
+        ],
         [
             "Danfoss Air Exhaust Fan Speed",
             REVOLUTIONS_PER_MINUTE,
@@ -96,14 +101,13 @@ def setup_platform(
         ],
     ]
 
-    dev = []
-
-    for sensor in sensors:
-        dev.append(
+    add_entities(
+        (
             DanfossAir(data, sensor[0], sensor[1], sensor[2], sensor[3], sensor[4])
-        )
-
-    add_entities(dev, True)
+            for sensor in sensors
+        ),
+        True,
+    )
 
 
 class DanfossAir(SensorEntity):

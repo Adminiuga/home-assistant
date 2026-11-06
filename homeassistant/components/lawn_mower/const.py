@@ -1,0 +1,60 @@
+"""Constants for the lawn mower integration."""
+
+from enum import IntFlag, StrEnum
+from typing import TYPE_CHECKING, Final
+
+from homeassistant.util.hass_dict import HassKey
+
+if TYPE_CHECKING:
+    from homeassistant.helpers.entity_component import EntityComponent
+
+    from .entity import LawnMowerEntity
+
+DOMAIN: Final = "lawn_mower"
+DATA_COMPONENT: HassKey[EntityComponent[LawnMowerEntity]] = HassKey(DOMAIN)
+
+
+class LawnMowerActivity(StrEnum):
+    """Activity state of lawn mower devices."""
+
+    ERROR = "error"
+    """Device is in error state, needs assistance."""
+
+    PAUSED = "paused"
+    """Paused during activity."""
+
+    MOWING = "mowing"
+    """Device is mowing."""
+
+    DOCKED = "docked"
+    """Device is docked."""
+
+    RETURNING = "returning"
+    """Device is returning."""
+
+    IDLE = "idle"
+    """Device is stopped, but neither docked nor paused."""
+
+
+class LawnMowerEntityFeature(IntFlag):
+    """Supported features of the lawn mower entity."""
+
+    START_MOWING = 1
+    PAUSE = 2
+    DOCK = 4
+    STOP = 8
+
+
+SERVICE_START_MOWING = "start_mowing"
+SERVICE_PAUSE = "pause"
+SERVICE_DOCK = "dock"
+SERVICE_STOP = "stop"
+
+
+class LawnMowerService(StrEnum):
+    """Store keys for lawn mower services."""
+
+    DOCK = "dock"
+    PAUSE = "pause"
+    START_MOWING = "start_mowing"
+    STOP = "stop"

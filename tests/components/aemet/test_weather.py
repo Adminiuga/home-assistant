@@ -1,63 +1,137 @@
-"""The sensor tests for the AEMET OpenData platform."""
+"""The weather tests for the AEMET OpenData platform."""
 
+from collections.abc import Generator
+import datetime as dt
 from unittest.mock import patch
 
-from homeassistant.components.aemet.const import ATTRIBUTION
+from freezegun.api import FrozenDateTimeFactory
+import pytest
+from pytest_homeassistant.common import snapshot_platform
+from pytest_homeassistant.typing import WebSocketGenerator
+from syrupy.assertion import SnapshotAssertion
+
+from homeassistant.components.aemet.coordinator import WEATHER_UPDATE_INTERVAL
 from homeassistant.components.weather import (
-    ATTR_CONDITION_PARTLYCLOUDY,
-    ATTR_CONDITION_SNOWY,
-    ATTR_FORECAST,
-    ATTR_FORECAST_CONDITION,
-    ATTR_FORECAST_PRECIPITATION,
-    ATTR_FORECAST_PRECIPITATION_PROBABILITY,
-    ATTR_FORECAST_TEMP,
-    ATTR_FORECAST_TEMP_LOW,
-    ATTR_FORECAST_TIME,
-    ATTR_FORECAST_WIND_BEARING,
-    ATTR_FORECAST_WIND_SPEED,
-    ATTR_WEATHER_HUMIDITY,
-    ATTR_WEATHER_PRESSURE,
-    ATTR_WEATHER_TEMPERATURE,
-    ATTR_WEATHER_WIND_BEARING,
-    ATTR_WEATHER_WIND_SPEED,
+    DOMAIN as WEATHER_DOMAIN,
+    SERVICE_GET_FORECASTS,
 )
-from homeassistant.const import ATTR_ATTRIBUTION
-import homeassistant.util.dt as dt_util
+from homeassistant.const import Platform
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
 
-from .util import async_init_integration
+from .util import async_init_integration, mock_api_call
 
 
-async def test_aemet_weather(hass):
-    """Test states of the weather."""
+@pytest.fixture(autouse=True)
+def override_platforms() -> Generator[None]:
+    """Override PLATFORMS."""
+    with patch("homeassistant.components.aemet.PLATFORMS", [Platform.WEATHER]):
+        yield
 
-    hass.config.set_time_zone("UTC")
-    now = dt_util.parse_datetime("2021-01-09 12:00:00+00:00")
-    with patch("homeassistant.util.dt.now", return_value=now), patch(
-        "homeassistant.util.dt.utcnow", return_value=now
-    ):
-        await async_init_integration(hass)
 
-    state = hass.states.get("weather.aemet_daily")
-    assert state
-    assert state.state == ATTR_CONDITION_SNOWY
-    assert state.attributes.get(ATTR_ATTRIBUTION) == ATTRIBUTION
-    assert state.attributes.get(ATTR_WEATHER_HUMIDITY) == 99.0
-    assert state.attributes.get(ATTR_WEATHER_PRESSURE) == 1004.4  # 100440.0 Pa -> hPa
-    assert state.attributes.get(ATTR_WEATHER_TEMPERATURE) == -0.7
-    assert state.attributes.get(ATTR_WEATHER_WIND_BEARING) == 90.0
-    assert state.attributes.get(ATTR_WEATHER_WIND_SPEED) == 15.0  # 4.17 m/s -> km/h
-    forecast = state.attributes.get(ATTR_FORECAST)[0]
-    assert forecast.get(ATTR_FORECAST_CONDITION) == ATTR_CONDITION_PARTLYCLOUDY
-    assert forecast.get(ATTR_FORECAST_PRECIPITATION) is None
-    assert forecast.get(ATTR_FORECAST_PRECIPITATION_PROBABILITY) == 30
-    assert forecast.get(ATTR_FORECAST_TEMP) == 4
-    assert forecast.get(ATTR_FORECAST_TEMP_LOW) == -4
-    assert (
-        forecast.get(ATTR_FORECAST_TIME)
-        == dt_util.parse_datetime("2021-01-10 00:00:00+00:00").isoformat()
+async def test_all_entities(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    freezer: FrozenDateTimeFactory,
+    snapshot: SnapshotAssertion,
+) -> None:
+    """Test all entities."""
+
+    await hass.config.async_set_time_zone("UTC")
+    freezer.move_to("2021-01-09 12:00:00+00:00")
+    config_entry = await async_init_integration(hass)
+
+    await snapshot_platform(hass, entity_registry, snapshot, config_entry.entry_id)
+
+    # The hourly forecast is served by the single weather entity, not a separate one
+    assert hass.states.get("weather.aemet_hourly") is None
+
+
+@pytest.mark.parametrize(
+    ("service"),
+    [SERVICE_GET_FORECASTS],
+)
+async def test_forecast_service(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    snapshot: SnapshotAssertion,
+    service: str,
+) -> None:
+    """Test multiple forecast."""
+
+    await hass.config.async_set_time_zone("UTC")
+    freezer.move_to("2021-01-09 12:00:00+00:00")
+    await async_init_integration(hass)
+
+    response = await hass.services.async_call(
+        WEATHER_DOMAIN,
+        service,
+        {
+            "entity_id": "weather.aemet",
+            "type": "daily",
+        },
+        blocking=True,
+        return_response=True,
     )
-    assert forecast.get(ATTR_FORECAST_WIND_BEARING) == 45.0
-    assert forecast.get(ATTR_FORECAST_WIND_SPEED) == 20.0  # 5.56 m/s -> km/h
+    assert response == snapshot
 
-    state = hass.states.get("weather.aemet_hourly")
-    assert state is None
+    response = await hass.services.async_call(
+        WEATHER_DOMAIN,
+        service,
+        {
+            "entity_id": "weather.aemet",
+            "type": "hourly",
+        },
+        blocking=True,
+        return_response=True,
+    )
+    assert response == snapshot
+
+
+@pytest.mark.parametrize("forecast_type", ["daily", "hourly"])
+async def test_forecast_subscription(
+    hass: HomeAssistant,
+    hass_ws_client: WebSocketGenerator,
+    freezer: FrozenDateTimeFactory,
+    snapshot: SnapshotAssertion,
+    forecast_type: str,
+) -> None:
+    """Test multiple forecast."""
+    client = await hass_ws_client(hass)
+
+    await hass.config.async_set_time_zone("UTC")
+    freezer.move_to("2021-01-09 12:00:00+00:00")
+    await async_init_integration(hass)
+
+    await client.send_json_auto_id(
+        {
+            "type": "weather/subscribe_forecast",
+            "forecast_type": forecast_type,
+            "entity_id": "weather.aemet",
+        }
+    )
+    msg = await client.receive_json()
+    assert msg["success"]
+    assert msg["result"] is None
+    subscription_id = msg["id"]
+
+    msg = await client.receive_json()
+    assert msg["id"] == subscription_id
+    assert msg["type"] == "event"
+    forecast1 = msg["event"]["forecast"]
+
+    assert forecast1 == snapshot
+
+    with patch(
+        "homeassistant.components.aemet.AEMET.api_call",
+        side_effect=mock_api_call,
+    ):
+        freezer.tick(WEATHER_UPDATE_INTERVAL + dt.timedelta(seconds=1))
+        await hass.async_block_till_done()
+        msg = await client.receive_json()
+
+    assert msg["id"] == subscription_id
+    assert msg["type"] == "event"
+    forecast2 = msg["event"]["forecast"]
+
+    assert forecast2 == snapshot

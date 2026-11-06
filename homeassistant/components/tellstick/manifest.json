@@ -1,9 +1,12 @@
 {
   "domain": "tellstick",
   "name": "TellStick",
-  "documentation": "https://www.home-assistant.io/integrations/tellstick",
-  "requirements": ["tellcore-net==0.4", "tellcore-py==1.1.2"],
+  "categories": ["hubs_protocols.wireless_protocols"],
   "codeowners": [],
+  "connectivity": ["rf"],
+  "documentation": "https://www.home-assistant.io/integrations/tellstick",
   "iot_class": "assumed_state",
-  "loggers": ["tellcore"]
+  "loggers": ["tellcore"],
+  "quality_scale": "legacy",
+  "requirements": ["tellcore-net==0.4", "tellcore-py==1.1.3"]
 }

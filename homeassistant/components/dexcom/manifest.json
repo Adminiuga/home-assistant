@@ -1,10 +1,13 @@
 {
   "domain": "dexcom",
   "name": "Dexcom",
-  "config_flow": true,
-  "documentation": "https://www.home-assistant.io/integrations/dexcom",
-  "requirements": ["pydexcom==0.2.3"],
+  "categories": ["health_wellbeing"],
   "codeowners": ["@gagebenne"],
+  "config_flow": true,
+  "connectivity": ["cloud"],
+  "documentation": "https://www.home-assistant.io/integrations/dexcom",
+  "integration_type": "service",
   "iot_class": "cloud_polling",
-  "loggers": ["pydexcom"]
+  "loggers": ["pydexcom"],
+  "requirements": ["pydexcom==0.5.1"]
 }

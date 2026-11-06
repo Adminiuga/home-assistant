@@ -1,17 +1,22 @@
 """Test reproduce state for Automation."""
-from homeassistant.core import State
+
+import pytest
+from pytest_homeassistant.common import async_mock_service
+
+from homeassistant.components.automation import DOMAIN
+from homeassistant.core import HomeAssistant, State
 from homeassistant.helpers.state import async_reproduce_state
 
-from tests.common import async_mock_service
 
-
-async def test_reproducing_states(hass, caplog):
+async def test_reproducing_states(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
     """Test reproducing Automation states."""
     hass.states.async_set("automation.entity_off", "off", {})
     hass.states.async_set("automation.entity_on", "on", {})
 
-    turn_on_calls = async_mock_service(hass, "automation", "turn_on")
-    turn_off_calls = async_mock_service(hass, "automation", "turn_off")
+    turn_on_calls = async_mock_service(hass, DOMAIN, "turn_on")
+    turn_off_calls = async_mock_service(hass, DOMAIN, "turn_off")
 
     # These calls should do nothing as entities already in desired state
     await async_reproduce_state(

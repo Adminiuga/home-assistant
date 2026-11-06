@@ -1,10 +1,11 @@
 """The tests for the wake on lan switch platform."""
-import subprocess
-from unittest.mock import patch
 
-import pytest
+from unittest.mock import AsyncMock, patch
 
-import homeassistant.components.switch as switch
+from pytest_homeassistant.common import async_mock_service
+
+from homeassistant.components import switch
+from homeassistant.components.wake_on_lan.switch import WolSwitch
 from homeassistant.const import (
     ATTR_ENTITY_ID,
     SERVICE_TURN_OFF,
@@ -12,19 +13,14 @@ from homeassistant.const import (
     STATE_OFF,
     STATE_ON,
 )
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.setup import async_setup_component
 
-from tests.common import async_mock_service
 
-
-@pytest.fixture(autouse=True)
-def mock_send_magic_packet():
-    """Mock magic packet."""
-    with patch("wakeonlan.send_magic_packet") as mock_send:
-        yield mock_send
-
-
-async def test_valid_hostname(hass):
+async def test_valid_hostname(
+    hass: HomeAssistant, mock_send_magic_packet: AsyncMock
+) -> None:
     """Test with valid hostname."""
     assert await async_setup_component(
         hass,
@@ -42,14 +38,14 @@ async def test_valid_hostname(hass):
     state = hass.states.get("switch.wake_on_lan")
     assert state.state == STATE_OFF
 
-    with patch.object(subprocess, "call", return_value=0):
-
+    with patch("homeassistant.components.wake_on_lan.switch.sp.call", return_value=0):
         await hass.services.async_call(
             switch.DOMAIN,
             SERVICE_TURN_ON,
             {ATTR_ENTITY_ID: "switch.wake_on_lan"},
             blocking=True,
         )
+        await hass.async_block_till_done()
 
         state = hass.states.get("switch.wake_on_lan")
         assert state.state == STATE_ON
@@ -60,14 +56,17 @@ async def test_valid_hostname(hass):
             {ATTR_ENTITY_ID: "switch.wake_on_lan"},
             blocking=True,
         )
+        await hass.async_block_till_done()
 
         state = hass.states.get("switch.wake_on_lan")
         assert state.state == STATE_ON
 
 
-async def test_broadcast_config_ip_and_port(hass, mock_send_magic_packet):
+async def test_broadcast_config_ip_and_port(
+    hass: HomeAssistant, mock_send_magic_packet: AsyncMock
+) -> None:
     """Test with broadcast address and broadcast port config."""
-    mac = "00-01-02-03-04-05"
+    mac = "00:01:02:03:04:05"
     broadcast_address = "255.255.255.255"
     port = 999
 
@@ -88,24 +87,25 @@ async def test_broadcast_config_ip_and_port(hass, mock_send_magic_packet):
     state = hass.states.get("switch.wake_on_lan")
     assert state.state == STATE_OFF
 
-    with patch.object(subprocess, "call", return_value=0):
+    await hass.services.async_call(
+        switch.DOMAIN,
+        SERVICE_TURN_ON,
+        {ATTR_ENTITY_ID: "switch.wake_on_lan"},
+        blocking=True,
+    )
 
-        await hass.services.async_call(
-            switch.DOMAIN,
-            SERVICE_TURN_ON,
-            {ATTR_ENTITY_ID: "switch.wake_on_lan"},
-            blocking=True,
-        )
-
-        mock_send_magic_packet.assert_called_with(
-            mac, ip_address=broadcast_address, port=port
-        )
+    mac = dr.format_mac(mac)
+    mock_send_magic_packet.assert_called_with(
+        mac, ip_address=broadcast_address, port=port
+    )
 
 
-async def test_broadcast_config_ip(hass, mock_send_magic_packet):
+async def test_broadcast_config_ip(
+    hass: HomeAssistant, mock_send_magic_packet: AsyncMock
+) -> None:
     """Test with only broadcast address."""
 
-    mac = "00-01-02-03-04-05"
+    mac = "00:01:02:03:04:05"
     broadcast_address = "255.255.255.255"
 
     assert await async_setup_component(
@@ -124,22 +124,23 @@ async def test_broadcast_config_ip(hass, mock_send_magic_packet):
     state = hass.states.get("switch.wake_on_lan")
     assert state.state == STATE_OFF
 
-    with patch.object(subprocess, "call", return_value=0):
+    await hass.services.async_call(
+        switch.DOMAIN,
+        SERVICE_TURN_ON,
+        {ATTR_ENTITY_ID: "switch.wake_on_lan"},
+        blocking=True,
+    )
 
-        await hass.services.async_call(
-            switch.DOMAIN,
-            SERVICE_TURN_ON,
-            {ATTR_ENTITY_ID: "switch.wake_on_lan"},
-            blocking=True,
-        )
-
-        mock_send_magic_packet.assert_called_with(mac, ip_address=broadcast_address)
+    mac = dr.format_mac(mac)
+    mock_send_magic_packet.assert_called_with(mac, ip_address=broadcast_address)
 
 
-async def test_broadcast_config_port(hass, mock_send_magic_packet):
+async def test_broadcast_config_port(
+    hass: HomeAssistant, mock_send_magic_packet: AsyncMock
+) -> None:
     """Test with only broadcast port config."""
 
-    mac = "00-01-02-03-04-05"
+    mac = "00:01:02:03:04:05"
     port = 999
 
     assert await async_setup_component(
@@ -152,19 +153,20 @@ async def test_broadcast_config_port(hass, mock_send_magic_packet):
     state = hass.states.get("switch.wake_on_lan")
     assert state.state == STATE_OFF
 
-    with patch.object(subprocess, "call", return_value=0):
+    await hass.services.async_call(
+        switch.DOMAIN,
+        SERVICE_TURN_ON,
+        {ATTR_ENTITY_ID: "switch.wake_on_lan"},
+        blocking=True,
+    )
 
-        await hass.services.async_call(
-            switch.DOMAIN,
-            SERVICE_TURN_ON,
-            {ATTR_ENTITY_ID: "switch.wake_on_lan"},
-            blocking=True,
-        )
-
-        mock_send_magic_packet.assert_called_with(mac, port=port)
+    mac = dr.format_mac(mac)
+    mock_send_magic_packet.assert_called_with(mac, port=port)
 
 
-async def test_off_script(hass):
+async def test_off_script(
+    hass: HomeAssistant, mock_send_magic_packet: AsyncMock
+) -> None:
     """Test with turn off script."""
 
     assert await async_setup_component(
@@ -185,34 +187,36 @@ async def test_off_script(hass):
     state = hass.states.get("switch.wake_on_lan")
     assert state.state == STATE_OFF
 
-    with patch.object(subprocess, "call", return_value=0):
-
+    with patch("homeassistant.components.wake_on_lan.switch.sp.call", return_value=0):
         await hass.services.async_call(
             switch.DOMAIN,
             SERVICE_TURN_ON,
             {ATTR_ENTITY_ID: "switch.wake_on_lan"},
             blocking=True,
         )
+        await hass.async_block_till_done()
 
         state = hass.states.get("switch.wake_on_lan")
         assert state.state == STATE_ON
         assert len(calls) == 0
 
-    with patch.object(subprocess, "call", return_value=2):
-
+    with patch("homeassistant.components.wake_on_lan.switch.sp.call", return_value=1):
         await hass.services.async_call(
             switch.DOMAIN,
             SERVICE_TURN_OFF,
             {ATTR_ENTITY_ID: "switch.wake_on_lan"},
             blocking=True,
         )
+        await hass.async_block_till_done()
 
         state = hass.states.get("switch.wake_on_lan")
         assert state.state == STATE_OFF
         assert len(calls) == 1
 
 
-async def test_no_hostname_state(hass):
+async def test_no_hostname_state(
+    hass: HomeAssistant, mock_send_magic_packet: AsyncMock
+) -> None:
     """Test that the state updates if we do not pass in a hostname."""
 
     assert await async_setup_component(
@@ -230,24 +234,139 @@ async def test_no_hostname_state(hass):
     state = hass.states.get("switch.wake_on_lan")
     assert state.state == STATE_OFF
 
-    with patch.object(subprocess, "call", return_value=0):
+    await hass.services.async_call(
+        switch.DOMAIN,
+        SERVICE_TURN_ON,
+        {ATTR_ENTITY_ID: "switch.wake_on_lan"},
+        blocking=True,
+    )
+    await hass.async_block_till_done()
 
-        await hass.services.async_call(
-            switch.DOMAIN,
-            SERVICE_TURN_ON,
-            {ATTR_ENTITY_ID: "switch.wake_on_lan"},
-            blocking=True,
-        )
+    state = hass.states.get("switch.wake_on_lan")
+    assert state.state == STATE_ON
 
-        state = hass.states.get("switch.wake_on_lan")
-        assert state.state == STATE_ON
+    await hass.services.async_call(
+        switch.DOMAIN,
+        SERVICE_TURN_OFF,
+        {ATTR_ENTITY_ID: "switch.wake_on_lan"},
+        blocking=True,
+    )
+    await hass.async_block_till_done()
 
+    state = hass.states.get("switch.wake_on_lan")
+    assert state.state == STATE_OFF
+
+
+async def test_remove_unloads_off_script(
+    hass: HomeAssistant, mock_send_magic_packet: AsyncMock
+) -> None:
+    """Test that removing the WOL switch unloads the off script."""
+    assert await async_setup_component(
+        hass,
+        switch.DOMAIN,
+        {
+            "switch": {
+                "platform": "wake_on_lan",
+                "mac": "00-01-02-03-04-05",
+                "host": "validhostname",
+                "turn_off": {"service": "shell_command.turn_off_target"},
+            }
+        },
+    )
+    await hass.async_block_till_done()
+
+    entity = hass.data[switch.DOMAIN].get_entity("switch.wake_on_lan")
+    assert isinstance(entity, WolSwitch)
+    assert entity._off_script is not None
+
+    with (
+        patch.object(
+            entity._off_script,
+            "async_stop",
+            wraps=entity._off_script.async_stop,
+        ) as stop_mock,
+        patch.object(
+            entity._off_script,
+            "async_unload",
+            wraps=entity._off_script.async_unload,
+        ) as unload_mock,
+    ):
+        await entity.async_remove()
+        await hass.async_block_till_done()
+
+    stop_mock.assert_called_once()
+    unload_mock.assert_called_once()
+
+
+async def test_changed_entity_id(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    mock_send_magic_packet: AsyncMock,
+) -> None:
+    """Test that the WOL switch still works after its entity_id is changed."""
+    assert await async_setup_component(
+        hass,
+        switch.DOMAIN,
+        {
+            "switch": {
+                "platform": "wake_on_lan",
+                "mac": "00-01-02-03-04-05",
+                "host": "validhostname",
+                "turn_off": {"service": "shell_command.turn_off_target"},
+            }
+        },
+    )
+    await hass.async_block_till_done()
+    calls = async_mock_service(hass, "shell_command", "turn_off_target")
+
+    state = hass.states.get("switch.wake_on_lan")
+    assert state is not None
+
+    # Turn off should work
+    with patch("homeassistant.components.wake_on_lan.switch.sp.call", return_value=1):
         await hass.services.async_call(
             switch.DOMAIN,
             SERVICE_TURN_OFF,
             {ATTR_ENTITY_ID: "switch.wake_on_lan"},
             blocking=True,
         )
+        await hass.async_block_till_done()
+    assert len(calls) == 1
 
-        state = hass.states.get("switch.wake_on_lan")
-        assert state.state == STATE_OFF
+    entity = hass.data[switch.DOMAIN].get_entity("switch.wake_on_lan")
+    assert isinstance(entity, WolSwitch)
+    assert entity._off_script is not None
+
+    # Change entity_id while loaded
+    with (
+        patch.object(
+            entity._off_script,
+            "async_stop",
+            wraps=entity._off_script.async_stop,
+        ) as stop_mock,
+        patch.object(
+            entity._off_script,
+            "async_unload",
+            wraps=entity._off_script.async_unload,
+        ) as unload_mock,
+    ):
+        entity_registry.async_update_entity(
+            "switch.wake_on_lan", new_entity_id="switch.custom_wol"
+        )
+        await hass.async_block_till_done()
+
+    # The entity is not removed, so the off script is neither stopped nor unloaded
+    stop_mock.assert_not_called()
+    unload_mock.assert_not_called()
+    assert hass.states.get("switch.wake_on_lan") is None
+
+    # Turn off should still work after entity_id change
+    with patch("homeassistant.components.wake_on_lan.switch.sp.call", return_value=1):
+        await hass.services.async_call(
+            switch.DOMAIN,
+            SERVICE_TURN_OFF,
+            {ATTR_ENTITY_ID: "switch.custom_wol"},
+            blocking=True,
+        )
+        await hass.async_block_till_done()
+    assert len(calls) == 2

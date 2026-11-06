@@ -1,6 +1,9 @@
 """The tests for the Canary sensor platform."""
+
 from datetime import timedelta
 from unittest.mock import patch
+
+from pytest_homeassistant.common import async_fire_time_changed
 
 from homeassistant.components.canary.const import DOMAIN, MANUFACTURER
 from homeassistant.components.canary.sensor import (
@@ -14,23 +17,22 @@ from homeassistant.const import (
     ATTR_UNIT_OF_MEASUREMENT,
     PERCENTAGE,
     SIGNAL_STRENGTH_DECIBELS_MILLIWATT,
-    TEMP_CELSIUS,
+    UnitOfTemperature,
 )
-from homeassistant.helpers.entity_component import async_update_entity
-from homeassistant.setup import async_setup_component
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.util.dt import utcnow
 
-from . import mock_device, mock_location, mock_reading
-
-from tests.common import async_fire_time_changed, mock_device_registry, mock_registry
+from . import init_integration, mock_device, mock_location, mock_reading
 
 
-async def test_sensors_pro(hass, canary) -> None:
+async def test_sensors_pro(
+    hass: HomeAssistant,
+    canary,
+    device_registry: dr.DeviceRegistry,
+    entity_registry: er.EntityRegistry,
+) -> None:
     """Test the creation and values of the sensors for Canary Pro."""
-
-    registry = mock_registry(hass)
-    device_registry = mock_device_registry(hass)
-
     online_device_at_home = mock_device(20, "Dining Room", True, "Canary Pro")
 
     instance = canary.return_value
@@ -44,27 +46,25 @@ async def test_sensors_pro(hass, canary) -> None:
         mock_reading("air_quality", "0.59"),
     ]
 
-    config = {DOMAIN: {"username": "test-username", "password": "test-password"}}
     with patch("homeassistant.components.canary.PLATFORMS", ["sensor"]):
-        assert await async_setup_component(hass, DOMAIN, config)
-        await hass.async_block_till_done()
+        entry = await init_integration(hass)
 
     sensors = {
-        "home_dining_room_temperature": (
+        "dining_room_home_dining_room_temperature": (
             "20_temperature",
             "21.12",
-            TEMP_CELSIUS,
+            UnitOfTemperature.CELSIUS,
             SensorDeviceClass.TEMPERATURE,
             None,
         ),
-        "home_dining_room_humidity": (
+        "dining_room_home_dining_room_humidity": (
             "20_humidity",
             "50.46",
             PERCENTAGE,
             SensorDeviceClass.HUMIDITY,
             None,
         ),
-        "home_dining_room_air_quality": (
+        "dining_room_home_dining_room_air_quality": (
             "20_air_quality",
             "0.59",
             None,
@@ -73,8 +73,8 @@ async def test_sensors_pro(hass, canary) -> None:
         ),
     }
 
-    for (sensor_id, data) in sensors.items():
-        entity_entry = registry.async_get(f"sensor.{sensor_id}")
+    for sensor_id, data in sensors.items():
+        entity_entry = entity_registry.async_get(f"sensor.{sensor_id}")
         assert entity_entry
         assert entity_entry.original_device_class == data[3]
         assert entity_entry.unique_id == data[0]
@@ -85,14 +85,16 @@ async def test_sensors_pro(hass, canary) -> None:
         assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) == data[2]
         assert state.state == data[1]
 
-    device = device_registry.async_get_device({(DOMAIN, "20")})
+    device = device_registry.async_get_device_by_identifier(
+        (DOMAIN, "20"), entry.entry_id
+    )
     assert device
     assert device.manufacturer == MANUFACTURER
     assert device.name == "Dining Room"
     assert device.model == "Canary Pro"
 
 
-async def test_sensors_attributes_pro(hass, canary) -> None:
+async def test_sensors_attributes_pro(hass: HomeAssistant, canary) -> None:
     """Test the creation and values of the sensors attributes for Canary Pro."""
 
     online_device_at_home = mock_device(20, "Dining Room", True, "Canary Pro")
@@ -108,12 +110,10 @@ async def test_sensors_attributes_pro(hass, canary) -> None:
         mock_reading("air_quality", "0.59"),
     ]
 
-    config = {DOMAIN: {"username": "test-username", "password": "test-password"}}
     with patch("homeassistant.components.canary.PLATFORMS", ["sensor"]):
-        assert await async_setup_component(hass, DOMAIN, config)
-        await hass.async_block_till_done()
+        await init_integration(hass)
 
-    entity_id = "sensor.home_dining_room_air_quality"
+    entity_id = "sensor.dining_room_home_dining_room_air_quality"
     state1 = hass.states.get(entity_id)
     assert state1
     assert state1.state == "0.59"
@@ -127,8 +127,7 @@ async def test_sensors_attributes_pro(hass, canary) -> None:
 
     future = utcnow() + timedelta(seconds=30)
     async_fire_time_changed(hass, future)
-    await async_update_entity(hass, entity_id)
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
 
     state2 = hass.states.get(entity_id)
     assert state2
@@ -143,8 +142,7 @@ async def test_sensors_attributes_pro(hass, canary) -> None:
 
     future += timedelta(seconds=30)
     async_fire_time_changed(hass, future)
-    await async_update_entity(hass, entity_id)
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
 
     state3 = hass.states.get(entity_id)
     assert state3
@@ -152,12 +150,13 @@ async def test_sensors_attributes_pro(hass, canary) -> None:
     assert state3.attributes[ATTR_AIR_QUALITY] == STATE_AIR_QUALITY_NORMAL
 
 
-async def test_sensors_flex(hass, canary) -> None:
+async def test_sensors_flex(
+    hass: HomeAssistant,
+    canary,
+    device_registry: dr.DeviceRegistry,
+    entity_registry: er.EntityRegistry,
+) -> None:
     """Test the creation and values of the sensors for Canary Flex."""
-
-    registry = mock_registry(hass)
-    device_registry = mock_device_registry(hass)
-
     online_device_at_home = mock_device(20, "Dining Room", True, "Canary Flex")
 
     instance = canary.return_value
@@ -170,20 +169,18 @@ async def test_sensors_flex(hass, canary) -> None:
         mock_reading("wifi", "-57"),
     ]
 
-    config = {DOMAIN: {"username": "test-username", "password": "test-password"}}
     with patch("homeassistant.components.canary.PLATFORMS", ["sensor"]):
-        assert await async_setup_component(hass, DOMAIN, config)
-        await hass.async_block_till_done()
+        entry = await init_integration(hass)
 
     sensors = {
-        "home_dining_room_battery": (
+        "dining_room_home_dining_room_battery": (
             "20_battery",
             "70.46",
             PERCENTAGE,
             SensorDeviceClass.BATTERY,
             None,
         ),
-        "home_dining_room_wifi": (
+        "dining_room_home_dining_room_wifi": (
             "20_wifi",
             "-57.0",
             SIGNAL_STRENGTH_DECIBELS_MILLIWATT,
@@ -192,8 +189,8 @@ async def test_sensors_flex(hass, canary) -> None:
         ),
     }
 
-    for (sensor_id, data) in sensors.items():
-        entity_entry = registry.async_get(f"sensor.{sensor_id}")
+    for sensor_id, data in sensors.items():
+        entity_entry = entity_registry.async_get(f"sensor.{sensor_id}")
         assert entity_entry
         assert entity_entry.original_device_class == data[3]
         assert entity_entry.unique_id == data[0]
@@ -204,7 +201,9 @@ async def test_sensors_flex(hass, canary) -> None:
         assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) == data[2]
         assert state.state == data[1]
 
-    device = device_registry.async_get_device({(DOMAIN, "20")})
+    device = device_registry.async_get_device_by_identifier(
+        (DOMAIN, "20"), entry.entry_id
+    )
     assert device
     assert device.manufacturer == MANUFACTURER
     assert device.name == "Dining Room"

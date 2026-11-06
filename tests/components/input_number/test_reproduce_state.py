@@ -1,5 +1,9 @@
 """Test reproduce state for Input number."""
-from homeassistant.core import State
+
+import pytest
+
+from homeassistant.components.input_number import DOMAIN
+from homeassistant.core import HomeAssistant, State
 from homeassistant.helpers.state import async_reproduce_state
 from homeassistant.setup import async_setup_component
 
@@ -7,12 +11,14 @@ VALID_NUMBER1 = "19.0"
 VALID_NUMBER2 = "99.9"
 
 
-async def test_reproducing_states(hass, caplog):
+async def test_reproducing_states(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
     """Test reproducing Input number states."""
 
     assert await async_setup_component(
         hass,
-        "input_number",
+        DOMAIN,
         {
             "input_number": {
                 "test_number": {"min": "5", "max": "100", "initial": VALID_NUMBER1}
@@ -47,7 +53,8 @@ async def test_reproducing_states(hass, caplog):
     # Test setting state to number out of range
     await async_reproduce_state(hass, [State("input_number.test_number", "150")])
 
-    # The entity states should be unchanged after trying to set them to out-of-range number
+    # The entity states should be unchanged after trying to set
+    # them to out-of-range number
     assert hass.states.get("input_number.test_number").state == VALID_NUMBER2
 
     await async_reproduce_state(

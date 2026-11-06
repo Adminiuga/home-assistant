@@ -1,13 +1,23 @@
 """Config flow for Tankerkoenig."""
-from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, override
 
-from pytankerkoenig import customException, getNearbyStations
-import voluptuous as vol
+from aiotankerkoenig import (
+    GasType,
+    Sort,
+    Station,
+    Tankerkoenig,
+    TankerkoenigError,
+    TankerkoenigInvalidKeyError,
+)
+import probatio
 
-from homeassistant import config_entries
+from homeassistant.config_entries import (
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlowWithReload,
+)
 from homeassistant.const import (
     CONF_API_KEY,
     CONF_LATITUDE,
@@ -16,39 +26,37 @@ from homeassistant.const import (
     CONF_NAME,
     CONF_RADIUS,
     CONF_SHOW_ON_MAP,
-    LENGTH_KILOMETERS,
+    UnitOfLength,
 )
-from homeassistant.core import HomeAssistant, callback
-from homeassistant.data_entry_flow import FlowResult
-import homeassistant.helpers.config_validation as cv
+from homeassistant.core import callback
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.selector import (
     LocationSelector,
     NumberSelector,
     NumberSelectorConfig,
 )
 
-from .const import CONF_FUEL_TYPES, CONF_STATIONS, DEFAULT_RADIUS, DOMAIN, FUEL_TYPES
+from .const import CONF_STATIONS, DEFAULT_RADIUS, DOMAIN
+from .coordinator import TankerkoenigConfigEntry
 
 
 async def async_get_nearby_stations(
-    hass: HomeAssistant, data: Mapping[str, Any]
-) -> dict[str, Any]:
+    tankerkoenig: Tankerkoenig, data: Mapping[str, Any]
+) -> list[Station]:
     """Fetch nearby stations."""
-    try:
-        return await hass.async_add_executor_job(
-            getNearbyStations,
-            data[CONF_API_KEY],
+    return await tankerkoenig.nearby_stations(
+        coordinates=(
             data[CONF_LOCATION][CONF_LATITUDE],
             data[CONF_LOCATION][CONF_LONGITUDE],
-            data[CONF_RADIUS],
-            "all",
-            "dist",
-        )
-    except customException as err:
-        return {"ok": False, "message": err, "exception": True}
+        ),
+        radius=data[CONF_RADIUS],
+        gas_type=GasType.ALL,
+        sort=Sort.DISTANCE,
+    )
 
 
-class FlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
+class FlowHandler(ConfigFlow, domain=DOMAIN):
     """Handle a config flow."""
 
     VERSION = 1
@@ -61,46 +69,17 @@ class FlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
 
     @staticmethod
     @callback
+    @override
     def async_get_options_flow(
-        config_entry: config_entries.ConfigEntry,
+        config_entry: TankerkoenigConfigEntry,
     ) -> OptionsFlowHandler:
         """Get the options flow for this handler."""
-        return OptionsFlowHandler(config_entry)
+        return OptionsFlowHandler()
 
-    async def async_step_import(self, config: dict[str, Any]) -> FlowResult:
-        """Import YAML configuration."""
-        await self.async_set_unique_id(
-            f"{config[CONF_LOCATION][CONF_LATITUDE]}_{config[CONF_LOCATION][CONF_LONGITUDE]}"
-        )
-        self._abort_if_unique_id_configured()
-
-        selected_station_ids: list[str] = []
-        # add all nearby stations
-        nearby_stations = await async_get_nearby_stations(self.hass, config)
-        for station in nearby_stations.get("stations", []):
-            selected_station_ids.append(station["id"])
-
-        # add all manual added stations
-        for station_id in config[CONF_STATIONS]:
-            selected_station_ids.append(station_id)
-
-        return self._create_entry(
-            data={
-                CONF_NAME: "Home",
-                CONF_API_KEY: config[CONF_API_KEY],
-                CONF_FUEL_TYPES: config[CONF_FUEL_TYPES],
-                CONF_LOCATION: config[CONF_LOCATION],
-                CONF_RADIUS: config[CONF_RADIUS],
-                CONF_STATIONS: selected_station_ids,
-            },
-            options={
-                CONF_SHOW_ON_MAP: config[CONF_SHOW_ON_MAP],
-            },
-        )
-
+    @override
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle a flow initialized by the user."""
         if not user_input:
             return self._show_form_user()
@@ -110,17 +89,28 @@ class FlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         )
         self._abort_if_unique_id_configured()
 
-        data = await async_get_nearby_stations(self.hass, user_input)
-        if not data.get("ok"):
+        tankerkoenig = Tankerkoenig(
+            api_key=user_input[CONF_API_KEY],
+            session=async_get_clientsession(self.hass),
+        )
+        try:
+            stations = await async_get_nearby_stations(tankerkoenig, user_input)
+        except TankerkoenigInvalidKeyError:
             return self._show_form_user(
                 user_input, errors={CONF_API_KEY: "invalid_auth"}
             )
-        if len(stations := data.get("stations", [])) == 0:
+        except TankerkoenigError:
+            return self._show_form_user(user_input, errors={"base": "cannot_connect"})
+
+        # no stations found
+        if len(stations) == 0:
             return self._show_form_user(user_input, errors={CONF_RADIUS: "no_stations"})
+
         for station in stations:
-            self._stations[
-                station["id"]
-            ] = f"{station['brand']} {station['street']} {station['houseNumber']} - ({station['dist']}km)"
+            self._stations[station.id] = (
+                f"{station.brand} {station.street} {station.house_number} -"
+                f" ({station.distance}km)"
+            )
 
         self._data = user_input
 
@@ -128,14 +118,14 @@ class FlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
 
     async def async_step_select_station(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle the step select_station of a flow initialized by the user."""
         if not user_input:
             return self.async_show_form(
                 step_id="select_station",
                 description_placeholders={"stations_count": str(len(self._stations))},
-                data_schema=vol.Schema(
-                    {vol.Required(CONF_STATIONS): cv.multi_select(self._stations)}
+                data_schema=probatio.Schema(
+                    {probatio.Required(CONF_STATIONS): cv.multi_select(self._stations)}
                 ),
             )
 
@@ -144,50 +134,56 @@ class FlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             options={CONF_SHOW_ON_MAP: True},
         )
 
-    async def async_step_reauth(self, entry_data: Mapping[str, Any]) -> FlowResult:
+    async def async_step_reauth(
+        self, entry_data: Mapping[str, Any]
+    ) -> ConfigFlowResult:
         """Perform reauth upon an API authentication error."""
         return await self.async_step_reauth_confirm()
 
     async def async_step_reauth_confirm(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Perform reauth confirm upon an API authentication error."""
         if not user_input:
             return self._show_form_reauth()
 
-        entry = self.hass.config_entries.async_get_entry(self.context["entry_id"])
-        assert entry
-        user_input = {**entry.data, **user_input}
-        data = await async_get_nearby_stations(self.hass, user_input)
-        if not data.get("ok"):
-            return self._show_form_reauth(user_input, {CONF_API_KEY: "invalid_auth"})
+        reauth_entry = self._get_reauth_entry()
+        user_input = {**reauth_entry.data, **user_input}
 
-        self.hass.config_entries.async_update_entry(entry, data=user_input)
-        await self.hass.config_entries.async_reload(entry.entry_id)
-        return self.async_abort(reason="reauth_successful")
+        tankerkoenig = Tankerkoenig(
+            api_key=user_input[CONF_API_KEY],
+            session=async_get_clientsession(self.hass),
+        )
+        try:
+            await async_get_nearby_stations(tankerkoenig, user_input)
+        except TankerkoenigInvalidKeyError:
+            return self._show_form_reauth(user_input, {CONF_API_KEY: "invalid_auth"})
+        except TankerkoenigError:
+            return self._show_form_reauth(user_input, {"base": "cannot_connect"})
+
+        return self.async_update_reload_and_abort(reauth_entry, data=user_input)
 
     def _show_form_user(
         self,
         user_input: dict[str, Any] | None = None,
         errors: dict[str, Any] | None = None,
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         if user_input is None:
             user_input = {}
         return self.async_show_form(
             step_id="user",
-            data_schema=vol.Schema(
+            data_schema=probatio.Schema(
                 {
-                    vol.Required(
+                    # Name field is no longer allowed in config flow schemas
+                    # pylint: disable-next=home-assistant-config-flow-name-field
+                    probatio.Required(
                         CONF_NAME, default=user_input.get(CONF_NAME, "")
                     ): cv.string,
-                    vol.Required(
-                        CONF_API_KEY, default=user_input.get(CONF_API_KEY, "")
+                    probatio.Required(
+                        probatio.Secret(CONF_API_KEY),
+                        default=user_input.get(CONF_API_KEY, ""),
                     ): cv.string,
-                    vol.Required(
-                        CONF_FUEL_TYPES,
-                        default=user_input.get(CONF_FUEL_TYPES, list(FUEL_TYPES)),
-                    ): cv.multi_select(FUEL_TYPES),
-                    vol.Required(
+                    probatio.Required(
                         CONF_LOCATION,
                         default=user_input.get(
                             CONF_LOCATION,
@@ -197,14 +193,14 @@ class FlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
                             },
                         ),
                     ): LocationSelector(),
-                    vol.Required(
+                    probatio.Required(
                         CONF_RADIUS, default=user_input.get(CONF_RADIUS, DEFAULT_RADIUS)
                     ): NumberSelector(
                         NumberSelectorConfig(
                             min=1.0,
                             max=25,
                             step=0.1,
-                            unit_of_measurement=LENGTH_KILOMETERS,
+                            unit_of_measurement=UnitOfLength.KILOMETERS,
                         ),
                     ),
                 }
@@ -216,15 +212,16 @@ class FlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         self,
         user_input: dict[str, Any] | None = None,
         errors: dict[str, Any] | None = None,
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         if user_input is None:
             user_input = {}
         return self.async_show_form(
             step_id="reauth_confirm",
-            data_schema=vol.Schema(
+            data_schema=probatio.Schema(
                 {
-                    vol.Required(
-                        CONF_API_KEY, default=user_input.get(CONF_API_KEY, "")
+                    probatio.Required(
+                        probatio.Secret(CONF_API_KEY),
+                        default=user_input.get(CONF_API_KEY, ""),
                     ): cv.string,
                 }
             ),
@@ -233,7 +230,7 @@ class FlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
 
     def _create_entry(
         self, data: dict[str, Any], options: dict[str, Any]
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         return self.async_create_entry(
             title=data[CONF_NAME],
             data=data,
@@ -241,17 +238,16 @@ class FlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
 
-class OptionsFlowHandler(config_entries.OptionsFlow):
+class OptionsFlowHandler(OptionsFlowWithReload):
     """Handle an options flow."""
 
-    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
+    def __init__(self) -> None:
         """Initialize options flow."""
-        self.config_entry = config_entry
         self._stations: dict[str, str] = {}
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle options flow."""
         if user_input is not None:
             self.hass.config_entries.async_update_entry(
@@ -263,14 +259,25 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
             )
             return self.async_create_entry(title="", data=user_input)
 
-        nearby_stations = await async_get_nearby_stations(
-            self.hass, self.config_entry.data
+        tankerkoenig = Tankerkoenig(
+            api_key=self.config_entry.data[CONF_API_KEY],
+            session=async_get_clientsession(self.hass),
         )
-        if stations := nearby_stations.get("stations"):
+        try:
+            stations = await async_get_nearby_stations(
+                tankerkoenig, self.config_entry.data
+            )
+        except TankerkoenigInvalidKeyError:
+            return self.async_show_form(step_id="init", errors={"base": "invalid_auth"})
+        except TankerkoenigError:
+            return self.async_abort(reason="cannot_connect")
+
+        if stations:
             for station in stations:
-                self._stations[
-                    station["id"]
-                ] = f"{station['brand']} {station['street']} {station['houseNumber']} - ({station['dist']}km)"
+                self._stations[station.id] = (
+                    f"{station.brand} {station.street} {station.house_number} -"
+                    f" ({station.distance}km)"
+                )
 
         # add possible extra selected stations from import
         for selected_station in self.config_entry.data[CONF_STATIONS]:
@@ -279,13 +286,13 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
 
         return self.async_show_form(
             step_id="init",
-            data_schema=vol.Schema(
+            data_schema=probatio.Schema(
                 {
-                    vol.Required(
+                    probatio.Required(
                         CONF_SHOW_ON_MAP,
                         default=self.config_entry.options[CONF_SHOW_ON_MAP],
                     ): bool,
-                    vol.Required(
+                    probatio.Required(
                         CONF_STATIONS, default=self.config_entry.data[CONF_STATIONS]
                     ): cv.multi_select(self._stations),
                 }

@@ -1,8 +1,7 @@
 """Provide functionality to stream HLS."""
-from __future__ import annotations
 
 from http import HTTPStatus
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, cast, override
 
 from aiohttp import web
 
@@ -27,6 +26,8 @@ from .core import (
 from .fmp4utils import get_codec_string, transform_init
 
 if TYPE_CHECKING:
+    from homeassistant.components.camera import DynamicStreamSettings
+
     from . import Stream
 
 
@@ -50,16 +51,25 @@ class HlsStreamOutput(StreamOutput):
         hass: HomeAssistant,
         idle_timer: IdleTimer,
         stream_settings: StreamSettings,
+        dynamic_stream_settings: DynamicStreamSettings,
     ) -> None:
         """Initialize HLS output."""
-        super().__init__(hass, idle_timer, stream_settings, deque_maxlen=MAX_SEGMENTS)
+        super().__init__(
+            hass,
+            idle_timer,
+            stream_settings,
+            dynamic_stream_settings,
+            deque_maxlen=MAX_SEGMENTS,
+        )
         self._target_duration = stream_settings.min_segment_duration
 
     @property
+    @override
     def name(self) -> str:
         """Return provider name."""
         return HLS_PROVIDER
 
+    @override
     def cleanup(self) -> None:
         """Handle cleanup."""
         super().cleanup()
@@ -71,6 +81,7 @@ class HlsStreamOutput(StreamOutput):
         return self._target_duration
 
     @callback
+    @override
     def _async_put(self, segment: Segment) -> None:
         """Async put and also update the target duration.
 
@@ -111,8 +122,10 @@ class HlsMasterPlaylistView(StreamView):
     @staticmethod
     def render(track: StreamOutput) -> str:
         """Render M3U8 file."""
-        # Need to calculate max bandwidth as input_container.bit_rate doesn't seem to work
-        # Calculate file size / duration and use a small multiplier to account for variation
+        # Need to calculate max bandwidth as
+        # input_container.bit_rate doesn't seem to work.
+        # Calculate file size / duration and use a small
+        # multiplier to account for variation
         # hls spec already allows for 25% variation
         if not (segment := track.get_segment(track.sequences[-2])):
             return ""
@@ -125,6 +138,7 @@ class HlsMasterPlaylistView(StreamView):
         ]
         return "\n".join(lines) + "\n"
 
+    @override
     async def handle(
         self, request: web.Request, stream: Stream, sequence: str, part_num: str
     ) -> web.Response:
@@ -176,11 +190,15 @@ class HlsPlaylistView(StreamView):
         ]
 
         if track.stream_settings.ll_hls:
+            part_dur = track.stream_settings.part_target_duration
+            start_offset = EXT_X_START_LL_HLS * part_dur
             playlist.extend(
                 [
-                    f"#EXT-X-PART-INF:PART-TARGET={track.stream_settings.part_target_duration:.3f}",
-                    f"#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK={2*track.stream_settings.part_target_duration:.3f}",
-                    f"#EXT-X-START:TIME-OFFSET=-{EXT_X_START_LL_HLS*track.stream_settings.part_target_duration:.3f},PRECISE=YES",
+                    "#EXT-X-PART-INF:PART-TARGET="
+                    f"{track.stream_settings.part_target_duration:.3f}",
+                    "#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK="
+                    f"{2 * track.stream_settings.part_target_duration:.3f}",
+                    f"#EXT-X-START:TIME-OFFSET=-{start_offset:.3f},PRECISE=YES",
                 ]
             )
         else:
@@ -193,7 +211,9 @@ class HlsPlaylistView(StreamView):
             # which seems to take precedence for setting target delay. Yet it also
             # doesn't seem to hurt, so we can stick with it for now.
             playlist.append(
-                f"#EXT-X-START:TIME-OFFSET=-{EXT_X_START_NON_LL_HLS*track.target_duration:.3f},PRECISE=YES"
+                "#EXT-X-START:TIME-OFFSET=-"
+                f"{EXT_X_START_NON_LL_HLS * track.target_duration:.3f}"
+                ",PRECISE=YES"
             )
 
         last_stream_id = first_segment.stream_id
@@ -238,6 +258,7 @@ class HlsPlaylistView(StreamView):
             status=HTTPStatus.NOT_FOUND,
         )
 
+    @override
     async def handle(
         self, request: web.Request, stream: Stream, sequence: str, part_num: str
     ) -> web.Response:
@@ -331,6 +352,7 @@ class HlsInitView(StreamView):
     name = "api:stream:hls:init"
     cors_allowed = True
 
+    @override
     async def handle(
         self, request: web.Request, stream: Stream, sequence: str, part_num: str
     ) -> web.Response:
@@ -339,7 +361,7 @@ class HlsInitView(StreamView):
         if not (segments := track.get_segments()) or not (body := segments[0].init):
             return web.HTTPNotFound()
         return web.Response(
-            body=transform_init(body, stream.orientation),
+            body=transform_init(body, stream.dynamic_stream_settings.orientation),
             headers={"Content-Type": "video/mp4"},
         )
 
@@ -351,6 +373,7 @@ class HlsPartView(StreamView):
     name = "api:stream:hls:part"
     cors_allowed = True
 
+    @override
     async def handle(
         self, request: web.Request, stream: Stream, sequence: str, part_num: str
     ) -> web.Response:
@@ -393,6 +416,7 @@ class HlsSegmentView(StreamView):
     name = "api:stream:hls:segment"
     cors_allowed = True
 
+    @override
     async def handle(
         self, request: web.Request, stream: Stream, sequence: str, part_num: str
     ) -> web.StreamResponse:

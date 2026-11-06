@@ -1,5 +1,6 @@
 """Support for the Rainforest Eagle energy monitor."""
-from __future__ import annotations
+
+from typing import override
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
@@ -7,37 +8,35 @@ from homeassistant.components.sensor import (
     SensorEntityDescription,
     SensorStateClass,
 )
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import ENERGY_KILO_WATT_HOUR, POWER_KILO_WATT
+from homeassistant.const import UnitOfEnergy, UnitOfPower
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity import DeviceInfo
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.typing import StateType
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN
-from .data import EagleDataCoordinator
+from .const import DOMAIN, SUMMATION_DELIVERED, SUMMATION_RECEIVED
+from .coordinator import EagleDataCoordinator, RainforestEagleConfigEntry
 
 SENSORS = (
     SensorEntityDescription(
         key="zigbee:InstantaneousDemand",
-        # We can drop the "Eagle-200" part of the name in HA 2021.12
-        name="Eagle-200 Meter Power Demand",
-        native_unit_of_measurement=POWER_KILO_WATT,
+        translation_key="power_demand",
+        native_unit_of_measurement=UnitOfPower.KILO_WATT,
         device_class=SensorDeviceClass.POWER,
         state_class=SensorStateClass.MEASUREMENT,
     ),
     SensorEntityDescription(
-        key="zigbee:CurrentSummationDelivered",
-        name="Eagle-200 Total Meter Energy Delivered",
-        native_unit_of_measurement=ENERGY_KILO_WATT_HOUR,
+        key=SUMMATION_DELIVERED,
+        translation_key="total_energy_delivered",
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
         device_class=SensorDeviceClass.ENERGY,
         state_class=SensorStateClass.TOTAL_INCREASING,
     ),
     SensorEntityDescription(
-        key="zigbee:CurrentSummationReceived",
-        name="Eagle-200 Total Meter Energy Received",
-        native_unit_of_measurement=ENERGY_KILO_WATT_HOUR,
+        key=SUMMATION_RECEIVED,
+        translation_key="total_energy_received",
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
         device_class=SensorDeviceClass.ENERGY,
         state_class=SensorStateClass.TOTAL_INCREASING,
     ),
@@ -45,10 +44,12 @@ SENSORS = (
 
 
 async def async_setup_entry(
-    hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
+    hass: HomeAssistant,
+    entry: RainforestEagleConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up a config entry."""
-    coordinator = hass.data[DOMAIN][entry.entry_id]
+    coordinator = entry.runtime_data
     entities = [EagleSensor(coordinator, description) for description in SENSORS]
 
     if coordinator.data.get("zigbee:Price") not in (None, "invalid"):
@@ -57,8 +58,8 @@ async def async_setup_entry(
                 coordinator,
                 SensorEntityDescription(
                     key="zigbee:Price",
-                    name="Meter Price",
-                    native_unit_of_measurement=f"{coordinator.data['zigbee:PriceCurrency']}/{ENERGY_KILO_WATT_HOUR}",
+                    translation_key="energy_price",
+                    native_unit_of_measurement=f"{coordinator.data['zigbee:PriceCurrency']}/{UnitOfEnergy.KILO_WATT_HOUR}",
                     state_class=SensorStateClass.MEASUREMENT,
                 ),
             )
@@ -70,32 +71,32 @@ async def async_setup_entry(
 class EagleSensor(CoordinatorEntity[EagleDataCoordinator], SensorEntity):
     """Implementation of the Rainforest Eagle sensor."""
 
+    _attr_has_entity_name = True
+
     def __init__(self, coordinator, entity_description):
         """Initialize the sensor."""
         super().__init__(coordinator)
         self.entity_description = entity_description
+        self._attr_unique_id = (
+            f"{coordinator.cloud_id}"
+            f"-${coordinator.hardware_address}"
+            f"-{entity_description.key}"
+        )
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, coordinator.cloud_id)},
+            manufacturer="Rainforest Automation",
+            model=coordinator.model,
+            name=coordinator.model,
+        )
 
     @property
-    def unique_id(self) -> str | None:
-        """Return unique ID of entity."""
-        return f"{self.coordinator.cloud_id}-${self.coordinator.hardware_address}-{self.entity_description.key}"
-
-    @property
+    @override
     def available(self) -> bool:
         """Return if entity is available."""
         return super().available and self.coordinator.is_connected
 
     @property
+    @override
     def native_value(self) -> StateType:
         """Return native value of the sensor."""
         return self.coordinator.data.get(self.entity_description.key)
-
-    @property
-    def device_info(self) -> DeviceInfo:
-        """Return device info."""
-        return DeviceInfo(
-            identifiers={(DOMAIN, self.coordinator.cloud_id)},
-            manufacturer="Rainforest Automation",
-            model=self.coordinator.model,
-            name=self.coordinator.model,
-        )

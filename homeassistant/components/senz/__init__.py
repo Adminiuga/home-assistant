@@ -1,99 +1,109 @@
 """The nVent RAYCHEM SENZ integration."""
-from __future__ import annotations
 
-from datetime import timedelta
+from http import HTTPStatus
 import logging
 
-from aiosenz import SENZAPI, Thermostat
-from httpx import RequestError
+from aiohttp import ClientResponseError
+from httpx2 import HTTPStatusError, RequestError
+import jwt
+from pysenz import SENZAPI
 
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryNotReady
-from homeassistant.helpers import (
-    config_entry_oauth2_flow,
-    config_validation as cv,
-    httpx_client,
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.helpers import config_validation as cv, httpx_client
+from homeassistant.helpers.config_entry_oauth2_flow import (
+    OAuth2Session,
+    async_get_config_entry_implementation,
 )
-from homeassistant.helpers.issue_registry import IssueSeverity, async_create_issue
-from homeassistant.helpers.typing import ConfigType
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import SENZConfigEntryAuth
 from .const import DOMAIN
-
-UPDATE_INTERVAL = timedelta(seconds=30)
+from .coordinator import SENZConfigEntry, SENZDataUpdateCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
-CONFIG_SCHEMA = cv.removed(DOMAIN, raise_if_present=False)
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
-PLATFORMS = [Platform.CLIMATE]
-
-SENZDataUpdateCoordinator = DataUpdateCoordinator[dict[str, Thermostat]]
+PLATFORMS = [Platform.CLIMATE, Platform.SENSOR]
 
 
-async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    """Set up the SENZ integration."""
-    if DOMAIN in config:
-        async_create_issue(
-            hass,
-            DOMAIN,
-            "removed_yaml",
-            breaks_in_ha_version="2022.8.0",
-            is_fixable=False,
-            severity=IssueSeverity.WARNING,
-            translation_key="removed_yaml",
-        )
-
-    return True
-
-
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_setup_entry(hass: HomeAssistant, entry: SENZConfigEntry) -> None:
     """Set up SENZ from a config entry."""
-    implementation = (
-        await config_entry_oauth2_flow.async_get_config_entry_implementation(
-            hass, entry
-        )
-    )
-    session = config_entry_oauth2_flow.OAuth2Session(hass, entry, implementation)
+    implementation = await async_get_config_entry_implementation(hass, entry)
+    session = OAuth2Session(hass, entry, implementation)
     auth = SENZConfigEntryAuth(httpx_client.get_async_client(hass), session)
     senz_api = SENZAPI(auth)
 
-    async def update_thermostats() -> dict[str, Thermostat]:
-        """Fetch SENZ thermostats data."""
-        try:
-            thermostats = await senz_api.get_thermostats()
-        except RequestError as err:
-            raise UpdateFailed from err
-        return {thermostat.serial_number: thermostat for thermostat in thermostats}
-
     try:
         account = await senz_api.get_account()
+    except HTTPStatusError as err:
+        if err.response.status_code == HTTPStatus.UNAUTHORIZED:
+            raise ConfigEntryAuthFailed(
+                translation_domain=DOMAIN,
+                translation_key="config_entry_auth_failed",
+            ) from err
+        raise ConfigEntryNotReady(
+            translation_domain=DOMAIN,
+            translation_key="config_entry_not_ready",
+        ) from err
+    except ClientResponseError as err:
+        if err.status in (HTTPStatus.UNAUTHORIZED, HTTPStatus.BAD_REQUEST):
+            raise ConfigEntryAuthFailed(
+                translation_domain=DOMAIN,
+                translation_key="config_entry_auth_failed",
+            ) from err
+        raise ConfigEntryNotReady(
+            translation_domain=DOMAIN,
+            translation_key="config_entry_not_ready",
+        ) from err
     except RequestError as err:
-        raise ConfigEntryNotReady from err
+        raise ConfigEntryNotReady(
+            translation_domain=DOMAIN,
+            translation_key="config_entry_not_ready",
+        ) from err
+    except Exception as err:
+        raise ConfigEntryAuthFailed(
+            translation_domain=DOMAIN,
+            translation_key="config_entry_auth_failed",
+        ) from err
 
     coordinator = SENZDataUpdateCoordinator(
         hass,
-        _LOGGER,
+        entry,
         name=account.username,
-        update_interval=UPDATE_INTERVAL,
-        update_method=update_thermostats,
+        senz_api=senz_api,
     )
 
     await coordinator.async_config_entry_first_refresh()
 
-    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
+    entry.runtime_data = coordinator
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    return True
 
-
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_unload_entry(hass: HomeAssistant, entry: SENZConfigEntry) -> None:
     """Unload a config entry."""
-    if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
-        hass.data[DOMAIN].pop(entry.entry_id)
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)
 
-    return unload_ok
+
+async def async_migrate_entry(
+    hass: HomeAssistant, config_entry: SENZConfigEntry
+) -> None:
+    """Migrate old entry."""
+
+    # Use sub(ject) from access_token as unique_id
+    if config_entry.version == 1 and config_entry.minor_version == 1:
+        token = jwt.decode(
+            config_entry.data["token"]["access_token"],
+            options={"verify_signature": False},
+        )
+        uid = token["sub"]
+        hass.config_entries.async_update_entry(
+            config_entry, unique_id=uid, minor_version=2
+        )
+        _LOGGER.info(
+            "Migration to version %s.%s successful",
+            config_entry.version,
+            config_entry.minor_version,
+        )

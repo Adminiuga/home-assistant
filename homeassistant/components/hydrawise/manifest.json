@@ -1,9 +1,13 @@
 {
   "domain": "hydrawise",
   "name": "Hunter Hydrawise",
+  "categories": ["garden_plants"],
+  "codeowners": ["@dknowles2", "@thomaskistler", "@ptcryan", "@frenck"],
+  "config_flow": true,
+  "connectivity": ["cloud"],
   "documentation": "https://www.home-assistant.io/integrations/hydrawise",
-  "requirements": ["hydrawiser==0.2"],
-  "codeowners": ["@ptcryan"],
+  "integration_type": "hub",
   "iot_class": "cloud_polling",
-  "loggers": ["hydrawiser"]
+  "loggers": ["pydrawise"],
+  "requirements": ["pydrawise==2026.10.1"]
 }

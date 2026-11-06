@@ -5,14 +5,15 @@ from unittest.mock import patch
 import pytest
 
 from homeassistant import config_entries
+from homeassistant.components.application_credentials import (
+    DOMAIN as APPLICATION_CREDENTIALS_DOMAIN,
+    ClientCredential,
+    async_import_client_credential,
+)
 from homeassistant.components.NEW_DOMAIN.const import (
     DOMAIN,
     OAUTH2_AUTHORIZE,
     OAUTH2_TOKEN,
-)
-from homeassistant.components.application_credentials import (
-    ClientCredential,
-    async_import_client_credential,
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import config_entry_oauth2_flow
@@ -25,7 +26,7 @@ CLIENT_SECRET = "5678"
 @pytest.fixture
 async def setup_credentials(hass: HomeAssistant) -> None:
     """Fixture to setup credentials."""
-    assert await async_setup_component(hass, "application_credentials", {})
+    assert await async_setup_component(hass, APPLICATION_CREDENTIALS_DOMAIN, {})
     await async_import_client_credential(
         hass,
         DOMAIN,
@@ -42,9 +43,9 @@ async def test_full_flow(
 ) -> None:
     """Check full flow."""
     result = await hass.config_entries.flow.async_init(
-        "NEW_DOMAIN", context={"source": config_entries.SOURCE_USER}
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
     )
-    state = config_entry_oauth2_flow._encode_jwt(
+    state = config_entry_oauth2_flow._encode_jwt(  # noqa: SLF001
         hass,
         {
             "flow_id": result["flow_id"],
@@ -74,7 +75,7 @@ async def test_full_flow(
     )
 
     with patch(
-        "homeassistant.components.NEW_DOMAIN.async_setup_entry", return_value=True
+        "homeassistant.components.NEW_DOMAIN.async_setup_entry", return_value=None
     ) as mock_setup:
         await hass.config_entries.flow.async_configure(result["flow_id"])
 

@@ -1,35 +1,24 @@
 """Tests for Tomorrow.io sensor entities."""
-from __future__ import annotations
 
 from datetime import datetime
 from typing import Any
-from unittest.mock import patch
 
+from freezegun import freeze_time
 import pytest
+from pytest_homeassistant.common import async_fire_time_changed
 
-from homeassistant.components.sensor import DOMAIN as SENSOR_DOMAIN
-from homeassistant.components.tomorrowio.config_flow import (
-    _get_config_schema,
-    _get_unique_id,
-)
-from homeassistant.components.tomorrowio.const import (
-    ATTRIBUTION,
-    CONF_TIMESTEP,
-    DEFAULT_NAME,
-    DEFAULT_TIMESTEP,
-    DOMAIN,
-)
+from homeassistant.components.sensor import DOMAIN as SENSOR_DOMAIN, async_rounded_state
+from homeassistant.components.tomorrowio.const import ATTRIBUTION
 from homeassistant.components.tomorrowio.sensor import TomorrowioSensorEntityDescription
-from homeassistant.config_entries import SOURCE_USER
-from homeassistant.const import ATTR_ATTRIBUTION, CONF_NAME
+from homeassistant.config_entries import RELOAD_AFTER_UPDATE_DELAY
+from homeassistant.const import ATTR_ATTRIBUTION
 from homeassistant.core import HomeAssistant, State, callback
-from homeassistant.helpers.entity_registry import async_get
+from homeassistant.helpers import entity_registry as er
 from homeassistant.util import dt as dt_util
 from homeassistant.util.unit_system import US_CUSTOMARY_SYSTEM
 
+from . import make_v2_config_entry
 from .const import API_V4_ENTRY_DATA
-
-from tests.common import MockConfigEntry
 
 CC_SENSOR_ENTITY_ID = "sensor.tomorrow_io_{}"
 
@@ -37,8 +26,8 @@ O3 = "ozone"
 CO = "carbon_monoxide"
 NO2 = "nitrogen_dioxide"
 SO2 = "sulphur_dioxide"
-PM25 = "particulate_matter_2_5_mm"
-PM10 = "particulate_matter_10_mm"
+PM25 = "pm2_5"
+PM10 = "pm10"
 MEP_AQI = "china_mep_air_quality_index"
 MEP_HEALTH_CONCERN = "china_mep_health_concern"
 MEP_PRIMARY_POLLUTANT = "china_mep_primary_pollutant"
@@ -51,15 +40,18 @@ WEED_POLLEN = "weed_pollen_index"
 TREE_POLLEN = "tree_pollen_index"
 FEELS_LIKE = "feels_like"
 DEW_POINT = "dew_point"
-PRESSURE_SURFACE_LEVEL = "pressure_surface_level"
+PRESSURE_SURFACE_LEVEL = "pressure"
 SNOW_ACCUMULATION = "snow_accumulation"
 ICE_ACCUMULATION = "ice_accumulation"
-GHI = "global_horizontal_irradiance"
+GHI = "irradiance"
 CLOUD_BASE = "cloud_base"
 CLOUD_COVER = "cloud_cover"
 CLOUD_CEILING = "cloud_ceiling"
 WIND_GUST = "wind_gust"
 PRECIPITATION_TYPE = "precipitation_type"
+UV_INDEX = "uv_index"
+UV_HEALTH_CONCERN = "uv_radiation_health_concern"
+
 
 V3_FIELDS = [
     O3,
@@ -91,17 +83,17 @@ V4_FIELDS = [
     CLOUD_CEILING,
     WIND_GUST,
     PRECIPITATION_TYPE,
+    UV_INDEX,
+    UV_HEALTH_CONCERN,
 ]
 
 
 @callback
 def _enable_entity(hass: HomeAssistant, entity_name: str) -> None:
     """Enable disabled entity."""
-    ent_reg = async_get(hass)
+    ent_reg = er.async_get(hass)
     entry = ent_reg.async_get(entity_name)
-    updated_entry = ent_reg.async_update_entity(
-        entry.entity_id, **{"disabled_by": None}
-    )
+    updated_entry = ent_reg.async_update_entity(entry.entity_id, disabled_by=None)
     assert updated_entry != entry
     assert updated_entry.disabled is False
 
@@ -110,33 +102,29 @@ async def _setup(
     hass: HomeAssistant, sensors: list[str], config: dict[str, Any]
 ) -> State:
     """Set up entry and return entity state."""
-    with patch(
-        "homeassistant.util.dt.utcnow",
-        return_value=datetime(2021, 3, 6, 23, 59, 59, tzinfo=dt_util.UTC),
-    ):
-        data = _get_config_schema(hass, SOURCE_USER)(config)
-        data[CONF_NAME] = DEFAULT_NAME
-        config_entry = MockConfigEntry(
-            domain=DOMAIN,
-            data=data,
-            options={CONF_TIMESTEP: DEFAULT_TIMESTEP},
-            unique_id=_get_unique_id(hass, data),
-            version=1,
-        )
+    with freeze_time(
+        datetime(2021, 3, 6, 23, 59, 59, tzinfo=dt_util.UTC)
+    ) as frozen_time:
+        config_entry = make_v2_config_entry(data=config)
         config_entry.add_to_hass(hass)
         assert await hass.config_entries.async_setup(config_entry.entry_id)
         await hass.async_block_till_done()
         for entity_name in sensors:
             _enable_entity(hass, CC_SENSOR_ENTITY_ID.format(entity_name))
         await hass.async_block_till_done()
+        # the enabled entity state will be fired in RELOAD_AFTER_UPDATE_DELAY
+        frozen_time.tick(delta=RELOAD_AFTER_UPDATE_DELAY)
+        async_fire_time_changed(hass)
+        await hass.async_block_till_done()
         assert len(hass.states.async_entity_ids(SENSOR_DOMAIN)) == len(sensors)
 
 
 def check_sensor_state(hass: HomeAssistant, entity_name: str, value: str):
     """Check the state of a Tomorrow.io sensor."""
-    state = hass.states.get(CC_SENSOR_ENTITY_ID.format(entity_name))
+    entity_id = CC_SENSOR_ENTITY_ID.format(entity_name)
+    state = hass.states.get(entity_id)
     assert state
-    assert state.state == value
+    assert async_rounded_state(hass, entity_id, state) == value
     assert state.attributes[ATTR_ATTRIBUTION] == ATTRIBUTION
 
 
@@ -160,7 +148,7 @@ async def test_v4_sensor(hass: HomeAssistant) -> None:
     check_sensor_state(hass, WEED_POLLEN, "none")
     check_sensor_state(hass, TREE_POLLEN, "none")
     check_sensor_state(hass, FEELS_LIKE, "101.3")
-    check_sensor_state(hass, DEW_POINT, "72.82")
+    check_sensor_state(hass, DEW_POINT, "72.8")
     check_sensor_state(hass, PRESSURE_SURFACE_LEVEL, "29.47")
     check_sensor_state(hass, GHI, "0")
     check_sensor_state(hass, CLOUD_BASE, "0.74")
@@ -168,6 +156,8 @@ async def test_v4_sensor(hass: HomeAssistant) -> None:
     check_sensor_state(hass, CLOUD_CEILING, "0.74")
     check_sensor_state(hass, WIND_GUST, "12.64")
     check_sensor_state(hass, PRECIPITATION_TYPE, "rain")
+    check_sensor_state(hass, UV_INDEX, "3")
+    check_sensor_state(hass, UV_HEALTH_CONCERN, "moderate")
 
 
 async def test_v4_sensor_imperial(hass: HomeAssistant) -> None:
@@ -191,14 +181,16 @@ async def test_v4_sensor_imperial(hass: HomeAssistant) -> None:
     check_sensor_state(hass, WEED_POLLEN, "none")
     check_sensor_state(hass, TREE_POLLEN, "none")
     check_sensor_state(hass, FEELS_LIKE, "214.3")
-    check_sensor_state(hass, DEW_POINT, "163.08")
-    check_sensor_state(hass, PRESSURE_SURFACE_LEVEL, "29.47")
+    check_sensor_state(hass, DEW_POINT, "163.1")
+    check_sensor_state(hass, PRESSURE_SURFACE_LEVEL, "0.43")
     check_sensor_state(hass, GHI, "0.0")
     check_sensor_state(hass, CLOUD_BASE, "0.46")
     check_sensor_state(hass, CLOUD_COVER, "100")
     check_sensor_state(hass, CLOUD_CEILING, "0.46")
     check_sensor_state(hass, WIND_GUST, "28.27")
     check_sensor_state(hass, PRECIPITATION_TYPE, "rain")
+    check_sensor_state(hass, UV_INDEX, "3")
+    check_sensor_state(hass, UV_HEALTH_CONCERN, "moderate")
 
 
 async def test_entity_description() -> None:

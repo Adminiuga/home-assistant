@@ -1,49 +1,258 @@
 """Support for esphome selects."""
-from __future__ import annotations
 
-from aioesphomeapi import SelectInfo, SelectState
+from dataclasses import replace
+from typing import override
 
-from homeassistant.components.select import SelectEntity
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from aioesphomeapi import EntityInfo, SelectInfo, SelectState
 
-from . import EsphomeEntity, esphome_state_property, platform_async_setup_entry
+from homeassistant.components.assist_pipeline import (
+    AssistPipelineSelect,
+    VadSensitivitySelect,
+    indexed_select_key,
+)
+from homeassistant.components.assist_satellite import AssistSatelliteConfiguration
+from homeassistant.components.select import SelectEntity, SelectEntityDescription
+from homeassistant.const import EntityCategory
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import restore_state
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+
+from .const import (
+    DOMAIN,
+    NO_WAKE_WORD,
+    VOICE_ASSISTANT_SELECT_COUNT,
+    WAKE_WORD_SELECT_KEY,
+)
+from .entity import (
+    EsphomeAssistEntity,
+    EsphomeEntity,
+    convert_api_error_ha_error,
+    esphome_state_property,
+    platform_async_setup_entry,
+)
+from .entry_data import ESPHomeConfigEntry, RuntimeEntryData
+
+PARALLEL_UPDATES = 0
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    entry: ESPHomeConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up esphome selects based on a config entry."""
     await platform_async_setup_entry(
         hass,
         entry,
         async_add_entities,
-        component_key="select",
         info_type=SelectInfo,
         entity_type=EsphomeSelect,
         state_type=SelectState,
     )
 
+    entry_data = entry.runtime_data
+    added = False
+
+    @callback
+    def _async_add_voice_assistant_selects() -> None:
+        """Add the voice assistant selects while the device offers one."""
+        nonlocal added
+        if (device_info := entry_data.device_info) is None:
+            return
+        if not device_info.voice_assistant_feature_flags_compat(entry_data.api_version):
+            added = False
+            return
+        if not added:
+            added = True
+            async_add_entities(_voice_assistant_selects(hass, entry_data))
+
+    _async_add_voice_assistant_selects()
+    entry.async_on_unload(
+        entry_data.async_subscribe_device_updated(_async_add_voice_assistant_selects)
+    )
+
+
+def _voice_assistant_selects(
+    hass: HomeAssistant, entry_data: RuntimeEntryData
+) -> list[SelectEntity]:
+    """Build the selects that exist only while the device offers a voice assistant."""
+    return [
+        *(
+            EsphomeAssistPipelineSelect(hass, entry_data, index=index)
+            for index in range(VOICE_ASSISTANT_SELECT_COUNT)
+        ),
+        EsphomeVadSensitivitySelect(hass, entry_data),
+        *(
+            EsphomeAssistSatelliteWakeWordSelect(entry_data, index=index)
+            for index in range(VOICE_ASSISTANT_SELECT_COUNT)
+        ),
+    ]
+
 
 class EsphomeSelect(EsphomeEntity[SelectInfo, SelectState], SelectEntity):
     """A select implementation for esphome."""
 
-    @property
-    def options(self) -> list[str]:
-        """Return a set of selectable options."""
-        return self._static_info.options
+    @callback
+    @override
+    def _on_static_info_update(self, static_info: EntityInfo) -> None:
+        """Set attrs from static info."""
+        super()._on_static_info_update(static_info)
+        self._attr_options = self._static_info.options
 
     @property
     @esphome_state_property
+    @override
     def current_option(self) -> str | None:
         """Return the state of the entity."""
-        if self._state.missing_state:
-            return None
-        return self._state.state
+        state = self._state
+        return None if state.missing_state else state.state
 
+    @convert_api_error_ha_error
+    @override
     async def async_select_option(self, option: str) -> None:
         """Change the selected option."""
-        await self._client.select_command(self._static_info.key, option)
+        self._client.select_command(
+            self._key, option, device_id=self._static_info.device_id
+        )
+
+
+class EsphomeAssistPipelineSelect(EsphomeAssistEntity, AssistPipelineSelect):
+    """Pipeline selector for esphome devices."""
+
+    def __init__(
+        self, hass: HomeAssistant, entry_data: RuntimeEntryData, index: int = 0
+    ) -> None:
+        """Initialize a pipeline selector."""
+        EsphomeAssistEntity.__init__(self, entry_data)
+        AssistPipelineSelect.__init__(
+            self, hass, DOMAIN, self._device_info.mac_address, index=index
+        )
+
+
+class EsphomeVadSensitivitySelect(EsphomeAssistEntity, VadSensitivitySelect):
+    """VAD sensitivity selector for ESPHome devices."""
+
+    def __init__(self, hass: HomeAssistant, entry_data: RuntimeEntryData) -> None:
+        """Initialize a VAD sensitivity selector."""
+        EsphomeAssistEntity.__init__(self, entry_data)
+        VadSensitivitySelect.__init__(self, hass, self._device_info.mac_address)
+
+
+class EsphomeAssistSatelliteWakeWordSelect(
+    EsphomeAssistEntity, SelectEntity, restore_state.RestoreEntity
+):
+    """Wake word selector for esphome devices."""
+
+    entity_description = SelectEntityDescription(
+        key=WAKE_WORD_SELECT_KEY,
+        translation_key="wake_word",
+        entity_category=EntityCategory.CONFIG,
+    )
+
+    _attr_current_option: str | None = None
+    _attr_options: list[str] = [NO_WAKE_WORD]
+
+    def __init__(self, entry_data: RuntimeEntryData, index: int = 0) -> None:
+        """Initialize a wake word selector."""
+        if index >= 1:
+            self.entity_description = replace(
+                self.entity_description,
+                key=indexed_select_key(WAKE_WORD_SELECT_KEY, index),
+                translation_key="wake_word_n",
+                translation_placeholders={"index": str(index + 1)},
+            )
+
+        EsphomeAssistEntity.__init__(self, entry_data)
+
+        unique_id_prefix = self._device_info.mac_address
+        self._attr_unique_id = f"{unique_id_prefix}-{self.entity_description.key}"
+
+        # name -> id
+        self._wake_words: dict[str, str] = {}
+        self._wake_word_index = index
+
+    @property
+    @override
+    def available(self) -> bool:
+        """Return if entity is available."""
+        return len(self._attr_options) > 1  # more than just NO_WAKE_WORD
+
+    @override
+    async def async_added_to_hass(self) -> None:
+        """Run when entity about to be added to hass."""
+        await super().async_added_to_hass()
+
+        if last_state := await self.async_get_last_state():
+            self._attr_current_option = last_state.state
+
+        # Update options when config is updated
+        self.async_on_remove(
+            self._entry_data.async_register_assist_satellite_config_updated_callback(
+                self.async_satellite_config_updated
+            )
+        )
+
+    @override
+    async def async_select_option(self, option: str) -> None:
+        """Select an option."""
+        self._attr_current_option = option
+        self.async_write_ha_state()
+
+        wake_word_id = self._wake_words.get(option)
+        self._entry_data.async_assist_satellite_set_wake_word(
+            self._wake_word_index, wake_word_id
+        )
+
+    def async_satellite_config_updated(
+        self, config: AssistSatelliteConfiguration
+    ) -> None:
+        """Update options with available wake words."""
+        if (not config.available_wake_words) or (config.max_active_wake_words < 1):
+            # No wake words
+            self._wake_words.clear()
+            self._attr_current_option = NO_WAKE_WORD
+            self._attr_options = [NO_WAKE_WORD]
+            self._entry_data.assist_satellite_wake_words.pop(
+                self._wake_word_index, None
+            )
+            self.async_write_ha_state()
+            return
+
+        self._wake_words = {w.wake_word: w.id for w in config.available_wake_words}
+        self._attr_options = [NO_WAKE_WORD, *sorted(self._wake_words)]
+
+        option = self._attr_current_option
+
+        if (
+            (self._wake_word_index == 0)
+            and (len(config.active_wake_words) == 1)
+            and (option in (None, NO_WAKE_WORD))
+        ):
+            option = next(
+                (
+                    wake_word
+                    for wake_word, wake_word_id in self._wake_words.items()
+                    if wake_word_id == config.active_wake_words[0]
+                ),
+                None,
+            )
+
+        if (
+            (option is None)
+            or ((wake_word_id := self._wake_words.get(option)) is None)
+            or (wake_word_id not in config.active_wake_words)
+        ):
+            option = NO_WAKE_WORD
+
+        self._attr_current_option = option
+        self.async_write_ha_state()
+
+        # Keep entry data in sync
+        if wake_word_id := self._wake_words.get(option):
+            self._entry_data.assist_satellite_wake_words[self._wake_word_index] = (
+                wake_word_id
+            )
+        else:
+            self._entry_data.assist_satellite_wake_words.pop(
+                self._wake_word_index, None
+            )

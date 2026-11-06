@@ -1,0 +1,28 @@
+{
+  "entity": {
+    "event": {
+      "automatic_backup_event": {
+        "default": "mdi:database"
+      }
+    },
+    "sensor": {
+      "backup_manager_state": {
+        "default": "mdi:database",
+        "state": {
+          "blocked": "mdi:database-lock",
+          "create_backup": "mdi:database-export",
+          "receive_backup": "mdi:database-import",
+          "restore_backup": "mdi:database-sync"
+        }
+      }
+    }
+  },
+  "services": {
+    "create": {
+      "service": "mdi:cloud-upload"
+    },
+    "create_automatic": {
+      "service": "mdi:cloud-upload"
+    }
+  }
+}

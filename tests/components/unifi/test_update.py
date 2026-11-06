@@ -1,32 +1,43 @@
 """The tests for the UniFi Network update platform."""
-from copy import deepcopy
 
+from copy import deepcopy
+from unittest.mock import patch
+
+import aiounifi
 from aiounifi.models.message import MessageKey
-from aiounifi.websocket import WebsocketState
+import pytest
+from pytest_homeassistant.common import MockConfigEntry, snapshot_platform
+from pytest_homeassistant.test_util.aiohttp import AiohttpClientMocker
+from syrupy.assertion import SnapshotAssertion
 from yarl import URL
 
-from homeassistant.components.unifi.const import CONF_SITE_ID
+from homeassistant.components.unifi.const import CONF_SITE_ID, DOMAIN
 from homeassistant.components.update import (
     ATTR_IN_PROGRESS,
     ATTR_INSTALLED_VERSION,
     ATTR_LATEST_VERSION,
     DOMAIN as UPDATE_DOMAIN,
     SERVICE_INSTALL,
-    UpdateDeviceClass,
-    UpdateEntityFeature,
 )
 from homeassistant.const import (
-    ATTR_DEVICE_CLASS,
     ATTR_ENTITY_ID,
-    ATTR_SUPPORTED_FEATURES,
     CONF_HOST,
     STATE_OFF,
     STATE_ON,
     STATE_UNAVAILABLE,
+    Platform,
+)
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import entity_registry as er
+
+from .conftest import (
+    ConfigEntryFactoryType,
+    WebsocketMessageMock,
+    WebsocketStateManager,
 )
 
-from .test_controller import DESCRIPTION, setup_unifi_integration
-
+# Device with new firmware available
 DEVICE_1 = {
     "board_rev": 3,
     "device_id": "mock-id",
@@ -43,6 +54,7 @@ DEVICE_1 = {
     "upgrade_to_firmware": "4.3.17.11279",
 }
 
+# Device without new firmware available
 DEVICE_2 = {
     "board_rev": 3,
     "device_id": "mock-id",
@@ -56,54 +68,61 @@ DEVICE_2 = {
     "version": "4.0.42.10433",
 }
 
+# Gateway with an IPS engine upgrade queued
+GATEWAY_IPS = {
+    "device_id": "mock-gateway-id",
+    "ip": "10.0.0.1",
+    "mac": "00:00:00:00:02:01",
+    "model": "UDMA6A8",
+    "name": "Gateway",
+    "state": 1,
+    "type": "udm",
+    "version": "5.0.16.30692",
+    "suricata_version": 6,
+    "supported_suricata_version": 8,
+    "suricata_upgrade_pending_target": 8,
+}
+IPS_ENGINE_ENTITY_ID = "update.gateway_ips_engine"
 
-async def test_no_entities(hass, aioclient_mock):
-    """Test the update_clients function when no clients are found."""
-    await setup_unifi_integration(hass, aioclient_mock)
 
-    assert len(hass.states.async_entity_ids(UPDATE_DOMAIN)) == 0
+@pytest.mark.usefixtures("entity_registry_enabled_by_default")
+@pytest.mark.parametrize("device_payload", [[DEVICE_1, DEVICE_2, GATEWAY_IPS]])
+@pytest.mark.parametrize(
+    "site_payload",
+    [
+        [{"desc": "Site name", "name": "site_id", "role": "admin", "_id": "1"}],
+        [{"desc": "Site name", "name": "site_id", "role": "not admin", "_id": "1"}],
+    ],
+)
+async def test_entity_and_device_data(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    config_entry_factory: ConfigEntryFactoryType,
+    snapshot: SnapshotAssertion,
+) -> None:
+    """Validate entity and device data with and without admin rights."""
+    with patch("homeassistant.components.unifi.PLATFORMS", [Platform.UPDATE]):
+        config_entry = await config_entry_factory()
+    await snapshot_platform(hass, entity_registry, snapshot, config_entry.entry_id)
 
 
-async def test_device_updates(hass, aioclient_mock, mock_unifi_websocket):
+@pytest.mark.parametrize("device_payload", [[DEVICE_1]])
+@pytest.mark.usefixtures("config_entry_setup")
+async def test_device_updates(
+    hass: HomeAssistant, mock_websocket_message: WebsocketMessageMock
+) -> None:
     """Test the update_items function with some devices."""
-    device_1 = deepcopy(DEVICE_1)
-    await setup_unifi_integration(
-        hass,
-        aioclient_mock,
-        devices_response=[device_1, DEVICE_2],
-    )
-
-    assert len(hass.states.async_entity_ids(UPDATE_DOMAIN)) == 2
-
-    device_1_state = hass.states.get("update.device_1")
+    device_1_state = hass.states.get("update.device_1_firmware")
     assert device_1_state.state == STATE_ON
-    assert device_1_state.attributes[ATTR_INSTALLED_VERSION] == "4.0.42.10433"
-    assert device_1_state.attributes[ATTR_LATEST_VERSION] == "4.3.17.11279"
     assert device_1_state.attributes[ATTR_IN_PROGRESS] is False
-    assert device_1_state.attributes[ATTR_DEVICE_CLASS] == UpdateDeviceClass.FIRMWARE
-    assert (
-        device_1_state.attributes[ATTR_SUPPORTED_FEATURES]
-        == UpdateEntityFeature.PROGRESS | UpdateEntityFeature.INSTALL
-    )
-
-    device_2_state = hass.states.get("update.device_2")
-    assert device_2_state.state == STATE_OFF
-    assert device_2_state.attributes[ATTR_INSTALLED_VERSION] == "4.0.42.10433"
-    assert device_2_state.attributes[ATTR_LATEST_VERSION] == "4.0.42.10433"
-    assert device_2_state.attributes[ATTR_IN_PROGRESS] is False
-    assert device_2_state.attributes[ATTR_DEVICE_CLASS] == UpdateDeviceClass.FIRMWARE
-    assert (
-        device_2_state.attributes[ATTR_SUPPORTED_FEATURES]
-        == UpdateEntityFeature.PROGRESS | UpdateEntityFeature.INSTALL
-    )
 
     # Simulate start of update
 
+    device_1 = deepcopy(DEVICE_1)
     device_1["state"] = 4
-    mock_unifi_websocket(message=MessageKey.DEVICE, data=device_1)
-    await hass.async_block_till_done()
+    mock_websocket_message(message=MessageKey.DEVICE, data=device_1)
 
-    device_1_state = hass.states.get("update.device_1")
+    device_1_state = hass.states.get("update.device_1_firmware")
     assert device_1_state.state == STATE_ON
     assert device_1_state.attributes[ATTR_INSTALLED_VERSION] == "4.0.42.10433"
     assert device_1_state.attributes[ATTR_LATEST_VERSION] == "4.3.17.11279"
@@ -111,58 +130,40 @@ async def test_device_updates(hass, aioclient_mock, mock_unifi_websocket):
 
     # Simulate update finished
 
-    device_1["state"] = "0"
+    device_1["state"] = 0
     device_1["version"] = "4.3.17.11279"
     device_1["upgradable"] = False
     del device_1["upgrade_to_firmware"]
-    mock_unifi_websocket(message=MessageKey.DEVICE, data=device_1)
-    await hass.async_block_till_done()
+    mock_websocket_message(message=MessageKey.DEVICE, data=device_1)
 
-    device_1_state = hass.states.get("update.device_1")
+    device_1_state = hass.states.get("update.device_1_firmware")
     assert device_1_state.state == STATE_OFF
     assert device_1_state.attributes[ATTR_INSTALLED_VERSION] == "4.3.17.11279"
     assert device_1_state.attributes[ATTR_LATEST_VERSION] == "4.3.17.11279"
     assert device_1_state.attributes[ATTR_IN_PROGRESS] is False
 
 
-async def test_not_admin(hass, aioclient_mock):
-    """Test that the INSTALL feature is not available on a non-admin account."""
-    description = deepcopy(DESCRIPTION)
-    description[0]["site_role"] = "not admin"
-
-    await setup_unifi_integration(
-        hass,
-        aioclient_mock,
-        site_description=description,
-        devices_response=[DEVICE_1],
-    )
-
-    assert len(hass.states.async_entity_ids(UPDATE_DOMAIN)) == 1
-    device_state = hass.states.get("update.device_1")
-    assert device_state.state == STATE_ON
-    assert (
-        device_state.attributes[ATTR_SUPPORTED_FEATURES] == UpdateEntityFeature.PROGRESS
-    )
-
-
-async def test_install(hass, aioclient_mock):
+@pytest.mark.parametrize("device_payload", [[DEVICE_1]])
+async def test_install(
+    hass: HomeAssistant,
+    aioclient_mock: AiohttpClientMocker,
+    config_entry_setup: MockConfigEntry,
+) -> None:
     """Test the device update install call."""
-    config_entry = await setup_unifi_integration(
-        hass, aioclient_mock, devices_response=[DEVICE_1]
-    )
-
-    assert len(hass.states.async_entity_ids(UPDATE_DOMAIN)) == 1
-    device_state = hass.states.get("update.device_1")
+    device_state = hass.states.get("update.device_1_firmware")
     assert device_state.state == STATE_ON
 
-    url = f"https://{config_entry.data[CONF_HOST]}:1234/api/s/{config_entry.data[CONF_SITE_ID]}/cmd/devmgr"
+    url = (
+        f"https://{config_entry_setup.data[CONF_HOST]}:1234"
+        f"/api/s/{config_entry_setup.data[CONF_SITE_ID]}/cmd/devmgr"
+    )
     aioclient_mock.clear_requests()
     aioclient_mock.post(url)
 
     await hass.services.async_call(
         UPDATE_DOMAIN,
         SERVICE_INSTALL,
-        {ATTR_ENTITY_ID: "update.device_1"},
+        {ATTR_ENTITY_ID: "update.device_1_firmware"},
         blocking=True,
     )
     await hass.async_block_till_done()
@@ -176,25 +177,92 @@ async def test_install(hass, aioclient_mock):
     )
 
 
-async def test_controller_state_change(hass, aioclient_mock, mock_unifi_websocket):
-    """Verify entities state reflect on controller becoming unavailable."""
-    await setup_unifi_integration(
-        hass,
-        aioclient_mock,
-        devices_response=[DEVICE_1],
-    )
-
-    assert len(hass.states.async_entity_ids(UPDATE_DOMAIN)) == 1
-    assert hass.states.get("update.device_1").state == STATE_ON
+@pytest.mark.parametrize("device_payload", [[DEVICE_1]])
+@pytest.mark.usefixtures("config_entry_setup")
+async def test_hub_state_change(
+    hass: HomeAssistant, mock_websocket_state: WebsocketStateManager
+) -> None:
+    """Verify entities state reflect on hub becoming unavailable."""
+    assert hass.states.get("update.device_1_firmware").state == STATE_ON
 
     # Controller unavailable
-    mock_unifi_websocket(state=WebsocketState.DISCONNECTED)
-    await hass.async_block_till_done()
-
-    assert hass.states.get("update.device_1").state == STATE_UNAVAILABLE
+    await mock_websocket_state.disconnect()
+    assert hass.states.get("update.device_1_firmware").state == STATE_UNAVAILABLE
 
     # Controller available
-    mock_unifi_websocket(state=WebsocketState.RUNNING)
+    await mock_websocket_state.reconnect()
+    assert hass.states.get("update.device_1_firmware").state == STATE_ON
+
+
+@pytest.mark.parametrize("device_payload", [[DEVICE_1]])
+async def test_install_request_failed(
+    hass: HomeAssistant,
+    config_entry_setup: MockConfigEntry,
+) -> None:
+    """Verify HomeAssistantError is raised when install API request fails."""
+    with (
+        patch.object(
+            config_entry_setup.runtime_data.api,
+            "request",
+            side_effect=aiounifi.AiounifiException,
+        ),
+        pytest.raises(HomeAssistantError) as exc_info,
+    ):
+        await hass.services.async_call(
+            UPDATE_DOMAIN,
+            SERVICE_INSTALL,
+            {ATTR_ENTITY_ID: "update.device_1_firmware"},
+            blocking=True,
+        )
+    assert exc_info.value.translation_domain == DOMAIN
+    assert exc_info.value.translation_key == "action_request_failed"
+
+
+@pytest.mark.parametrize("device_payload", [[GATEWAY_IPS]])
+@pytest.mark.usefixtures("config_entry_setup")
+async def test_ips_engine_disabled_by_default(
+    hass: HomeAssistant, entity_registry: er.EntityRegistry
+) -> None:
+    """Test the IPS engine entity is disabled by default."""
+    assert hass.states.get(IPS_ENGINE_ENTITY_ID) is None
+    entry = entity_registry.async_get(IPS_ENGINE_ENTITY_ID)
+    assert entry.disabled_by is er.RegistryEntryDisabler.INTEGRATION
+
+
+@pytest.mark.parametrize("device_payload", [[GATEWAY_IPS]])
+@pytest.mark.usefixtures("entity_registry_enabled_by_default", "config_entry_setup")
+async def test_ips_engine_updates(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    mock_websocket_message: WebsocketMessageMock,
+) -> None:
+    """Test the IPS engine entity follows the gateway."""
+    assert hass.states.get(IPS_ENGINE_ENTITY_ID).state == STATE_ON
+
+    # Newer engine supported, but no upgrade queued
+    gateway = deepcopy(GATEWAY_IPS)
+    del gateway["suricata_upgrade_pending_target"]
+    mock_websocket_message(message=MessageKey.DEVICE, data=gateway)
+
+    state = hass.states.get(IPS_ENGINE_ENTITY_ID)
+    assert state.state == STATE_OFF
+    assert state.attributes[ATTR_INSTALLED_VERSION] == "6"
+    assert state.attributes[ATTR_LATEST_VERSION] == "6"
+
+    # Queued engine upgrade applied
+    gateway["suricata_version"] = 8
+    mock_websocket_message(message=MessageKey.DEVICE, data=gateway)
+
+    state = hass.states.get(IPS_ENGINE_ENTITY_ID)
+    assert state.state == STATE_OFF
+    assert state.attributes[ATTR_INSTALLED_VERSION] == "8"
+    assert state.attributes[ATTR_LATEST_VERSION] == "8"
+
+    # Engine no longer reported, the entity is removed
+    del gateway["suricata_version"]
+    del gateway["supported_suricata_version"]
+    mock_websocket_message(message=MessageKey.DEVICE, data=gateway)
     await hass.async_block_till_done()
 
-    assert hass.states.get("update.device_1").state == STATE_ON
+    assert hass.states.get(IPS_ENGINE_ENTITY_ID) is None
+    assert entity_registry.async_get(IPS_ENGINE_ENTITY_ID) is None

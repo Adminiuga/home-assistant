@@ -1,14 +1,20 @@
 """Test significant change helper."""
+
+from types import MappingProxyType
+from typing import Any
+
 import pytest
 
 from homeassistant.components.sensor import SensorDeviceClass
 from homeassistant.const import ATTR_DEVICE_CLASS, STATE_UNAVAILABLE, STATE_UNKNOWN
-from homeassistant.core import State
+from homeassistant.core import HomeAssistant, State
 from homeassistant.helpers import significant_change
 
 
 @pytest.fixture(name="checker")
-async def checker_fixture(hass):
+async def checker_fixture(
+    hass: HomeAssistant,
+) -> significant_change.SignificantlyChangedChecker:
     """Checker fixture."""
     checker = await significant_change.create_checker(hass, "test")
 
@@ -17,13 +23,15 @@ async def checker_fixture(hass):
     ):
         return abs(float(old_state) - float(new_state)) > 4
 
-    hass.data[significant_change.DATA_FUNCTIONS][
-        "test_domain"
-    ] = async_check_significant_change
+    hass.data[significant_change.DATA_FUNCTIONS]["test_domain"] = (
+        async_check_significant_change
+    )
     return checker
 
 
-async def test_signicant_change(hass, checker):
+async def test_signicant_change(
+    checker: significant_change.SignificantlyChangedChecker,
+) -> None:
     """Test initialize helper works."""
     ent_id = "test_domain.test_entity"
     attrs = {ATTR_DEVICE_CLASS: SensorDeviceClass.BATTERY}
@@ -47,7 +55,9 @@ async def test_signicant_change(hass, checker):
     assert checker.async_is_significant_change(State(ent_id, STATE_UNAVAILABLE, attrs))
 
 
-async def test_significant_change_extra(hass, checker):
+async def test_significant_change_extra(
+    checker: significant_change.SignificantlyChangedChecker,
+) -> None:
     """Test extra significant checker works."""
     ent_id = "test_domain.test_entity"
     attrs = {ATTR_DEVICE_CLASS: SensorDeviceClass.BATTERY}
@@ -60,15 +70,56 @@ async def test_significant_change_extra(hass, checker):
     assert checker.async_is_significant_change(State(ent_id, "100", attrs), extra_arg=1)
 
     def extra_significant_check(
-        hass, old_state, old_attrs, old_extra_arg, new_state, new_attrs, new_extra_arg
-    ):
+        hass: HomeAssistant,
+        old_state: str,
+        old_attrs: dict | MappingProxyType,
+        old_extra_arg: Any,
+        new_state: str,
+        new_attrs: dict | MappingProxyType,
+        new_extra_arg: Any,
+    ) -> bool | None:
         return old_extra_arg != new_extra_arg
 
     checker.extra_significant_check = extra_significant_check
 
-    # This is normally a significant change (100 -> 200), but the extra arg check marks it
+    # This is normally a significant change (100 -> 200), but the
+    # extra arg check marks it
     # as insignificant.
     assert not checker.async_is_significant_change(
         State(ent_id, "200", attrs), extra_arg=1
     )
     assert checker.async_is_significant_change(State(ent_id, "200", attrs), extra_arg=2)
+
+
+async def test_check_valid_float() -> None:
+    """Test extra significant checker works."""
+    assert significant_change.check_valid_float("1")
+    assert significant_change.check_valid_float("1.0")
+    assert significant_change.check_valid_float(1)
+    assert significant_change.check_valid_float(1.0)
+    assert not significant_change.check_valid_float("")
+    assert not significant_change.check_valid_float("invalid")
+    assert not significant_change.check_valid_float("1.1.1")
+
+
+@pytest.mark.parametrize(
+    ("old_state", "new_state", "change", "expected"),
+    [
+        pytest.param(100.0, 103.0, 2.0, True, id="positive_changed"),
+        pytest.param(100.0, 101.0, 2.0, False, id="positive_unchanged"),
+        pytest.param(-100.0, -103.0, 2.0, True, id="negative_decrease"),
+        pytest.param(-100.0, -97.0, 2.0, True, id="negative_increase"),
+        pytest.param(-100.0, -101.0, 2.0, False, id="negative_unchanged"),
+        pytest.param(-100.0, 100.0, 2.0, True, id="sign_change"),
+        pytest.param(0.0, 1.0, 2.0, True, id="from_zero"),
+        pytest.param(-5.0, -5.0, 2.0, False, id="equal"),
+    ],
+)
+def test_check_percentage_change(
+    old_state: float, new_state: float, change: float, expected: bool
+) -> None:
+    """Test check_percentage_change is relative to the magnitude of the old value."""
+    assert (
+        significant_change.check_percentage_change(old_state, new_state, change)
+        is expected
+    )

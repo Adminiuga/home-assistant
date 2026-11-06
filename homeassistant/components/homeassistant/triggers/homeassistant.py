@@ -1,19 +1,22 @@
 """Offer Home Assistant core automation rules."""
-import voluptuous as vol
 
-from homeassistant.const import CONF_EVENT, CONF_PLATFORM, EVENT_HOMEASSISTANT_STOP
-from homeassistant.core import CALLBACK_TYPE, HassJob, HomeAssistant, callback
+import probatio
+
+from homeassistant.const import CONF_EVENT, CONF_PLATFORM, EVENT_HOMEASSISTANT_STARTED
+from homeassistant.core import CALLBACK_TYPE, Event, HassJob, HomeAssistant, callback
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.trigger import TriggerActionType, TriggerInfo
 from homeassistant.helpers.typing import ConfigType
+
+from ..const import DOMAIN
 
 EVENT_START = "start"
 EVENT_SHUTDOWN = "shutdown"
 
 TRIGGER_SCHEMA = cv.TRIGGER_BASE_SCHEMA.extend(
     {
-        vol.Required(CONF_PLATFORM): "homeassistant",
-        vol.Required(CONF_EVENT): vol.Any(EVENT_START, EVENT_SHUTDOWN),
+        probatio.Required(CONF_PLATFORM): DOMAIN,
+        probatio.Required(CONF_EVENT): probatio.Any(EVENT_START, EVENT_SHUTDOWN),
     }
 )
 
@@ -27,41 +30,46 @@ async def async_attach_trigger(
     """Listen for events based on configuration."""
     trigger_data = trigger_info["trigger_data"]
     event = config.get(CONF_EVENT)
-    job = HassJob(action)
+    job = HassJob(action, f"homeassistant trigger {trigger_info}")
 
     if event == EVENT_SHUTDOWN:
+        return hass.async_add_shutdown_job(
+            job,
+            {
+                "trigger": {
+                    **trigger_data,
+                    "platform": DOMAIN,
+                    "event": event,
+                    "description": "Home Assistant stopping",
+                }
+            },
+        )
 
-        @callback
-        def hass_shutdown(event):
-            """Execute when Home Assistant is shutting down."""
-            hass.async_run_hass_job(
-                job,
-                {
-                    "trigger": {
-                        **trigger_data,
-                        "platform": "homeassistant",
-                        "event": event,
-                        "description": "Home Assistant stopping",
-                    }
-                },
-                event.context,
-            )
+    unsub: CALLBACK_TYPE | None = None
 
-        return hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, hass_shutdown)
-
-    # Automation are enabled while hass is starting up, fire right away
-    # Check state because a config reload shouldn't trigger it.
-    if trigger_info["home_assistant_start"]:
+    @callback
+    def hass_started(_: Event) -> None:
+        nonlocal unsub
+        unsub = None
         hass.async_run_hass_job(
             job,
             {
                 "trigger": {
                     **trigger_data,
-                    "platform": "homeassistant",
+                    "platform": DOMAIN,
                     "event": event,
                     "description": "Home Assistant starting",
                 }
             },
         )
 
-    return lambda: None
+    # Only fires if armed before EVENT_HOMEASSISTANT_STARTED; if hass is already
+    # started, the trigger doesn't fire.
+    unsub = hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, hass_started)
+
+    @callback
+    def remove() -> None:
+        if unsub is not None:
+            unsub()
+
+    return remove

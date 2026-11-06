@@ -2,35 +2,35 @@
 
 from unittest.mock import MagicMock
 
+from pytest_homeassistant.common import MockConfigEntry
+
 from homeassistant.components.cpuspeed.const import DOMAIN
 from homeassistant.components.cpuspeed.sensor import ATTR_ARCH, ATTR_BRAND, ATTR_HZ
 from homeassistant.components.homeassistant import (
     DOMAIN as HOME_ASSISTANT_DOMAIN,
     SERVICE_UPDATE_ENTITY,
 )
+from homeassistant.components.sensor import SensorDeviceClass
 from homeassistant.const import (
     ATTR_DEVICE_CLASS,
     ATTR_ENTITY_ID,
     ATTR_FRIENDLY_NAME,
-    ATTR_ICON,
     STATE_UNKNOWN,
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.setup import async_setup_component
 
-from tests.common import MockConfigEntry
-
 
 async def test_sensor(
     hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
+    entity_registry: er.EntityRegistry,
     mock_cpuinfo: MagicMock,
     init_integration: MockConfigEntry,
 ) -> None:
     """Test the CPU Speed sensor."""
     await async_setup_component(hass, "homeassistant", {})
-    entity_registry = er.async_get(hass)
-    device_registry = dr.async_get(hass)
 
     entry = entity_registry.async_get("sensor.cpu_speed")
     assert entry
@@ -41,8 +41,7 @@ async def test_sensor(
     assert state
     assert state.state == "3.2"
     assert state.attributes.get(ATTR_FRIENDLY_NAME) == "CPU Speed"
-    assert state.attributes.get(ATTR_ICON) == "mdi:pulse"
-    assert ATTR_DEVICE_CLASS not in state.attributes
+    assert state.attributes.get(ATTR_DEVICE_CLASS) == SensorDeviceClass.FREQUENCY
 
     assert state.attributes.get(ATTR_ARCH) == "aargh"
     assert state.attributes.get(ATTR_BRAND) == "Intel Ryzen 7"

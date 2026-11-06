@@ -1,5 +1,19 @@
 """Provides the constants needed for component."""
-from enum import IntEnum
+
+from enum import IntFlag, StrEnum
+from typing import TYPE_CHECKING, Final
+
+import probatio
+
+from homeassistant.util.hass_dict import HassKey
+
+if TYPE_CHECKING:
+    from homeassistant.helpers.entity_component import EntityComponent
+
+    from .entity import HumidifierEntity
+
+DOMAIN: Final = "humidifier"
+DATA_COMPONENT: HassKey[EntityComponent[HumidifierEntity]] = HassKey(DOMAIN)
 
 MODE_NORMAL = "normal"
 MODE_ECO = "eco"
@@ -11,31 +25,80 @@ MODE_SLEEP = "sleep"
 MODE_AUTO = "auto"
 MODE_BABY = "baby"
 
+
+class HumidifierAction(StrEnum):
+    """Actions for humidifier devices."""
+
+    HUMIDIFYING = "humidifying"
+    DRYING = "drying"
+    IDLE = "idle"
+    OFF = "off"
+
+
+ATTR_ACTION = "action"
 ATTR_AVAILABLE_MODES = "available_modes"
+ATTR_CURRENT_HUMIDITY = "current_humidity"
 ATTR_HUMIDITY = "humidity"
 ATTR_MAX_HUMIDITY = "max_humidity"
 ATTR_MIN_HUMIDITY = "min_humidity"
+ATTR_TARGET_HUMIDITY_STEP = "target_humidity_step"
 
 DEFAULT_MIN_HUMIDITY = 0
 DEFAULT_MAX_HUMIDITY = 100
 
-DOMAIN = "humidifier"
-
-# DEVICE_CLASS_* below are deprecated as of 2021.12
-# use the HumidifierDeviceClass enum instead.
-DEVICE_CLASS_HUMIDIFIER = "humidifier"
-DEVICE_CLASS_DEHUMIDIFIER = "dehumidifier"
 
 SERVICE_SET_MODE = "set_mode"
 SERVICE_SET_HUMIDITY = "set_humidity"
 
 
-class HumidifierEntityFeature(IntEnum):
-    """Supported features of the alarm control panel entity."""
+class HumidifierEntityCapabilityAttribute(StrEnum):
+    """Capability attributes for humidifier entities."""
+
+    MIN_HUMIDITY = "min_humidity"
+    MAX_HUMIDITY = "max_humidity"
+    TARGET_HUMIDITY_STEP = "target_humidity_step"
+    AVAILABLE_MODES = "available_modes"
+
+
+class HumidifierEntityStateAttribute(StrEnum):
+    """State attributes for humidifier entities."""
+
+    ACTION = "action"
+    CURRENT_HUMIDITY = "current_humidity"
+    HUMIDITY = "humidity"
+    MODE = "mode"
+
+
+class HumidifierEntityFeature(IntFlag):
+    """Supported features of the humidifier entity."""
 
     MODES = 1
 
 
-# The SUPPORT_MODES constant is deprecated as of Home Assistant 2022.5.
-# Please use the HumidifierEntityFeature enum instead.
-SUPPORT_MODES = 1
+class HumidifierDeviceClass(StrEnum):
+    """Device class for humidifiers."""
+
+    HUMIDIFIER = "humidifier"
+    DEHUMIDIFIER = "dehumidifier"
+
+
+DEVICE_CLASSES_SCHEMA = probatio.All(
+    probatio.Lower, probatio.Coerce(HumidifierDeviceClass)
+)
+
+
+class HumidifierService(StrEnum):
+    """Store keys for humidifier services."""
+
+    SET_HUMIDITY = "set_humidity"
+    SET_MODE = "set_mode"
+    TOGGLE = "toggle"
+    TURN_OFF = "turn_off"
+    TURN_ON = "turn_on"
+
+
+class HumidifierServiceArgument(StrEnum):
+    """Store keys for humidifier service arguments."""
+
+    HUMIDITY = "humidity"
+    MODE = "mode"

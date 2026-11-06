@@ -1,15 +1,15 @@
 """Provides device triggers for Shelly."""
-from __future__ import annotations
 
 from typing import Final
 
-import voluptuous as vol
+import probatio
 
-from homeassistant.components.device_automation import DEVICE_TRIGGER_BASE_SCHEMA
-from homeassistant.components.device_automation.exceptions import (
+from homeassistant.components.device_automation import (
+    DEVICE_TRIGGER_BASE_SCHEMA,
     InvalidDeviceAutomationConfig,
 )
 from homeassistant.components.homeassistant.triggers import event as event_trigger
+from homeassistant.components.homeassistant.triggers.event import EventTriggerArgument
 from homeassistant.const import (
     ATTR_DEVICE_ID,
     CONF_DEVICE_ID,
@@ -45,10 +45,10 @@ from .utils import (
 
 TRIGGER_SCHEMA: Final = DEVICE_TRIGGER_BASE_SCHEMA.extend(
     {
-        vol.Required(CONF_TYPE): vol.In(
+        probatio.Required(CONF_TYPE): probatio.In(
             RPC_INPUTS_EVENTS_TYPES | BLOCK_INPUTS_EVENTS_TYPES
         ),
-        vol.Required(CONF_SUBTYPE): vol.In(INPUTS_EVENTS_SUBTYPES),
+        probatio.Required(CONF_SUBTYPE): probatio.In(INPUTS_EVENTS_SUBTYPES),
     }
 )
 
@@ -104,7 +104,9 @@ async def async_validate_trigger_config(
                 return config
 
     raise InvalidDeviceAutomationConfig(
-        f"Invalid ({CONF_TYPE},{CONF_SUBTYPE}): {trigger}"
+        translation_domain=DOMAIN,
+        translation_key="invalid_trigger",
+        translation_placeholders={"trigger": str(trigger)},
     )
 
 
@@ -136,7 +138,11 @@ async def async_get_triggers(
 
         return triggers
 
-    raise InvalidDeviceAutomationConfig(f"Device not found: {device_id}")
+    raise InvalidDeviceAutomationConfig(
+        translation_domain=DOMAIN,
+        translation_key="device_not_found",
+        translation_placeholders={"device": device_id},
+    )
 
 
 async def async_attach_trigger(
@@ -147,9 +153,9 @@ async def async_attach_trigger(
 ) -> CALLBACK_TYPE:
     """Attach a trigger."""
     event_config = {
-        event_trigger.CONF_PLATFORM: CONF_EVENT,
-        event_trigger.CONF_EVENT_TYPE: EVENT_SHELLY_CLICK,
-        event_trigger.CONF_EVENT_DATA: {
+        EventTriggerArgument.PLATFORM: CONF_EVENT,
+        EventTriggerArgument.EVENT_TYPE: EVENT_SHELLY_CLICK,
+        EventTriggerArgument.EVENT_DATA: {
             ATTR_DEVICE_ID: config[CONF_DEVICE_ID],
             ATTR_CHANNEL: INPUTS_EVENTS_SUBTYPES[config[CONF_SUBTYPE]],
             ATTR_CLICK_TYPE: config[CONF_TYPE],

@@ -1,20 +1,24 @@
 """Test reproduce state for Number entities."""
+
+import pytest
+from pytest_homeassistant.common import async_mock_service
+
 from homeassistant.components.number.const import (
     ATTR_MAX,
     ATTR_MIN,
     DOMAIN,
     SERVICE_SET_VALUE,
 )
-from homeassistant.core import State
+from homeassistant.core import HomeAssistant, State
 from homeassistant.helpers.state import async_reproduce_state
-
-from tests.common import async_mock_service
 
 VALID_NUMBER1 = "19.0"
 VALID_NUMBER2 = "99.9"
 
 
-async def test_reproducing_states(hass, caplog):
+async def test_reproducing_states(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
     """Test reproducing Number states."""
 
     hass.states.async_set(

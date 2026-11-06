@@ -1,33 +1,57 @@
 """Config flow for PrusaLink integration."""
-from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any
+from typing import Any, override
 
-from aiohttp import ClientError
-import async_timeout
 from awesomeversion import AwesomeVersion, AwesomeVersionException
-from pyprusalink import InvalidAuth, PrusaLink
-import voluptuous as vol
+from httpx2 import HTTPError, InvalidURL
+import probatio
+from pyprusalink import PrusaLink
+from pyprusalink.types import InvalidAuth, VersionInfo
 
-from homeassistant import config_entries
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant
-from homeassistant.data_entry_flow import FlowResult
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.httpx_client import get_async_client
 
 from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
 
-STEP_USER_DATA_SCHEMA = vol.Schema(
+STEP_USER_DATA_SCHEMA = probatio.Schema(
     {
-        vol.Required("host"): str,
-        vol.Required("api_key"): str,
+        probatio.Required(CONF_HOST): str,
+        # "maker" is currently hardcoded in the firmware
+        # https://github.com/prusa3d/Prusa-Firmware-Buddy/blob/bfb0ffc745ee6546e7efdba618d0e7c0f4c909cd/lib/WUI/wui_api.h#L19
+        probatio.Required(CONF_USERNAME, default="maker"): str,
+        probatio.Required(probatio.Secret(CONF_PASSWORD)): str,
     }
 )
+
+
+def ensure_printer_is_supported(version: VersionInfo) -> None:
+    """Raise NotSupported exception if the printer is not supported."""
+
+    try:
+        if AwesomeVersion("2.0.0") <= AwesomeVersion(version["api"]):
+            return
+
+        # Workaround to allow PrusaLink 0.7.2 on MK3 and MK2.5 that supports
+        # the 2.0.0 API, but doesn't advertise it yet
+        original_value = version.get("original")
+        original = original_value if isinstance(original_value, str) else ""
+        if original.startswith(("PrusaLink I3MK3", "PrusaLink I3MK2")) and (
+            AwesomeVersion("0.7.2") <= AwesomeVersion(version["server"])
+        ):
+            return
+
+    except AwesomeVersionException as err:
+        raise NotSupported from err
+
+    raise NotSupported
 
 
 async def validate_input(hass: HomeAssistant, data: dict[str, str]) -> dict[str, str]:
@@ -35,46 +59,50 @@ async def validate_input(hass: HomeAssistant, data: dict[str, str]) -> dict[str,
 
     Data has the keys from STEP_USER_DATA_SCHEMA with values provided by the user.
     """
-    api = PrusaLink(async_get_clientsession(hass), data["host"], data["api_key"])
+    api = PrusaLink(
+        get_async_client(hass),
+        data[CONF_HOST],
+        data[CONF_USERNAME],
+        data[CONF_PASSWORD],
+    )
 
     try:
-        async with async_timeout.timeout(5):
+        async with asyncio.timeout(5):
             version = await api.get_version()
 
-    except (asyncio.TimeoutError, ClientError) as err:
+    except (TimeoutError, HTTPError, InvalidURL) as err:
         _LOGGER.error("Could not connect to PrusaLink: %s", err)
         raise CannotConnect from err
 
-    try:
-        if AwesomeVersion(version["api"]) < AwesomeVersion("2.0.0"):
-            raise NotSupported
-    except AwesomeVersionException as err:
-        raise NotSupported from err
+    ensure_printer_is_supported(version)
 
-    return {"title": version["hostname"]}
+    return {"title": version["hostname"] or version["text"]}
 
 
-class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
+class PrusaLinkConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for PrusaLink."""
 
     VERSION = 1
+    MINOR_VERSION = 2
 
+    @override
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle the initial step."""
         if user_input is None:
             return self.async_show_form(
                 step_id="user", data_schema=STEP_USER_DATA_SCHEMA
             )
 
-        host = user_input["host"].rstrip("/")
+        host = user_input[CONF_HOST].rstrip("/")
         if not host.startswith(("http://", "https://")):
             host = f"http://{host}"
 
         data = {
-            "host": host,
-            "api_key": user_input["api_key"],
+            CONF_HOST: host,
+            CONF_USERNAME: user_input[CONF_USERNAME],
+            CONF_PASSWORD: user_input[CONF_PASSWORD],
         }
         errors = {}
 
@@ -86,7 +114,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             errors["base"] = "not_supported"
         except InvalidAuth:
             errors["base"] = "invalid_auth"
-        except Exception:  # pylint: disable=broad-except
+        except Exception:
             _LOGGER.exception("Unexpected exception")
             errors["base"] = "unknown"
         else:

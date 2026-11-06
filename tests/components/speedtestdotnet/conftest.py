@@ -1,16 +1,25 @@
 """Conftest for speedtestdotnet."""
+
 from unittest.mock import patch
 
 import pytest
 
-from . import MOCK_RESULTS, MOCK_SERVERS
+from . import MOCK_SERVERS
 
 
-@pytest.fixture(autouse=True)
+@pytest.fixture
+def mock_setup_entry():
+    """Mock setting up a config entry."""
+    with patch(
+        "homeassistant.components.speedtestdotnet.async_setup_entry",
+        return_value=None,
+    ) as mock_setup:
+        yield mock_setup
+
+
+@pytest.fixture
 def mock_api():
     """Mock entry setup."""
     with patch("speedtest.Speedtest") as mock_api:
         mock_api.return_value.get_servers.return_value = MOCK_SERVERS
-        mock_api.return_value.get_best_server.return_value = MOCK_SERVERS[1][0]
-        mock_api.return_value.results.dict.return_value = MOCK_RESULTS
         yield mock_api

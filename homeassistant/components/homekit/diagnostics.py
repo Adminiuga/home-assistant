@@ -1,5 +1,4 @@
 """Diagnostics support for HomeKit."""
-from __future__ import annotations
 
 from typing import Any
 
@@ -7,21 +6,19 @@ from pyhap.accessory_driver import AccessoryDriver
 from pyhap.state import State
 
 from homeassistant.components.diagnostics import async_redact_data
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
-from . import HomeKit
 from .accessories import HomeAccessory, HomeBridge
-from .const import DOMAIN, HOMEKIT
+from .models import HomeKitConfigEntry
 
 TO_REDACT = {"access_token", "entity_picture"}
 
 
 async def async_get_config_entry_diagnostics(
-    hass: HomeAssistant, entry: ConfigEntry
+    hass: HomeAssistant, entry: HomeKitConfigEntry
 ) -> dict[str, Any]:
     """Return diagnostics for a config entry."""
-    homekit: HomeKit = hass.data[DOMAIN][entry.entry_id][HOMEKIT]
+    homekit = entry.runtime_data.homekit
     data: dict[str, Any] = {
         "status": homekit.status,
         "config-entry": {
@@ -67,13 +64,16 @@ def _get_accessory_diagnostics(
     hass: HomeAssistant, accessory: HomeAccessory
 ) -> dict[str, Any]:
     """Return diagnostics for an accessory."""
-    return {
+    entity_state = None
+    if accessory.entity_id:
+        entity_state = hass.states.get(accessory.entity_id)
+    data = {
         "aid": accessory.aid,
         "config": accessory.config,
         "category": accessory.category,
         "name": accessory.display_name,
         "entity_id": accessory.entity_id,
-        "entity_state": async_redact_data(
-            hass.states.get(accessory.entity_id), TO_REDACT
-        ),
     }
+    if entity_state:
+        data["entity_state"] = async_redact_data(entity_state, TO_REDACT)
+    return data

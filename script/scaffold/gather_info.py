@@ -1,5 +1,8 @@
 """Gather info for scaffolding."""
+
 import json
+
+from hassfest.model import IntegrationType
 
 from homeassistant.util import slugify
 from script.hassfest.manifest import SUPPORTED_IOT_CLASSES
@@ -23,7 +26,13 @@ def gather_info(arguments) -> Info:
         info = _gather_info(
             {
                 "domain": {
-                    "prompt": "What is the domain?",
+                    "prompt": (
+                        """What is the domain?
+
+Hint: The domain is a short name consisting of characters and underscores.
+This domain has to be unique, cannot be changed,
+and has to match the directory name of the integration."""
+                    ),
                     "validators": [
                         CHECK_EMPTY,
                         [
@@ -71,16 +80,15 @@ def gather_new_integration(determine_auth: bool) -> Info:
         },
         "codeowner": {
             "prompt": "What is your GitHub handle?",
-            "validators": [
-                CHECK_EMPTY,
-                [
-                    'GitHub handles need to start with an "@"',
-                    lambda value: value.startswith("@"),
-                ],
-            ],
+            "validators": [CHECK_EMPTY],
+            "converter": (
+                lambda value: value if value.startswith("@") else f"@{value}"
+            ),
         },
         "requirement": {
-            "prompt": "What PyPI package and version do you depend on? Leave blank for none.",
+            "prompt": (
+                "What PyPI package and version do you depend on? Leave blank for none."
+            ),
             "validators": [
                 [
                     "Versions should be pinned using '=='.",
@@ -92,9 +100,9 @@ def gather_new_integration(determine_auth: bool) -> Info:
             "prompt": (
                 f"""How will your integration gather data?
 
-Valid values are {', '.join(SUPPORTED_IOT_CLASSES)}
+Valid values are {", ".join(SUPPORTED_IOT_CLASSES)}
 
-More info @ https://developers.home-assistant.io/docs/creating_integration_manifest#iot-class
+More info @ https://contributors.home-assistant.io/core/integrations/manifest/#iot_class
 """
             ),
             "validators": [
@@ -110,22 +118,50 @@ More info @ https://developers.home-assistant.io/docs/creating_integration_manif
         fields.update(
             {
                 "authentication": {
-                    "prompt": "Does Home Assistant need the user to authenticate to control the device/service? (yes/no)",
+                    "prompt": (
+                        "Does Home Assistant need the user"
+                        " to authenticate to control the"
+                        " device/service? (yes/no)"
+                    ),
                     "default": "yes",
                     **YES_NO,
                 },
                 "discoverable": {
-                    "prompt": "Is the device/service discoverable on the local network? (yes/no)",
+                    "prompt": (
+                        "Is the device/service discoverable"
+                        " on the local network? (yes/no)"
+                    ),
                     "default": "no",
                     **YES_NO,
                 },
-                "helper": {
-                    "prompt": "Is this a helper integration? (yes/no)",
-                    "default": "no",
-                    **YES_NO,
+                "integration_type": {
+                    "prompt": (
+                        "What is the integration type?"
+                        "\n\nValid types are "
+                        f"{', '.join(IntegrationType)}."
+                        "\nThis field is recommended and"
+                        " required in some cases."
+                        " To intentionally leave it"
+                        " unset, type 'omit'."
+                        "\n\nMore info @ "
+                        "https://contributors.home-assistant.io"
+                        "/core/integrations/manifest"
+                        "/#integration_type\n"
+                    ),
+                    "validators": [
+                        [
+                            "You need to pick one of"
+                            f" {', '.join(IntegrationType)}"
+                            " or 'omit'.",
+                            lambda value: value in IntegrationType or value == "omit",
+                        ]
+                    ],
+                    "converter": lambda value: None if value == "omit" else value,
                 },
                 "oauth2": {
-                    "prompt": "Can the user authenticate the device using OAuth2? (yes/no)",
+                    "prompt": (
+                        "Can the user authenticate the device using OAuth2? (yes/no)"
+                    ),
                     "default": "no",
                     **YES_NO,
                 },
@@ -162,8 +198,8 @@ def _gather_info(fields) -> dict:
                 if "default" in info:
                     msg += f" [{info['default']}]"
                 value = input(f"{msg}\n> ")
-            except (KeyboardInterrupt, EOFError):
-                raise ExitApp("Interrupted!", 1)
+            except (KeyboardInterrupt, EOFError) as err:
+                raise ExitApp("Interrupted!", 1) from err
 
             value = value.strip()
 

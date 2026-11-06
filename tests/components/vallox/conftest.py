@@ -1,85 +1,71 @@
 """Common utilities for Vallox tests."""
 
-import random
-import string
-from typing import Any
-from unittest.mock import patch
-from uuid import UUID
+from collections.abc import Generator
+from unittest.mock import AsyncMock, patch
 
 import pytest
-from vallox_websocket_api.vallox import PROFILE
+from pytest_homeassistant.common import MockConfigEntry, load_json_object_fixture
+from vallox_websocket_api import MetricData, MetricValue
 
 from homeassistant.components.vallox.const import DOMAIN
 from homeassistant.const import CONF_HOST, CONF_NAME
 from homeassistant.core import HomeAssistant
 
-from tests.common import MockConfigEntry
+from . import TEST_HOST, TEST_NAME, setup_integration
 
 
 @pytest.fixture
-def mock_entry(hass: HomeAssistant) -> MockConfigEntry:
-    """Create mocked Vallox config entry."""
-    vallox_mock_entry = MockConfigEntry(
+def mock_config_entry() -> MockConfigEntry:
+    """Return the default mocked config entry."""
+    return MockConfigEntry(
         domain=DOMAIN,
-        data={
-            CONF_HOST: "192.168.100.50",
-            CONF_NAME: "Vallox",
-        },
-    )
-    vallox_mock_entry.add_to_hass(hass)
-
-    return vallox_mock_entry
-
-
-def patch_metrics(metrics: dict[str, Any]):
-    """Patch the Vallox metrics response."""
-    return patch(
-        "homeassistant.components.vallox.Vallox.fetch_metrics",
-        return_value=metrics,
+        title=TEST_NAME,
+        data={CONF_HOST: TEST_HOST, CONF_NAME: TEST_NAME},
     )
 
 
-@pytest.fixture(autouse=True)
-def patch_profile_home():
-    """Patch the Vallox profile response."""
-    with patch(
-        "homeassistant.components.vallox.Vallox.get_profile",
-        return_value=PROFILE.HOME,
+@pytest.fixture
+def default_metrics() -> dict[str, MetricValue]:
+    """Return default Vallox metrics."""
+    return load_json_object_fixture("metrics.json", DOMAIN)
+
+
+@pytest.fixture
+def metrics() -> dict[str, MetricValue]:
+    """Return metrics that override the default metrics."""
+    return {}
+
+
+@pytest.fixture
+def mock_vallox_client(
+    default_metrics: dict[str, MetricValue],
+    metrics: dict[str, MetricValue],
+) -> Generator[AsyncMock]:
+    """Return a mocked Vallox client used by both the integration and config flow."""
+    with (
+        patch("homeassistant.components.vallox.Vallox", autospec=True) as mock_class,
+        patch("homeassistant.components.vallox.config_flow.Vallox", new=mock_class),
     ):
-        yield
+        client = mock_class.return_value
+        client.fetch_metric_data.return_value = MetricData(default_metrics | metrics)
+        yield client
 
 
-@pytest.fixture(autouse=True)
-def patch_model():
-    """Patch the Vallox model response."""
+@pytest.fixture
+async def init_integration(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_vallox_client: AsyncMock,
+) -> MockConfigEntry:
+    """Set up the Vallox integration for testing."""
+    await setup_integration(hass, mock_config_entry)
+    return mock_config_entry
+
+
+@pytest.fixture
+def mock_setup_entry() -> Generator[AsyncMock]:
+    """Override async_setup_entry."""
     with patch(
-        "homeassistant.components.vallox._api_get_model",
-        return_value="Vallox Testmodel",
-    ):
-        yield
-
-
-@pytest.fixture(autouse=True)
-def patch_sw_version():
-    """Patch the Vallox SW version response."""
-    with patch(
-        "homeassistant.components.vallox._api_get_sw_version",
-        return_value="0.1.2",
-    ):
-        yield
-
-
-@pytest.fixture(autouse=True)
-def patch_uuid():
-    """Patch the Vallox UUID response."""
-    with patch(
-        "homeassistant.components.vallox._api_get_uuid",
-        return_value=_random_uuid(),
-    ):
-        yield
-
-
-def _random_uuid():
-    """Generate a random UUID."""
-    uuid = "".join(random.choices(string.hexdigits, k=32))
-    return UUID(uuid)
+        "homeassistant.components.vallox.async_setup_entry", return_value=None
+    ) as mock_setup_entry:
+        yield mock_setup_entry

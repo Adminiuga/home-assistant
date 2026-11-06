@@ -1,6 +1,12 @@
 """The tests for the DirecTV remote platform."""
+
 from unittest.mock import patch
 
+from directv import DIRECTVError
+import pytest
+from pytest_homeassistant.test_util.aiohttp import AiohttpClientMocker
+
+from homeassistant.components.directv.const import DOMAIN
 from homeassistant.components.remote import (
     ATTR_COMMAND,
     DOMAIN as REMOTE_DOMAIN,
@@ -8,18 +14,15 @@ from homeassistant.components.remote import (
 )
 from homeassistant.const import ATTR_ENTITY_ID, SERVICE_TURN_OFF, SERVICE_TURN_ON
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
 
-from . import setup_integration
-
-from tests.test_util.aiohttp import AiohttpClientMocker
+from . import RECEIVER_ID, setup_integration
 
 ATTR_UNIQUE_ID = "unique_id"
 CLIENT_ENTITY_ID = f"{REMOTE_DOMAIN}.client"
 MAIN_ENTITY_ID = f"{REMOTE_DOMAIN}.host"
 UNAVAILABLE_ENTITY_ID = f"{REMOTE_DOMAIN}.unavailable_client"
-
-# pylint: disable=redefined-outer-name
 
 
 async def test_setup(hass: HomeAssistant, aioclient_mock: AiohttpClientMocker) -> None:
@@ -31,12 +34,12 @@ async def test_setup(hass: HomeAssistant, aioclient_mock: AiohttpClientMocker) -
 
 
 async def test_unique_id(
-    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    aioclient_mock: AiohttpClientMocker,
 ) -> None:
     """Test unique id."""
     await setup_integration(hass, aioclient_mock)
-
-    entity_registry = er.async_get(hass)
 
     main = entity_registry.async_get(MAIN_ENTITY_ID)
     assert main.unique_id == "028877455858"
@@ -80,3 +83,29 @@ async def test_main_services(
             blocking=True,
         )
         remote_mock.assert_called_once_with("dash", "0")
+
+
+async def test_send_command_failed(
+    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker
+) -> None:
+    """Test that a failed command raises an error."""
+    await setup_integration(hass, aioclient_mock)
+
+    with (
+        patch("directv.DIRECTV.remote", side_effect=DIRECTVError) as remote_mock,
+        pytest.raises(HomeAssistantError) as err,
+    ):
+        await hass.services.async_call(
+            REMOTE_DOMAIN,
+            SERVICE_SEND_COMMAND,
+            {ATTR_ENTITY_ID: MAIN_ENTITY_ID, ATTR_COMMAND: ["dash"]},
+            blocking=True,
+        )
+
+    remote_mock.assert_called_once_with("dash", "0")
+    assert err.value.translation_domain == DOMAIN
+    assert err.value.translation_key == "send_command_failed"
+    assert err.value.translation_placeholders == {
+        "command": "dash",
+        "device": RECEIVER_ID,
+    }

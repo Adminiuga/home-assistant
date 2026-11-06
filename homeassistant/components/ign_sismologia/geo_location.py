@@ -1,28 +1,30 @@
 """Support for IGN Sismologia (Earthquakes) Feeds."""
-from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import timedelta
 import logging
-from typing import Any
+from typing import Any, override
 
 from georss_ign_sismologia_client import (
     IgnSismologiaFeedEntry,
     IgnSismologiaFeedManager,
 )
-import voluptuous as vol
+import probatio
 
-from homeassistant.components.geo_location import PLATFORM_SCHEMA, GeolocationEvent
+from homeassistant.components.geo_location import (
+    PLATFORM_SCHEMA as GEO_LOCATION_PLATFORM_SCHEMA,
+    GeolocationEvent,
+)
 from homeassistant.const import (
     CONF_LATITUDE,
     CONF_LONGITUDE,
     CONF_RADIUS,
     CONF_SCAN_INTERVAL,
     EVENT_HOMEASSISTANT_START,
-    LENGTH_KILOMETERS,
+    UnitOfLength,
 )
 from homeassistant.core import Event, HomeAssistant, callback
-import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.dispatcher import async_dispatcher_connect, dispatcher_send
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import track_time_interval
@@ -46,12 +48,14 @@ SCAN_INTERVAL = timedelta(minutes=5)
 
 SOURCE = "ign_sismologia"
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
+PLATFORM_SCHEMA = GEO_LOCATION_PLATFORM_SCHEMA.extend(
     {
-        vol.Optional(CONF_LATITUDE): cv.latitude,
-        vol.Optional(CONF_LONGITUDE): cv.longitude,
-        vol.Optional(CONF_RADIUS, default=DEFAULT_RADIUS_IN_KM): vol.Coerce(float),
-        vol.Optional(
+        probatio.Optional(CONF_LATITUDE): cv.latitude,
+        probatio.Optional(CONF_LONGITUDE): cv.longitude,
+        probatio.Optional(CONF_RADIUS, default=DEFAULT_RADIUS_IN_KM): probatio.Coerce(
+            float
+        ),
+        probatio.Optional(
             CONF_MINIMUM_MAGNITUDE, default=DEFAULT_MINIMUM_MAGNITUDE
         ): cv.positive_float,
     }
@@ -141,12 +145,12 @@ class IgnSismologiaFeedEntityManager:
 
 
 class IgnSismologiaLocationEvent(GeolocationEvent):
-    """This represents an external event with IGN Sismologia feed data."""
+    """Represents an external event with IGN Sismologia feed data."""
 
     _attr_icon = "mdi:pulse"
     _attr_should_poll = False
     _attr_source = SOURCE
-    _attr_unit_of_measurement = LENGTH_KILOMETERS
+    _attr_unit_of_measurement = UnitOfLength.KILOMETERS
 
     def __init__(
         self, feed_manager: IgnSismologiaFeedEntityManager, external_id: str
@@ -162,6 +166,7 @@ class IgnSismologiaLocationEvent(GeolocationEvent):
         self._remove_signal_delete: Callable[[], None]
         self._remove_signal_update: Callable[[], None]
 
+    @override
     async def async_added_to_hass(self) -> None:
         """Call when entity is added to hass."""
         self._remove_signal_delete = async_dispatcher_connect(
@@ -207,6 +212,7 @@ class IgnSismologiaLocationEvent(GeolocationEvent):
         self._image_url = feed_entry.image_url
 
     @property
+    @override
     def name(self) -> str | None:
         """Return the name of the entity."""
         if self._magnitude and self._region:
@@ -218,17 +224,18 @@ class IgnSismologiaLocationEvent(GeolocationEvent):
         return self._title
 
     @property
+    @override
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return the device state attributes."""
-        attributes = {}
-        for key, value in (
-            (ATTR_EXTERNAL_ID, self._external_id),
-            (ATTR_TITLE, self._title),
-            (ATTR_REGION, self._region),
-            (ATTR_MAGNITUDE, self._magnitude),
-            (ATTR_PUBLICATION_DATE, self._publication_date),
-            (ATTR_IMAGE_URL, self._image_url),
-        ):
-            if value or isinstance(value, bool):
-                attributes[key] = value
-        return attributes
+        return {
+            key: value
+            for key, value in (
+                (ATTR_EXTERNAL_ID, self._external_id),
+                (ATTR_TITLE, self._title),
+                (ATTR_REGION, self._region),
+                (ATTR_MAGNITUDE, self._magnitude),
+                (ATTR_PUBLICATION_DATE, self._publication_date),
+                (ATTR_IMAGE_URL, self._image_url),
+            )
+            if value or isinstance(value, bool)
+        }

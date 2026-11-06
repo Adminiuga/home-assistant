@@ -1,9 +1,13 @@
 {
   "domain": "orvibo",
   "name": "Orvibo",
-  "documentation": "https://www.home-assistant.io/integrations/orvibo",
-  "requirements": ["orvibo==1.1.1"],
+  "categories": ["plugs_switches"],
   "codeowners": [],
+  "config_flow": true,
+  "connectivity": ["network"],
+  "documentation": "https://www.home-assistant.io/integrations/orvibo",
+  "integration_type": "device",
   "iot_class": "local_push",
-  "loggers": ["orvibo"]
+  "loggers": ["orvibo"],
+  "requirements": ["orvibo==1.1.2"]
 }

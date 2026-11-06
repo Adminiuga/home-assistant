@@ -1,51 +1,42 @@
 """Helper functions for mysensors package."""
-from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Callable
 from enum import IntEnum
 import logging
+from typing import cast
 
 from mysensors import BaseAsyncGateway, Message
 from mysensors.sensor import ChildSensor
-import voluptuous as vol
+import probatio
 
 from homeassistant.const import CONF_NAME, Platform
 from homeassistant.core import HomeAssistant, callback
-import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.util.decorator import Registry
 
 from .const import (
     ATTR_DEVICES,
     ATTR_GATEWAY_ID,
+    ATTR_NODE_ID,
     DOMAIN,
     FLAT_PLATFORM_TYPES,
     MYSENSORS_DISCOVERY,
-    MYSENSORS_ON_UNLOAD,
+    MYSENSORS_NODE_DISCOVERY,
     TYPE_TO_PLATFORMS,
     DevId,
     GatewayId,
     SensorType,
     ValueType,
 )
+from .models import MySensorsConfigEntry
 
 _LOGGER = logging.getLogger(__name__)
 SCHEMAS: Registry[
-    tuple[str, str], Callable[[BaseAsyncGateway, ChildSensor, ValueType], vol.Schema]
+    tuple[str, str],
+    Callable[[BaseAsyncGateway, ChildSensor, ValueType], probatio.Schema],
 ] = Registry()
-
-
-@callback
-def on_unload(hass: HomeAssistant, gateway_id: GatewayId, fnct: Callable) -> None:
-    """Register a callback to be called when entry is unloaded.
-
-    This function is used by platforms to cleanup after themselves.
-    """
-    key = MYSENSORS_ON_UNLOAD.format(gateway_id)
-    if key not in hass.data[DOMAIN]:
-        hass.data[DOMAIN][key] = []
-    hass.data[DOMAIN][key].append(fnct)
 
 
 @callback
@@ -65,9 +56,37 @@ def discover_mysensors_platform(
     )
 
 
+@callback
+def discover_mysensors_node(
+    hass: HomeAssistant, entry: MySensorsConfigEntry, node_id: int
+) -> None:
+    """Discover a MySensors node."""
+    discovered_nodes = entry.runtime_data.discovered_nodes
+
+    if node_id not in discovered_nodes:
+        discovered_nodes.add(node_id)
+        async_dispatcher_send(
+            hass,
+            MYSENSORS_NODE_DISCOVERY.format(entry.entry_id),
+            {
+                ATTR_GATEWAY_ID: entry.entry_id,
+                ATTR_NODE_ID: node_id,
+            },
+        )
+
+
+@callback
+def remove_node_dev_ids(entry: MySensorsConfigEntry, node_id: int) -> None:
+    """Remove all discovered dev ids belonging to a node."""
+    for dev_ids in entry.runtime_data.discovered_dev_ids.values():
+        dev_ids.difference_update(
+            {dev_id for dev_id in dev_ids if dev_id[1] == node_id}
+        )
+
+
 def default_schema(
     gateway: BaseAsyncGateway, child: ChildSensor, value_type_name: ValueType
-) -> vol.Schema:
+) -> probatio.Schema:
     """Return a default validation schema for value types."""
     schema = {value_type_name: cv.string}
     return get_child_schema(gateway, child, value_type_name, schema)
@@ -76,7 +95,7 @@ def default_schema(
 @SCHEMAS.register(("light", "V_DIMMER"))
 def light_dimmer_schema(
     gateway: BaseAsyncGateway, child: ChildSensor, value_type_name: ValueType
-) -> vol.Schema:
+) -> probatio.Schema:
     """Return a validation schema for V_DIMMER."""
     schema = {"V_DIMMER": cv.string, "V_LIGHT": cv.string}
     return get_child_schema(gateway, child, value_type_name, schema)
@@ -85,7 +104,7 @@ def light_dimmer_schema(
 @SCHEMAS.register(("light", "V_PERCENTAGE"))
 def light_percentage_schema(
     gateway: BaseAsyncGateway, child: ChildSensor, value_type_name: ValueType
-) -> vol.Schema:
+) -> probatio.Schema:
     """Return a validation schema for V_PERCENTAGE."""
     schema = {"V_PERCENTAGE": cv.string, "V_STATUS": cv.string}
     return get_child_schema(gateway, child, value_type_name, schema)
@@ -94,7 +113,7 @@ def light_percentage_schema(
 @SCHEMAS.register(("light", "V_RGB"))
 def light_rgb_schema(
     gateway: BaseAsyncGateway, child: ChildSensor, value_type_name: ValueType
-) -> vol.Schema:
+) -> probatio.Schema:
     """Return a validation schema for V_RGB."""
     schema = {"V_RGB": cv.string, "V_STATUS": cv.string}
     return get_child_schema(gateway, child, value_type_name, schema)
@@ -103,7 +122,7 @@ def light_rgb_schema(
 @SCHEMAS.register(("light", "V_RGBW"))
 def light_rgbw_schema(
     gateway: BaseAsyncGateway, child: ChildSensor, value_type_name: ValueType
-) -> vol.Schema:
+) -> probatio.Schema:
     """Return a validation schema for V_RGBW."""
     schema = {"V_RGBW": cv.string, "V_STATUS": cv.string}
     return get_child_schema(gateway, child, value_type_name, schema)
@@ -112,7 +131,7 @@ def light_rgbw_schema(
 @SCHEMAS.register(("switch", "V_IR_SEND"))
 def switch_ir_send_schema(
     gateway: BaseAsyncGateway, child: ChildSensor, value_type_name: ValueType
-) -> vol.Schema:
+) -> probatio.Schema:
     """Return a validation schema for V_IR_SEND."""
     schema = {"V_IR_SEND": cv.string, "V_LIGHT": cv.string}
     return get_child_schema(gateway, child, value_type_name, schema)
@@ -123,30 +142,30 @@ def get_child_schema(
     child: ChildSensor,
     value_type_name: ValueType,
     schema: dict,
-) -> vol.Schema:
+) -> probatio.Schema:
     """Return a child schema."""
     set_req = gateway.const.SetReq
-    child_schema = child.get_schema(gateway.protocol_version)
-    schema = child_schema.extend(
+    child_schema = cast(probatio.Schema, child.get_schema(gateway.protocol_version))
+    return child_schema.extend(
         {
-            vol.Required(
+            probatio.Required(
                 set_req[name].value, msg=invalid_msg(gateway, child, name)
             ): child_schema.schema.get(set_req[name].value, valid)
             for name, valid in schema.items()
         },
-        extra=vol.ALLOW_EXTRA,
+        extra=probatio.ALLOW_EXTRA,
     )
-    return schema
 
 
 def invalid_msg(
     gateway: BaseAsyncGateway, child: ChildSensor, value_type_name: ValueType
 ) -> str:
     """Return a message for an invalid child during schema validation."""
-    pres = gateway.const.Presentation
+    presentation = gateway.const.Presentation
     set_req = gateway.const.SetReq
     return (
-        f"{pres(child.type).name} requires value_type {set_req[value_type_name].name}"
+        f"{presentation(child.type).name} requires"
+        f" value_type {set_req[value_type_name].name}"
     )
 
 
@@ -177,10 +196,10 @@ def validate_child(
 ) -> defaultdict[Platform, list[DevId]]:
     """Validate a child. Returns a dict mapping hass platform names to list of DevId."""
     validated: defaultdict[Platform, list[DevId]] = defaultdict(list)
-    pres: type[IntEnum] = gateway.const.Presentation
+    presentation: type[IntEnum] = gateway.const.Presentation
     set_req: type[IntEnum] = gateway.const.SetReq
     child_type_name: SensorType | None = next(
-        (member.name for member in pres if member.value == child.type), None
+        (member.name for member in presentation if member.value == child.type), None
     )
     if not child_type_name:
         _LOGGER.warning("Child type %s is not supported", child.type)
@@ -211,7 +230,7 @@ def validate_child(
             child_schema = child_schema_gen(gateway, child, v_name)
             try:
                 child_schema(child.values)
-            except vol.Invalid as exc:
+            except probatio.Invalid as exc:
                 _LOGGER.warning(
                     "Invalid %s on node %s, %s platform: %s",
                     child,

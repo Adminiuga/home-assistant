@@ -1,29 +1,40 @@
-"""The test for zha device automation actions."""
-from unittest.mock import call, patch
+"""The test for ZHA device automation actions."""
 
+from collections.abc import Callable, Coroutine
+from unittest.mock import AsyncMock, patch
+
+import probatio
 import pytest
-from zhaquirks.inovelli.VZM31SN import InovelliVZM31SNv11
-import zigpy.profiles.zha
-import zigpy.zcl.clusters.general as general
-import zigpy.zcl.clusters.security as security
-import zigpy.zcl.foundation as zcl_f
-
-import homeassistant.components.automation as automation
-from homeassistant.components.device_automation import DeviceAutomationType
-from homeassistant.components.zha import DOMAIN
-from homeassistant.const import Platform
-from homeassistant.helpers import device_registry as dr
-from homeassistant.setup import async_setup_component
-
-from .conftest import SIG_EP_INPUT, SIG_EP_OUTPUT, SIG_EP_TYPE
-
-from tests.common import (
-    assert_lists_same,
+from pytest_homeassistant.common import (
+    MockConfigEntry,
     async_get_device_automations,
     async_mock_service,
-    mock_coro,
 )
-from tests.components.blueprint.conftest import stub_blueprint_populate  # noqa: F401
+from pytest_unordered import unordered
+from zhaquirks.inovelli.types import AllLEDEffectType, SingleLEDEffectType
+from zigpy.application import ControllerApplication
+from zigpy.device import GreenPowerDevice as ZigpyGreenPowerDevice, ZigbeeDevice
+from zigpy.profiles import zha
+from zigpy.zcl.clusters import general, security
+import zigpy.zcl.foundation as zcl_f
+from zigpy.zgp.types import ApplicationID, SrcID
+
+from homeassistant.components import automation
+from homeassistant.components.device_automation import DeviceAutomationType
+from homeassistant.components.zha import DOMAIN, device_action
+from homeassistant.components.zha.helpers import get_zha_gateway, get_zha_gateway_proxy
+from homeassistant.const import Platform
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr, entity_registry as er
+from homeassistant.setup import async_setup_component
+
+from .conftest import (
+    FIXTURE_GRP_WITH_ENTITIES_ID,
+    SIG_EP_INPUT,
+    SIG_EP_OUTPUT,
+    SIG_EP_PROFILE,
+    SIG_EP_TYPE,
+)
 
 SHORT_PRESS = "remote_button_short_press"
 COMMAND = "command"
@@ -32,7 +43,7 @@ COMMAND_SINGLE = "single"
 
 @pytest.fixture(autouse=True)
 def required_platforms_only():
-    """Only setup the required platforms and required base platforms to speed up tests."""
+    """Only set up required platforms and base platforms."""
     with patch(
         "homeassistant.components.zha.PLATFORMS",
         (
@@ -50,64 +61,99 @@ def required_platforms_only():
         yield
 
 
-@pytest.fixture
-async def device_ias(hass, zigpy_device_mock, zha_device_joined_restored):
-    """IAS device fixture."""
+async def test_get_actions_group_device(
+    hass: HomeAssistant,
+    setup_zha: Callable[..., Coroutine[None]],
+    zigpy_app_controller_with_group: ControllerApplication,
+) -> None:
+    """Test that ZHA group devices expose no ZHA device actions."""
+    await setup_zha()
 
-    clusters = [general.Basic, security.IasZone, security.IasWd]
-    zigpy_device = zigpy_device_mock(
-        {
-            1: {
-                SIG_EP_INPUT: [c.cluster_id for c in clusters],
-                SIG_EP_OUTPUT: [general.OnOff.cluster_id],
-                SIG_EP_TYPE: zigpy.profiles.zha.DeviceType.ON_OFF_SWITCH,
-            }
-        },
+    gateway_proxy = get_zha_gateway_proxy(hass)
+    group_proxy = gateway_proxy.group_proxies[FIXTURE_GRP_WITH_ENTITIES_ID]
+    assert group_proxy.device_id is not None
+
+    actions = await async_get_device_automations(
+        hass, DeviceAutomationType.ACTION, group_proxy.device_id
     )
+    # Entity based actions (e.g. from the switch domain) are fine, but the
+    # group device must not offer ZHA device actions (squawk/warn)
+    assert actions
+    assert not [action for action in actions if action["domain"] == DOMAIN]
 
-    zha_device = await zha_device_joined_restored(zigpy_device)
-    zha_device.update_available(True)
-    await hass.async_block_till_done()
-    return zigpy_device, zha_device
+
+async def test_get_actions_green_power_device(
+    hass: HomeAssistant,
+    setup_zha: Callable[..., Coroutine[None]],
+) -> None:
+    """Test that Green Power devices expose no ZHA device actions."""
+    await setup_zha()
+    gateway = get_zha_gateway(hass)
+
+    zigpy_gpd = ZigpyGreenPowerDevice(
+        gateway.application_controller,
+        application_id=ApplicationID.SrcID,
+        src_id=SrcID(0x12345678),
+    )
+    gateway.application_controller.devices[zigpy_gpd.ieee] = zigpy_gpd
+    gateway.get_or_create_device(zigpy_gpd)
+    await gateway.async_device_initialized(zigpy_gpd)
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    device_proxy = get_zha_gateway_proxy(hass).device_proxies[zigpy_gpd.ieee]
+    assert device_proxy.device_id is not None
+
+    assert await device_action.async_get_actions(hass, device_proxy.device_id) == []
 
 
-@pytest.fixture
-async def device_inovelli(hass, zigpy_device_mock, zha_device_joined):
-    """Inovelli device fixture."""
+async def test_get_actions(
+    hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
+    entity_registry: er.EntityRegistry,
+    config_entry: MockConfigEntry,
+    setup_zha: Callable[..., Coroutine[None]],
+    zigpy_device_mock: Callable[..., ZigbeeDevice],
+) -> None:
+    """Test we get the expected actions from a ZHA device."""
+
+    await setup_zha()
+    gateway = get_zha_gateway(hass)
 
     zigpy_device = zigpy_device_mock(
         {
             1: {
                 SIG_EP_INPUT: [
                     general.Basic.cluster_id,
-                    general.Identify.cluster_id,
-                    general.OnOff.cluster_id,
-                    general.LevelControl.cluster_id,
-                    0xFC31,
+                    security.IasZone.cluster_id,
+                    security.IasWd.cluster_id,
                 ],
-                SIG_EP_OUTPUT: [],
-                SIG_EP_TYPE: zigpy.profiles.zha.DeviceType.DIMMABLE_LIGHT,
+                SIG_EP_OUTPUT: [general.OnOff.cluster_id],
+                SIG_EP_TYPE: zha.DeviceType.IAS_WARNING_DEVICE,
+                SIG_EP_PROFILE: zha.PROFILE_ID,
             }
-        },
-        ieee="00:1d:8f:08:0c:90:69:6b",
-        manufacturer="Inovelli",
-        model="VZM31-SN",
-        quirk=InovelliVZM31SNv11,
+        }
     )
 
-    zha_device = await zha_device_joined(zigpy_device)
-    zha_device.update_available(True)
-    await hass.async_block_till_done()
-    return zigpy_device, zha_device
+    gateway.get_or_create_device(zigpy_device)
+    await gateway.async_device_initialized(zigpy_device)
+    await hass.async_block_till_done(wait_background_tasks=True)
+    ieee_address = str(zigpy_device.ieee)
 
-
-async def test_get_actions(hass, device_ias):
-    """Test we get the expected actions from a zha device."""
-
-    ieee_address = str(device_ias[0].ieee)
-
-    ha_device_registry = dr.async_get(hass)
-    reg_device = ha_device_registry.async_get_device({(DOMAIN, ieee_address)})
+    reg_device = device_registry.async_get_device_by_identifier(
+        (DOMAIN, ieee_address), config_entry.entry_id
+    )
+    siren_level_select = entity_registry.async_get(
+        "select.fakemanufacturer_fakemodel_default_siren_level"
+    )
+    siren_tone_select = entity_registry.async_get(
+        "select.fakemanufacturer_fakemodel_default_siren_tone"
+    )
+    strobe_level_select = entity_registry.async_get(
+        "select.fakemanufacturer_fakemodel_default_strobe_level"
+    )
+    strobe_select = entity_registry.async_get(
+        "select.fakemanufacturer_fakemodel_default_strobe"
+    )
 
     actions = await async_get_device_automations(
         hass, DeviceAutomationType.ACTION, reg_device.id
@@ -121,142 +167,76 @@ async def test_get_actions(hass, device_ias):
             "metadata": {},
         },
         {"domain": DOMAIN, "type": "warn", "device_id": reg_device.id, "metadata": {}},
-        {
-            "domain": Platform.SELECT,
-            "type": "select_option",
-            "device_id": reg_device.id,
-            "entity_id": "select.fakemanufacturer_fakemodel_default_siren_tone",
-            "metadata": {"secondary": True},
-        },
-        {
-            "domain": Platform.SELECT,
-            "type": "select_option",
-            "device_id": reg_device.id,
-            "entity_id": "select.fakemanufacturer_fakemodel_default_siren_level",
-            "metadata": {"secondary": True},
-        },
-        {
-            "domain": Platform.SELECT,
-            "type": "select_option",
-            "device_id": reg_device.id,
-            "entity_id": "select.fakemanufacturer_fakemodel_default_strobe_level",
-            "metadata": {"secondary": True},
-        },
-        {
-            "domain": Platform.SELECT,
-            "type": "select_option",
-            "device_id": reg_device.id,
-            "entity_id": "select.fakemanufacturer_fakemodel_default_strobe",
-            "metadata": {"secondary": True},
-        },
     ]
-
-    assert_lists_same(actions, expected_actions)
-
-
-async def test_get_inovelli_actions(hass, device_inovelli):
-    """Test we get the expected actions from a zha device."""
-
-    inovelli_ieee_address = str(device_inovelli[0].ieee)
-    ha_device_registry = dr.async_get(hass)
-    inovelli_reg_device = ha_device_registry.async_get_device(
-        {(DOMAIN, inovelli_ieee_address)}
+    expected_actions.extend(
+        [
+            {
+                "domain": Platform.SELECT,
+                "type": action,
+                "device_id": reg_device.id,
+                "entity_id": entity_id,
+                "metadata": {"secondary": True},
+            }
+            for action in (
+                "select_first",
+                "select_last",
+                "select_next",
+                "select_option",
+                "select_previous",
+            )
+            for entity_id in (
+                siren_level_select.id,
+                siren_tone_select.id,
+                strobe_level_select.id,
+                strobe_select.id,
+            )
+        ]
     )
 
-    actions = await async_get_device_automations(
-        hass, DeviceAutomationType.ACTION, inovelli_reg_device.id
+    assert actions == unordered(expected_actions)
+
+
+async def test_action(
+    hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
+    config_entry: MockConfigEntry,
+    setup_zha: Callable[..., Coroutine[None]],
+    zigpy_device_mock: Callable[..., ZigbeeDevice],
+) -> None:
+    """Test for executing a ZHA device action."""
+    await setup_zha()
+    gateway = get_zha_gateway(hass)
+
+    zigpy_device = zigpy_device_mock(
+        {
+            1: {
+                SIG_EP_INPUT: [
+                    general.Basic.cluster_id,
+                    security.IasZone.cluster_id,
+                    security.IasWd.cluster_id,
+                ],
+                SIG_EP_OUTPUT: [general.OnOff.cluster_id],
+                SIG_EP_TYPE: zha.DeviceType.ON_OFF_SWITCH,
+                SIG_EP_PROFILE: zha.PROFILE_ID,
+            }
+        }
     )
-
-    expected_actions = [
-        {
-            "device_id": inovelli_reg_device.id,
-            "domain": DOMAIN,
-            "metadata": {},
-            "type": "issue_all_led_effect",
-        },
-        {
-            "device_id": inovelli_reg_device.id,
-            "domain": DOMAIN,
-            "metadata": {},
-            "type": "issue_individual_led_effect",
-        },
-        {
-            "device_id": inovelli_reg_device.id,
-            "domain": Platform.BUTTON,
-            "entity_id": "button.inovelli_vzm31_sn_identify",
-            "metadata": {"secondary": True},
-            "type": "press",
-        },
-        {
-            "device_id": inovelli_reg_device.id,
-            "domain": Platform.LIGHT,
-            "entity_id": "light.inovelli_vzm31_sn_light",
-            "metadata": {"secondary": False},
-            "type": "turn_off",
-        },
-        {
-            "device_id": inovelli_reg_device.id,
-            "domain": Platform.LIGHT,
-            "entity_id": "light.inovelli_vzm31_sn_light",
-            "metadata": {"secondary": False},
-            "type": "turn_on",
-        },
-        {
-            "device_id": inovelli_reg_device.id,
-            "domain": Platform.LIGHT,
-            "entity_id": "light.inovelli_vzm31_sn_light",
-            "metadata": {"secondary": False},
-            "type": "toggle",
-        },
-        {
-            "device_id": inovelli_reg_device.id,
-            "domain": Platform.LIGHT,
-            "entity_id": "light.inovelli_vzm31_sn_light",
-            "metadata": {"secondary": False},
-            "type": "brightness_increase",
-        },
-        {
-            "device_id": inovelli_reg_device.id,
-            "domain": Platform.LIGHT,
-            "entity_id": "light.inovelli_vzm31_sn_light",
-            "metadata": {"secondary": False},
-            "type": "brightness_decrease",
-        },
-        {
-            "device_id": inovelli_reg_device.id,
-            "domain": Platform.LIGHT,
-            "entity_id": "light.inovelli_vzm31_sn_light",
-            "metadata": {"secondary": False},
-            "type": "flash",
-        },
-    ]
-
-    assert_lists_same(actions, expected_actions)
-
-
-async def test_action(hass, device_ias, device_inovelli):
-    """Test for executing a zha device action."""
-    zigpy_device, zha_device = device_ias
-    inovelli_zigpy_device, inovelli_zha_device = device_inovelli
-
     zigpy_device.device_automation_triggers = {
         (SHORT_PRESS, SHORT_PRESS): {COMMAND: COMMAND_SINGLE}
     }
 
-    ieee_address = str(zha_device.ieee)
-    inovelli_ieee_address = str(inovelli_zha_device.ieee)
+    gateway.get_or_create_device(zigpy_device)
+    await gateway.async_device_initialized(zigpy_device)
+    await hass.async_block_till_done(wait_background_tasks=True)
+    ieee_address = str(zigpy_device.ieee)
 
-    ha_device_registry = dr.async_get(hass)
-    reg_device = ha_device_registry.async_get_device({(DOMAIN, ieee_address)})
-    inovelli_reg_device = ha_device_registry.async_get_device(
-        {(DOMAIN, inovelli_ieee_address)}
+    reg_device = device_registry.async_get_device_by_identifier(
+        (DOMAIN, ieee_address), config_entry.entry_id
     )
-
-    cluster = inovelli_zigpy_device.endpoints[1].in_clusters[0xFC31]
 
     with patch(
         "zigpy.zcl.Cluster.request",
-        return_value=mock_coro([0x00, zcl_f.Status.SUCCESS]),
+        return_value=[0x00, zcl_f.Status.SUCCESS],
     ):
         assert await async_setup_component(
             hass,
@@ -277,25 +257,6 @@ async def test_action(hass, device_ias, device_inovelli):
                                 "device_id": reg_device.id,
                                 "type": "warn",
                             },
-                            {
-                                "domain": DOMAIN,
-                                "device_id": inovelli_reg_device.id,
-                                "type": "issue_all_led_effect",
-                                "effect_type": "Open_Close",
-                                "duration": 5,
-                                "level": 10,
-                                "color": 41,
-                            },
-                            {
-                                "domain": DOMAIN,
-                                "device_id": inovelli_reg_device.id,
-                                "type": "issue_individual_led_effect",
-                                "effect_type": "Falling",
-                                "led_number": 1,
-                                "duration": 5,
-                                "level": 10,
-                                "color": 41,
-                            },
                         ],
                     }
                 ]
@@ -305,8 +266,9 @@ async def test_action(hass, device_ias, device_inovelli):
         await hass.async_block_till_done()
         calls = async_mock_service(hass, DOMAIN, "warning_device_warn")
 
-        channel = zha_device.channels.pools[0].client_channels["1:0x0006"]
-        channel.zha_send_event(COMMAND_SINGLE, [])
+        zigpy_device.endpoints[1].out_clusters[general.OnOff.cluster_id].listener_event(
+            "zha_send_event", COMMAND_SINGLE, []
+        )
         await hass.async_block_till_done()
 
         assert len(calls) == 1
@@ -314,47 +276,163 @@ async def test_action(hass, device_ias, device_inovelli):
         assert calls[0].service == "warning_device_warn"
         assert calls[0].data["ieee"] == ieee_address
 
-        assert len(cluster.request.mock_calls) == 2
-        assert (
-            call(
-                False,
-                cluster.commands_by_name["led_effect"].id,
-                cluster.commands_by_name["led_effect"].schema,
-                6,
-                41,
-                10,
-                5,
-                expect_reply=False,
-                manufacturer=4151,
-                tries=1,
-                tsn=None,
-            )
-            in cluster.request.call_args_list
-        )
-        assert (
-            call(
-                False,
-                cluster.commands_by_name["individual_led_effect"].id,
-                cluster.commands_by_name["individual_led_effect"].schema,
-                1,
-                6,
-                41,
-                10,
-                5,
-                expect_reply=False,
-                manufacturer=4151,
-                tries=1,
-                tsn=None,
-            )
-            in cluster.request.call_args_list
-        )
+
+@pytest.mark.parametrize(
+    ("action_type", "extra_config", "cluster_method", "expected_effect"),
+    [
+        pytest.param(
+            "issue_all_led_effect",
+            {},
+            "led_effect",
+            AllLEDEffectType.Clear,
+            id="all_leds",
+        ),
+        pytest.param(
+            "issue_individual_led_effect",
+            {"led_number": 1},
+            "individual_led_effect",
+            SingleLEDEffectType.Clear,
+            id="individual_led",
+        ),
+    ],
+)
+async def test_inovelli_led_effect_from_unvalidated_config(
+    hass: HomeAssistant,
+    action_type: str,
+    extra_config: dict[str, int],
+    cluster_method: str,
+    expected_effect: AllLEDEffectType | SingleLEDEffectType,
+) -> None:
+    """Test the LED effect is sent as an effect type, even if ZHA didn't validate it.
+
+    ZHA only validates the action when it is loaded, so the action can receive
+    the effect type as it was configured.
+    """
+    cluster = AsyncMock()
+    config = {
+        "device_id": "device_id",
+        "domain": DOMAIN,
+        "type": action_type,
+        "effect_type": "Clear",
+        "color": 200,
+        "level": 100,
+        "duration": 255,
+        **extra_config,
+    }
+
+    with patch(
+        "homeassistant.components.zha.device_action._find_inovelli_cluster",
+        return_value=cluster,
+    ):
+        await device_action.async_call_action_from_config(hass, config, {}, None)
+
+    assert getattr(cluster, cluster_method).call_args.kwargs["led_effect"] is (
+        expected_effect
+    )
 
 
-async def test_invalid_zha_event_type(hass, device_ias):
-    """Test that unexpected types are not passed to `zha_send_event`."""
-    zigpy_device, zha_device = device_ias
-    channel = zha_device.channels.pools[0].client_channels["1:0x0006"]
+@pytest.mark.parametrize(
+    ("action_type", "extra_config"),
+    [
+        pytest.param("issue_all_led_effect", {}, id="all_leds"),
+        pytest.param(
+            "issue_individual_led_effect", {"led_number": 1}, id="individual_led"
+        ),
+    ],
+)
+@pytest.mark.parametrize("effect_type", [77, "77", "Unknown"])
+async def test_inovelli_led_effect_rejects_unknown_effect(
+    hass: HomeAssistant,
+    action_type: str,
+    extra_config: dict[str, int],
+    effect_type: int | str,
+) -> None:
+    """Test only known effect names pass validation, not raw effect codes."""
+    config = {
+        "device_id": "device_id",
+        "domain": DOMAIN,
+        "type": action_type,
+        "effect_type": effect_type,
+        "color": 200,
+        "level": 100,
+        "duration": 255,
+        **extra_config,
+    }
 
-    # `zha_send_event` accepts only zigpy responses, lists, and dicts
-    with pytest.raises(TypeError):
-        channel.zha_send_event(COMMAND_SINGLE, 123)
+    with pytest.raises(probatio.Invalid):
+        await device_action.async_validate_action_config(hass, config)
+
+
+async def test_action_without_type_is_invalid(hass: HomeAssistant) -> None:
+    """Test an action without a type fails validation."""
+    config = {"device_id": "device_id", "domain": DOMAIN}
+
+    with pytest.raises(probatio.Invalid):
+        await device_action.async_validate_action_config(hass, config)
+
+
+async def test_client_unique_id_suffix_stripped(
+    hass: HomeAssistant,
+    setup_zha: Callable[..., Coroutine[None]],
+    zigpy_device_mock: Callable[..., ZigbeeDevice],
+) -> None:
+    """Test that the `_CLIENT_` unique ID suffix is stripped."""
+    assert await async_setup_component(
+        hass,
+        automation.DOMAIN,
+        {
+            automation.DOMAIN: {
+                "trigger": {
+                    "platform": "event",
+                    "event_type": "zha_event",
+                    "event_data": {
+                        # no `_CLIENT` suffix
+                        "unique_id": "38:5b:44:ff:fe:a7:cc:69:1:0x0006",
+                        "endpoint_id": 1,
+                        "cluster_id": 6,
+                        "command": "on",
+                        "args": [],
+                        "params": {},
+                    },
+                },
+                "action": {"service": "zha.test"},
+            }
+        },
+    )
+
+    service_calls = async_mock_service(hass, DOMAIN, "test")
+
+    await setup_zha()
+    gateway = get_zha_gateway(hass)
+
+    zigpy_device = zigpy_device_mock(
+        {
+            1: {
+                SIG_EP_INPUT: [
+                    general.Basic.cluster_id,
+                    security.IasZone.cluster_id,
+                    security.IasWd.cluster_id,
+                ],
+                SIG_EP_OUTPUT: [general.OnOff.cluster_id],
+                SIG_EP_TYPE: zha.DeviceType.ON_OFF_SWITCH,
+                SIG_EP_PROFILE: zha.PROFILE_ID,
+            }
+        }
+    )
+
+    zha_device = gateway.get_or_create_device(zigpy_device)
+    await gateway.async_device_initialized(zha_device.device)
+
+    zha_device.emit_zha_event(
+        {
+            "unique_id": "38:5b:44:ff:fe:a7:cc:69:1:0x0006_CLIENT",
+            "endpoint_id": 1,
+            "cluster_id": 6,
+            "command": "on",
+            "args": [],
+            "params": {},
+        }
+    )
+
+    await hass.async_block_till_done(wait_background_tasks=True)
+    assert len(service_calls) == 1

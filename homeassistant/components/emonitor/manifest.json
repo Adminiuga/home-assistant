@@ -1,14 +1,22 @@
 {
   "domain": "emonitor",
   "name": "SiteSage Emonitor",
-  "config_flow": true,
-  "documentation": "https://www.home-assistant.io/integrations/emonitor",
-  "requirements": ["aioemonitor==1.0.5"],
-  "dhcp": [
-    { "hostname": "emonitor*", "macaddress": "0090C2*" },
-    { "registered_devices": true }
-  ],
+  "categories": ["energy.meters_monitoring"],
   "codeowners": ["@bdraco"],
+  "config_flow": true,
+  "connectivity": ["network"],
+  "dhcp": [
+    {
+      "hostname": "emonitor*",
+      "macaddress": "0090C2*"
+    },
+    {
+      "registered_devices": true
+    }
+  ],
+  "documentation": "https://www.home-assistant.io/integrations/emonitor",
+  "integration_type": "device",
   "iot_class": "local_polling",
-  "loggers": ["aioemonitor"]
+  "loggers": ["aioemonitor"],
+  "requirements": ["aioemonitor==1.0.5"]
 }

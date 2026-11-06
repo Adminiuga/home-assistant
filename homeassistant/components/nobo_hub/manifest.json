@@ -1,9 +1,22 @@
 {
   "domain": "nobo_hub",
   "name": "Nob\u00f8 Ecohub",
-  "config_flow": true,
-  "documentation": "https://www.home-assistant.io/integrations/nobo_hub",
-  "requirements": ["pynobo==1.6.0"],
+  "categories": ["climate.thermostats_heating"],
   "codeowners": ["@echoromeo", "@oyvindwe"],
-  "iot_class": "local_push"
+  "config_flow": true,
+  "connectivity": ["network"],
+  "dhcp": [
+    {
+      "registered_devices": true
+    },
+    {
+      "hostname": "hub*",
+      "macaddress": "7C8306*"
+    }
+  ],
+  "documentation": "https://www.home-assistant.io/integrations/nobo_hub",
+  "integration_type": "hub",
+  "iot_class": "local_push",
+  "quality_scale": "platinum",
+  "requirements": ["pynobo==1.9.0"]
 }

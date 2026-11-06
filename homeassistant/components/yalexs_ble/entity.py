@@ -1,12 +1,14 @@
 """The yalexs_ble integration entities."""
-from __future__ import annotations
+
+from typing import override
 
 from yalexs_ble import ConnectionInfo, LockInfo, LockState
 
 from homeassistant.components import bluetooth
 from homeassistant.core import callback
 from homeassistant.helpers import device_registry as dr
-from homeassistant.helpers.entity import DeviceInfo, Entity
+from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.entity import Entity
 
 from .const import DOMAIN
 from .models import YaleXSBLEData
@@ -15,6 +17,7 @@ from .models import YaleXSBLEData
 class YALEXSBLEEntity(Entity):
     """Base class for yale xs ble entities."""
 
+    _attr_has_entity_name = True
     _attr_should_poll = False
 
     def __init__(self, data: YaleXSBLEData) -> None:
@@ -45,7 +48,7 @@ class YALEXSBLEEntity(Entity):
         self, new_state: LockState, lock_info: LockInfo, connection_info: ConnectionInfo
     ) -> None:
         """Update the state."""
-        self._attr_available = True
+        self._attr_available = bool(not new_state.auth or new_state.auth.successful)
 
     @callback
     def _async_state_changed(
@@ -63,6 +66,7 @@ class YALEXSBLEEntity(Entity):
         self._attr_available = False
         self.async_write_ha_state()
 
+    @override
     async def async_added_to_hass(self) -> None:
         """Register callbacks."""
         self.async_on_remove(

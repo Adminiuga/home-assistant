@@ -1,10 +1,12 @@
-"""Config flow for Huisbaasje integration."""
+"""Config flow for EnergyFlip integration."""
+
 import logging
+from typing import Any, override
 
 from energyflip import EnergyFlip, EnergyFlipConnectionException, EnergyFlipException
-import voluptuous as vol
+import probatio
 
-from homeassistant import config_entries
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_ID, CONF_PASSWORD, CONF_USERNAME
 from homeassistant.data_entry_flow import AbortFlow
 
@@ -12,17 +14,23 @@ from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
-DATA_SCHEMA = vol.Schema(
-    {vol.Required(CONF_USERNAME): str, vol.Required(CONF_PASSWORD): str}
+DATA_SCHEMA = probatio.Schema(
+    {
+        probatio.Required(CONF_USERNAME): str,
+        probatio.Required(probatio.Secret(CONF_PASSWORD)): str,
+    }
 )
 
 
-class HuisbaasjeConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
-    """Handle a config flow for Huisbaasje."""
+class EnergyFlipConfigFlow(ConfigFlow, domain=DOMAIN):
+    """Handle a config flow for EnergyFlip."""
 
     VERSION = 1
 
-    async def async_step_user(self, user_input=None):
+    @override
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle a flow initiated by the user."""
         if user_input is None:
             return await self._show_setup_form(user_input)
@@ -39,7 +47,7 @@ class HuisbaasjeConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             errors["base"] = "invalid_auth"
         except AbortFlow:
             raise
-        except Exception:  # pylint: disable=broad-except
+        except Exception:
             _LOGGER.exception("Unexpected exception")
             errors["base"] = "unknown"
         else:

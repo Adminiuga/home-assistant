@@ -1,54 +1,63 @@
 """Sensor from an SQL Query."""
-from __future__ import annotations
 
-from datetime import date
-import decimal
 import logging
+from typing import Any, override
 
-import sqlalchemy
 from sqlalchemy.engine import Result
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import scoped_session, sessionmaker
-import voluptuous as vol
+from sqlalchemy.orm import scoped_session
 
-from homeassistant.components.recorder import CONF_DB_URL, DEFAULT_DB_FILE, DEFAULT_URL
-from homeassistant.components.sensor import (
-    PLATFORM_SCHEMA as PARENT_PLATFORM_SCHEMA,
-    SensorEntity,
+from homeassistant.components.recorder import CONF_DB_URL, get_instance
+from homeassistant.components.sensor import CONF_STATE_CLASS, DOMAIN as SENSOR_DOMAIN
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import (
+    CONF_DEVICE_CLASS,
+    CONF_ICON,
+    CONF_NAME,
+    CONF_UNIQUE_ID,
+    CONF_UNIT_OF_MEASUREMENT,
+    CONF_VALUE_TEMPLATE,
+    MATCH_ALL,
 )
-from homeassistant.config_entries import SOURCE_IMPORT, ConfigEntry
-from homeassistant.const import CONF_NAME, CONF_UNIT_OF_MEASUREMENT, CONF_VALUE_TEMPLATE
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import TemplateError
-import homeassistant.helpers.config_validation as cv
-from homeassistant.helpers.device_registry import DeviceEntryType
-from homeassistant.helpers.entity import DeviceInfo
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.exceptions import PlatformNotReady, TemplateError
+from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
+from homeassistant.helpers.entity_platform import (
+    AddConfigEntryEntitiesCallback,
+    AddEntitiesCallback,
+    async_create_platform_config_not_supported_issue,
+)
 from homeassistant.helpers.template import Template
+from homeassistant.helpers.trigger_template_entity import (
+    CONF_AVAILABILITY,
+    CONF_PICTURE,
+    ManualTriggerSensorEntity,
+    ValueTemplate,
+)
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
-from .const import CONF_COLUMN_NAME, CONF_QUERIES, CONF_QUERY, DB_URL_RE, DOMAIN
+from .const import CONF_ADDITIONAL_OPTIONS, CONF_COLUMN_NAME, CONF_QUERY, DOMAIN
+from .util import (
+    InvalidSqlQuery,
+    async_create_sessionmaker,
+    check_and_render_sql_query,
+    convert_value,
+    generate_lambda_stmt,
+    redact_credentials,
+    resolve_db_url,
+    validate_query,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
-
-def redact_credentials(data: str) -> str:
-    """Redact credentials from string data."""
-    return DB_URL_RE.sub("//****:****@", data)
-
-
-_QUERY_SCHEME = vol.Schema(
-    {
-        vol.Required(CONF_COLUMN_NAME): cv.string,
-        vol.Required(CONF_NAME): cv.string,
-        vol.Required(CONF_QUERY): cv.string,
-        vol.Optional(CONF_UNIT_OF_MEASUREMENT): cv.string,
-        vol.Optional(CONF_VALUE_TEMPLATE): cv.string,
-    }
-)
-
-PLATFORM_SCHEMA = PARENT_PLATFORM_SCHEMA.extend(
-    {vol.Required(CONF_QUERIES): [_QUERY_SCHEME], vol.Optional(CONF_DB_URL): cv.string}
+TRIGGER_ENTITY_OPTIONS = (
+    CONF_AVAILABILITY,
+    CONF_DEVICE_CLASS,
+    CONF_ICON,
+    CONF_PICTURE,
+    CONF_UNIQUE_ID,
+    CONF_STATE_CLASS,
+    CONF_UNIT_OF_MEASUREMENT,
 )
 
 
@@ -58,154 +67,253 @@ async def async_setup_platform(
     async_add_entities: AddEntitiesCallback,
     discovery_info: DiscoveryInfoType | None = None,
 ) -> None:
-    """Set up the SQL sensor platform."""
-    _LOGGER.warning(
-        # SQL config flow added in 2022.4 and should be removed in 2022.6
-        "Configuration of the SQL sensor platform in YAML is deprecated and "
-        "will be removed in Home Assistant 2022.6; Your existing configuration "
-        "has been imported into the UI automatically and can be safely removed "
-        "from your configuration.yaml file"
-    )
-
-    default_db_url = DEFAULT_URL.format(
-        hass_config_path=hass.config.path(DEFAULT_DB_FILE)
-    )
-
-    for query in config[CONF_QUERIES]:
-        new_config = {
-            CONF_DB_URL: config.get(CONF_DB_URL, default_db_url),
-            CONF_NAME: query[CONF_NAME],
-            CONF_QUERY: query[CONF_QUERY],
-            CONF_UNIT_OF_MEASUREMENT: query.get(CONF_UNIT_OF_MEASUREMENT),
-            CONF_VALUE_TEMPLATE: query.get(CONF_VALUE_TEMPLATE),
-            CONF_COLUMN_NAME: query[CONF_COLUMN_NAME],
-        }
-        hass.async_create_task(
-            hass.config_entries.flow.async_init(
-                DOMAIN,
-                context={"source": SOURCE_IMPORT},
-                data=new_config,
-            )
+    """Set up the SQL sensor from yaml."""
+    if (conf := discovery_info) is None:
+        async_create_platform_config_not_supported_issue(
+            hass,
+            DOMAIN,
+            SENSOR_DOMAIN,
+            yaml_config_under_integration_supported=True,
+            learn_more_url="https://www.home-assistant.io/integrations/sql/",
+            logger=_LOGGER,
         )
+        return
+
+    name: Template = conf[CONF_NAME]
+    query_template: ValueTemplate = conf[CONF_QUERY]
+    value_template: ValueTemplate | None = conf.get(CONF_VALUE_TEMPLATE)
+    column_name: str = conf[CONF_COLUMN_NAME]
+    unique_id: str | None = conf.get(CONF_UNIQUE_ID)
+    db_url: str = resolve_db_url(hass, conf.get(CONF_DB_URL))
+
+    trigger_entity_config = {CONF_NAME: name}
+    for key in TRIGGER_ENTITY_OPTIONS:
+        if key not in conf:
+            continue
+        trigger_entity_config[key] = conf[key]
+
+    await async_setup_sensor(
+        hass,
+        trigger_entity_config,
+        query_template,
+        column_name,
+        value_template,
+        unique_id,
+        db_url,
+        True,
+        async_add_entities,
+        None,
+    )
 
 
 async def async_setup_entry(
-    hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    """Set up the SQL sensor entry."""
+    """Set up the SQL sensor from config entry."""
 
-    db_url: str = entry.options[CONF_DB_URL]
-    name: str = entry.options[CONF_NAME]
+    db_url: str = resolve_db_url(hass, entry.data.get(CONF_DB_URL))
+    name: str = entry.title
     query_str: str = entry.options[CONF_QUERY]
-    unit: str | None = entry.options.get(CONF_UNIT_OF_MEASUREMENT)
-    template: str | None = entry.options.get(CONF_VALUE_TEMPLATE)
+    template: str | None = entry.options[CONF_ADDITIONAL_OPTIONS].get(
+        CONF_VALUE_TEMPLATE
+    )
     column_name: str = entry.options[CONF_COLUMN_NAME]
 
-    value_template: Template | None = None
+    query_template: ValueTemplate | None = None
+    try:
+        query_template = ValueTemplate(query_str, hass)
+        query_template.ensure_valid()
+    except TemplateError as err:
+        raise PlatformNotReady("Invalid SQL query template") from err
+
+    value_template: ValueTemplate | None = None
     if template is not None:
         try:
-            value_template = Template(template)
+            value_template = ValueTemplate(template, hass)
             value_template.ensure_valid()
         except TemplateError:
             value_template = None
-        if value_template is not None:
-            value_template.hass = hass
 
-    try:
-        engine = sqlalchemy.create_engine(db_url, future=True)
-        sessmaker = scoped_session(sessionmaker(bind=engine, future=True))
-    except SQLAlchemyError as err:
-        _LOGGER.error("Can not open database %s", {redact_credentials(str(err))})
+    name_template = Template(name, hass)
+    trigger_entity_config = {CONF_NAME: name_template, CONF_UNIQUE_ID: entry.entry_id}
+    for key in TRIGGER_ENTITY_OPTIONS:
+        if key not in entry.options[CONF_ADDITIONAL_OPTIONS]:
+            continue
+        trigger_entity_config[key] = entry.options[CONF_ADDITIONAL_OPTIONS][key]
+
+    await async_setup_sensor(
+        hass,
+        trigger_entity_config,
+        query_template,
+        column_name,
+        value_template,
+        entry.entry_id,
+        db_url,
+        False,
+        async_add_entities,
+        entry.entry_id,
+    )
+
+
+async def async_setup_sensor(
+    hass: HomeAssistant,
+    trigger_entity_config: ConfigType,
+    query_template: ValueTemplate,
+    column_name: str,
+    value_template: ValueTemplate | None,
+    unique_id: str | None,
+    db_url: str,
+    yaml: bool,
+    async_add_entities: AddEntitiesCallback | AddConfigEntryEntitiesCallback,
+    config_entry_id: str | None,
+) -> None:
+    """Set up the SQL sensor."""
+    (
+        sessmaker,
+        uses_recorder_db,
+        use_database_executor,
+    ) = await async_create_sessionmaker(hass, db_url)
+    if sessmaker is None:
         return
+    validate_query(hass, query_template, uses_recorder_db, unique_id, config_entry_id)
 
+    query_str = check_and_render_sql_query(hass, query_template)
+    upper_query = query_str.upper()
     # MSSQL uses TOP and not LIMIT
-    if not ("LIMIT" in query_str.upper() or "SELECT TOP" in query_str.upper()):
+    mod_query_template = query_template
+    if not ("LIMIT" in upper_query or "SELECT TOP" in upper_query):
         if "mssql" in db_url:
-            query_str = query_str.upper().replace("SELECT", "SELECT TOP 1")
+            _query = query_template.template.replace("SELECT", "SELECT TOP 1")
         else:
-            query_str = query_str.replace(";", "") + " LIMIT 1;"
+            _query = query_template.template.replace(";", "") + " LIMIT 1;"
+        mod_query_template = ValueTemplate(_query, hass)
 
     async_add_entities(
         [
             SQLSensor(
-                name,
+                trigger_entity_config,
                 sessmaker,
-                query_str,
+                mod_query_template,
                 column_name,
-                unit,
                 value_template,
-                entry.entry_id,
+                yaml,
+                use_database_executor,
             )
         ],
-        True,
     )
 
 
-class SQLSensor(SensorEntity):
+class SQLSensor(ManualTriggerSensorEntity):
     """Representation of an SQL sensor."""
 
-    _attr_icon = "mdi:database-search"
-    _attr_has_entity_name = True
+    _unrecorded_attributes = frozenset({MATCH_ALL})
 
     def __init__(
         self,
-        name: str,
+        trigger_entity_config: ConfigType,
         sessmaker: scoped_session,
-        query: str,
+        query: ValueTemplate,
         column: str,
-        unit: str | None,
-        value_template: Template | None,
-        entry_id: str,
+        value_template: ValueTemplate | None,
+        yaml: bool,
+        use_database_executor: bool,
     ) -> None:
         """Initialize the SQL sensor."""
+        super().__init__(self.hass, trigger_entity_config)
         self._query = query
-        self._attr_native_unit_of_measurement = unit
         self._template = value_template
         self._column_name = column
         self.sessionmaker = sessmaker
         self._attr_extra_state_attributes = {}
-        self._attr_unique_id = entry_id
-        self._attr_device_info = DeviceInfo(
-            entry_type=DeviceEntryType.SERVICE,
-            identifiers={(DOMAIN, entry_id)},
-            manufacturer="SQL",
-            name=name,
-        )
+        self._use_database_executor = use_database_executor
+        if not yaml and (unique_id := trigger_entity_config.get(CONF_UNIQUE_ID)):
+            self._attr_name = None
+            self._attr_has_entity_name = True
+            self._attr_device_info = DeviceInfo(
+                entry_type=DeviceEntryType.SERVICE,
+                identifiers={(DOMAIN, unique_id)},
+                manufacturer="SQL",
+                name=self._rendered.get(CONF_NAME),
+            )
 
-    def update(self) -> None:
+    @property
+    @override
+    def name(self) -> str | None:
+        """Name of the entity."""
+        if self.has_entity_name:
+            return self._attr_name
+        return self._rendered.get(CONF_NAME)
+
+    @override
+    async def async_added_to_hass(self) -> None:
+        """Call when entity about to be added to hass."""
+        await super().async_added_to_hass()
+        await self.async_update()
+
+    @property
+    @override
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Return extra attributes."""
+        return dict(self._attr_extra_state_attributes)
+
+    async def async_update(self) -> None:
+        """Retrieve sensor data from the query using the right executor."""
+        if self._use_database_executor:
+            await get_instance(self.hass).async_add_executor_job(self._update)
+        else:
+            await self.hass.async_add_executor_job(self._update)
+
+    def _update(self) -> None:
         """Retrieve sensor data from the query."""
-
         data = None
         self._attr_extra_state_attributes = {}
         sess: scoped_session = self.sessionmaker()
         try:
-            result: Result = sess.execute(sqlalchemy.text(self._query))
+            rendered_query = check_and_render_sql_query(self.hass, self._query)
+            _lambda_stmt = generate_lambda_stmt(rendered_query)
+            result: Result = sess.execute(_lambda_stmt)
+        except (TemplateError, InvalidSqlQuery) as err:
+            _LOGGER.error(
+                "Error rendering query %s: %s",
+                redact_credentials(self._query.template),
+                redact_credentials(str(err)),
+            )
+            sess.rollback()
+            sess.close()
+            return
         except SQLAlchemyError as err:
             _LOGGER.error(
                 "Error executing query %s: %s",
-                self._query,
+                rendered_query,
                 redact_credentials(str(err)),
             )
+            sess.rollback()
+            sess.close()
             return
 
         for res in result.mappings():
-            _LOGGER.debug("Query %s result in %s", self._query, res.items())
+            _LOGGER.debug("Query %s result in %s", rendered_query, res.items())
             data = res[self._column_name]
             for key, value in res.items():
-                if isinstance(value, decimal.Decimal):
-                    value = float(value)
-                if isinstance(value, date):
-                    value = value.isoformat()
-                self._attr_extra_state_attributes[key] = value
+                self._attr_extra_state_attributes[key] = convert_value(value)
+
+        if data is not None and isinstance(data, (bytes, bytearray)):
+            data = f"0x{data.hex()}"
 
         if data is not None and self._template is not None:
-            self._attr_native_value = (
-                self._template.async_render_with_possible_json_value(data, None)
-            )
+            variables = self._template_variables_with_value(data)
+            if self._render_availability_template(variables):
+                _value = self._template.async_render_as_value_template(
+                    self.entity_id, variables, None
+                )
+                self._set_native_value_with_possible_timestamp(_value)
+                self._process_manual_data(variables)
         else:
             self._attr_native_value = data
 
         if data is None:
-            _LOGGER.warning("%s returned no results", self._query)
+            _LOGGER.warning("%s returned no results", rendered_query)
 
         sess.close()

@@ -1,10 +1,22 @@
 {
   "domain": "sma",
   "name": "SMA Solar",
+  "categories": ["energy.solar_batteries"],
+  "codeowners": ["@kellerza", "@rklomp", "@erwindouna"],
   "config_flow": true,
+  "connectivity": ["network"],
+  "dhcp": [
+    {
+      "hostname": "sma*",
+      "macaddress": "0015BB*"
+    },
+    {
+      "registered_devices": true
+    }
+  ],
   "documentation": "https://www.home-assistant.io/integrations/sma",
-  "requirements": ["pysma==0.7.2"],
-  "codeowners": ["@kellerza", "@rklomp"],
+  "integration_type": "device",
   "iot_class": "local_polling",
-  "loggers": ["pysma"]
+  "loggers": ["pysma"],
+  "requirements": ["pysma==1.1.9"]
 }

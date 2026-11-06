@@ -1,9 +1,11 @@
 """Tests for dlna_dms.media_source, mostly testing DmsMediaSource."""
+
 from unittest.mock import ANY, Mock
 
 from async_upnp_client.exceptions import UpnpError
 from didl_lite import didl_lite
 import pytest
+from pytest_homeassistant.common import MockConfigEntry
 
 from homeassistant.components import media_source
 from homeassistant.components.dlna_dms.const import DOMAIN
@@ -12,11 +14,11 @@ from homeassistant.components.dlna_dms.media_source import (
     DmsMediaSource,
     async_get_media_source,
 )
-from homeassistant.components.media_player.errors import BrowseError
-from homeassistant.components.media_source.error import Unresolvable
-from homeassistant.components.media_source.models import (
+from homeassistant.components.media_player import BrowseError
+from homeassistant.components.media_source import (
     BrowseMediaSource,
     MediaSourceItem,
+    Unresolvable,
 )
 from homeassistant.const import CONF_DEVICE_ID, CONF_URL
 from homeassistant.core import HomeAssistant
@@ -27,8 +29,6 @@ from .conftest import (
     MOCK_DEVICE_TYPE,
     MOCK_SOURCE_ID,
 )
-
-from tests.common import MockConfigEntry
 
 # Auto-use a few fixtures from conftest
 pytestmark = [

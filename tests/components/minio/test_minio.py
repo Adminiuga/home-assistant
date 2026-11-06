@@ -1,4 +1,5 @@
 """Tests for Minio Hass related code."""
+
 import asyncio
 import json
 from unittest.mock import MagicMock, call, patch
@@ -7,16 +8,15 @@ import pytest
 
 from homeassistant.components.minio import (
     CONF_ACCESS_KEY,
-    CONF_HOST,
     CONF_LISTEN,
     CONF_LISTEN_BUCKET,
-    CONF_PORT,
     CONF_SECRET_KEY,
     CONF_SECURE,
     DOMAIN,
     QueueListener,
 )
-from homeassistant.core import callback
+from homeassistant.const import CONF_HOST, CONF_PORT
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.setup import async_setup_component
 
 from .common import TEST_EVENT
@@ -52,7 +52,9 @@ def minio_client_event_fixture():
         yield minio_client_mock
 
 
-async def test_minio_services(hass, caplog, minio_client):
+async def test_minio_services(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture, minio_client
+) -> None:
     """Test Minio services."""
     hass.config.allowlist_external_dirs = {"/test"}
 
@@ -72,8 +74,6 @@ async def test_minio_services(hass, caplog, minio_client):
 
     await hass.async_start()
     await hass.async_block_till_done()
-
-    assert "Setup of domain minio took" in caplog.text
 
     # Call services
     await hass.services.async_call(
@@ -105,7 +105,9 @@ async def test_minio_services(hass, caplog, minio_client):
     minio_client.reset_mock()
 
 
-async def test_minio_listen(hass, caplog, minio_client_event):
+async def test_minio_listen(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture, minio_client_event
+) -> None:
     """Test minio listen on notifications."""
     minio_client_event.presigned_get_object.return_value = "http://url"
 
@@ -136,8 +138,6 @@ async def test_minio_listen(hass, caplog, minio_client_event):
     await hass.async_start()
     await hass.async_block_till_done()
 
-    assert "Setup of domain minio took" in caplog.text
-
     while not events:
         await asyncio.sleep(0)
 
@@ -153,7 +153,7 @@ async def test_minio_listen(hass, caplog, minio_client_event):
     assert len(event.data["metadata"]) == 0
 
 
-async def test_queue_listener():
+async def test_queue_listener() -> None:
     """Tests QueueListener firing events on Home Assistant event bus."""
     hass = MagicMock()
 

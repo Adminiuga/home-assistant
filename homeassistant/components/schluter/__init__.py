@@ -1,15 +1,15 @@
 """The Schluter DITRA-HEAT integration."""
+
 import logging
 
+import probatio
 from requests import RequestException, Session
 from schluter.api import Api
 from schluter.authenticator import AuthenticationState, Authenticator
-import voluptuous as vol
 
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME, Platform
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers import discovery
-import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers import config_validation as cv, discovery
 from homeassistant.helpers.typing import ConfigType
 
 from .const import DOMAIN
@@ -20,16 +20,16 @@ DATA_SCHLUTER_API = "schluter_api"
 SCHLUTER_CONFIG_FILE = ".schluter.conf"
 API_TIMEOUT = 10
 
-CONFIG_SCHEMA = vol.Schema(
+CONFIG_SCHEMA = probatio.Schema(
     {
-        vol.Required(DOMAIN): vol.Schema(
+        probatio.Required(DOMAIN): probatio.Schema(
             {
-                vol.Required(CONF_USERNAME): cv.string,
-                vol.Required(CONF_PASSWORD): cv.string,
+                probatio.Required(CONF_USERNAME): cv.string,
+                probatio.Required(probatio.Secret(CONF_PASSWORD)): cv.string,
             }
         )
     },
-    extra=vol.ALLOW_EXTRA,
+    extra=probatio.ALLOW_EXTRA,
 )
 
 

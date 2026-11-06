@@ -5,6 +5,8 @@ automatic sensor creation.
 
 """
 
+import pytest
+
 from homeassistant.components.rflink import (
     CONF_RECONNECT_INTERVAL,
     DATA_ENTITY_LOOKUP,
@@ -17,27 +19,33 @@ from homeassistant.const import (
     ATTR_ICON,
     ATTR_UNIT_OF_MEASUREMENT,
     PERCENTAGE,
+    STATE_UNAVAILABLE,
     STATE_UNKNOWN,
+    UnitOfPrecipitationDepth,
     UnitOfTemperature,
 )
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
 
 from .test_init import mock_rflink
 
 DOMAIN = "sensor"
 
+
 CONFIG = {
     "rflink": {
         "port": "/dev/ttyABC0",
         "ignore_devices": ["ignore_wildcard_*", "ignore_sensor"],
-    },
-    DOMAIN: {
-        "platform": "rflink",
-        "devices": {"test": {"name": "test", "sensor_type": "temperature"}},
+        DOMAIN: {
+            "devices": {"test": {"name": "test", "sensor_type": "temperature"}},
+        },
     },
 }
 
 
-async def test_default_setup(hass, monkeypatch):
+async def test_default_setup(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Test all basic functionality of the rflink sensor component."""
     # setup mocking rflink module
     event_callback, create, _, _ = await mock_rflink(hass, CONFIG, DOMAIN, monkeypatch)
@@ -87,24 +95,26 @@ async def test_default_setup(hass, monkeypatch):
     )  # temperature uses SensorEntityDescription
 
     # test event for new unconfigured sensor
-    event_callback(
-        {"id": "test3", "sensor": "humidity", "value": 43, "unit": PERCENTAGE}
-    )
+    event_callback({"id": "test3", "sensor": "battery", "value": "ok", "unit": None})
     await hass.async_block_till_done()
 
-    # test state of hum sensor
-    hum_sensor = hass.states.get("sensor.test3")
-    assert hum_sensor
-    assert hum_sensor.state == "43"
-    assert hum_sensor.attributes[ATTR_UNIT_OF_MEASUREMENT] == PERCENTAGE
-    assert hum_sensor.attributes[ATTR_ICON] == "mdi:water-percent"
+    # test state of battery sensor
+    bat_sensor = hass.states.get("sensor.test3")
+    assert bat_sensor
+    assert bat_sensor.state == "ok"
+    assert ATTR_UNIT_OF_MEASUREMENT not in bat_sensor.attributes
+    assert bat_sensor.attributes[ATTR_ICON] == "mdi:battery"
 
 
-async def test_disable_automatic_add(hass, monkeypatch):
+async def test_disable_automatic_add(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """If disabled new devices should not be automatically added."""
     config = {
-        "rflink": {"port": "/dev/ttyABC0"},
-        DOMAIN: {"platform": "rflink", "automatic_add": False},
+        "rflink": {
+            "port": "/dev/ttyABC0",
+            DOMAIN: {"automatic_add": False},
+        },
     }
 
     # setup mocking rflink module
@@ -125,18 +135,26 @@ async def test_disable_automatic_add(hass, monkeypatch):
     assert not hass.states.get("sensor.test2")
 
 
-async def test_entity_availability(hass, monkeypatch):
+async def test_entity_availability(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """If Rflink device is disconnected, entities should become unavailable."""
-    # Make sure Rflink mock does not 'recover' to quickly from the
+    # Make sure Rflink mock does not 'recover' too quickly from the
     # disconnect or else the unavailability cannot be measured
-    config = CONFIG
-    failures = [True, True]
-    config[CONF_RECONNECT_INTERVAL] = 60
+    config = {
+        **CONFIG,
+        "rflink": {
+            **CONFIG["rflink"],
+            CONF_RECONNECT_INTERVAL: 60,
+        },
+    }
+    failures = [False, True, False]
 
     # Create platform and entities
     _, _, _, disconnect_callback = await mock_rflink(
         hass, config, DOMAIN, monkeypatch, failures=failures
     )
+    await hass.async_block_till_done()
 
     # Entities are available by default
     assert hass.states.get("sensor.test").state == STATE_UNKNOWN
@@ -148,7 +166,7 @@ async def test_entity_availability(hass, monkeypatch):
     await hass.async_block_till_done()
 
     # Entity should be unavailable
-    assert hass.states.get("sensor.test").state == "unavailable"
+    assert hass.states.get("sensor.test").state == STATE_UNAVAILABLE
 
     # Reconnect the Rflink device
     disconnect_callback()
@@ -160,18 +178,19 @@ async def test_entity_availability(hass, monkeypatch):
     assert hass.states.get("sensor.test").state == STATE_UNKNOWN
 
 
-async def test_aliases(hass, monkeypatch):
+async def test_aliases(hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch) -> None:
     """Validate the response to sensor's alias (with aliases)."""
     config = {
-        "rflink": {"port": "/dev/ttyABC0"},
-        DOMAIN: {
-            "platform": "rflink",
-            "devices": {
-                "test_02": {
-                    "name": "test_02",
-                    "sensor_type": "humidity",
-                    "aliases": ["test_alias_02_0"],
-                }
+        "rflink": {
+            "port": "/dev/ttyABC0",
+            DOMAIN: {
+                "devices": {
+                    "test_02": {
+                        "name": "test_02",
+                        "sensor_type": "humidity",
+                        "aliases": ["test_alias_02_0"],
+                    }
+                },
             },
         },
     }
@@ -195,16 +214,18 @@ async def test_aliases(hass, monkeypatch):
     )
     await hass.async_block_till_done()
 
-    # test  state of new sensor
+    # test state of new sensor
     updated_sensor = hass.states.get("sensor.test_02")
     assert updated_sensor
     assert updated_sensor.state == "65"
     assert updated_sensor.attributes[ATTR_UNIT_OF_MEASUREMENT] == PERCENTAGE
 
 
-async def test_race_condition(hass, monkeypatch):
+async def test_race_condition(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Test race condition for unknown components."""
-    config = {"rflink": {"port": "/dev/ttyABC0"}, DOMAIN: {"platform": "rflink"}}
+    config = {"rflink": {"port": "/dev/ttyABC0", DOMAIN: {}}}
     tmp_entity = TMP_ENTITY.format("test3")
 
     # setup mocking rflink module
@@ -221,11 +242,11 @@ async def test_race_condition(hass, monkeypatch):
 
     await hass.async_block_till_done()
 
-    # test  state of new sensor
+    # test state of new sensor
     updated_sensor = hass.states.get("sensor.test3")
     assert updated_sensor
 
-    # test  state of new sensor
+    # test state of new sensor
     new_sensor = hass.states.get(f"{DOMAIN}.test3")
     assert new_sensor
     assert new_sensor.state == "ok"
@@ -235,45 +256,71 @@ async def test_race_condition(hass, monkeypatch):
     # tmp_entity must be deleted from EVENT_KEY_COMMAND
     assert tmp_entity not in hass.data[DATA_ENTITY_LOOKUP][EVENT_KEY_SENSOR]["test3"]
 
-    # test  state of new sensor
+    # test state of new sensor
     new_sensor = hass.states.get(f"{DOMAIN}.test3")
     assert new_sensor
     assert new_sensor.state == "ko"
 
 
-async def test_sensor_attributes(hass, monkeypatch):
+async def test_sensor_attributes(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Validate the sensor attributes."""
 
     config = {
-        "rflink": {"port": "/dev/ttyABC0"},
-        DOMAIN: {
-            "platform": "rflink",
-            "devices": {
-                "my_humidity_device_unique_id": {
-                    "name": "humidity_device",
-                    "sensor_type": "humidity",
-                },
-                "my_temperature_device_unique_id": {
-                    "name": "temperature_device",
-                    "sensor_type": "temperature",
-                },
-                "another_temperature_device_unique_id": {
-                    "name": "fahrenheit_device",
-                    "sensor_type": "temperature",
-                    "unit_of_measurement": "F",
+        "rflink": {
+            "port": "/dev/ttyABC0",
+            DOMAIN: {
+                "devices": {
+                    "my_meter_device_unique_id": {
+                        "name": "meter_device",
+                        "sensor_type": "meter_value",
+                    },
+                    "my_rain_device_unique_id": {
+                        "name": "rain_device",
+                        "sensor_type": "total_rain",
+                    },
+                    "my_humidity_device_unique_id": {
+                        "name": "humidity_device",
+                        "sensor_type": "humidity",
+                    },
+                    "my_temperature_device_unique_id": {
+                        "name": "temperature_device",
+                        "sensor_type": "temperature",
+                    },
+                    "another_temperature_device_unique_id": {
+                        "name": "fahrenheit_device",
+                        "sensor_type": "temperature",
+                        "unit_of_measurement": "F",
+                    },
                 },
             },
         },
     }
 
     # setup mocking rflink module
-    event_callback, _, _, _ = await mock_rflink(hass, config, DOMAIN, monkeypatch)
+    _event_callback, _, _, _ = await mock_rflink(hass, config, DOMAIN, monkeypatch)
 
     # test sensor loaded from config
+    meter_state = hass.states.get("sensor.meter_device")
+    assert meter_state
+    assert "device_class" not in meter_state.attributes
+    assert "state_class" not in meter_state.attributes
+    assert "unit_of_measurement" not in meter_state.attributes
+
+    rain_state = hass.states.get("sensor.rain_device")
+    assert rain_state
+    assert rain_state.attributes["device_class"] == SensorDeviceClass.PRECIPITATION
+    assert rain_state.attributes["state_class"] == SensorStateClass.TOTAL_INCREASING
+    assert (
+        rain_state.attributes["unit_of_measurement"]
+        == UnitOfPrecipitationDepth.MILLIMETERS
+    )
+
     humidity_state = hass.states.get("sensor.humidity_device")
     assert humidity_state
-    assert "device_class" not in humidity_state.attributes
-    assert "state_class" not in humidity_state.attributes
+    assert humidity_state.attributes["device_class"] == SensorDeviceClass.HUMIDITY
+    assert humidity_state.attributes["state_class"] == SensorStateClass.MEASUREMENT
     assert humidity_state.attributes["unit_of_measurement"] == PERCENTAGE
 
     temperature_state = hass.states.get("sensor.temperature_device")
@@ -289,3 +336,154 @@ async def test_sensor_attributes(hass, monkeypatch):
     assert fahrenheit_state.attributes["device_class"] == SensorDeviceClass.TEMPERATURE
     assert fahrenheit_state.attributes["state_class"] == SensorStateClass.MEASUREMENT
     assert fahrenheit_state.attributes["unit_of_measurement"] == "F"
+
+
+async def test_empty_discovery_info(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test sensor platform initialization with empty discovery info."""
+
+    config = {
+        "rflink": {
+            "port": "/dev/ttyABC0",
+            DOMAIN: {},
+        },
+    }
+    # setup mocking rflink module
+    event_callback, _, _, _ = await mock_rflink(hass, config, DOMAIN, monkeypatch)
+
+    # test event for new unconfigured sensor
+    event_callback(
+        {
+            "id": "test2",
+            "sensor": "temperature",
+            "value": 20,
+            "unit": UnitOfTemperature.CELSIUS,
+        }
+    )
+    await hass.async_block_till_done()
+
+    # test state of temp sensor
+    temp_sensor = hass.states.get("sensor.test2")
+    assert temp_sensor
+    assert temp_sensor.state == "20"
+    assert temp_sensor.attributes[ATTR_UNIT_OF_MEASUREMENT] == UnitOfTemperature.CELSIUS
+    assert "device_id not known and automatic add disabled" not in caplog.text
+
+    # test event for command type event (should not create sensor)
+    event_callback({"id": "protocol_0_0", "command": "off"})
+    await hass.async_block_till_done()
+
+    # make sure new device is not added
+    assert not hass.states.get(f"{DOMAIN}.protocol_0_0")
+    assert not hass.states.get("light.protocol_0_0")
+    assert "device_id not known and automatic add disabled" in caplog.text
+
+
+async def test_removed_sensor_unregisters_lookups(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    entity_registry: er.EntityRegistry,
+) -> None:
+    """Test a removed sensor is dropped from the event lookups."""
+    config = {
+        "rflink": {
+            "port": "/dev/ttyABC0",
+            DOMAIN: {
+                "automatic_add": False,
+                "devices": {
+                    "test_02": {
+                        "name": "test_02",
+                        "sensor_type": "humidity",
+                        "aliases": ["test_alias_02_0"],
+                    },
+                    # Shares the alias of the removed sensor
+                    "test_03": {
+                        "name": "test_03",
+                        "sensor_type": "humidity",
+                        "aliases": ["test_alias_02_0"],
+                    },
+                },
+            },
+        },
+    }
+    event_callback, _, _, _ = await mock_rflink(hass, config, DOMAIN, monkeypatch)
+    lookup = hass.data[DATA_ENTITY_LOOKUP][EVENT_KEY_SENSOR]
+    assert lookup["test_02"] == ["sensor.test_02"]
+
+    entity_registry.async_remove("sensor.test_02")
+    await hass.async_block_till_done()
+    assert hass.states.get("sensor.test_02") is None
+
+    assert lookup == {
+        "test_03": ["sensor.test_03"],
+        "test_alias_02_0": ["sensor.test_03"],
+    }
+
+    for event_id in ("test_02", "test_alias_02_0"):
+        event_callback(
+            {"id": event_id, "sensor": "humidity", "value": 65, "unit": PERCENTAGE}
+        )
+    await hass.async_block_till_done()
+
+    assert hass.states.get("sensor.test_02") is None
+    assert hass.states.get("sensor.test_03").state == "65"
+
+
+@pytest.mark.parametrize(
+    "event_id",
+    [
+        pytest.param("test_02", id="device_id"),
+        pytest.param("test_alias_02_0", id="alias"),
+    ],
+)
+async def test_renamed_sensor_handles_events(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    entity_registry: er.EntityRegistry,
+    event_id: str,
+) -> None:
+    """Test events are routed to the new entity_id after renaming a sensor."""
+    config = {
+        "rflink": {
+            "port": "/dev/ttyABC0",
+            DOMAIN: {
+                "devices": {
+                    "test_02": {
+                        "name": "test_02",
+                        "sensor_type": "humidity",
+                        "aliases": ["test_alias_02_0"],
+                    }
+                },
+            },
+        },
+    }
+    event_callback, _, _, _ = await mock_rflink(hass, config, DOMAIN, monkeypatch)
+
+    entity_registry.async_update_entity(
+        "sensor.test_02", new_entity_id="sensor.renamed"
+    )
+    await hass.async_block_till_done()
+
+    assert hass.states.get("sensor.test_02") is None
+    assert hass.states.get("sensor.renamed").state == STATE_UNKNOWN
+    # The old entity_id is no longer routed to, so it can be reused
+    assert hass.data[DATA_ENTITY_LOOKUP][EVENT_KEY_SENSOR] == {
+        "test_02": ["sensor.renamed"],
+        "test_alias_02_0": ["sensor.renamed"],
+    }
+
+    event_callback(
+        {"id": event_id, "sensor": "humidity", "value": 65, "unit": PERCENTAGE}
+    )
+    await hass.async_block_till_done()
+
+    assert hass.states.get("sensor.renamed").state == "65"
+
+    # Removing the renamed sensor unregisters it under its new entity_id
+    entity_registry.async_remove("sensor.renamed")
+    await hass.async_block_till_done()
+
+    assert hass.data[DATA_ENTITY_LOOKUP][EVENT_KEY_SENSOR] == {}

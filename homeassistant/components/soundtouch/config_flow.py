@@ -1,43 +1,33 @@
 """Config flow for Bose SoundTouch integration."""
-import logging
+
+from typing import Any, override
 
 from libsoundtouch import soundtouch_device
+import probatio
 from requests import RequestException
-import voluptuous as vol
 
-from homeassistant import config_entries
-from homeassistant.components.zeroconf import ZeroconfServiceInfo
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_HOST
-from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.service_info.zeroconf import ZeroconfServiceInfo
 
 from .const import DOMAIN
 
-_LOGGER = logging.getLogger(__name__)
 
-
-class SoundtouchConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
+class SoundtouchConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Bose SoundTouch."""
 
     VERSION = 1
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize a new SoundTouch config flow."""
-        self.host = None
-        self.name = None
+        self.host: str | None = None
+        self.name: str | None = None
 
-    async def async_step_import(self, import_data):
-        """Handle a flow initiated by configuration file."""
-        self.host = import_data[CONF_HOST]
-
-        try:
-            await self._async_get_device_id()
-        except RequestException:
-            return self.async_abort(reason="cannot_connect")
-
-        return await self._async_create_soundtouch_entry()
-
-    async def async_step_user(self, user_input=None):
+    @override
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle a flow initiated by the user."""
         errors = {}
 
@@ -54,17 +44,48 @@ class SoundtouchConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return self.async_show_form(
             step_id="user",
             last_step=True,
-            data_schema=vol.Schema(
+            data_schema=probatio.Schema(
                 {
-                    vol.Required(CONF_HOST): cv.string,
+                    probatio.Required(CONF_HOST): cv.string,
                 }
             ),
             errors=errors,
         )
 
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle reconfiguration of the device host."""
+        errors = {}
+        reconfigure_entry = self._get_reconfigure_entry()
+
+        if user_input is not None:
+            try:
+                device = await self.hass.async_add_executor_job(
+                    soundtouch_device, user_input[CONF_HOST]
+                )
+            except RequestException:
+                errors["base"] = "cannot_connect"
+            else:
+                await self.async_set_unique_id(device.config.device_id)
+                self._abort_if_unique_id_mismatch()
+                return self.async_update_reload_and_abort(
+                    reconfigure_entry, data_updates=user_input
+                )
+
+        return self.async_show_form(
+            step_id="reconfigure",
+            data_schema=self.add_suggested_values_to_schema(
+                probatio.Schema({probatio.Required(CONF_HOST): cv.string}),
+                user_input or reconfigure_entry.data,
+            ),
+            errors=errors,
+        )
+
+    @override
     async def async_step_zeroconf(
         self, discovery_info: ZeroconfServiceInfo
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle a flow initiated by a zeroconf discovery."""
         self.host = discovery_info.host
 
@@ -73,17 +94,21 @@ class SoundtouchConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         except RequestException:
             return self.async_abort(reason="cannot_connect")
 
-        self.context["title_placeholders"] = {"name": self.name}
+        if self.name:
+            # If we have a name, use it as flow title
+            self.context["title_placeholders"] = {"name": self.name}
         return await self.async_step_zeroconf_confirm()
 
-    async def async_step_zeroconf_confirm(self, user_input=None):
+    async def async_step_zeroconf_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle user-confirmation of discovered node."""
         if user_input is not None:
             return await self._async_create_soundtouch_entry()
         return self.async_show_form(
             step_id="zeroconf_confirm",
             last_step=True,
-            description_placeholders={"name": self.name},
+            description_placeholders={"name": self.name or "?"},
         )
 
     async def _async_get_device_id(self, raise_on_progress: bool = True) -> None:
@@ -98,10 +123,10 @@ class SoundtouchConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         self.name = device.config.name
 
-    async def _async_create_soundtouch_entry(self):
+    async def _async_create_soundtouch_entry(self) -> ConfigFlowResult:
         """Finish config flow and create a SoundTouch config entry."""
         return self.async_create_entry(
-            title=self.name,
+            title=self.name or "SoundTouch",
             data={
                 CONF_HOST: self.host,
             },

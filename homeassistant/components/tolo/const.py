@@ -1,17 +1,27 @@
 """Constants for the tolo integration."""
 
+from enum import Enum
+
+from tololib import AromaTherapySlot as ToloAromaTherapySlot, LampMode as ToloLampMode
+
 DOMAIN = "tolo"
 DEFAULT_NAME = "TOLO Sauna"
 
 DEFAULT_RETRY_TIMEOUT = 1
 DEFAULT_RETRY_COUNT = 3
 
-DEFAULT_MAX_TEMP = 60
-DEFAULT_MIN_TEMP = 20
+REQUEST_REFRESH_COOLDOWN = 1
 
-DEFAULT_MAX_HUMIDITY = 99
-DEFAULT_MIN_HUMIDITY = 60
 
-POWER_TIMER_MAX = 60
-SALT_BATH_TIMER_MAX = 60
-FAN_TIMER_MAX = 60
+class AromaTherapySlot(Enum):
+    """Mapping to TOLO Aroma Therapy Slot."""
+
+    A = ToloAromaTherapySlot.A
+    B = ToloAromaTherapySlot.B
+
+
+class LampMode(Enum):
+    """Mapping to TOLO Lamp Mode."""
+
+    MANUAL = ToloLampMode.MANUAL
+    AUTOMATIC = ToloLampMode.AUTOMATIC

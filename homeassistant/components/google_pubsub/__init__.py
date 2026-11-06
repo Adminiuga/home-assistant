@@ -1,17 +1,17 @@
 """Support for Google Cloud Pub/Sub."""
-from __future__ import annotations
 
-import datetime
+import datetime as dt
 import json
 import logging
 import os
+from typing import override
 
 from google.cloud.pubsub_v1 import PublisherClient
-import voluptuous as vol
+import probatio
 
 from homeassistant.const import EVENT_STATE_CHANGED, STATE_UNAVAILABLE, STATE_UNKNOWN
-from homeassistant.core import Event, HomeAssistant
-import homeassistant.helpers.config_validation as cv
+from homeassistant.core import Event, EventStateChangedData, HomeAssistant
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.entityfilter import FILTER_SCHEMA
 from homeassistant.helpers.typing import ConfigType
 
@@ -24,18 +24,18 @@ CONF_TOPIC_NAME = "topic_name"
 CONF_SERVICE_PRINCIPAL = "credentials_json"
 CONF_FILTER = "filter"
 
-CONFIG_SCHEMA = vol.Schema(
+CONFIG_SCHEMA = probatio.Schema(
     {
-        DOMAIN: vol.Schema(
+        DOMAIN: probatio.Schema(
             {
-                vol.Required(CONF_PROJECT_ID): cv.string,
-                vol.Required(CONF_TOPIC_NAME): cv.string,
-                vol.Required(CONF_SERVICE_PRINCIPAL): cv.string,
-                vol.Required(CONF_FILTER): FILTER_SCHEMA,
+                probatio.Required(CONF_PROJECT_ID): cv.string,
+                probatio.Required(CONF_TOPIC_NAME): cv.string,
+                probatio.Required(CONF_SERVICE_PRINCIPAL): cv.string,
+                probatio.Required(CONF_FILTER): FILTER_SCHEMA,
             }
         )
     },
-    extra=vol.ALLOW_EXTRA,
+    extra=probatio.ALLOW_EXTRA,
 )
 
 
@@ -58,9 +58,9 @@ def setup(hass: HomeAssistant, yaml_config: ConfigType) -> bool:
 
     encoder = DateTimeJSONEncoder()
 
-    def send_to_pubsub(event: Event):
+    def send_to_pubsub(event: Event[EventStateChangedData]):
         """Send states to Pub/Sub."""
-        state = event.data.get("new_state")
+        state = event.data["new_state"]
         if (
             state is None
             or state.state in (STATE_UNKNOWN, "", STATE_UNAVAILABLE)
@@ -84,8 +84,9 @@ class DateTimeJSONEncoder(json.JSONEncoder):
     Additionally add encoding for datetime objects as isoformat.
     """
 
+    @override
     def default(self, o):
         """Implement encoding logic."""
-        if isinstance(o, datetime.datetime):
+        if isinstance(o, dt.datetime):
             return o.isoformat()
         return super().default(o)

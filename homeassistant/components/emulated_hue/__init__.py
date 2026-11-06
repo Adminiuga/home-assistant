@@ -1,20 +1,20 @@
 """Support for local control of entities by emulating a Philips Hue bridge."""
-from __future__ import annotations
 
 import logging
 
 from aiohttp import web
-import voluptuous as vol
+import probatio
 
+from homeassistant.components.http import KEY_HASS
 from homeassistant.components.network import async_get_source_ip
 from homeassistant.const import (
     CONF_ENTITIES,
     CONF_TYPE,
-    EVENT_HOMEASSISTANT_START,
+    EVENT_HOMEASSISTANT_STARTED,
     EVENT_HOMEASSISTANT_STOP,
 )
 from homeassistant.core import Event, HomeAssistant
-import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.typing import ConfigType
 
 from .config import (
@@ -53,39 +53,41 @@ from .upnp import DescriptionXmlView, async_create_upnp_datagram_endpoint
 _LOGGER = logging.getLogger(__name__)
 
 
-CONFIG_ENTITY_SCHEMA = vol.Schema(
+CONFIG_ENTITY_SCHEMA = probatio.Schema(
     {
-        vol.Optional(CONF_ENTITY_NAME): cv.string,
-        vol.Optional(CONF_ENTITY_HIDDEN): cv.boolean,
+        probatio.Optional(CONF_ENTITY_NAME): cv.string,
+        probatio.Optional(CONF_ENTITY_HIDDEN): cv.boolean,
     }
 )
 
 
-CONFIG_SCHEMA = vol.Schema(
+CONFIG_SCHEMA = probatio.Schema(
     {
-        DOMAIN: vol.Schema(
+        DOMAIN: probatio.Schema(
             {
-                vol.Optional(CONF_HOST_IP): cv.string,
-                vol.Optional(CONF_LISTEN_PORT, default=DEFAULT_LISTEN_PORT): cv.port,
-                vol.Optional(CONF_ADVERTISE_IP): cv.string,
-                vol.Optional(CONF_ADVERTISE_PORT): cv.port,
-                vol.Optional(CONF_UPNP_BIND_MULTICAST): cv.boolean,
-                vol.Optional(CONF_OFF_MAPS_TO_ON_DOMAINS): cv.ensure_list,
-                vol.Optional(CONF_EXPOSE_BY_DEFAULT): cv.boolean,
-                vol.Optional(CONF_EXPOSED_DOMAINS): cv.ensure_list,
-                vol.Optional(CONF_TYPE, default=DEFAULT_TYPE): vol.Any(
+                probatio.Optional(CONF_HOST_IP): cv.string,
+                probatio.Optional(
+                    CONF_LISTEN_PORT, default=DEFAULT_LISTEN_PORT
+                ): probatio.Port(),
+                probatio.Optional(CONF_ADVERTISE_IP): cv.string,
+                probatio.Optional(CONF_ADVERTISE_PORT): probatio.Port(),
+                probatio.Optional(CONF_UPNP_BIND_MULTICAST): cv.boolean,
+                probatio.Optional(CONF_OFF_MAPS_TO_ON_DOMAINS): probatio.EnsureList(),
+                probatio.Optional(CONF_EXPOSE_BY_DEFAULT): cv.boolean,
+                probatio.Optional(CONF_EXPOSED_DOMAINS): probatio.EnsureList(),
+                probatio.Optional(CONF_TYPE, default=DEFAULT_TYPE): probatio.Any(
                     TYPE_ALEXA, TYPE_GOOGLE
                 ),
-                vol.Optional(CONF_ENTITIES): vol.Schema(
+                probatio.Optional(CONF_ENTITIES): probatio.Schema(
                     {cv.entity_id: CONFIG_ENTITY_SCHEMA}
                 ),
-                vol.Optional(
+                probatio.Optional(
                     CONF_LIGHTS_ALL_DIMMABLE, default=DEFAULT_LIGHTS_ALL_DIMMABLE
                 ): cv.boolean,
             }
         )
     },
-    extra=vol.ALLOW_EXTRA,
+    extra=probatio.ALLOW_EXTRA,
 )
 
 
@@ -130,29 +132,28 @@ async def async_setup(hass: HomeAssistant, yaml_config: ConfigType) -> bool:
     await config.async_setup()
 
     app = web.Application()
-    app["hass"] = hass
+    app[KEY_HASS] = hass
 
     # We misunderstood the startup signal. You're not allowed to change
     # anything during startup. Temp workaround.
-    # pylint: disable=protected-access
-    app._on_startup.freeze()
+    app._on_startup.freeze()  # noqa: SLF001
     await app.startup()
 
-    DescriptionXmlView(config).register(app, app.router)
-    HueUsernameView().register(app, app.router)
-    HueConfigView(config).register(app, app.router)
-    HueUnauthorizedUser().register(app, app.router)
-    HueAllLightsStateView(config).register(app, app.router)
-    HueOneLightStateView(config).register(app, app.router)
-    HueOneLightChangeView(config).register(app, app.router)
-    HueAllGroupsStateView(config).register(app, app.router)
-    HueGroupView(config).register(app, app.router)
-    HueFullStateView(config).register(app, app.router)
+    DescriptionXmlView(config).register(hass, app, app.router)
+    HueUsernameView().register(hass, app, app.router)
+    HueConfigView(config).register(hass, app, app.router)
+    HueUnauthorizedUser().register(hass, app, app.router)
+    HueAllLightsStateView(config).register(hass, app, app.router)
+    HueOneLightStateView(config).register(hass, app, app.router)
+    HueOneLightChangeView(config).register(hass, app, app.router)
+    HueAllGroupsStateView(config).register(hass, app, app.router)
+    HueGroupView(config).register(hass, app, app.router)
+    HueFullStateView(config).register(hass, app, app.router)
 
     async def _start(event: Event) -> None:
         """Start the bridge."""
         await start_emulated_hue_bridge(hass, config, app)
 
-    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_START, _start)
+    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _start)
 
     return True

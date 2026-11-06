@@ -1,21 +1,17 @@
 """Support for interfacing with the XBMC/Kodi JSON-RPC API."""
-from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Coroutine
 from datetime import timedelta
 from functools import wraps
 import logging
 import re
-from typing import Any, TypeVar
+from typing import Any, Concatenate, override
 
 from jsonrpc_base.jsonrpc import ProtocolError, TransportError
 from pykodi import CannotConnectError
-from typing_extensions import Concatenate, ParamSpec
-import voluptuous as vol
 
 from homeassistant.components import media_source
 from homeassistant.components.media_player import (
-    PLATFORM_SCHEMA,
     BrowseError,
     BrowseMedia,
     MediaPlayerEntity,
@@ -24,71 +20,33 @@ from homeassistant.components.media_player import (
     MediaType,
     async_process_play_media_url,
 )
-from homeassistant.config_entries import SOURCE_IMPORT, ConfigEntry
 from homeassistant.const import (
     ATTR_ENTITY_ID,
-    CONF_HOST,
+    CONF_DEVICE_ID,
     CONF_NAME,
-    CONF_PASSWORD,
-    CONF_PORT,
-    CONF_PROXY_SSL,
-    CONF_SSL,
-    CONF_TIMEOUT,
-    CONF_USERNAME,
+    CONF_TYPE,
     EVENT_HOMEASSISTANT_STARTED,
 )
 from homeassistant.core import CoreState, HomeAssistant, callback
-from homeassistant.helpers import (
-    config_validation as cv,
-    device_registry,
-    entity_platform,
-)
-from homeassistant.helpers.entity import DeviceInfo
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.network import is_internal_request
-from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
-import homeassistant.util.dt as dt_util
+from homeassistant.util import dt as dt_util
 
+from . import KodiConfigEntry
 from .browse_media import (
     build_item_response,
     get_media_info,
     library_payload,
     media_source_content_filter,
 )
-from .const import (
-    CONF_WS_PORT,
-    DATA_CONNECTION,
-    DATA_KODI,
-    DEFAULT_PORT,
-    DEFAULT_SSL,
-    DEFAULT_TIMEOUT,
-    DEFAULT_WS_PORT,
-    DOMAIN,
-    EVENT_TURN_OFF,
-    EVENT_TURN_ON,
-)
-
-_KodiEntityT = TypeVar("_KodiEntityT", bound="KodiEntity")
-_P = ParamSpec("_P")
+from .const import DOMAIN, EVENT_TURN_OFF, EVENT_TURN_ON
 
 _LOGGER = logging.getLogger(__name__)
 
 EVENT_KODI_CALL_METHOD_RESULT = "kodi_call_method_result"
-
-CONF_TCP_PORT = "tcp_port"
-CONF_TURN_ON_ACTION = "turn_on_action"
-CONF_TURN_OFF_ACTION = "turn_off_action"
-CONF_ENABLE_WEBSOCKET = "enable_websocket"
-
-DEPRECATED_TURN_OFF_ACTIONS = {
-    None: None,
-    "quit": "Application.Quit",
-    "hibernate": "System.Hibernate",
-    "suspend": "System.Suspend",
-    "reboot": "System.Reboot",
-    "shutdown": "System.Shutdown",
-}
 
 WEBSOCKET_WATCHDOG_INTERVAL = timedelta(seconds=10)
 
@@ -119,118 +77,23 @@ MAP_KODI_MEDIA_TYPES: dict[MediaType | str, str] = {
 }
 
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
-    {
-        vol.Required(CONF_HOST): cv.string,
-        vol.Optional(CONF_NAME): cv.string,
-        vol.Optional(CONF_PORT, default=DEFAULT_PORT): cv.port,
-        vol.Optional(CONF_TCP_PORT, default=DEFAULT_WS_PORT): cv.port,
-        vol.Optional(CONF_PROXY_SSL, default=DEFAULT_SSL): cv.boolean,
-        vol.Optional(CONF_TURN_ON_ACTION): cv.SCRIPT_SCHEMA,
-        vol.Optional(CONF_TURN_OFF_ACTION): vol.Any(
-            cv.SCRIPT_SCHEMA, vol.In(DEPRECATED_TURN_OFF_ACTIONS)
-        ),
-        vol.Optional(CONF_TIMEOUT, default=DEFAULT_TIMEOUT): cv.positive_int,
-        vol.Inclusive(CONF_USERNAME, "auth"): cv.string,
-        vol.Inclusive(CONF_PASSWORD, "auth"): cv.string,
-        vol.Optional(CONF_ENABLE_WEBSOCKET, default=True): cv.boolean,
-    }
-)
-
-
-SERVICE_ADD_MEDIA = "add_to_playlist"
-SERVICE_CALL_METHOD = "call_method"
-
-ATTR_MEDIA_TYPE = "media_type"
-ATTR_MEDIA_NAME = "media_name"
-ATTR_MEDIA_ARTIST_NAME = "artist_name"
-ATTR_MEDIA_ID = "media_id"
-ATTR_METHOD = "method"
-
-
-KODI_ADD_MEDIA_SCHEMA = {
-    vol.Required(ATTR_MEDIA_TYPE): cv.string,
-    vol.Optional(ATTR_MEDIA_ID): cv.string,
-    vol.Optional(ATTR_MEDIA_NAME): cv.string,
-    vol.Optional(ATTR_MEDIA_ARTIST_NAME): cv.string,
-}
-
-KODI_CALL_METHOD_SCHEMA = cv.make_entity_service_schema(
-    {vol.Required(ATTR_METHOD): cv.string}, extra=vol.ALLOW_EXTRA
-)
-
-
-def find_matching_config_entries_for_host(hass, host):
-    """Search existing config entries for one matching the host."""
-    for entry in hass.config_entries.async_entries(DOMAIN):
-        if entry.data[CONF_HOST] == host:
-            return entry
-    return None
-
-
-async def async_setup_platform(
-    hass: HomeAssistant,
-    config: ConfigType,
-    async_add_entities: AddEntitiesCallback,
-    discovery_info: DiscoveryInfoType | None = None,
-) -> None:
-    """Set up the Kodi platform."""
-    if discovery_info:
-        # Now handled by zeroconf in the config flow
-        return
-
-    host = config[CONF_HOST]
-    if find_matching_config_entries_for_host(hass, host):
-        return
-
-    websocket = config.get(CONF_ENABLE_WEBSOCKET)
-    ws_port = config.get(CONF_TCP_PORT) if websocket else None
-
-    entry_data = {
-        CONF_NAME: config.get(CONF_NAME, host),
-        CONF_HOST: host,
-        CONF_PORT: config.get(CONF_PORT),
-        CONF_WS_PORT: ws_port,
-        CONF_USERNAME: config.get(CONF_USERNAME),
-        CONF_PASSWORD: config.get(CONF_PASSWORD),
-        CONF_SSL: config.get(CONF_PROXY_SSL),
-        CONF_TIMEOUT: config.get(CONF_TIMEOUT),
-    }
-
-    hass.async_create_task(
-        hass.config_entries.flow.async_init(
-            DOMAIN, context={"source": SOURCE_IMPORT}, data=entry_data
-        )
-    )
-
-
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    config_entry: KodiConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up the Kodi media player platform."""
-    platform = entity_platform.async_get_current_platform()
-    platform.async_register_entity_service(
-        SERVICE_ADD_MEDIA, KODI_ADD_MEDIA_SCHEMA, "async_add_media_to_playlist"
-    )
-    platform.async_register_entity_service(
-        SERVICE_CALL_METHOD, KODI_CALL_METHOD_SCHEMA, "async_call_method"
-    )
-
-    data = hass.data[DOMAIN][config_entry.entry_id]
-    connection = data[DATA_CONNECTION]
-    kodi = data[DATA_KODI]
+    data = config_entry.runtime_data
     name = config_entry.data[CONF_NAME]
     if (uid := config_entry.unique_id) is None:
         uid = config_entry.entry_id
 
-    entity = KodiEntity(connection, kodi, name, uid)
+    entity = KodiEntity(data.connection, data.kodi, name, uid)
     async_add_entities([entity])
 
 
-def cmd(
-    func: Callable[Concatenate[_KodiEntityT, _P], Awaitable[Any]]
+def cmd[_KodiEntityT: KodiEntity, **_P](
+    func: Callable[Concatenate[_KodiEntityT, _P], Awaitable[Any]],
 ) -> Callable[Concatenate[_KodiEntityT, _P], Coroutine[Any, Any, None]]:
     """Catch command exceptions."""
 
@@ -258,6 +121,9 @@ def cmd(
 class KodiEntity(MediaPlayerEntity):
     """Representation of a XBMC/Kodi device."""
 
+    _attr_has_entity_name = True
+    _attr_name = None
+    _attr_translation_key = "media_player"
     _attr_supported_features = (
         MediaPlayerEntityFeature.BROWSE_MEDIA
         | MediaPlayerEntityFeature.NEXT_TRACK
@@ -279,7 +145,8 @@ class KodiEntity(MediaPlayerEntity):
         """Initialize the Kodi entity."""
         self._connection = connection
         self._kodi = kodi
-        self._unique_id = uid
+        self._attr_unique_id = uid
+        self._device_id = None
         self._players = None
         self._properties = {}
         self._item = {}
@@ -288,7 +155,11 @@ class KodiEntity(MediaPlayerEntity):
         self._media_position = None
         self._connect_error = False
 
-        self._attr_name = name
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, uid)},
+            manufacturer="Kodi",
+            name=name,
+        )
 
     def _reset_state(self, players=None):
         self._players = players
@@ -337,6 +208,20 @@ class KodiEntity(MediaPlayerEntity):
         self._app_properties["muted"] = data["muted"]
         self.async_write_ha_state()
 
+    @callback
+    def async_on_key_press(self, sender, data):
+        """Handle a incoming key press notification."""
+        self.hass.bus.async_fire(
+            f"{DOMAIN}_keypress",
+            {
+                CONF_TYPE: "keypress",
+                CONF_DEVICE_ID: self._device_id,
+                ATTR_ENTITY_ID: self.entity_id,
+                "sender": sender,
+                "data": data,
+            },
+        )
+
     async def async_on_quit(self, sender, data):
         """Reset the player state on quit action."""
         await self._clear_connection()
@@ -348,20 +233,7 @@ class KodiEntity(MediaPlayerEntity):
             await self._connection.close()
 
     @property
-    def unique_id(self):
-        """Return the unique id of the device."""
-        return self._unique_id
-
-    @property
-    def device_info(self) -> DeviceInfo:
-        """Return device info for this device."""
-        return DeviceInfo(
-            identifiers={(DOMAIN, self.unique_id)},
-            manufacturer="Kodi",
-            name=self.name,
-        )
-
-    @property
+    @override
     def state(self) -> MediaPlayerState:
         """Return the state of the device."""
         if self._kodi_is_off:
@@ -375,6 +247,7 @@ class KodiEntity(MediaPlayerEntity):
 
         return MediaPlayerState.PLAYING
 
+    @override
     async def async_added_to_hass(self) -> None:
         """Connect the websocket if needed."""
         if not self._connection.can_subscribe:
@@ -396,7 +269,7 @@ class KodiEntity(MediaPlayerEntity):
 
         # If Home Assistant is already in a running state, start the watchdog
         # immediately, else trigger it after Home Assistant has finished starting.
-        if self.hass.state == CoreState.running:
+        if self.hass.state is CoreState.running:
             await start_watchdog()
         else:
             self.hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, start_watchdog)
@@ -408,9 +281,11 @@ class KodiEntity(MediaPlayerEntity):
 
         version = (await self._kodi.get_application_properties(["version"]))["version"]
         sw_version = f"{version['major']}.{version['minor']}"
-        dev_reg = device_registry.async_get(self.hass)
-        device = dev_reg.async_get_device({(DOMAIN, self.unique_id)})
-        dev_reg.async_update_device(device.id, sw_version=sw_version)
+        if self.device_entry:
+            dr.async_get(self.hass).async_update_device(
+                self.device_entry.id, sw_version=sw_version
+            )
+            self._device_id = self.device_entry.id
 
         self.async_schedule_update_ha_state(True)
 
@@ -419,7 +294,7 @@ class KodiEntity(MediaPlayerEntity):
         try:
             await self._connection.connect()
             await self._on_ws_connected()
-        except (TransportError, CannotConnectError):
+        except TransportError, CannotConnectError:
             if not self._connect_error:
                 self._connect_error = True
                 _LOGGER.warning("Unable to connect to Kodi via websocket")
@@ -430,7 +305,7 @@ class KodiEntity(MediaPlayerEntity):
     async def _ping(self):
         try:
             await self._kodi.ping()
-        except (TransportError, CannotConnectError):
+        except TransportError, CannotConnectError:
             if not self._connect_error:
                 self._connect_error = True
                 _LOGGER.warning("Unable to ping Kodi via websocket")
@@ -458,6 +333,7 @@ class KodiEntity(MediaPlayerEntity):
         self._connection.server.Application.OnVolumeChanged = (
             self.async_on_volume_changed
         )
+        self._connection.server.Other.OnKeyPress = self.async_on_key_press
         self._connection.server.System.OnQuit = self.async_on_quit
         self._connection.server.System.OnRestart = self.async_on_quit
         self._connection.server.System.OnSleep = self.async_on_quit
@@ -469,7 +345,13 @@ class KodiEntity(MediaPlayerEntity):
             self._reset_state()
             return
 
-        self._players = await self._kodi.get_players()
+        try:
+            self._players = await self._kodi.get_players()
+        except TransportError, ProtocolError:
+            if not self._connection.can_subscribe:
+                self._reset_state()
+                return
+            raise
 
         if self._kodi_is_off:
             self._reset_state()
@@ -502,33 +384,40 @@ class KodiEntity(MediaPlayerEntity):
                     "album",
                     "season",
                     "episode",
+                    "streamdetails",
                 ],
             )
         else:
             self._reset_state([])
 
     @property
+    @override
     def should_poll(self) -> bool:
         """Return True if entity has to be polled for state."""
         return not self._connection.can_subscribe
 
     @property
-    def volume_level(self):
+    @override
+    def volume_level(self) -> float | None:
         """Volume level of the media player (0..1)."""
         if "volume" in self._app_properties:
             return int(self._app_properties["volume"]) / 100.0
+        return None
 
     @property
+    @override
     def is_volume_muted(self):
         """Boolean if volume is currently muted."""
         return self._app_properties.get("muted")
 
     @property
+    @override
     def media_content_id(self):
         """Content ID of current playing media."""
         return self._item.get("uniqueid", None)
 
     @property
+    @override
     def media_content_type(self):
         """Content type of current playing media.
 
@@ -540,6 +429,7 @@ class KodiEntity(MediaPlayerEntity):
         return item_type
 
     @property
+    @override
     def media_duration(self):
         """Duration of current playing media in seconds."""
         if self._properties.get("live"):
@@ -555,6 +445,7 @@ class KodiEntity(MediaPlayerEntity):
         )
 
     @property
+    @override
     def media_position(self):
         """Position of current playing media in seconds."""
         if (time := self._properties.get("time")) is None:
@@ -563,11 +454,13 @@ class KodiEntity(MediaPlayerEntity):
         return time["hours"] * 3600 + time["minutes"] * 60 + time["seconds"]
 
     @property
+    @override
     def media_position_updated_at(self):
         """Last valid time of media position."""
         return self._media_position_updated_at
 
     @property
+    @override
     def media_image_url(self):
         """Image url of current playing media."""
         if (thumbnail := self._item.get("thumbnail")) is None:
@@ -576,6 +469,7 @@ class KodiEntity(MediaPlayerEntity):
         return self._kodi.thumbnail_url(thumbnail)
 
     @property
+    @override
     def media_title(self):
         """Title of current playing media."""
         # find a string we can use as a title
@@ -583,26 +477,31 @@ class KodiEntity(MediaPlayerEntity):
         return item.get("title") or item.get("label") or item.get("file")
 
     @property
+    @override
     def media_series_title(self):
         """Title of series of current playing media, TV show only."""
         return self._item.get("showtitle")
 
     @property
+    @override
     def media_season(self):
         """Season of current playing media, TV show only."""
         return self._item.get("season")
 
     @property
+    @override
     def media_episode(self):
         """Episode of current playing media, TV show only."""
         return self._item.get("episode")
 
     @property
+    @override
     def media_album_name(self):
         """Album name of current playing media, music track only."""
         return self._item.get("album")
 
     @property
+    @override
     def media_artist(self):
         """Artist of current playing media, music track only."""
         if artists := self._item.get("artist"):
@@ -611,6 +510,7 @@ class KodiEntity(MediaPlayerEntity):
         return None
 
     @property
+    @override
     def media_album_artist(self):
         """Album artist of current playing media, music track only."""
         if artists := self._item.get("albumartist"):
@@ -618,72 +518,102 @@ class KodiEntity(MediaPlayerEntity):
 
         return None
 
+    @property
+    @override
+    def extra_state_attributes(self) -> dict[str, str | None]:
+        """Return the state attributes."""
+        state_attr: dict[str, str | None] = {}
+        if self.state == MediaPlayerState.OFF:
+            return state_attr
+
+        state_attr["dynamic_range"] = "sdr"
+        if (video_details := self._item.get("streamdetails", {}).get("video")) and (
+            hdr_type := video_details[0].get("hdrtype")
+        ):
+            state_attr["dynamic_range"] = hdr_type
+
+        return state_attr
+
+    @override
     async def async_turn_on(self) -> None:
         """Turn the media player on."""
         _LOGGER.debug("Firing event to turn on device")
         self.hass.bus.async_fire(EVENT_TURN_ON, {ATTR_ENTITY_ID: self.entity_id})
 
+    @override
     async def async_turn_off(self) -> None:
         """Turn the media player off."""
         _LOGGER.debug("Firing event to turn off device")
         self.hass.bus.async_fire(EVENT_TURN_OFF, {ATTR_ENTITY_ID: self.entity_id})
 
     @cmd
+    @override
     async def async_volume_up(self) -> None:
         """Volume up the media player."""
         await self._kodi.volume_up()
 
     @cmd
+    @override
     async def async_volume_down(self) -> None:
         """Volume down the media player."""
         await self._kodi.volume_down()
 
     @cmd
+    @override
     async def async_set_volume_level(self, volume: float) -> None:
         """Set volume level, range 0..1."""
         await self._kodi.set_volume_level(int(volume * 100))
 
     @cmd
+    @override
     async def async_mute_volume(self, mute: bool) -> None:
         """Mute (true) or unmute (false) media player."""
         await self._kodi.mute(mute)
 
     @cmd
+    @override
     async def async_media_play_pause(self) -> None:
         """Pause media on media player."""
         await self._kodi.play_pause()
 
     @cmd
+    @override
     async def async_media_play(self) -> None:
         """Play media."""
         await self._kodi.play()
 
     @cmd
+    @override
     async def async_media_pause(self) -> None:
         """Pause the media player."""
         await self._kodi.pause()
 
     @cmd
+    @override
     async def async_media_stop(self) -> None:
         """Stop the media player."""
         await self._kodi.stop()
 
     @cmd
+    @override
     async def async_media_next_track(self) -> None:
         """Send next track command."""
         await self._kodi.next_track()
 
     @cmd
+    @override
     async def async_media_previous_track(self) -> None:
         """Send next track command."""
         await self._kodi.previous_track()
 
     @cmd
+    @override
     async def async_media_seek(self, position: float) -> None:
         """Send seek command."""
         await self._kodi.media_seek(position)
 
     @cmd
+    @override
     async def async_play_media(
         self, media_type: MediaType | str, media_id: str, **kwargs: Any
     ) -> None:
@@ -728,6 +658,7 @@ class KodiEntity(MediaPlayerEntity):
             await self._kodi.play_file(media_id)
 
     @cmd
+    @override
     async def async_set_shuffle(self, shuffle: bool) -> None:
         """Set shuffle mode, for the first player."""
         if self._no_active_players:
@@ -772,6 +703,7 @@ class KodiEntity(MediaPlayerEntity):
             )
         return result
 
+    @override
     async def async_clear_playlist(self) -> None:
         """Clear default playlist (i.e. playlistid=0)."""
         await self._kodi.clear_playlist()
@@ -884,8 +816,11 @@ class KodiEntity(MediaPlayerEntity):
 
         return sorted(out, key=lambda out: out[1], reverse=True)
 
+    @override
     async def async_browse_media(
-        self, media_content_type: str | None = None, media_content_id: str | None = None
+        self,
+        media_content_type: MediaType | str | None = None,
+        media_content_id: str | None = None,
     ) -> BrowseMedia:
         """Implement the websocket media browsing helper."""
         is_internal = is_internal_request(self.hass)
@@ -925,9 +860,10 @@ class KodiEntity(MediaPlayerEntity):
             )
         return response
 
+    @override
     async def async_get_browse_image(
         self,
-        media_content_type: str,
+        media_content_type: MediaType | str,
         media_content_id: str,
         media_image_id: str | None = None,
     ) -> tuple[bytes | None, str | None]:
@@ -936,7 +872,7 @@ class KodiEntity(MediaPlayerEntity):
             image_url, _, _ = await get_media_info(
                 self._kodi, media_content_id, media_content_type
             )
-        except (ProtocolError, TransportError):
+        except ProtocolError, TransportError:
             return (None, None)
 
         if image_url:

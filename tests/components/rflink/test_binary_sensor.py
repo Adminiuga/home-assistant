@@ -1,12 +1,14 @@
-"""
-Test for RFlink sensor components.
+"""Test for RFlink sensor components.
 
 Test setup of rflink sensor component/platform. Verify manual and
 automatic sensor creation.
 """
+
 from datetime import timedelta
 
 from freezegun import freeze_time
+import pytest
+from pytest_homeassistant.common import async_fire_time_changed, mock_restore_cache
 
 from homeassistant.components.rflink import CONF_RECONNECT_INTERVAL
 from homeassistant.const import (
@@ -16,36 +18,36 @@ from homeassistant.const import (
     STATE_UNAVAILABLE,
     STATE_UNKNOWN,
 )
-from homeassistant.core import CoreState, State, callback
-import homeassistant.util.dt as dt_util
+from homeassistant.core import CoreState, HomeAssistant, State, callback
+from homeassistant.util import dt as dt_util
 
 from .test_init import mock_rflink
 
-from tests.common import async_fire_time_changed, mock_restore_cache
-
 DOMAIN = "binary_sensor"
+
 
 CONFIG = {
     "rflink": {
         "port": "/dev/ttyABC0",
         "ignore_devices": ["ignore_wildcard_*", "ignore_sensor"],
-    },
-    DOMAIN: {
-        "platform": "rflink",
-        "devices": {
-            "test": {"name": "test", "device_class": "door"},
-            "test2": {
-                "name": "test2",
-                "device_class": "motion",
-                "off_delay": 30,
-                "force_update": True,
+        DOMAIN: {
+            "devices": {
+                "test": {"name": "test", "device_class": "door"},
+                "test2": {
+                    "name": "test2",
+                    "device_class": "motion",
+                    "off_delay": 30,
+                    "force_update": True,
+                },
             },
         },
     },
 }
 
 
-async def test_default_setup(hass, monkeypatch):
+async def test_default_setup(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Test all basic functionality of the rflink sensor component."""
     # setup mocking rflink module
     event_callback, create, _, _ = await mock_rflink(hass, CONFIG, DOMAIN, monkeypatch)
@@ -84,18 +86,26 @@ async def test_default_setup(hass, monkeypatch):
     assert hass.states.get("binary_sensor.test").state == STATE_OFF
 
 
-async def test_entity_availability(hass, monkeypatch):
+async def test_entity_availability(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """If Rflink device is disconnected, entities should become unavailable."""
-    # Make sure Rflink mock does not 'recover' to quickly from the
+    # Make sure Rflink mock does not 'recover' too quickly from the
     # disconnect or else the unavailability cannot be measured
-    config = CONFIG
-    failures = [True, True]
-    config[CONF_RECONNECT_INTERVAL] = 60
+    config = {
+        **CONFIG,
+        "rflink": {
+            **CONFIG["rflink"],
+            CONF_RECONNECT_INTERVAL: 60,
+        },
+    }
+    failures = [False, True, False]
 
     # Create platform and entities
     event_callback, _, _, disconnect_callback = await mock_rflink(
         hass, config, DOMAIN, monkeypatch, failures=failures
     )
+    await hass.async_block_till_done()
 
     # Entities are unknown by default
     assert hass.states.get("binary_sensor.test").state == STATE_UNKNOWN
@@ -125,7 +135,7 @@ async def test_entity_availability(hass, monkeypatch):
     assert hass.states.get("binary_sensor.test").state == STATE_ON
 
 
-async def test_off_delay(hass, monkeypatch):
+async def test_off_delay(hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch) -> None:
     """Test off_delay option."""
     # setup mocking rflink module
     event_callback, create, _, _ = await mock_rflink(hass, CONFIG, DOMAIN, monkeypatch)
@@ -188,13 +198,15 @@ async def test_off_delay(hass, monkeypatch):
     assert len(events) == 3
 
 
-async def test_restore_state(hass, monkeypatch):
+async def test_restore_state(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Ensure states are restored on startup."""
     mock_restore_cache(
         hass, (State(f"{DOMAIN}.test", STATE_ON), State(f"{DOMAIN}.test2", STATE_ON))
     )
 
-    hass.state = CoreState.starting
+    hass.set_state(CoreState.starting)
 
     # setup mocking rflink module
     _, _, _, _ = await mock_rflink(hass, CONFIG, DOMAIN, monkeypatch)

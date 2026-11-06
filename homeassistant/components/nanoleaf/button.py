@@ -1,40 +1,61 @@
 """Support for Nanoleaf buttons."""
 
-from aionanoleaf import Nanoleaf
+from typing import override
 
-from homeassistant.components.button import ButtonEntity
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.components.button import (
+    DOMAIN as BUTTON_DOMAIN,
+    ButtonDeviceClass,
+    ButtonEntity,
+)
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity import EntityCategory
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from . import NanoleafEntryData
 from .const import DOMAIN
-from .entity import NanoleafEntity
+from .coordinator import NanoleafConfigEntry, NanoleafCoordinator
+from .entity import NanoleafEntity, async_handle_nanoleaf_errors
+
+
+def _identify_unique_id(serial_no: str) -> str:
+    """Return the unique ID of the identify button of a device."""
+    return f"{serial_no}_identify"
 
 
 async def async_setup_entry(
-    hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
+    hass: HomeAssistant,
+    entry: NanoleafConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up the Nanoleaf button."""
-    entry_data: NanoleafEntryData = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities(
-        [NanoleafIdentifyButton(entry_data.device, entry_data.coordinator)]
-    )
+    coordinator = entry.runtime_data
+
+    # Devices without an event stream (Nanoleaf Essentials) have no identify
+    # endpoint either: the request is answered with HTTP 400 or 404.
+    if not coordinator.nanoleaf.supports_events:
+        registry = er.async_get(hass)
+        unique_id = _identify_unique_id(coordinator.nanoleaf.serial_no)
+        # Remove the button that earlier versions created for these devices.
+        if entity_id := registry.async_get_entity_id(BUTTON_DOMAIN, DOMAIN, unique_id):
+            registry.async_remove(entity_id)
+        return
+
+    async_add_entities([NanoleafIdentifyButton(coordinator)])
 
 
 class NanoleafIdentifyButton(NanoleafEntity, ButtonEntity):
     """Representation of a Nanoleaf identify button."""
 
-    def __init__(self, nanoleaf: Nanoleaf, coordinator: DataUpdateCoordinator) -> None:
-        """Initialize the Nanoleaf button."""
-        super().__init__(nanoleaf, coordinator)
-        self._attr_unique_id = f"{nanoleaf.serial_no}_identify"
-        self._attr_name = f"Identify {nanoleaf.name}"
-        self._attr_icon = "mdi:magnify"
-        self._attr_entity_category = EntityCategory.CONFIG
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_device_class = ButtonDeviceClass.IDENTIFY
 
+    def __init__(self, coordinator: NanoleafCoordinator) -> None:
+        """Initialize the Nanoleaf button."""
+        super().__init__(coordinator)
+        self._attr_unique_id = _identify_unique_id(self._nanoleaf.serial_no)
+
+    @override
+    @async_handle_nanoleaf_errors
     async def async_press(self) -> None:
         """Identify the Nanoleaf."""
         await self._nanoleaf.identify()

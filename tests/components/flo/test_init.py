@@ -1,18 +1,57 @@
 """Test init."""
-from homeassistant.components.flo.const import DOMAIN as FLO_DOMAIN
-from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
-from homeassistant.setup import async_setup_component
 
-from .common import TEST_PASSWORD, TEST_USER_ID
+from unittest.mock import AsyncMock, patch
+
+from aioflo.errors import RequestError
+import pytest
+from pytest_homeassistant.common import MockConfigEntry
+from syrupy.assertion import SnapshotAssertion
+
+from homeassistant.components.flo.const import CONF_USE_SSO
+from homeassistant.config_entries import ConfigEntryState
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr
 
 
-async def test_setup_entry(hass, config_entry, aioclient_mock_fixture):
+@pytest.mark.usefixtures("aioclient_mock_fixture")
+async def test_setup_entry(
+    hass: HomeAssistant,
+    config_entry: MockConfigEntry,
+    device_registry: dr.DeviceRegistry,
+    snapshot: SnapshotAssertion,
+) -> None:
     """Test migration of config entry from v1."""
     config_entry.add_to_hass(hass)
-    assert await async_setup_component(
-        hass, FLO_DOMAIN, {CONF_USERNAME: TEST_USER_ID, CONF_PASSWORD: TEST_PASSWORD}
-    )
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
     await hass.async_block_till_done()
-    assert len(hass.data[FLO_DOMAIN][config_entry.entry_id]["devices"]) == 2
+    assert config_entry.state is ConfigEntryState.LOADED
+
+    assert (
+        dr.async_entries_for_config_entry(device_registry, config_entry.entry_id)
+        == snapshot
+    )
 
     assert await hass.config_entries.async_unload(config_entry.entry_id)
+    assert config_entry.state is ConfigEntryState.NOT_LOADED
+
+
+async def test_setup_entry_persists_sso_flag(
+    hass: HomeAssistant, config_entry: MockConfigEntry
+) -> None:
+    """Test setup stores use_sso when legacy auth fails and SSO succeeds."""
+    config_entry.add_to_hass(hass)
+    assert CONF_USE_SSO not in config_entry.data
+
+    client = AsyncMock()
+    client.user.get_info = AsyncMock(return_value={"locations": []})
+
+    with patch(
+        "homeassistant.components.flo.async_get_api",
+        new_callable=AsyncMock,
+        side_effect=[RequestError("legacy failed"), client],
+    ):
+        assert await hass.config_entries.async_setup(config_entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert config_entry.state is ConfigEntryState.LOADED
+    assert config_entry.data[CONF_USE_SSO] is True

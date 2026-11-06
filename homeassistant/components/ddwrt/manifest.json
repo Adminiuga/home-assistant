@@ -1,7 +1,13 @@
 {
   "domain": "ddwrt",
   "name": "DD-WRT",
-  "documentation": "https://www.home-assistant.io/integrations/ddwrt",
+  "categories": [
+    "computers_network.routers_network",
+    "presence_location.network_presence"
+  ],
   "codeowners": [],
-  "iot_class": "local_polling"
+  "connectivity": ["network"],
+  "documentation": "https://www.home-assistant.io/integrations/ddwrt",
+  "iot_class": "local_polling",
+  "quality_scale": "legacy"
 }

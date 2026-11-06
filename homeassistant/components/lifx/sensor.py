@@ -1,7 +1,6 @@
 """Sensors for LIFX lights."""
-from __future__ import annotations
 
-from datetime import timedelta
+from typing import override
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
@@ -9,20 +8,19 @@ from homeassistant.components.sensor import (
     SensorEntityDescription,
     SensorStateClass,
 )
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.entity import EntityCategory
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .const import ATTR_RSSI, DOMAIN
-from .coordinator import LIFXSensorUpdateCoordinator, LIFXUpdateCoordinator
-from .entity import LIFXSensorEntity
+from .const import ATTR_RSSI
+from .coordinator import LIFXConfigEntry, LIFXUpdateCoordinator
+from .entity import LIFXEntity
 
-SCAN_INTERVAL = timedelta(seconds=30)
+PARALLEL_UPDATES = 0
 
 RSSI_SENSOR = SensorEntityDescription(
     key=ATTR_RSSI,
-    name="RSSI",
+    translation_key="rssi",
     device_class=SensorDeviceClass.SIGNAL_STRENGTH,
     entity_category=EntityCategory.DIAGNOSTIC,
     state_class=SensorStateClass.MEASUREMENT,
@@ -31,43 +29,36 @@ RSSI_SENSOR = SensorEntityDescription(
 
 
 async def async_setup_entry(
-    hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
+    hass: HomeAssistant,
+    entry: LIFXConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up LIFX sensor from config entry."""
-    coordinator: LIFXUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities([LIFXRssiSensor(coordinator.sensor_coordinator, RSSI_SENSOR)])
+    coordinator = entry.runtime_data
+    async_add_entities([LIFXRssiSensor(coordinator, RSSI_SENSOR)])
 
 
-class LIFXRssiSensor(LIFXSensorEntity, SensorEntity):
+class LIFXRssiSensor(LIFXEntity, SensorEntity):
     """LIFX RSSI sensor."""
-
-    _attr_has_entity_name = True
 
     def __init__(
         self,
-        coordinator: LIFXSensorUpdateCoordinator,
+        coordinator: LIFXUpdateCoordinator,
         description: SensorEntityDescription,
     ) -> None:
         """Initialise the RSSI sensor."""
 
-        super().__init__(coordinator)
-        self.entity_description = description
-        self._attr_name = description.name
-        self._attr_unique_id = f"{coordinator.parent.serial_number}_{description.key}"
+        super().__init__(coordinator, description)
         self._attr_native_unit_of_measurement = coordinator.rssi_uom
-
-    @callback
-    def _handle_coordinator_update(self) -> None:
-        """Handle updated data from the coordinator."""
         self._async_update_attrs()
-        super()._handle_coordinator_update()
 
     @callback
+    @override
     def _async_update_attrs(self) -> None:
         """Handle coordinator updates."""
         self._attr_native_value = self.coordinator.rssi
 
-    @callback
+    @override
     async def async_added_to_hass(self) -> None:
         """Enable RSSI updates."""
         self.async_on_remove(self.coordinator.async_enable_rssi_updates())

@@ -1,52 +1,211 @@
 {
   "config": {
-    "flow_title": "{serial}",
-    "step": {
-      "user": {
-        "title": "Connect to EZVIZ Cloud",
-        "data": {
-          "username": "[%key:common::config_flow::data::username%]",
-          "password": "[%key:common::config_flow::data::password%]",
-          "url": "[%key:common::config_flow::data::url%]"
-        }
-      },
-      "user_custom_url": {
-        "title": "Connect to custom EZVIZ URL",
-        "description": "Manually specify your region URL",
-        "data": {
-          "username": "[%key:common::config_flow::data::username%]",
-          "password": "[%key:common::config_flow::data::password%]",
-          "url": "[%key:common::config_flow::data::url%]"
-        }
-      },
-      "confirm": {
-        "title": "Discovered EZVIZ Camera",
-        "description": "Enter RTSP credentials for EZVIZ camera {serial} with IP {ip_address}",
-        "data": {
-          "username": "[%key:common::config_flow::data::username%]",
-          "password": "[%key:common::config_flow::data::password%]"
-        }
-      }
+    "abort": {
+      "already_configured_account": "[%key:common::config_flow::abort::already_configured_account%]",
+      "ezviz_cloud_account_missing": "EZVIZ cloud account missing. Please reconfigure EZVIZ cloud account",
+      "reconfigure_camera_not_supported": "Only the EZVIZ cloud account can be reconfigured. To change the RTSP credentials of a camera, remove and re-add it.",
+      "unknown": "[%key:common::config_flow::error::unknown%]"
     },
     "error": {
       "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]",
       "invalid_auth": "[%key:common::config_flow::error::invalid_auth%]",
-      "invalid_host": "[%key:common::config_flow::error::invalid_host%]"
+      "invalid_host": "[%key:common::config_flow::error::invalid_host%]",
+      "mfa_required": "2FA enabled on account, please disable and retry",
+      "unknown": "[%key:common::config_flow::error::unknown%]"
     },
-    "abort": {
-      "already_configured_account": "[%key:common::config_flow::abort::already_configured_account%]",
-      "unknown": "[%key:common::config_flow::error::unknown%]",
-      "ezviz_cloud_account_missing": "EZVIZ cloud account missing. Please reconfigure EZVIZ cloud account"
+    "flow_title": "{serial}",
+    "step": {
+      "confirm": {
+        "data": {
+          "password": "[%key:common::config_flow::data::password%]",
+          "username": "[%key:common::config_flow::data::username%]"
+        },
+        "description": "Enter RTSP credentials for EZVIZ camera {serial} with IP {ip_address}",
+        "title": "Discovered EZVIZ Camera"
+      },
+      "reauth_confirm": {
+        "data": {
+          "password": "[%key:common::config_flow::data::password%]",
+          "username": "[%key:common::config_flow::data::username%]"
+        },
+        "description": "Enter credentials to reauthenticate to EZVIZ cloud account",
+        "title": "[%key:common::config_flow::title::reauth%]"
+      },
+      "reconfigure": {
+        "data": {
+          "password": "[%key:common::config_flow::data::password%]",
+          "url": "[%key:common::config_flow::data::url%]"
+        },
+        "description": "Update the password and region URL of EZVIZ cloud account {username}."
+      },
+      "user": {
+        "data": {
+          "password": "[%key:common::config_flow::data::password%]",
+          "url": "[%key:common::config_flow::data::url%]",
+          "username": "[%key:common::config_flow::data::username%]"
+        },
+        "title": "Connect to EZVIZ Cloud"
+      },
+      "user_custom_url": {
+        "data": {
+          "password": "[%key:common::config_flow::data::password%]",
+          "url": "[%key:common::config_flow::data::url%]",
+          "username": "[%key:common::config_flow::data::username%]"
+        },
+        "description": "Manually specify your region URL",
+        "title": "Connect to custom EZVIZ URL"
+      }
+    }
+  },
+  "entity": {
+    "binary_sensor": {
+      "alarm_schedules_enabled": {
+        "name": "Alarm schedules enabled"
+      },
+      "encrypted": {
+        "name": "Encryption"
+      }
+    },
+    "button": {
+      "ptz_down": {
+        "name": "PTZ down"
+      },
+      "ptz_left": {
+        "name": "PTZ left"
+      },
+      "ptz_right": {
+        "name": "PTZ right"
+      },
+      "ptz_up": {
+        "name": "PTZ up"
+      }
+    },
+    "image": {
+      "last_motion_image": {
+        "name": "Last motion image"
+      }
+    },
+    "light": {
+      "light": {
+        "name": "[%key:component::light::title%]"
+      }
+    },
+    "number": {
+      "detection_sensibility": {
+        "name": "Detection sensitivity"
+      }
+    },
+    "select": {
+      "alarm_sound_mode": {
+        "name": "Warning sound",
+        "state": {
+          "intensive": "Intensive",
+          "silent": "Silent",
+          "soft": "Soft"
+        }
+      },
+      "battery_camera_work_mode": {
+        "name": "Battery work mode",
+        "state": {
+          "custom": "Custom",
+          "high_performance": "High performance",
+          "plugged_in": "Plugged in",
+          "power_save": "Power save",
+          "super_power_save": "Super power saving"
+        }
+      }
+    },
+    "sensor": {
+      "alarm_sound_mod": {
+        "name": "Alarm sound level"
+      },
+      "last_alarm_time": {
+        "name": "Last alarm time"
+      },
+      "last_alarm_type_code": {
+        "name": "Last alarm type code"
+      },
+      "last_alarm_type_name": {
+        "name": "Last alarm type name"
+      },
+      "local_ip": {
+        "name": "Local IP"
+      },
+      "pir_status": {
+        "name": "PIR status"
+      },
+      "seconds_last_trigger": {
+        "name": "Seconds since last trigger"
+      },
+      "supported_channels": {
+        "name": "Supported channels"
+      },
+      "wan_ip": {
+        "name": "WAN IP"
+      }
+    },
+    "siren": {
+      "siren": {
+        "name": "[%key:component::siren::title%]"
+      }
+    },
+    "switch": {
+      "all_day_video_recording": {
+        "name": "All day video recording"
+      },
+      "audio": {
+        "name": "Audio"
+      },
+      "auto_sleep": {
+        "name": "Auto sleep"
+      },
+      "flicker_light_on_movement": {
+        "name": "Flicker light on movement"
+      },
+      "follow_movement": {
+        "name": "Follow movement"
+      },
+      "infrared_light": {
+        "name": "Infrared light"
+      },
+      "motion_tracking": {
+        "name": "Motion tracking"
+      },
+      "pir_motion_activated_light": {
+        "name": "PIR motion activated light"
+      },
+      "privacy": {
+        "name": "Privacy"
+      },
+      "sleep": {
+        "name": "Sleep"
+      },
+      "status_light": {
+        "name": "Status light"
+      },
+      "tamper_alarm": {
+        "name": "Tamper alarm"
+      }
     }
   },
   "options": {
     "step": {
       "init": {
         "data": {
-          "timeout": "Request Timeout (seconds)",
-          "ffmpeg_arguments": "Arguments passed to ffmpeg for cameras"
+          "encryption_password": "Image encryption password",
+          "ffmpeg_arguments": "Arguments passed to FFmpeg for cameras",
+          "timeout": "Request timeout (seconds)"
+        },
+        "data_description": {
+          "encryption_password": "Password used to decrypt motion pictures when it differs from the camera verification code. Leave empty to use the verification code."
         }
       }
+    }
+  },
+  "services": {
+    "wake_device": {
+      "description": "Wakes a camera from sleep mode. Especially useful for battery cameras.",
+      "name": "Wake camera"
     }
   }
 }

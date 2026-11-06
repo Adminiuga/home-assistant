@@ -1,16 +1,16 @@
 """Support for HomeMatic devices."""
+
 from datetime import datetime
 from functools import partial
 import logging
+from typing import Any
 
+import probatio
 from pyhomematic import HMConnection
-import voluptuous as vol
 
 from homeassistant.const import (
     ATTR_ENTITY_ID,
-    ATTR_MODE,
     ATTR_NAME,
-    ATTR_TIME,
     CONF_HOST,
     CONF_HOSTS,
     CONF_PASSWORD,
@@ -23,8 +23,7 @@ from homeassistant.const import (
     EVENT_HOMEASSISTANT_STOP,
 )
 from homeassistant.core import HomeAssistant, ServiceCall
-from homeassistant.helpers import discovery
-import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers import config_validation as cv, discovery
 from homeassistant.helpers.typing import ConfigType
 
 from .const import (
@@ -39,9 +38,6 @@ from .const import (
     ATTR_LOWBAT,
     ATTR_MESSAGE,
     ATTR_PARAM,
-    ATTR_PARAMSET,
-    ATTR_PARAMSET_KEY,
-    ATTR_RX_MODE,
     ATTR_UNIQUE_ID,
     ATTR_VALUE,
     ATTR_VALUE_TYPE,
@@ -73,14 +69,12 @@ from .const import (
     HM_IGNORE_DISCOVERY_NODE_EXCEPTIONS,
     HM_IMPULSE_EVENTS,
     HM_PRESS_EVENTS,
-    SERVICE_PUT_PARAMSET,
-    SERVICE_RECONNECT,
     SERVICE_SET_DEVICE_VALUE,
-    SERVICE_SET_INSTALL_MODE,
     SERVICE_SET_VARIABLE_VALUE,
     SERVICE_VIRTUALKEY,
 )
 from .entity import HMHub
+from .services import setup_services
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -97,114 +91,99 @@ DEFAULT_VERIFY_SSL = False
 DEFAULT_CHANNEL = 1
 
 
-DEVICE_SCHEMA = vol.Schema(
+DEVICE_SCHEMA = probatio.Schema(
     {
-        vol.Required(CONF_PLATFORM): "homematic",
-        vol.Required(ATTR_NAME): cv.string,
-        vol.Required(ATTR_ADDRESS): cv.string,
-        vol.Required(ATTR_INTERFACE): cv.string,
-        vol.Optional(ATTR_DEVICE_TYPE): cv.string,
-        vol.Optional(ATTR_CHANNEL, default=DEFAULT_CHANNEL): vol.Coerce(int),
-        vol.Optional(ATTR_PARAM): cv.string,
-        vol.Optional(ATTR_UNIQUE_ID): cv.string,
+        probatio.Required(CONF_PLATFORM): "homematic",
+        probatio.Required(ATTR_NAME): cv.string,
+        probatio.Required(ATTR_ADDRESS): cv.string,
+        probatio.Required(ATTR_INTERFACE): cv.string,
+        probatio.Optional(ATTR_DEVICE_TYPE): cv.string,
+        probatio.Optional(ATTR_CHANNEL, default=DEFAULT_CHANNEL): probatio.Coerce(int),
+        probatio.Optional(ATTR_PARAM): cv.string,
+        probatio.Optional(ATTR_UNIQUE_ID): cv.string,
     }
 )
 
-CONFIG_SCHEMA = vol.Schema(
+CONFIG_SCHEMA = probatio.Schema(
     {
-        DOMAIN: vol.Schema(
+        DOMAIN: probatio.Schema(
             {
-                vol.Optional(CONF_INTERFACES, default={}): {
+                probatio.Optional(CONF_INTERFACES, default={}): {
                     cv.match_all: {
-                        vol.Required(CONF_HOST): cv.string,
-                        vol.Optional(CONF_PORT, default=DEFAULT_PORT): cv.port,
-                        vol.Optional(CONF_PATH, default=DEFAULT_PATH): cv.string,
-                        vol.Optional(
+                        probatio.Required(CONF_HOST): cv.string,
+                        probatio.Optional(
+                            CONF_PORT, default=DEFAULT_PORT
+                        ): probatio.Port(),
+                        probatio.Optional(CONF_PATH, default=DEFAULT_PATH): cv.string,
+                        probatio.Optional(
                             CONF_RESOLVENAMES, default=DEFAULT_RESOLVENAMES
-                        ): vol.In(CONF_RESOLVENAMES_OPTIONS),
-                        vol.Optional(CONF_JSONPORT, default=DEFAULT_JSONPORT): cv.port,
-                        vol.Optional(
+                        ): probatio.In(CONF_RESOLVENAMES_OPTIONS),
+                        probatio.Optional(
+                            CONF_JSONPORT, default=DEFAULT_JSONPORT
+                        ): probatio.Port(),
+                        probatio.Optional(
                             CONF_USERNAME, default=DEFAULT_USERNAME
                         ): cv.string,
-                        vol.Optional(
-                            CONF_PASSWORD, default=DEFAULT_PASSWORD
+                        probatio.Optional(
+                            probatio.Secret(CONF_PASSWORD), default=DEFAULT_PASSWORD
                         ): cv.string,
-                        vol.Optional(CONF_CALLBACK_IP): cv.string,
-                        vol.Optional(CONF_CALLBACK_PORT): cv.port,
-                        vol.Optional(CONF_SSL, default=DEFAULT_SSL): cv.boolean,
-                        vol.Optional(
+                        probatio.Optional(CONF_CALLBACK_IP): cv.string,
+                        probatio.Optional(CONF_CALLBACK_PORT): probatio.Port(),
+                        probatio.Optional(CONF_SSL, default=DEFAULT_SSL): cv.boolean,
+                        probatio.Optional(
                             CONF_VERIFY_SSL, default=DEFAULT_VERIFY_SSL
                         ): cv.boolean,
                     }
                 },
-                vol.Optional(CONF_HOSTS, default={}): {
+                probatio.Optional(CONF_HOSTS, default={}): {
                     cv.match_all: {
-                        vol.Required(CONF_HOST): cv.string,
-                        vol.Optional(CONF_PORT, default=DEFAULT_PORT): cv.port,
-                        vol.Optional(
+                        probatio.Required(CONF_HOST): cv.string,
+                        probatio.Optional(
+                            CONF_PORT, default=DEFAULT_PORT
+                        ): probatio.Port(),
+                        probatio.Optional(
                             CONF_USERNAME, default=DEFAULT_USERNAME
                         ): cv.string,
-                        vol.Optional(
-                            CONF_PASSWORD, default=DEFAULT_PASSWORD
+                        probatio.Optional(
+                            probatio.Secret(CONF_PASSWORD), default=DEFAULT_PASSWORD
                         ): cv.string,
                     }
                 },
-                vol.Optional(CONF_LOCAL_IP, default=DEFAULT_LOCAL_IP): cv.string,
-                vol.Optional(CONF_LOCAL_PORT): cv.port,
+                probatio.Optional(CONF_LOCAL_IP, default=DEFAULT_LOCAL_IP): cv.string,
+                probatio.Optional(CONF_LOCAL_PORT): probatio.Port(),
             }
         )
     },
-    extra=vol.ALLOW_EXTRA,
+    extra=probatio.ALLOW_EXTRA,
 )
 
-SCHEMA_SERVICE_VIRTUALKEY = vol.Schema(
+SCHEMA_SERVICE_VIRTUALKEY = probatio.Schema(
     {
-        vol.Required(ATTR_ADDRESS): vol.All(cv.string, vol.Upper),
-        vol.Required(ATTR_CHANNEL): vol.Coerce(int),
-        vol.Required(ATTR_PARAM): cv.string,
-        vol.Optional(ATTR_INTERFACE): cv.string,
+        probatio.Required(ATTR_ADDRESS): probatio.All(cv.string, probatio.Upper),
+        probatio.Required(ATTR_CHANNEL): probatio.Coerce(int),
+        probatio.Required(ATTR_PARAM): cv.string,
+        probatio.Optional(ATTR_INTERFACE): cv.string,
     }
 )
 
-SCHEMA_SERVICE_SET_VARIABLE_VALUE = vol.Schema(
+SCHEMA_SERVICE_SET_VARIABLE_VALUE = probatio.Schema(
     {
-        vol.Required(ATTR_NAME): cv.string,
-        vol.Required(ATTR_VALUE): cv.match_all,
-        vol.Optional(ATTR_ENTITY_ID): cv.entity_ids,
+        probatio.Required(ATTR_NAME): cv.string,
+        probatio.Required(ATTR_VALUE): cv.match_all,
+        probatio.Optional(ATTR_ENTITY_ID): cv.entity_ids,
     }
 )
 
-SCHEMA_SERVICE_SET_DEVICE_VALUE = vol.Schema(
+SCHEMA_SERVICE_SET_DEVICE_VALUE = probatio.Schema(
     {
-        vol.Required(ATTR_ADDRESS): vol.All(cv.string, vol.Upper),
-        vol.Required(ATTR_CHANNEL): vol.Coerce(int),
-        vol.Required(ATTR_PARAM): vol.All(cv.string, vol.Upper),
-        vol.Required(ATTR_VALUE): cv.match_all,
-        vol.Optional(ATTR_VALUE_TYPE): vol.In(
+        probatio.Required(ATTR_ADDRESS): probatio.All(cv.string, probatio.Upper),
+        probatio.Required(ATTR_CHANNEL): probatio.Coerce(int),
+        probatio.Required(ATTR_PARAM): probatio.All(cv.string, probatio.Upper),
+        probatio.Required(ATTR_VALUE): cv.match_all,
+        probatio.Optional(ATTR_VALUE_TYPE): probatio.In(
             ["boolean", "dateTime.iso8601", "double", "int", "string"]
         ),
-        vol.Optional(ATTR_INTERFACE): cv.string,
-    }
-)
-
-SCHEMA_SERVICE_RECONNECT = vol.Schema({})
-
-SCHEMA_SERVICE_SET_INSTALL_MODE = vol.Schema(
-    {
-        vol.Required(ATTR_INTERFACE): cv.string,
-        vol.Optional(ATTR_TIME, default=60): cv.positive_int,
-        vol.Optional(ATTR_MODE, default=1): vol.All(vol.Coerce(int), vol.In([1, 2])),
-        vol.Optional(ATTR_ADDRESS): vol.All(cv.string, vol.Upper),
-    }
-)
-
-SCHEMA_SERVICE_PUT_PARAMSET = vol.Schema(
-    {
-        vol.Required(ATTR_INTERFACE): cv.string,
-        vol.Required(ATTR_ADDRESS): vol.All(cv.string, vol.Upper),
-        vol.Required(ATTR_PARAMSET_KEY): vol.All(cv.string, vol.Upper),
-        vol.Required(ATTR_PARAMSET): dict,
-        vol.Optional(ATTR_RX_MODE): vol.All(cv.string, vol.Upper),
+        probatio.Optional(ATTR_INTERFACE): cv.string,
     }
 )
 
@@ -215,8 +194,11 @@ def setup(hass: HomeAssistant, config: ConfigType) -> bool:
     hass.data[DATA_CONF] = remotes = {}
     hass.data[DATA_STORE] = set()
 
+    interfaces: dict[str, dict[str, Any]] = conf[CONF_INTERFACES]
+    hosts: dict[str, dict[str, Any]] = conf[CONF_HOSTS]
+
     # Create hosts-dictionary for pyhomematic
-    for rname, rconfig in conf[CONF_INTERFACES].items():
+    for rname, rconfig in interfaces.items():
         remotes[rname] = {
             "ip": rconfig.get(CONF_HOST),
             "port": rconfig.get(CONF_PORT),
@@ -232,7 +214,7 @@ def setup(hass: HomeAssistant, config: ConfigType) -> bool:
             "connect": True,
         }
 
-    for sname, sconfig in conf[CONF_HOSTS].items():
+    for sname, sconfig in hosts.items():
         remotes[sname] = {
             "ip": sconfig.get(CONF_HOST),
             "port": sconfig[CONF_PORT],
@@ -258,9 +240,7 @@ def setup(hass: HomeAssistant, config: ConfigType) -> bool:
     hass.bus.listen_once(EVENT_HOMEASSISTANT_STOP, hass.data[DATA_HOMEMATIC].stop)
 
     # Init homematic hubs
-    entity_hubs = []
-    for hub_name in conf[CONF_HOSTS]:
-        entity_hubs.append(HMHub(hass, homematic, hub_name))
+    entity_hubs = [HMHub(hass, homematic, hub_name) for hub_name in hosts]
 
     def _hm_service_virtualkey(service: ServiceCall) -> None:
         """Service to handle virtualkey servicecalls."""
@@ -287,6 +267,8 @@ def setup(hass: HomeAssistant, config: ConfigType) -> bool:
         # Call parameter
         hmdevice.actionNodeData(param, True, channel)
 
+    # Should be adjusted to register actions in setup_services in services.py
+    # pylint: disable-next=home-assistant-action-registered-outside-services-module
     hass.services.register(
         DOMAIN,
         SERVICE_VIRTUALKEY,
@@ -296,7 +278,7 @@ def setup(hass: HomeAssistant, config: ConfigType) -> bool:
 
     def _service_handle_value(service: ServiceCall) -> None:
         """Service to call setValue method for HomeMatic system variable."""
-        entity_ids = service.data.get(ATTR_ENTITY_ID)
+        entity_ids: list[str] | None = service.data.get(ATTR_ENTITY_ID)
         name = service.data[ATTR_NAME]
         value = service.data[ATTR_VALUE]
 
@@ -314,22 +296,12 @@ def setup(hass: HomeAssistant, config: ConfigType) -> bool:
         for hub in entities:
             hub.hm_set_variable(name, value)
 
+    # pylint: disable-next=home-assistant-action-registered-outside-services-module
     hass.services.register(
         DOMAIN,
         SERVICE_SET_VARIABLE_VALUE,
         _service_handle_value,
         schema=SCHEMA_SERVICE_SET_VARIABLE_VALUE,
-    )
-
-    def _service_handle_reconnect(service: ServiceCall) -> None:
-        """Service to reconnect all HomeMatic hubs."""
-        homematic.reconnect()
-
-    hass.services.register(
-        DOMAIN,
-        SERVICE_RECONNECT,
-        _service_handle_reconnect,
-        schema=SCHEMA_SERVICE_RECONNECT,
     )
 
     def _service_handle_device(service: ServiceCall) -> None:
@@ -363,6 +335,7 @@ def setup(hass: HomeAssistant, config: ConfigType) -> bool:
 
         hmdevice.setValue(param, value, channel)
 
+    # pylint: disable-next=home-assistant-action-registered-outside-services-module
     hass.services.register(
         DOMAIN,
         SERVICE_SET_DEVICE_VALUE,
@@ -370,49 +343,7 @@ def setup(hass: HomeAssistant, config: ConfigType) -> bool:
         schema=SCHEMA_SERVICE_SET_DEVICE_VALUE,
     )
 
-    def _service_handle_install_mode(service: ServiceCall) -> None:
-        """Service to set interface into install mode."""
-        interface = service.data.get(ATTR_INTERFACE)
-        mode = service.data.get(ATTR_MODE)
-        time = service.data.get(ATTR_TIME)
-        address = service.data.get(ATTR_ADDRESS)
-
-        homematic.setInstallMode(interface, t=time, mode=mode, address=address)
-
-    hass.services.register(
-        DOMAIN,
-        SERVICE_SET_INSTALL_MODE,
-        _service_handle_install_mode,
-        schema=SCHEMA_SERVICE_SET_INSTALL_MODE,
-    )
-
-    def _service_put_paramset(service: ServiceCall) -> None:
-        """Service to call the putParamset method on a HomeMatic connection."""
-        interface = service.data[ATTR_INTERFACE]
-        address = service.data[ATTR_ADDRESS]
-        paramset_key = service.data[ATTR_PARAMSET_KEY]
-        # When passing in the paramset from a YAML file we get an OrderedDict
-        # here instead of a dict, so add this explicit cast.
-        # The service schema makes sure that this cast works.
-        paramset = dict(service.data[ATTR_PARAMSET])
-        rx_mode = service.data.get(ATTR_RX_MODE)
-
-        _LOGGER.debug(
-            "Calling putParamset: %s, %s, %s, %s, %s",
-            interface,
-            address,
-            paramset_key,
-            paramset,
-            rx_mode,
-        )
-        homematic.putParamset(interface, address, paramset_key, paramset, rx_mode)
-
-    hass.services.register(
-        DOMAIN,
-        SERVICE_PUT_PARAMSET,
-        _service_put_paramset,
-        schema=SCHEMA_SERVICE_PUT_PARAMSET,
-    )
+    setup_services(hass)
 
     return True
 
@@ -551,7 +482,7 @@ def _get_devices(hass, discovery_type, keys, interface):
                 try:
                     DEVICE_SCHEMA(device_dict)
                     device_arr.append(device_dict)
-                except vol.MultipleInvalid as err:
+                except probatio.MultipleInvalid as err:
                     _LOGGER.error("Invalid device config: %s", str(err))
     return device_arr
 
@@ -574,6 +505,8 @@ def _create_ha_id(name, channel, param, count):
     if count > 1 and param is not None:
         return f"{name} {channel} {param}"
 
+    raise ValueError(f"Unable to create unique id for count:{count} and param:{param}")
+
 
 def _hm_event_handler(hass, interface, device, caller, attribute, value):
     """Handle all pyhomematic device events."""
@@ -581,7 +514,7 @@ def _hm_event_handler(hass, interface, device, caller, attribute, value):
         channel = int(device.split(":")[1])
         address = device.split(":")[0]
         hmdevice = hass.data[DATA_HOMEMATIC].devices[interface].get(address)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         _LOGGER.error("Event handling channel convert error!")
         return
 
@@ -622,3 +555,4 @@ def _device_from_servicecall(hass, service):
     for devices in hass.data[DATA_HOMEMATIC].devices.values():
         if address in devices:
             return devices[address]
+    return None

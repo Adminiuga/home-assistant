@@ -1,5 +1,4 @@
 """The wiz integration discovery."""
-from __future__ import annotations
 
 import asyncio
 from dataclasses import asdict
@@ -33,6 +32,8 @@ async def async_discover_devices(
         if isinstance(discovered, Exception):
             _LOGGER.debug("Scanning %s failed with error: %s", targets[idx], discovered)
             continue
+        if isinstance(discovered, BaseException):
+            raise discovered from None
         for device in discovered:
             assert isinstance(device, DiscoveredBulb)
             combined_discoveries[device.ip_address] = device

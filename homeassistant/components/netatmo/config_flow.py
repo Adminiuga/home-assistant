@@ -1,20 +1,22 @@
 """Config flow for Netatmo."""
-from __future__ import annotations
 
 from collections.abc import Mapping
 import logging
-from typing import Any
+from typing import Any, override
 import uuid
 
-from pyatmo.const import ALL_SCOPES
-import voluptuous as vol
+import probatio
 
-from homeassistant import config_entries
-from homeassistant.const import CONF_SHOW_ON_MAP
+from homeassistant.config_entries import (
+    SOURCE_RECONFIGURE,
+    ConfigFlowResult,
+    OptionsFlow,
+)
+from homeassistant.const import CONF_SHOW_ON_MAP, CONF_UUID
 from homeassistant.core import callback
-from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers import config_entry_oauth2_flow, config_validation as cv
 
+from .api import get_api_scopes
 from .const import (
     CONF_AREA_NAME,
     CONF_LAT_NE,
@@ -23,10 +25,10 @@ from .const import (
     CONF_LON_SW,
     CONF_NEW_AREA,
     CONF_PUBLIC_MODE,
-    CONF_UUID,
     CONF_WEATHER_AREAS,
     DOMAIN,
 )
+from .coordinator import NetatmoConfigEntry
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -40,56 +42,62 @@ class NetatmoFlowHandler(
 
     @staticmethod
     @callback
+    @override
     def async_get_options_flow(
-        config_entry: config_entries.ConfigEntry,
-    ) -> config_entries.OptionsFlow:
+        config_entry: NetatmoConfigEntry,
+    ) -> OptionsFlow:
         """Get the options flow for this handler."""
         return NetatmoOptionsFlowHandler(config_entry)
 
     @property
+    @override
     def logger(self) -> logging.Logger:
         """Return logger."""
         return logging.getLogger(__name__)
 
     @property
+    @override
     def extra_authorize_data(self) -> dict:
         """Extra data that needs to be appended to the authorize url."""
-        exclude = []
-        if self.flow_impl.name == "Home Assistant Cloud":
-            exclude = ["access_doorbell", "read_doorbell"]
-
-        scopes = [scope for scope in ALL_SCOPES if scope not in exclude]
-        scopes.sort()
-
+        scopes = get_api_scopes(self.flow_impl.domain)
         return {"scope": " ".join(scopes)}
 
-    async def async_step_user(self, user_input: dict | None = None) -> FlowResult:
+    @override
+    async def async_step_user(self, user_input: dict | None = None) -> ConfigFlowResult:
         """Handle a flow start."""
         await self.async_set_unique_id(DOMAIN)
-
-        if (
-            self.source != config_entries.SOURCE_REAUTH
-            and self._async_current_entries()
-        ):
-            return self.async_abort(reason="single_instance_allowed")
-
         return await super().async_step_user(user_input)
 
-    async def async_step_reauth(self, entry_data: Mapping[str, Any]) -> FlowResult:
+    async def async_step_reauth(
+        self, entry_data: Mapping[str, Any]
+    ) -> ConfigFlowResult:
         """Perform reauth upon an API authentication error."""
         return await self.async_step_reauth_confirm()
 
     async def async_step_reauth_confirm(
         self, user_input: dict | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Dialog that informs the user that reauth is required."""
         if user_input is None:
             return self.async_show_form(step_id="reauth_confirm")
 
         return await self.async_step_user()
 
-    async def async_oauth_create_entry(self, data: dict) -> FlowResult:
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle reconfiguration by re-running the OAuth flow."""
+        return await self.async_step_user()
+
+    @override
+    async def async_oauth_create_entry(self, data: dict) -> ConfigFlowResult:
         """Create an oauth config entry or update existing entry for reauth."""
+        if self.source == SOURCE_RECONFIGURE:
+            entry = self._get_reconfigure_entry()
+            result = self.async_update_and_abort(entry, data_updates=data)
+            # The update listener only signals public weather changes, it won't reload
+            self.hass.config_entries.async_schedule_reload(entry.entry_id)
+            return result
         existing_entry = await self.async_set_unique_id(DOMAIN)
         if existing_entry:
             self.hass.config_entries.async_update_entry(existing_entry, data=data)
@@ -99,22 +107,21 @@ class NetatmoFlowHandler(
         return await super().async_oauth_create_entry(data)
 
 
-class NetatmoOptionsFlowHandler(config_entries.OptionsFlow):
+class NetatmoOptionsFlowHandler(OptionsFlow):
     """Handle Netatmo options."""
 
-    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
+    def __init__(self, config_entry: NetatmoConfigEntry) -> None:
         """Initialize Netatmo options flow."""
-        self.config_entry = config_entry
         self.options = dict(config_entry.options)
         self.options.setdefault(CONF_WEATHER_AREAS, {})
 
-    async def async_step_init(self, user_input: dict | None = None) -> FlowResult:
+    async def async_step_init(self, user_input: dict | None = None) -> ConfigFlowResult:
         """Manage the Netatmo options."""
         return await self.async_step_public_weather_areas()
 
     async def async_step_public_weather_areas(
         self, user_input: dict | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Manage configuration of Netatmo public weather areas."""
         errors: dict = {}
 
@@ -134,13 +141,13 @@ class NetatmoOptionsFlowHandler(config_entries.OptionsFlow):
 
         weather_areas = list(self.options[CONF_WEATHER_AREAS])
 
-        data_schema = vol.Schema(
+        data_schema = probatio.Schema(
             {
-                vol.Optional(
+                probatio.Optional(
                     CONF_WEATHER_AREAS,
                     default=weather_areas,
-                ): cv.multi_select({wa: None for wa in weather_areas}),
-                vol.Optional(CONF_NEW_AREA): str,
+                ): cv.multi_select(dict.fromkeys(weather_areas)),
+                probatio.Optional(CONF_NEW_AREA): str,
             }
         )
         return self.async_show_form(
@@ -149,16 +156,16 @@ class NetatmoOptionsFlowHandler(config_entries.OptionsFlow):
             errors=errors,
         )
 
-    async def async_step_public_weather(self, user_input: dict) -> FlowResult:
+    async def async_step_public_weather(self, user_input: dict) -> ConfigFlowResult:
         """Manage configuration of Netatmo public weather sensors."""
         if user_input is not None and CONF_NEW_AREA not in user_input:
-            self.options[CONF_WEATHER_AREAS][
-                user_input[CONF_AREA_NAME]
-            ] = fix_coordinates(user_input)
+            self.options[CONF_WEATHER_AREAS][user_input[CONF_AREA_NAME]] = (
+                fix_coordinates(user_input)
+            )
 
-            self.options[CONF_WEATHER_AREAS][user_input[CONF_AREA_NAME]][
-                CONF_UUID
-            ] = str(uuid.uuid4())
+            self.options[CONF_WEATHER_AREAS][user_input[CONF_AREA_NAME]][CONF_UUID] = (
+                str(uuid.uuid4())
+            )
 
             return await self.async_step_public_weather_areas()
 
@@ -170,38 +177,40 @@ class NetatmoOptionsFlowHandler(config_entries.OptionsFlow):
         default_latitude = self.hass.config.latitude
         default_size = 0.04
 
-        data_schema = vol.Schema(
+        data_schema = probatio.Schema(
             {
-                vol.Optional(CONF_AREA_NAME, default=user_input[CONF_NEW_AREA]): str,
-                vol.Optional(
+                probatio.Optional(
+                    CONF_AREA_NAME, default=user_input[CONF_NEW_AREA]
+                ): str,
+                probatio.Optional(
                     CONF_LAT_NE,
                     default=orig_options.get(
                         CONF_LAT_NE, default_latitude + default_size
                     ),
                 ): cv.latitude,
-                vol.Optional(
+                probatio.Optional(
                     CONF_LON_NE,
                     default=orig_options.get(
                         CONF_LON_NE, default_longitude + default_size
                     ),
                 ): cv.longitude,
-                vol.Optional(
+                probatio.Optional(
                     CONF_LAT_SW,
                     default=orig_options.get(
                         CONF_LAT_SW, default_latitude - default_size
                     ),
                 ): cv.latitude,
-                vol.Optional(
+                probatio.Optional(
                     CONF_LON_SW,
                     default=orig_options.get(
                         CONF_LON_SW, default_longitude - default_size
                     ),
                 ): cv.longitude,
-                vol.Required(
+                probatio.Required(
                     CONF_PUBLIC_MODE,
                     default=orig_options.get(CONF_PUBLIC_MODE, "avg"),
-                ): vol.In(["avg", "max"]),
-                vol.Required(
+                ): probatio.In(["avg", "max", "min"]),
+                probatio.Required(
                     CONF_SHOW_ON_MAP,
                     default=orig_options.get(CONF_SHOW_ON_MAP, False),
                 ): bool,
@@ -210,7 +219,7 @@ class NetatmoOptionsFlowHandler(config_entries.OptionsFlow):
 
         return self.async_show_form(step_id="public_weather", data_schema=data_schema)
 
-    def _create_options_entry(self) -> FlowResult:
+    def _create_options_entry(self) -> ConfigFlowResult:
         """Update config entry options."""
         return self.async_create_entry(
             title="Netatmo Public Weather", data=self.options
@@ -222,7 +231,7 @@ def fix_coordinates(user_input: dict) -> dict:
     # Ensure coordinates have acceptable length for the Netatmo API
     for coordinate in (CONF_LAT_NE, CONF_LAT_SW, CONF_LON_NE, CONF_LON_SW):
         if len(str(user_input[coordinate]).split(".")[1]) < 7:
-            user_input[coordinate] = user_input[coordinate] + 0.0000001
+            user_input[coordinate] = user_input[coordinate] + 1e-7
 
     # Swap coordinates if entered in wrong order
     if user_input[CONF_LAT_NE] < user_input[CONF_LAT_SW]:

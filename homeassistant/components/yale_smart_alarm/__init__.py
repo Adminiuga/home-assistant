@@ -1,41 +1,77 @@
 """The yale_smart_alarm component."""
-from __future__ import annotations
 
+from homeassistant.components.lock import CONF_DEFAULT_CODE, DOMAIN as LOCK_DOMAIN
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import CONF_CODE, CONF_NAME
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.helpers import device_registry as dr, entity_registry as er
 
-from .const import COORDINATOR, DOMAIN, PLATFORMS
+from .const import LOGGER, PLATFORMS
 from .coordinator import YaleDataUpdateCoordinator
 
+type YaleConfigEntry = ConfigEntry[YaleDataUpdateCoordinator]
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+
+async def async_setup_entry(hass: HomeAssistant, entry: YaleConfigEntry) -> None:
     """Set up Yale from a config entry."""
 
     coordinator = YaleDataUpdateCoordinator(hass, entry)
-    if not await hass.async_add_executor_job(coordinator.get_updates):
-        raise ConfigEntryAuthFailed
-
     await coordinator.async_config_entry_first_refresh()
-    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
-        COORDINATOR: coordinator,
-    }
+    entry.runtime_data = coordinator
+
+    # Register the alarm panel device so child devices can link to it via
+    # via_device_id, since the panel is otherwise only registered by a sibling
+    # entity on a concurrently loaded platform.
+    dr.async_get(hass).async_get_or_create_from_info(
+        config_entry_id=entry.entry_id,
+        device_info=coordinator.device_info,
+    )
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-    entry.async_on_unload(entry.add_update_listener(update_listener))
-
-    return True
 
 
-async def update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Handle options update."""
-    await hass.config_entries.async_reload(entry.entry_id)
-
-
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_unload_entry(hass: HomeAssistant, entry: YaleConfigEntry) -> None:
     """Unload a config entry."""
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)
 
-    if await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
-        hass.data[DOMAIN].pop(entry.entry_id)
-        return True
-    return False
+
+async def async_migrate_entry(hass: HomeAssistant, entry: YaleConfigEntry) -> None:
+    """Migrate old entry."""
+    LOGGER.debug("Migrating from version %s.%s", entry.version, entry.minor_version)
+
+    if entry.version == 1:
+        new_options = entry.options.copy()
+        if config_entry_default_code := entry.options.get(CONF_CODE):
+            entity_reg = er.async_get(hass)
+            entries = er.async_entries_for_config_entry(entity_reg, entry.entry_id)
+            for entity in entries:
+                if entity.entity_id.startswith("lock"):
+                    entity_reg.async_update_entity_options(
+                        entity.entity_id,
+                        LOCK_DOMAIN,
+                        {CONF_DEFAULT_CODE: config_entry_default_code},
+                    )
+            del new_options[CONF_CODE]
+
+        hass.config_entries.async_update_entry(entry, options=new_options, version=2)
+
+    if entry.version == 2 and entry.minor_version == 1:
+        # Removes name from entry data
+        new_data = entry.data.copy()
+        del new_data[CONF_NAME]
+        hass.config_entries.async_update_entry(entry, data=new_data, minor_version=2)
+
+    if entry.version == 2 and entry.minor_version == 2:
+        entity_reg = er.async_get(hass)
+        entries = er.async_entries_for_config_entry(entity_reg, entry.entry_id)
+        for entity in entries:
+            if entity.unique_id == "yale_smart_alarm-panic":
+                entity_reg.async_update_entity(
+                    entity.entity_id,
+                    new_unique_id=f"{entry.entry_id}-panic",
+                )
+        hass.config_entries.async_update_entry(entry, minor_version=3)
+
+    LOGGER.debug(
+        "Migration to version %s.%s successful", entry.version, entry.minor_version
+    )

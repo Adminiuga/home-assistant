@@ -1,18 +1,28 @@
 {
   "domain": "qingping",
   "name": "Qingping",
-  "config_flow": true,
-  "documentation": "https://www.home-assistant.io/integrations/qingping",
   "bluetooth": [
-    { "local_name": "Qingping*", "connectable": false },
-    { "local_name": "Lee Guitars*", "connectable": false },
     {
-      "service_data_uuid": "0000fdcd-0000-1000-8000-00805f9b34fb",
-      "connectable": false
+      "connectable": false,
+      "local_name": "Qingping*"
+    },
+    {
+      "connectable": false,
+      "local_name": "Lee Guitars*"
+    },
+    {
+      "connectable": false,
+      "service_data_uuid": "0000fdcd-0000-1000-8000-00805f9b34fb"
     }
   ],
-  "requirements": ["qingping-ble==0.8.2"],
-  "dependencies": ["bluetooth"],
-  "codeowners": ["@bdraco", "@skgsergio"],
-  "iot_class": "local_push"
+  "categories": ["sensors.temperature_humidity", "sensors.air_quality"],
+  "codeowners": ["@bdraco", "@tengfeili-qingping"],
+  "config_flow": true,
+  "connectivity": ["bluetooth"],
+  "dependencies": ["bluetooth_adapters"],
+  "documentation": "https://www.home-assistant.io/integrations/qingping",
+  "integration_type": "device",
+  "iot_class": "local_push",
+  "quality_scale": "gold",
+  "requirements": ["qingping-ble==1.3.0"]
 }

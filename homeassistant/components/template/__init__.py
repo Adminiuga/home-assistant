@@ -1,168 +1,141 @@
 """The template component."""
-from __future__ import annotations
 
-import asyncio
-from collections.abc import Callable
 import logging
 
-from homeassistant import config as conf_util
-from homeassistant.const import (
-    CONF_UNIQUE_ID,
-    EVENT_HOMEASSISTANT_START,
-    SERVICE_RELOAD,
-)
-from homeassistant.core import CoreState, Event, HomeAssistant, ServiceCall, callback
-from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers import (
-    discovery,
-    trigger as trigger_helper,
-    update_coordinator,
-)
-from homeassistant.helpers.reload import async_reload_integration_platforms
-from homeassistant.helpers.service import async_register_admin_service
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import CONF_DEVICE_ID, CONF_NAME
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryError
+from homeassistant.helpers import device_registry as dr, issue_registry as ir
+from homeassistant.helpers.helper_integration import async_remove_helper_devices
 from homeassistant.helpers.typing import ConfigType
-from homeassistant.loader import async_get_integration
 
-from .const import CONF_TRIGGER, DOMAIN, PLATFORMS
+from .const import CONF_ADDITIONAL_OPTIONS, CONF_MAX, CONF_MIN, CONF_STEP, DOMAIN
+from .helpers import async_get_blueprints, process_config
+from .services import async_setup_services
 
 _LOGGER = logging.getLogger(__name__)
+
+__all__ = [
+    "DOMAIN",
+]
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the template integration."""
+
+    # Register template as valid domain for Blueprint
+    blueprints = async_get_blueprints(hass)
+
+    # Add some default blueprints to blueprints/template, does nothing
+    # if blueprints/template already exists but still has to create
+    # an executor job to check if the folder exists so we run it in a
+    # separate task to avoid waiting for it to finish setting up
+    # since a tracked task will be waited at the end of startup
+    hass.async_create_task(blueprints.async_populate(), eager_start=True)
+
     if DOMAIN in config:
-        await _process_config(hass, config)
+        await process_config(hass, config)
 
-    async def _reload_config(call: Event | ServiceCall) -> None:
-        """Reload top-level + platforms."""
-        try:
-            unprocessed_conf = await conf_util.async_hass_config_yaml(hass)
-        except HomeAssistantError as err:
-            _LOGGER.error(err)
-            return
-
-        conf = await conf_util.async_process_component_config(
-            hass, unprocessed_conf, await async_get_integration(hass, DOMAIN)
-        )
-
-        if conf is None:
-            return
-
-        await async_reload_integration_platforms(hass, DOMAIN, PLATFORMS)
-
-        if DOMAIN in conf:
-            await _process_config(hass, conf)
-
-        hass.bus.async_fire(f"event_{DOMAIN}_reloaded", context=call.context)
-
-    async_register_admin_service(hass, DOMAIN, SERVICE_RELOAD, _reload_config)
+    async_setup_services(hass)
 
     return True
 
 
-async def _process_config(hass: HomeAssistant, hass_config: ConfigType) -> None:
-    """Process config."""
-    coordinators: list[TriggerUpdateCoordinator] | None = hass.data.pop(DOMAIN, None)
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Set up a config entry."""
 
-    # Remove old ones
-    if coordinators:
-        for coordinator in coordinators:
-            coordinator.async_remove()
+    device_id = entry.options.get(CONF_DEVICE_ID)
 
-    async def init_coordinator(hass, conf_section):
-        coordinator = TriggerUpdateCoordinator(hass, conf_section)
-        await coordinator.async_setup(hass_config)
-        return coordinator
+    # Clean up devices this helper created for previously selected source devices;
+    # this can be removed in HA Core 2027.8.
+    async_remove_helper_devices(
+        hass,
+        helper_config_entry_id=entry.entry_id,
+        source_device_id=device_id,
+        remove_all_devices=True,
+    )
 
-    coordinator_tasks = []
+    device_registry = dr.async_get(hass)
+    if (
+        device_id is not None
+        and device_registry.async_get(
+            device_id,
+            include_main_devices=False,
+            include_child_devices=False,
+            include_composite_devices=True,
+        )
+        is not None
+    ):
+        # The device was split into one device per config entry; ask the user to
+        # select a device again
+        ir.async_create_issue(
+            hass,
+            DOMAIN,
+            f"composite_device_id_{entry.entry_id}",
+            config_entry_id=entry.entry_id,
+            data={"entry_id": entry.entry_id},
+            is_fixable=True,
+            severity=ir.IssueSeverity.WARNING,
+            translation_key="composite_device_id",
+            translation_placeholders={"name": entry.title},
+        )
+    else:
+        ir.async_delete_issue(hass, DOMAIN, f"composite_device_id_{entry.entry_id}")
 
-    for conf_section in hass_config[DOMAIN]:
-        if CONF_TRIGGER in conf_section:
-            coordinator_tasks.append(init_coordinator(hass, conf_section))
+    for key in (CONF_MAX, CONF_MIN, CONF_STEP):
+        if key not in entry.options:
             continue
-
-        for platform_domain in PLATFORMS:
-            if platform_domain in conf_section:
-                hass.async_create_task(
-                    discovery.async_load_platform(
-                        hass,
-                        platform_domain,
-                        DOMAIN,
-                        {
-                            "unique_id": conf_section.get(CONF_UNIQUE_ID),
-                            "entities": conf_section[platform_domain],
-                        },
-                        hass_config,
-                    )
-                )
-
-    if coordinator_tasks:
-        hass.data[DOMAIN] = await asyncio.gather(*coordinator_tasks)
-
-
-class TriggerUpdateCoordinator(update_coordinator.DataUpdateCoordinator):
-    """Class to handle incoming data."""
-
-    REMOVE_TRIGGER = object()
-
-    def __init__(self, hass, config):
-        """Instantiate trigger data."""
-        super().__init__(hass, _LOGGER, name="Trigger Update Coordinator")
-        self.config = config
-        self._unsub_start: Callable[[], None] | None = None
-        self._unsub_trigger: Callable[[], None] | None = None
-
-    @property
-    def unique_id(self) -> str | None:
-        """Return unique ID for the entity."""
-        return self.config.get("unique_id")
-
-    @callback
-    def async_remove(self):
-        """Signal that the entities need to remove themselves."""
-        if self._unsub_start:
-            self._unsub_start()
-        if self._unsub_trigger:
-            self._unsub_trigger()
-
-    async def async_setup(self, hass_config: ConfigType) -> None:
-        """Set up the trigger and create entities."""
-        if self.hass.state == CoreState.running:
-            await self._attach_triggers()
-        else:
-            self._unsub_start = self.hass.bus.async_listen_once(
-                EVENT_HOMEASSISTANT_START, self._attach_triggers
+        if isinstance(entry.options[key], str):
+            raise ConfigEntryError(
+                f"The '{entry.options.get(CONF_NAME) or ''}' number template needs to "
+                f"be reconfigured, {key} must be a number, got '{entry.options[key]}'"
             )
 
-        for platform_domain in PLATFORMS:
-            if platform_domain in self.config:
-                self.hass.async_create_task(
-                    discovery.async_load_platform(
-                        self.hass,
-                        platform_domain,
-                        DOMAIN,
-                        {"coordinator": self, "entities": self.config[platform_domain]},
-                        hass_config,
-                    )
+    await hass.config_entries.async_forward_entry_setups(
+        entry, (entry.options["template_type"],)
+    )
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Unload a config entry."""
+    await hass.config_entries.async_unload_platforms_or_raise(
+        entry, (entry.options["template_type"],)
+    )
+
+
+async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> None:
+    """Migrate old entry."""
+
+    _LOGGER.debug(
+        "Migrating configuration from version %s.%s",
+        config_entry.version,
+        config_entry.minor_version,
+    )
+
+    if config_entry.version == 1:
+        if config_entry.minor_version < 2:
+            # Remove the template config entry from the source device
+            if source_device_id := config_entry.options.get(CONF_DEVICE_ID):
+                async_remove_helper_devices(
+                    hass,
+                    helper_config_entry_id=config_entry.entry_id,
+                    source_device_id=source_device_id,
                 )
+            hass.config_entries.async_update_entry(
+                config_entry, version=1, minor_version=2
+            )
 
-    async def _attach_triggers(self, start_event=None) -> None:
-        """Attach the triggers."""
-        if start_event is not None:
-            self._unsub_start = None
-
-        self._unsub_trigger = await trigger_helper.async_initialize_triggers(
-            self.hass,
-            self.config[CONF_TRIGGER],
-            self._handle_triggered,
-            DOMAIN,
-            self.name,
-            self.logger.log,
-            start_event is not None,
+        options = {**config_entry.options}
+        # The "advanced_options" section was renamed to "additional_options"
+        if (additional := options.pop("advanced_options", None)) is not None:
+            options[CONF_ADDITIONAL_OPTIONS] = additional
+        hass.config_entries.async_update_entry(
+            config_entry, options=options, version=2, minor_version=1
         )
 
-    @callback
-    def _handle_triggered(self, run_variables, context=None):
-        self.async_set_updated_data(
-            {"run_variables": run_variables, "context": context}
-        )
+    _LOGGER.debug(
+        "Migration to configuration version %s.%s successful",
+        config_entry.version,
+        config_entry.minor_version,
+    )

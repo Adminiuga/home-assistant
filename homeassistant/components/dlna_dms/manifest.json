@@ -1,11 +1,16 @@
 {
   "domain": "dlna_dms",
   "name": "DLNA Digital Media Server",
-  "config_flow": true,
-  "documentation": "https://www.home-assistant.io/integrations/dlna_dms",
-  "requirements": ["async-upnp-client==0.32.2"],
-  "dependencies": ["ssdp"],
   "after_dependencies": ["media_source"],
+  "categories": ["media_entertainment", "computers_network.nas_servers"],
+  "codeowners": ["@chishm"],
+  "config_flow": true,
+  "connectivity": ["network"],
+  "dependencies": ["ssdp"],
+  "documentation": "https://www.home-assistant.io/integrations/dlna_dms",
+  "integration_type": "service",
+  "iot_class": "local_polling",
+  "requirements": ["async-upnp-client==0.49.0"],
   "ssdp": [
     {
       "deviceType": "urn:schemas-upnp-org:device:MediaServer:1",
@@ -23,8 +28,5 @@
       "deviceType": "urn:schemas-upnp-org:device:MediaServer:4",
       "st": "urn:schemas-upnp-org:device:MediaServer:4"
     }
-  ],
-  "codeowners": ["@chishm"],
-  "iot_class": "local_polling",
-  "quality_scale": "platinum"
+  ]
 }

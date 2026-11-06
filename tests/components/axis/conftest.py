@@ -1,47 +1,379 @@
 """Axis conftest."""
-from __future__ import annotations
 
-from unittest.mock import patch
+from collections.abc import Callable, Coroutine, Generator
+from copy import deepcopy
+import re
+from types import MappingProxyType
+from typing import Any, Protocol
+from unittest.mock import AsyncMock, patch
 
-from axis.rtsp import (
-    SIGNAL_DATA,
-    SIGNAL_FAILED,
-    SIGNAL_PLAYING,
-    STATE_PLAYING,
-    STATE_STOPPED,
-)
+from axis.rtsp import Signal, State
 import pytest
+from pytest_homeassistant.common import MockConfigEntry
+from pytest_homeassistant.test_util.aiohttp import (
+    AiohttpClientMocker,
+    AiohttpClientMockResponse,
+)
+from yarl import URL
 
-from tests.components.light.conftest import mock_light_profiles  # noqa: F401
+from homeassistant.components.axis.const import CONF_COMPANION, DOMAIN
+from homeassistant.const import (
+    CONF_HOST,
+    CONF_MODEL,
+    CONF_NAME,
+    CONF_PASSWORD,
+    CONF_PORT,
+    CONF_USERNAME,
+)
+from homeassistant.core import HomeAssistant
+
+from .const import (
+    API_DISCOVERY_RESPONSE,
+    APP_AOA_RESPONSE,
+    APP_VMD4_RESPONSE,
+    APPLICATIONS_LIST_RESPONSE,
+    BASIC_DEVICE_INFO_RESPONSE,
+    BRAND_RESPONSE,
+    DEFAULT_HOST,
+    FORMATTED_MAC,
+    IMAGE_RESPONSE,
+    MODEL,
+    MQTT_CLIENT_RESPONSE,
+    NAME,
+    PORT_MANAGEMENT_RESPONSE,
+    PORTS_RESPONSE,
+    PROPERTIES_RESPONSE,
+    PTZ_RESPONSE,
+    STREAM_PROFILES_RESPONSE,
+    VIEW_AREAS_RESPONSE,
+)
+
+type ConfigEntryFactoryType = Callable[[], Coroutine[Any, Any, MockConfigEntry]]
+type RtspStateType = Callable[[bool], None]
+
+
+class RtspEventMock(Protocol):
+    """Fixture to allow mocking received RTSP events."""
+
+    def __call__(
+        self,
+        topic: str,
+        data_type: str,
+        data_value: str,
+        operation: str = "Initialized",
+        source_name: str = "",
+        source_idx: str = "",
+    ) -> None:
+        """Send RTSP event."""
+
+
+class _RtspClientMock(Protocol):
+    def __call__(
+        self, data: bytes | None = None, state: Signal | None = None
+    ) -> None: ...
+
+
+@pytest.fixture(name="mock_setup_entry")
+def fixture_setup_entry() -> Generator[AsyncMock]:
+    """Override async_setup_entry."""
+    with patch(
+        "homeassistant.components.axis.async_setup_entry", return_value=None
+    ) as mock_setup_entry:
+        yield mock_setup_entry
+
+
+# Config entry fixtures
+
+
+@pytest.fixture(name="config_entry")
+def fixture_config_entry(
+    config_entry_data: MappingProxyType[str, Any],
+    config_entry_options: MappingProxyType[str, Any],
+    config_entry_version: int,
+) -> MockConfigEntry:
+    """Define a config entry fixture."""
+    return MockConfigEntry(
+        domain=DOMAIN,
+        entry_id="676abe5b73621446e6550a2e86ffe3dd",
+        unique_id=FORMATTED_MAC,
+        data=config_entry_data,
+        options=config_entry_options,
+        version=config_entry_version,
+    )
+
+
+@pytest.fixture(name="config_entry_version")
+def fixture_config_entry_version() -> int:
+    """Define a config entry version fixture."""
+    return 3
+
+
+@pytest.fixture(name="config_entry_data")
+def fixture_config_entry_data() -> MappingProxyType[str, Any]:
+    """Define a config entry data fixture."""
+    return {
+        CONF_HOST: DEFAULT_HOST,
+        CONF_USERNAME: "root",
+        CONF_PASSWORD: "pass",
+        CONF_PORT: 80,
+        CONF_MODEL: MODEL,
+        CONF_NAME: NAME,
+        CONF_COMPANION: False,
+    }
+
+
+@pytest.fixture(name="config_entry_options")
+def fixture_config_entry_options() -> MappingProxyType[str, Any]:
+    """Define a config entry options fixture."""
+    return {}
+
+
+# Axis API fixtures
 
 
 @pytest.fixture(autouse=True)
-def mock_axis_rtspclient():
+def reset_mock_requests(aioclient_mock: AiohttpClientMocker) -> Generator[None]:
+    """Reset mocked HTTP routes after the test."""
+    yield
+    aioclient_mock.clear_requests()
+
+
+@pytest.fixture(name="mock_requests")
+def fixture_request(
+    aioclient_mock: AiohttpClientMocker,
+    basic_device_info_payload: dict[str, Any],
+    port_management_payload: dict[str, Any],
+    param_brand_payload: str,
+    param_properties_payload: str,
+    param_properties_status_code: int,
+    param_ports_payload: str,
+    mqtt_status_code: int,
+) -> Callable[[str], None]:
+    """Mock default Vapix requests responses."""
+
+    def __mock_default_requests(host: str) -> None:
+        def _url_pattern(path: str) -> re.Pattern[str]:
+            return re.compile(rf"^https?://{re.escape(host)}(?::\d+)?{path}$")
+
+        def _text_response(
+            url: URL, text: str, status: int = 200
+        ) -> AiohttpClientMockResponse:
+            return AiohttpClientMockResponse(
+                "post",
+                url,
+                text=text,
+                headers={"Content-Type": "text/plain"},
+                status=status,
+            )
+
+        async def _param_cgi_response(
+            _method: str, url: URL, data: dict[str, Any] | None
+        ) -> AiohttpClientMockResponse:
+            group = (data or {}).get("group")
+            if group == "root.Brand":
+                return _text_response(url, param_brand_payload)
+            if group == "root.Image":
+                return _text_response(url, IMAGE_RESPONSE)
+            if group == "root.Input":
+                return _text_response(url, PORTS_RESPONSE)
+            if group == "root.IOPort":
+                return _text_response(url, param_ports_payload)
+            if group == "root.Output":
+                return _text_response(url, PORTS_RESPONSE)
+            if group == "root.Properties":
+                return _text_response(
+                    url, param_properties_payload, param_properties_status_code
+                )
+            if group == "root.PTZ":
+                return _text_response(url, PTZ_RESPONSE)
+            if group == "root.StreamProfile":
+                return _text_response(url, STREAM_PROFILES_RESPONSE)
+            return _text_response(url, "")
+
+        if host != DEFAULT_HOST:
+            aioclient_mock.post(
+                _url_pattern("/axis-cgi/apidiscovery.cgi"),
+                json=API_DISCOVERY_RESPONSE,
+            )
+        aioclient_mock.post(
+            _url_pattern("/axis-cgi/basicdeviceinfo.cgi"),
+            json=basic_device_info_payload,
+        )
+        aioclient_mock.post(
+            _url_pattern("/axis-cgi/io/portmanagement.cgi"),
+            json=port_management_payload,
+        )
+        aioclient_mock.post(
+            _url_pattern("/axis-cgi/mqtt/client.cgi"),
+            json=MQTT_CLIENT_RESPONSE,
+            status=mqtt_status_code,
+        )
+        aioclient_mock.post(
+            _url_pattern("/axis-cgi/streamprofile.cgi"),
+            json=STREAM_PROFILES_RESPONSE,
+        )
+        aioclient_mock.post(
+            _url_pattern("/axis-cgi/viewarea/info.cgi"),
+            json=VIEW_AREAS_RESPONSE,
+        )
+        aioclient_mock.post(
+            _url_pattern("/axis-cgi/param.cgi"),
+            side_effect=_param_cgi_response,
+        )
+        aioclient_mock.post(
+            _url_pattern("/axis-cgi/applications/list.cgi"),
+            text=APPLICATIONS_LIST_RESPONSE,
+            headers={"Content-Type": "text/xml"},
+        )
+        aioclient_mock.post(
+            _url_pattern("/local/fenceguard/control.cgi"), json=APP_VMD4_RESPONSE
+        )
+        aioclient_mock.post(
+            _url_pattern("/local/loiteringguard/control.cgi"),
+            json=APP_VMD4_RESPONSE,
+        )
+        aioclient_mock.post(
+            _url_pattern("/local/motionguard/control.cgi"), json=APP_VMD4_RESPONSE
+        )
+        aioclient_mock.post(
+            _url_pattern("/local/vmd/control.cgi"), json=APP_VMD4_RESPONSE
+        )
+        aioclient_mock.post(
+            _url_pattern("/local/objectanalytics/control.cgi"),
+            json=APP_AOA_RESPONSE,
+        )
+
+    return __mock_default_requests
+
+
+@pytest.fixture
+def api_discovery_items() -> dict[str, Any]:
+    """Additional Apidiscovery items."""
+    return {}
+
+
+@pytest.fixture(autouse=True)
+def fixture_api_discovery(
+    aioclient_mock: AiohttpClientMocker,
+    api_discovery_items: dict[str, Any],
+) -> None:
+    """Apidiscovery mock response."""
+    data = deepcopy(API_DISCOVERY_RESPONSE)
+    if api_discovery_items:
+        data["data"]["apiList"].append(api_discovery_items)
+    aioclient_mock.post(
+        re.compile(
+            rf"^https?://{re.escape(DEFAULT_HOST)}(?::\d+)?/axis-cgi/apidiscovery.cgi$"
+        ),
+        json=data,
+    )
+
+
+@pytest.fixture(name="basic_device_info_payload")
+def fixture_basic_device_info_data() -> dict[str, Any]:
+    """Basic device information data."""
+    return BASIC_DEVICE_INFO_RESPONSE
+
+
+@pytest.fixture(name="port_management_payload")
+def fixture_io_port_management_data() -> dict[str, Any]:
+    """Property parameter data."""
+    return PORT_MANAGEMENT_RESPONSE
+
+
+@pytest.fixture(name="param_brand_payload")
+def fixture_param_brand_data() -> str:
+    """Brand parameter data."""
+    return BRAND_RESPONSE
+
+
+@pytest.fixture(name="param_properties_payload")
+def fixture_param_properties_data() -> str:
+    """Property parameter data."""
+    return PROPERTIES_RESPONSE
+
+
+@pytest.fixture(name="param_ports_payload")
+def fixture_param_ports_data() -> str:
+    """Property parameter data."""
+    return PORTS_RESPONSE
+
+
+@pytest.fixture(name="param_properties_status_code")
+def fixture_param_properties_status_code() -> int:
+    """Property parameter status code."""
+    return 200
+
+
+@pytest.fixture(name="mqtt_status_code")
+def fixture_mqtt_status_code() -> int:
+    """MQTT status code."""
+    return 200
+
+
+@pytest.fixture(name="mock_default_requests")
+def fixture_default_requests(mock_requests: Callable[[str], None]) -> None:
+    """Mock default Vapix requests responses."""
+    mock_requests(DEFAULT_HOST)
+
+
+@pytest.fixture(name="config_entry_factory")
+async def fixture_config_entry_factory(
+    hass: HomeAssistant,
+    config_entry: MockConfigEntry,
+    mock_requests: Callable[[str], None],
+) -> ConfigEntryFactoryType:
+    """Fixture factory to set up Axis network device."""
+
+    async def __mock_setup_config_entry() -> MockConfigEntry:
+        config_entry.add_to_hass(hass)
+        mock_requests(config_entry.data[CONF_HOST])
+        await hass.config_entries.async_setup(config_entry.entry_id)
+        await hass.async_block_till_done()
+        return config_entry
+
+    return __mock_setup_config_entry
+
+
+@pytest.fixture(name="config_entry_setup")
+async def fixture_config_entry_setup(
+    config_entry_factory: ConfigEntryFactoryType,
+) -> MockConfigEntry:
+    """Define a fixture to set up Axis network device."""
+    return await config_entry_factory()
+
+
+# RTSP fixtures
+
+
+@pytest.fixture(autouse=True, name="_mock_rtsp_client")
+def fixture_axis_rtsp_client() -> Generator[_RtspClientMock]:
     """No real RTSP communication allowed."""
-    with patch("axis.streammanager.RTSPClient") as rtsp_client_mock:
+    with patch("axis.stream_manager.RTSPClient") as rtsp_client_mock:
+        rtsp_client_mock.return_value.session.state = State.STOPPED
 
-        rtsp_client_mock.return_value.session.state = STATE_STOPPED
-
-        async def start_stream():
+        async def start_stream() -> None:
             """Set state to playing when calling RTSPClient.start."""
-            rtsp_client_mock.return_value.session.state = STATE_PLAYING
+            rtsp_client_mock.return_value.session.state = State.PLAYING
 
         rtsp_client_mock.return_value.start = start_stream
 
-        def stop_stream():
+        def stop_stream() -> None:
             """Set state to stopped when calling RTSPClient.stop."""
-            rtsp_client_mock.return_value.session.state = STATE_STOPPED
+            rtsp_client_mock.return_value.session.state = State.STOPPED
 
         rtsp_client_mock.return_value.stop = stop_stream
 
-        def make_rtsp_call(data: dict | None = None, state: str = ""):
+        def make_rtsp_call(
+            data: bytes | None = None, state: Signal | None = None
+        ) -> None:
             """Generate a RTSP call."""
             axis_streammanager_session_callback = rtsp_client_mock.call_args[0][4]
 
-            if data:
-                rtsp_client_mock.return_value.rtp.data = data
-                axis_streammanager_session_callback(signal=SIGNAL_DATA)
-            elif state:
+            if data is not None:
+                rtsp_client_mock.return_value.data = data
+                axis_streammanager_session_callback(signal=Signal.DATA)
+            elif state is not None:
                 axis_streammanager_session_callback(signal=state)
             else:
                 raise NotImplementedError
@@ -49,8 +381,8 @@ def mock_axis_rtspclient():
         yield make_rtsp_call
 
 
-@pytest.fixture(autouse=True)
-def mock_rtsp_event(mock_axis_rtspclient):
+@pytest.fixture(autouse=True, name="mock_rtsp_event")
+def fixture_rtsp_event(_mock_rtsp_client: _RtspClientMock) -> RtspEventMock:
     """Fixture to allow mocking received RTSP events."""
 
     def send_event(
@@ -95,18 +427,18 @@ def mock_rtsp_event(mock_axis_rtspclient):
 </tt:MetadataStream>
 """
 
-        mock_axis_rtspclient(data=event.encode("utf-8"))
+        _mock_rtsp_client(data=event.encode("utf-8"))
 
-    yield send_event
+    return send_event
 
 
-@pytest.fixture(autouse=True)
-def mock_rtsp_signal_state(mock_axis_rtspclient):
+@pytest.fixture(autouse=True, name="mock_rtsp_signal_state")
+def fixture_rtsp_signal_state(_mock_rtsp_client: _RtspClientMock) -> RtspStateType:
     """Fixture to allow mocking RTSP state signalling."""
 
     def send_signal(connected: bool) -> None:
         """Signal state change of RTSP connection."""
-        signal = SIGNAL_PLAYING if connected else SIGNAL_FAILED
-        mock_axis_rtspclient(state=signal)
+        signal = Signal.PLAYING if connected else Signal.FAILED
+        _mock_rtsp_client(state=signal)
 
-    yield send_signal
+    return send_signal

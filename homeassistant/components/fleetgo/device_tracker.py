@@ -1,14 +1,13 @@
 """Support for FleetGO Platform."""
-from __future__ import annotations
 
 import logging
 
+import probatio
 import requests
 from ritassist import API
-import voluptuous as vol
 
 from homeassistant.components.device_tracker import (
-    PLATFORM_SCHEMA as PARENT_PLATFORM_SCHEMA,
+    PLATFORM_SCHEMA as DEVICE_TRACKER_PLATFORM_SCHEMA,
     SeeCallback,
 )
 from homeassistant.const import (
@@ -19,19 +18,21 @@ from homeassistant.const import (
     CONF_USERNAME,
 )
 from homeassistant.core import HomeAssistant
-import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.event import track_utc_time_change
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORM_SCHEMA = PARENT_PLATFORM_SCHEMA.extend(
+PLATFORM_SCHEMA = DEVICE_TRACKER_PLATFORM_SCHEMA.extend(
     {
-        vol.Required(CONF_USERNAME): cv.string,
-        vol.Required(CONF_PASSWORD): cv.string,
-        vol.Required(CONF_CLIENT_ID): cv.string,
-        vol.Required(CONF_CLIENT_SECRET): cv.string,
-        vol.Optional(CONF_INCLUDE, default=[]): vol.All(cv.ensure_list, [cv.string]),
+        probatio.Required(CONF_USERNAME): cv.string,
+        probatio.Required(probatio.Secret(CONF_PASSWORD)): cv.string,
+        probatio.Required(CONF_CLIENT_ID): cv.string,
+        probatio.Required(probatio.Secret(CONF_CLIENT_SECRET)): cv.string,
+        probatio.Optional(CONF_INCLUDE, default=[]): probatio.All(
+            probatio.EnsureList(), [cv.string]
+        ),
     }
 )
 
@@ -53,7 +54,7 @@ def setup_scanner(
 class FleetGoDeviceScanner:
     """Define a scanner for the FleetGO platform."""
 
-    def __init__(self, config, see: SeeCallback):
+    def __init__(self, config, see: SeeCallback) -> None:
         """Initialize FleetGoDeviceScanner."""
         self._include = config.get(CONF_INCLUDE)
         self._see = see
@@ -86,7 +87,6 @@ class FleetGoDeviceScanner:
 
             for device in devices:
                 if not self._include or device.license_plate in self._include:
-
                     if device.active or device.current_address is None:
                         device.get_map_details()
 

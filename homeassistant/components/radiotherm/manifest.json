@@ -1,14 +1,22 @@
 {
   "domain": "radiotherm",
   "name": "Radio Thermostat",
+  "categories": ["climate.thermostats_heating"],
+  "codeowners": ["@vinnyfuria"],
+  "config_flow": true,
+  "connectivity": ["network"],
+  "dhcp": [
+    {
+      "hostname": "thermostat*",
+      "macaddress": "5CDAD4*"
+    },
+    {
+      "registered_devices": true
+    }
+  ],
   "documentation": "https://www.home-assistant.io/integrations/radiotherm",
-  "requirements": ["radiotherm==2.1.0"],
-  "codeowners": ["@bdraco", "@vinnyfuria"],
+  "integration_type": "device",
   "iot_class": "local_polling",
   "loggers": ["radiotherm"],
-  "dhcp": [
-    { "hostname": "thermostat*", "macaddress": "5CDAD4*" },
-    { "registered_devices": true }
-  ],
-  "config_flow": true
+  "requirements": ["radiotherm==2.1.0"]
 }

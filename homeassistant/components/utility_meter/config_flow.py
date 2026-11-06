@@ -1,18 +1,18 @@
 """Config flow for Utility Meter integration."""
-from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, cast
+from typing import Any, cast, override
 
-import voluptuous as vol
+import probatio
 
+from homeassistant.components.sensor import DOMAIN as SENSOR_DOMAIN
 from homeassistant.const import CONF_NAME
 from homeassistant.helpers import selector
 from homeassistant.helpers.schema_config_entry_flow import (
+    SchemaCommonFlowHandler,
     SchemaConfigFlowHandler,
     SchemaFlowError,
     SchemaFlowFormStep,
-    SchemaFlowMenuStep,
 )
 
 from .const import (
@@ -20,7 +20,9 @@ from .const import (
     CONF_METER_DELTA_VALUES,
     CONF_METER_NET_CONSUMPTION,
     CONF_METER_OFFSET,
+    CONF_METER_PERIODICALLY_RESETTING,
     CONF_METER_TYPE,
+    CONF_SENSOR_ALWAYS_AVAILABLE,
     CONF_SOURCE_SENSOR,
     CONF_TARIFFS,
     DAILY,
@@ -34,80 +36,105 @@ from .const import (
 )
 
 METER_TYPES = [
-    selector.SelectOptionDict(value="none", label="No cycle"),
-    selector.SelectOptionDict(value=QUARTER_HOURLY, label="Every 15 minutes"),
-    selector.SelectOptionDict(value=HOURLY, label="Hourly"),
-    selector.SelectOptionDict(value=DAILY, label="Daily"),
-    selector.SelectOptionDict(value=WEEKLY, label="Weekly"),
-    selector.SelectOptionDict(value=MONTHLY, label="Monthly"),
-    selector.SelectOptionDict(value=BIMONTHLY, label="Every two months"),
-    selector.SelectOptionDict(value=QUARTERLY, label="Quarterly"),
-    selector.SelectOptionDict(value=YEARLY, label="Yearly"),
+    "none",
+    QUARTER_HOURLY,
+    HOURLY,
+    DAILY,
+    WEEKLY,
+    MONTHLY,
+    BIMONTHLY,
+    QUARTERLY,
+    YEARLY,
 ]
 
 
-def _validate_config(data: Any) -> Any:
+async def _validate_config(
+    handler: SchemaCommonFlowHandler, user_input: dict[str, Any]
+) -> dict[str, Any]:
     """Validate config."""
     try:
-        vol.Unique()(data[CONF_TARIFFS])
-    except vol.Invalid as exc:
+        probatio.Unique()(user_input[CONF_TARIFFS])
+    except probatio.Invalid as exc:
         raise SchemaFlowError("tariffs_not_unique") from exc
 
-    return data
+    return user_input
 
 
-OPTIONS_SCHEMA = vol.Schema(
+OPTIONS_SCHEMA = probatio.Schema(
     {
-        vol.Required(CONF_SOURCE_SENSOR): selector.EntitySelector(
-            selector.EntitySelectorConfig(domain="sensor"),
+        probatio.Required(CONF_SOURCE_SENSOR): selector.EntitySelector(
+            selector.EntitySelectorConfig(domain=SENSOR_DOMAIN),
         ),
+        probatio.Required(
+            CONF_METER_PERIODICALLY_RESETTING,
+        ): selector.BooleanSelector(),
+        probatio.Optional(
+            CONF_SENSOR_ALWAYS_AVAILABLE,
+            default=False,
+        ): selector.BooleanSelector(),
     }
 )
 
-CONFIG_SCHEMA = vol.Schema(
+CONFIG_SCHEMA = probatio.Schema(
     {
-        vol.Required(CONF_NAME): selector.TextSelector(),
-        vol.Required(CONF_SOURCE_SENSOR): selector.EntitySelector(
-            selector.EntitySelectorConfig(domain="sensor"),
+        probatio.Required(CONF_NAME): selector.TextSelector(),
+        probatio.Required(CONF_SOURCE_SENSOR): selector.EntitySelector(
+            selector.EntitySelectorConfig(domain=SENSOR_DOMAIN),
         ),
-        vol.Required(CONF_METER_TYPE): selector.SelectSelector(
-            selector.SelectSelectorConfig(options=METER_TYPES),
+        probatio.Required(CONF_METER_TYPE): selector.SelectSelector(
+            selector.SelectSelectorConfig(
+                options=METER_TYPES, translation_key=CONF_METER_TYPE
+            ),
         ),
-        vol.Required(CONF_METER_OFFSET, default=0): selector.NumberSelector(
+        probatio.Required(CONF_METER_OFFSET, default=0): selector.NumberSelector(
             selector.NumberSelectorConfig(
                 min=0,
                 max=28,
                 mode=selector.NumberSelectorMode.BOX,
                 unit_of_measurement="days",
+                translation_key=CONF_METER_OFFSET,
             ),
         ),
-        vol.Required(CONF_TARIFFS, default=[]): selector.SelectSelector(
+        probatio.Required(CONF_TARIFFS, default=[]): selector.SelectSelector(
             selector.SelectSelectorConfig(options=[], custom_value=True, multiple=True),
         ),
-        vol.Required(
+        probatio.Required(
             CONF_METER_NET_CONSUMPTION, default=False
         ): selector.BooleanSelector(),
-        vol.Required(
+        probatio.Required(
             CONF_METER_DELTA_VALUES, default=False
+        ): selector.BooleanSelector(),
+        probatio.Required(
+            CONF_METER_PERIODICALLY_RESETTING,
+            default=True,
+        ): selector.BooleanSelector(),
+        probatio.Optional(
+            CONF_SENSOR_ALWAYS_AVAILABLE,
+            default=False,
         ): selector.BooleanSelector(),
     }
 )
 
-CONFIG_FLOW: dict[str, SchemaFlowFormStep | SchemaFlowMenuStep] = {
+CONFIG_FLOW = {
     "user": SchemaFlowFormStep(CONFIG_SCHEMA, validate_user_input=_validate_config)
 }
 
-OPTIONS_FLOW: dict[str, SchemaFlowFormStep | SchemaFlowMenuStep] = {
-    "init": SchemaFlowFormStep(OPTIONS_SCHEMA)
+OPTIONS_FLOW = {
+    "init": SchemaFlowFormStep(OPTIONS_SCHEMA),
 }
 
 
 class ConfigFlowHandler(SchemaConfigFlowHandler, domain=DOMAIN):
     """Handle a config or options flow for Utility Meter."""
 
+    VERSION = 2
+    MINOR_VERSION = 2
+
     config_flow = CONFIG_FLOW
     options_flow = OPTIONS_FLOW
+    options_flow_reloads = True
 
+    @override
     def async_config_entry_title(self, options: Mapping[str, Any]) -> str:
         """Return config entry title."""
 

@@ -1,69 +1,88 @@
 """Support for command line notification services."""
-from __future__ import annotations
 
-import logging
-import subprocess
+import shlex
+from typing import Any, override
 
-import voluptuous as vol
-
-from homeassistant.components.notify import PLATFORM_SCHEMA, BaseNotificationService
-from homeassistant.const import CONF_COMMAND, CONF_NAME
+from homeassistant.components.notify import (
+    DOMAIN as NOTIFY_DOMAIN,
+    BaseNotificationService,
+)
+from homeassistant.const import CONF_COMMAND
 from homeassistant.core import HomeAssistant
-import homeassistant.helpers.config_validation as cv
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
-from homeassistant.util.process import kill_subprocess
 
-from .const import CONF_COMMAND_TIMEOUT, DEFAULT_TIMEOUT
-
-_LOGGER = logging.getLogger(__name__)
-
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
-    {
-        vol.Required(CONF_COMMAND): cv.string,
-        vol.Optional(CONF_NAME): cv.string,
-        vol.Optional(CONF_COMMAND_TIMEOUT, default=DEFAULT_TIMEOUT): cv.positive_int,
-    }
+from .const import CONF_COMMAND_TIMEOUT, DOMAIN, LOGGER
+from .utils import (
+    async_run_shell_command,
+    create_platform_yaml_not_supported_issue,
+    notify_name,
+    render_template_args,
 )
 
 
-def get_service(
+async def async_get_service(
     hass: HomeAssistant,
     config: ConfigType,
     discovery_info: DiscoveryInfoType | None = None,
-) -> CommandLineNotificationService:
+) -> CommandLineNotificationService | None:
     """Get the Command Line notification service."""
-    command: str = config[CONF_COMMAND]
-    timeout: int = config[CONF_COMMAND_TIMEOUT]
+    if not discovery_info:
+        create_platform_yaml_not_supported_issue(hass, NOTIFY_DOMAIN)
+        return None
 
-    return CommandLineNotificationService(command, timeout)
+    notify_config = discovery_info
+    command: str = notify_config[CONF_COMMAND]
+    timeout: int = notify_config[CONF_COMMAND_TIMEOUT]
+    return CommandLineNotificationService(command, timeout, notify_name(notify_config))
 
 
 class CommandLineNotificationService(BaseNotificationService):
     """Implement the notification service for the Command Line service."""
 
-    def __init__(self, command: str, timeout: int) -> None:
+    def __init__(self, command: str, timeout: int, name: str) -> None:
         """Initialize the service."""
         self.command = command
         self._timeout = timeout
+        self._name = name
 
-    def send_message(self, message="", **kwargs) -> None:
+    @override
+    async def async_send_message(self, message: str = "", **kwargs: Any) -> None:
         """Send a message to a command line."""
-        with subprocess.Popen(
-            self.command,
-            universal_newlines=True,
-            stdin=subprocess.PIPE,
-            shell=True,  # nosec # shell by design
-        ) as proc:
-            try:
-                proc.communicate(input=message, timeout=self._timeout)
-                if proc.returncode != 0:
-                    _LOGGER.error(
-                        "Command failed (with return code %s): %s",
-                        proc.returncode,
-                        self.command,
-                    )
-            except subprocess.TimeoutExpired:
-                _LOGGER.error("Timeout for command: %s", self.command)
-                kill_subprocess(proc)
-            except subprocess.SubprocessError:
-                _LOGGER.error("Error trying to exec command: %s", self.command)
+        if not (
+            command := render_template_args(
+                self.hass, self.command, NOTIFY_DOMAIN, self._name
+            )
+        ):
+            return
+
+        # Stringify once for use in error messages; command may be a list (exec path).
+        command_str = shlex.join(command) if isinstance(command, list) else command
+        LOGGER.debug("Running with message: %s", message)
+
+        try:
+            proc, _ = await async_run_shell_command(
+                command, self._timeout, stdin=message.encode()
+            )
+        except TimeoutError as err:
+            # TimeoutError subclasses OSError, so it must be caught first.
+            LOGGER.debug("Timeout for command: %s", command_str)
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="timeout_error",
+                translation_placeholders={"command": command_str},
+            ) from err
+        except OSError as err:
+            LOGGER.debug("Error trying to exec command: %s", command_str)
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="command_error",
+                translation_placeholders={"command": command_str, "error": str(err)},
+            ) from err
+
+        if proc.returncode != 0:
+            LOGGER.error(
+                "Command failed (with return code %s): %s",
+                proc.returncode,
+                command_str,
+            )

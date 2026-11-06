@@ -1,11 +1,14 @@
 {
   "domain": "iss",
-  "config_flow": true,
   "name": "International Space Station (ISS)",
-  "integration_type": "service",
-  "documentation": "https://www.home-assistant.io/integrations/iss",
-  "requirements": ["pyiss==1.0.1"],
+  "categories": ["vehicles_transport.flights"],
   "codeowners": ["@DurgNomis-drol"],
+  "config_flow": true,
+  "connectivity": ["cloud"],
+  "documentation": "https://www.home-assistant.io/integrations/iss",
+  "integration_type": "service",
   "iot_class": "cloud_polling",
-  "loggers": ["pyiss"]
+  "loggers": ["pyiss"],
+  "requirements": ["pyiss==1.0.1"],
+  "single_config_entry": true
 }

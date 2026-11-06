@@ -1,16 +1,15 @@
 """Blueprint models."""
-from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 import logging
 import pathlib
 import shutil
 from typing import Any
 
 from awesomeversion import AwesomeVersion
-import voluptuous as vol
-from voluptuous.humanize import humanize_error
+import probatio
+from probatio.humanize import humanize_error
 
 from homeassistant import loader
 from homeassistant.const import (
@@ -20,9 +19,10 @@ from homeassistant.const import (
     CONF_PATH,
     __version__,
 )
-from homeassistant.core import DOMAIN as HA_DOMAIN, HomeAssistant, callback
+from homeassistant.core import DOMAIN as HOMEASSISTANT_DOMAIN, HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.util import yaml
+from homeassistant.helpers.field_visibility import get_hidden_fields
+from homeassistant.util import yaml as yaml_util
 
 from .const import (
     BLUEPRINT_FOLDER,
@@ -32,6 +32,7 @@ from .const import (
     CONF_MIN_VERSION,
     CONF_SOURCE_URL,
     CONF_USE_BLUEPRINT,
+    CONF_VISIBLE,
     DOMAIN,
 )
 from .errors import (
@@ -43,7 +44,7 @@ from .errors import (
     InvalidBlueprintInputs,
     MissingInput,
 )
-from .schemas import BLUEPRINT_INSTANCE_FIELDS, BLUEPRINT_SCHEMA
+from .schemas import BLUEPRINT_INSTANCE_FIELDS
 
 
 class Blueprint:
@@ -55,11 +56,12 @@ class Blueprint:
         *,
         path: str | None = None,
         expected_domain: str | None = None,
+        schema: Callable[[Any], Any],
     ) -> None:
         """Initialize a blueprint."""
         try:
-            data = self.data = BLUEPRINT_SCHEMA(data)
-        except vol.Invalid as err:
+            data = self.data = schema(data)
+        except probatio.Invalid as err:
             raise InvalidBlueprint(expected_domain, path, data, err) from err
 
         # In future, we will treat this as "incorrect" and allow to recover from this
@@ -69,12 +71,15 @@ class Blueprint:
                 expected_domain,
                 path or self.name,
                 data,
-                f"Found incorrect blueprint type {data_domain}, expected {expected_domain}",
+                (
+                    f"Found incorrect blueprint type {data_domain}, expected"
+                    f" {expected_domain}"
+                ),
             )
 
         self.domain = data_domain
 
-        missing = yaml.extract_inputs(data) - set(data[CONF_BLUEPRINT][CONF_INPUT])
+        missing = yaml_util.extract_inputs(data) - set(self.inputs)
 
         if missing:
             raise InvalidBlueprint(
@@ -87,17 +92,38 @@ class Blueprint:
     @property
     def name(self) -> str:
         """Return blueprint name."""
-        return self.data[CONF_BLUEPRINT][CONF_NAME]
+        return self.data[CONF_BLUEPRINT][CONF_NAME]  # type: ignore[no-any-return]
 
     @property
-    def inputs(self) -> dict:
-        """Return blueprint inputs."""
-        return self.data[CONF_BLUEPRINT][CONF_INPUT]
+    def inputs(self) -> dict[str, Any]:
+        """Return flattened blueprint inputs."""
+        inputs = {}
+        for key, value in self.data[CONF_BLUEPRINT][CONF_INPUT].items():
+            if value and CONF_INPUT in value:
+                inputs.update(dict(value[CONF_INPUT]))
+            else:
+                inputs[key] = value
+        return inputs
 
     @property
-    def metadata(self) -> dict:
+    def input_visibility(self) -> dict[str, Any]:
+        """Return the visible condition of each input, including its section's."""
+        visibility = {}
+        for key, value in self.data[CONF_BLUEPRINT][CONF_INPUT].items():
+            if value and CONF_INPUT in value:
+                for name, blueprint_input in value[CONF_INPUT].items():
+                    visibility[name] = _combine_visible(
+                        value.get(CONF_VISIBLE),
+                        (blueprint_input or {}).get(CONF_VISIBLE),
+                    )
+            else:
+                visibility[key] = _combine_visible((value or {}).get(CONF_VISIBLE))
+        return visibility
+
+    @property
+    def metadata(self) -> dict[str, Any]:
         """Return blueprint metadata."""
-        return self.data[CONF_BLUEPRINT]
+        return self.data[CONF_BLUEPRINT]  # type: ignore[no-any-return]
 
     def update_metadata(self, *, source_url: str | None = None) -> None:
         """Update metadata."""
@@ -106,7 +132,7 @@ class Blueprint:
 
     def yaml(self) -> str:
         """Dump blueprint as YAML."""
-        return yaml.dump(self.data)
+        return yaml_util.dump(self.data)
 
     @callback
     def validate(self) -> list[str] | None:
@@ -137,12 +163,12 @@ class BlueprintInputs:
         self.config_with_inputs = config_with_inputs
 
     @property
-    def inputs(self):
+    def inputs(self) -> dict[str, Any]:
         """Return the inputs."""
-        return self.config_with_inputs[CONF_USE_BLUEPRINT][CONF_INPUT]
+        return self.config_with_inputs[CONF_USE_BLUEPRINT][CONF_INPUT]  # type: ignore[no-any-return]
 
     @property
-    def inputs_with_default(self):
+    def inputs_with_default(self) -> dict[str, Any]:
         """Return the inputs and fallback to defaults."""
         no_input = set(self.blueprint.inputs) - set(self.inputs)
 
@@ -152,6 +178,16 @@ class BlueprintInputs:
             blueprint_input = self.blueprint.inputs[inp]
             if isinstance(blueprint_input, dict) and CONF_DEFAULT in blueprint_input:
                 inputs_with_default[inp] = blueprint_input[CONF_DEFAULT]
+
+        for inp in get_hidden_fields(
+            self.blueprint.input_visibility, inputs_with_default
+        ):
+            blueprint_input = self.blueprint.inputs[inp]
+            inputs_with_default[inp] = (
+                blueprint_input.get(CONF_DEFAULT)
+                if isinstance(blueprint_input, dict)
+                else None
+            )
 
         return inputs_with_default
 
@@ -168,7 +204,7 @@ class BlueprintInputs:
     @callback
     def async_substitute(self) -> dict:
         """Get the blueprint value with the inputs substituted."""
-        processed = yaml.substitute(self.blueprint.data, self.inputs_with_default)
+        processed = yaml_util.substitute(self.blueprint.data, self.inputs_with_default)
         combined = {**processed, **self.config_with_inputs}
         # From config_with_inputs
         combined.pop(CONF_USE_BLUEPRINT)
@@ -186,14 +222,18 @@ class DomainBlueprints:
         domain: str,
         logger: logging.Logger,
         blueprint_in_use: Callable[[HomeAssistant, str], bool],
+        reload_blueprint_consumers: Callable[[HomeAssistant, str], Awaitable[None]],
+        blueprint_schema: Callable[[Any], Any],
     ) -> None:
         """Initialize a domain blueprints instance."""
         self.hass = hass
         self.domain = domain
         self.logger = logger
         self._blueprint_in_use = blueprint_in_use
+        self._reload_blueprint_consumers = reload_blueprint_consumers
         self._blueprints: dict[str, Blueprint | None] = {}
         self._load_lock = asyncio.Lock()
+        self._blueprint_schema = blueprint_schema
 
         hass.data.setdefault(DOMAIN, {})[domain] = self
 
@@ -207,10 +247,12 @@ class DomainBlueprints:
         async with self._load_lock:
             self._blueprints = {}
 
-    def _load_blueprint(self, blueprint_path) -> Blueprint:
+    def _load_blueprint(self, blueprint_path: str) -> Blueprint:
         """Load a blueprint."""
         try:
-            blueprint_data = yaml.load_yaml(self.blueprint_folder / blueprint_path)
+            blueprint_data = yaml_util.load_yaml_dict(
+                self.blueprint_folder / blueprint_path
+            )
         except FileNotFoundError as err:
             raise FailedToLoad(
                 self.domain,
@@ -220,9 +262,11 @@ class DomainBlueprints:
         except HomeAssistantError as err:
             raise FailedToLoad(self.domain, blueprint_path, err) from err
 
-        assert isinstance(blueprint_data, dict)
         return Blueprint(
-            blueprint_data, expected_domain=self.domain, path=blueprint_path
+            blueprint_data,
+            expected_domain=self.domain,
+            path=blueprint_path,
+            schema=self._blueprint_schema,
         )
 
     def _load_blueprints(self) -> dict[str, Blueprint | BlueprintException | None]:
@@ -258,7 +302,7 @@ class DomainBlueprints:
     async def async_get_blueprint(self, blueprint_path: str) -> Blueprint:
         """Get a blueprint."""
 
-        def load_from_cache():
+        def load_from_cache() -> Blueprint:
             """Load blueprint from cache."""
             if (blueprint := self._blueprints[blueprint_path]) is None:
                 raise FailedToLoad(
@@ -280,7 +324,7 @@ class DomainBlueprints:
                 blueprint = await self.hass.async_add_executor_job(
                     self._load_blueprint, blueprint_path
                 )
-            except Exception:
+            except FailedToLoad:
                 self._blueprints[blueprint_path] = None
                 raise
 
@@ -293,7 +337,7 @@ class DomainBlueprints:
         """Process a blueprint config."""
         try:
             config_with_blueprint = BLUEPRINT_INSTANCE_FIELDS(config_with_blueprint)
-        except vol.Invalid as err:
+        except probatio.Invalid as err:
             raise InvalidBlueprintInputs(
                 self.domain, humanize_error(config_with_blueprint, err)
             ) from err
@@ -312,30 +356,40 @@ class DomainBlueprints:
         await self.hass.async_add_executor_job(path.unlink)
         self._blueprints[blueprint_path] = None
 
-    def _create_file(self, blueprint: Blueprint, blueprint_path: str) -> None:
-        """Create blueprint file."""
+    def _create_file(
+        self, blueprint: Blueprint, blueprint_path: str, allow_override: bool
+    ) -> bool:
+        """Create blueprint file.
+
+        Returns true if the action overrides an existing blueprint.
+        """
 
         path = pathlib.Path(
             self.hass.config.path(BLUEPRINT_FOLDER, self.domain, blueprint_path)
         )
-        if path.exists():
+        exists = path.exists()
+
+        if not allow_override and exists:
             raise FileAlreadyExists(self.domain, blueprint_path)
 
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(blueprint.yaml(), encoding="utf-8")
+        return exists
 
     async def async_add_blueprint(
-        self, blueprint: Blueprint, blueprint_path: str
-    ) -> None:
+        self, blueprint: Blueprint, blueprint_path: str, allow_override: bool = False
+    ) -> bool:
         """Add a blueprint."""
-        if not blueprint_path.endswith(".yaml"):
-            blueprint_path = f"{blueprint_path}.yaml"
-
-        await self.hass.async_add_executor_job(
-            self._create_file, blueprint, blueprint_path
+        overrides_existing = await self.hass.async_add_executor_job(
+            self._create_file, blueprint, blueprint_path, allow_override
         )
 
         self._blueprints[blueprint_path] = blueprint
+
+        if overrides_existing:
+            await self._reload_blueprint_consumers(self.hass, blueprint_path)
+
+        return overrides_existing
 
     async def async_populate(self) -> None:
         """Create folder if it doesn't exist and populate with examples."""
@@ -345,13 +399,25 @@ class DomainBlueprints:
 
         integration = await loader.async_get_integration(self.hass, self.domain)
 
-        def populate():
+        def populate() -> None:
             if self.blueprint_folder.exists():
                 return
 
             shutil.copytree(
                 integration.file_path / BLUEPRINT_FOLDER,
-                self.blueprint_folder / HA_DOMAIN,
+                self.blueprint_folder / HOMEASSISTANT_DOMAIN,
             )
 
         await self.hass.async_add_executor_job(populate)
+
+
+def _combine_visible(*options: Any) -> bool | list[Any]:
+    """Combine visible options so all of them must match."""
+    conditions: list[Any] = []
+    for visible in options:
+        if visible is None or visible is True:
+            continue
+        if visible is False:
+            return False
+        conditions.extend(visible if isinstance(visible, list) else [visible])
+    return conditions

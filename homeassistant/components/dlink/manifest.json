@@ -1,9 +1,18 @@
 {
   "domain": "dlink",
   "name": "D-Link Wi-Fi Smart Plugs",
+  "categories": ["plugs_switches"],
+  "codeowners": ["@tkdrob"],
+  "config_flow": true,
+  "connectivity": ["network"],
+  "dhcp": [
+    {
+      "hostname": "dsp-w215"
+    }
+  ],
   "documentation": "https://www.home-assistant.io/integrations/dlink",
-  "requirements": ["pyW215==0.7.0"],
-  "codeowners": [],
+  "integration_type": "device",
   "iot_class": "local_polling",
-  "loggers": ["pyW215"]
+  "loggers": ["pyW215"],
+  "requirements": ["pyW215==0.8.0"]
 }

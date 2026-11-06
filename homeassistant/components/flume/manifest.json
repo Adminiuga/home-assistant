@@ -1,15 +1,18 @@
 {
   "domain": "flume",
   "name": "Flume",
-  "documentation": "https://www.home-assistant.io/integrations/flume/",
-  "requirements": ["pyflume==0.6.5"],
+  "categories": ["water.meters_leak_detection"],
   "codeowners": ["@ChrisMandich", "@bdraco", "@jeeftor"],
   "config_flow": true,
+  "connectivity": ["cloud"],
   "dhcp": [
     {
       "hostname": "flume-gw-*"
     }
   ],
+  "documentation": "https://www.home-assistant.io/integrations/flume",
+  "integration_type": "hub",
   "iot_class": "cloud_polling",
-  "loggers": ["pyflume"]
+  "loggers": ["pyflume"],
+  "requirements": ["PyFlume==0.6.5"]
 }

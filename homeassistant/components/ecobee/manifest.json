@@ -1,17 +1,34 @@
 {
   "domain": "ecobee",
   "name": "ecobee",
+  "categories": ["climate.thermostats_heating"],
+  "codeowners": [],
   "config_flow": true,
+  "connectivity": ["cloud"],
   "documentation": "https://www.home-assistant.io/integrations/ecobee",
-  "requirements": ["python-ecobee-api==0.2.14"],
-  "codeowners": ["@marthoc"],
   "homekit": {
-    "models": ["EB-*", "ecobee*"]
+    "models": ["EB", "ecobee*"]
   },
-  "zeroconf": [
-    { "type": "_sideplay._tcp.local.", "properties": { "mdl": "eb-*" } },
-    { "type": "_sideplay._tcp.local.", "properties": { "mdl": "ecobee*" } }
-  ],
+  "integration_type": "hub",
   "iot_class": "cloud_polling",
-  "loggers": ["pyecobee"]
+  "loggers": ["pyecobee"],
+  "requirements": ["python-ecobee-api==0.4.2"],
+  "single_config_entry": true,
+  "zeroconf": [
+    {
+      "type": "_ecobee._tcp.local."
+    },
+    {
+      "properties": {
+        "mdl": "eb-*"
+      },
+      "type": "_sideplay._tcp.local."
+    },
+    {
+      "properties": {
+        "mdl": "ecobee*"
+      },
+      "type": "_sideplay._tcp.local."
+    }
+  ]
 }

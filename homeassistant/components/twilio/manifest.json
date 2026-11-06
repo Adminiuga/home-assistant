@@ -1,11 +1,14 @@
 {
   "domain": "twilio",
   "name": "Twilio",
-  "config_flow": true,
-  "documentation": "https://www.home-assistant.io/integrations/twilio",
-  "requirements": ["twilio==6.32.0"],
-  "dependencies": ["webhook"],
+  "categories": ["messaging_notifications.email_sms_calls"],
   "codeowners": [],
+  "config_flow": true,
+  "connectivity": ["cloud"],
+  "dependencies": ["webhook"],
+  "documentation": "https://www.home-assistant.io/integrations/twilio",
+  "integration_type": "service",
   "iot_class": "cloud_push",
-  "loggers": ["twilio"]
+  "loggers": ["twilio"],
+  "requirements": ["twilio==6.32.0"]
 }

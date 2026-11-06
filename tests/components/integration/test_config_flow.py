@@ -1,17 +1,24 @@
 """Test the Integration - Riemann sum integral config flow."""
+
 from unittest.mock import patch
 
 import pytest
+from pytest_homeassistant.common import MockConfigEntry, get_schema_suggested_value
 
 from homeassistant import config_entries
 from homeassistant.components.integration.const import DOMAIN
+from homeassistant.components.sensor import (
+    DEVICE_CLASS_STATE_CLASSES,
+    SensorDeviceClass,
+    SensorStateClass,
+)
+from homeassistant.const import UnitOfPower
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.helpers import selector
 
-from tests.common import MockConfigEntry
 
-
-@pytest.mark.parametrize("platform", ("sensor",))
+@pytest.mark.parametrize("platform", ["sensor"])
 async def test_config_flow(hass: HomeAssistant, platform) -> None:
     """Test the config flow."""
     input_sensor_entity_id = "sensor.input"
@@ -19,12 +26,20 @@ async def test_config_flow(hass: HomeAssistant, platform) -> None:
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": config_entries.SOURCE_USER}
     )
-    assert result["type"] == FlowResultType.FORM
+    assert result["type"] is FlowResultType.FORM
     assert result["errors"] is None
+
+    device_class = result["data_schema"].schema["device_class"]
+    assert isinstance(device_class, selector.SelectSelector)
+    assert all(
+        option in DEVICE_CLASS_STATE_CLASSES
+        and SensorStateClass.TOTAL in DEVICE_CLASS_STATE_CLASSES[option]
+        for option in device_class.config["options"]
+    )
 
     with patch(
         "homeassistant.components.integration.async_setup_entry",
-        return_value=True,
+        return_value=None,
     ) as mock_setup_entry:
         result = await hass.config_entries.flow.async_configure(
             result["flow_id"],
@@ -33,13 +48,14 @@ async def test_config_flow(hass: HomeAssistant, platform) -> None:
                 "name": "My integration",
                 "round": 1,
                 "source": input_sensor_entity_id,
-                "unit_prefix": "none",
+                "device_class": SensorDeviceClass.VOLUME,
                 "unit_time": "min",
+                "max_sub_interval": {"seconds": 0},
             },
         )
         await hass.async_block_till_done()
 
-    assert result["type"] == FlowResultType.CREATE_ENTRY
+    assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["title"] == "My integration"
     assert result["data"] == {}
     assert result["options"] == {
@@ -47,8 +63,9 @@ async def test_config_flow(hass: HomeAssistant, platform) -> None:
         "name": "My integration",
         "round": 1.0,
         "source": "sensor.input",
-        "unit_prefix": "none",
+        "device_class": SensorDeviceClass.VOLUME,
         "unit_time": "min",
+        "max_sub_interval": {"seconds": 0},
     }
     assert len(mock_setup_entry.mock_calls) == 1
 
@@ -59,27 +76,106 @@ async def test_config_flow(hass: HomeAssistant, platform) -> None:
         "name": "My integration",
         "round": 1.0,
         "source": "sensor.input",
-        "unit_prefix": "none",
+        "device_class": SensorDeviceClass.VOLUME,
         "unit_time": "min",
+        "max_sub_interval": {"seconds": 0},
     }
     assert config_entry.title == "My integration"
 
 
-def get_suggested(schema, key):
-    """Get suggested value for key in voluptuous schema."""
-    for k in schema.keys():
-        if k == key:
-            if k.description is None or "suggested_value" not in k.description:
-                return None
-            return k.description["suggested_value"]
-    # Wanted key absent from schema
-    raise Exception
-
-
-@pytest.mark.parametrize("platform", ("sensor",))
+@pytest.mark.parametrize("platform", ["sensor"])
 async def test_options(hass: HomeAssistant, platform) -> None:
     """Test reconfiguring."""
     # Setup the config entry
+    config_entry = MockConfigEntry(
+        data={},
+        domain=DOMAIN,
+        options={
+            "method": "left",
+            "name": "My integration",
+            "round": 1.0,
+            "source": "sensor.input",
+            "unit_prefix": "k",
+            "unit_time": "min",
+            "max_sub_interval": {"minutes": 1},
+        },
+        title="My integration",
+    )
+    config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    hass.states.async_set("sensor.input", 10, {"unit_of_measurement": "dog"})
+    hass.states.async_set("sensor.valid", 10, {"unit_of_measurement": "dog"})
+    hass.states.async_set("sensor.invalid", 10, {"unit_of_measurement": "cat"})
+
+    result = await hass.config_entries.options.async_init(config_entry.entry_id)
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "init"
+    schema = result["data_schema"].schema
+    assert get_schema_suggested_value(schema, "round") == 1.0
+
+    source = schema["source"]
+    assert isinstance(source, selector.EntitySelector)
+    assert source.config["include_entities"] == [
+        "sensor.input",
+        "sensor.valid",
+    ]
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={
+            "method": "right",
+            "round": 2.0,
+            "source": "sensor.input",
+            "device_class": SensorDeviceClass.MONETARY,
+            "max_sub_interval": {"minutes": 1},
+        },
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["data"] == {
+        "method": "right",
+        "name": "My integration",
+        "round": 2.0,
+        "source": "sensor.input",
+        "device_class": SensorDeviceClass.MONETARY,
+        "unit_prefix": "k",
+        "unit_time": "min",
+        "max_sub_interval": {"minutes": 1},
+    }
+    assert config_entry.data == {}
+    assert config_entry.options == {
+        "method": "right",
+        "name": "My integration",
+        "round": 2.0,
+        "source": "sensor.input",
+        "device_class": SensorDeviceClass.MONETARY,
+        "unit_prefix": "k",
+        "unit_time": "min",
+        "max_sub_interval": {"minutes": 1},
+    }
+    assert config_entry.title == "My integration"
+
+    # Check config entry is reloaded with new options
+    await hass.async_block_till_done()
+
+    # Check the entity was updated, no new entity was created
+    assert len(hass.states.async_all()) == 4
+
+    # Check the state of the entity has changed as expected
+    hass.states.async_set("sensor.input", 10, {"unit_of_measurement": "dog"})
+    hass.states.async_set("sensor.input", 11, {"unit_of_measurement": "dog"})
+    await hass.async_block_till_done()
+
+    state = hass.states.get(f"{platform}.my_integration")
+    assert state.state != "unknown"
+    assert state.attributes["unit_of_measurement"] == "kdogmin"
+
+
+async def test_options_source_selector_with_missing_source_unit(
+    hass: HomeAssistant,
+) -> None:
+    """Test reconfiguring when the current source unit is missing."""
     config_entry = MockConfigEntry(
         data={},
         domain=DOMAIN,
@@ -97,49 +193,16 @@ async def test_options(hass: HomeAssistant, platform) -> None:
     assert await hass.config_entries.async_setup(config_entry.entry_id)
     await hass.async_block_till_done()
 
-    result = await hass.config_entries.options.async_init(config_entry.entry_id)
-    assert result["type"] == FlowResultType.FORM
-    assert result["step_id"] == "init"
-    schema = result["data_schema"].schema
-    assert get_suggested(schema, "round") == 1.0
-
-    result = await hass.config_entries.options.async_configure(
-        result["flow_id"],
-        user_input={
-            "round": 2.0,
-        },
+    hass.states.async_set("sensor.input", "unavailable")
+    hass.states.async_set(
+        "sensor.valid_power", 10, {"unit_of_measurement": UnitOfPower.WATT}
     )
-    assert result["type"] == FlowResultType.CREATE_ENTRY
-    assert result["data"] == {
-        "method": "left",
-        "name": "My integration",
-        "round": 2.0,
-        "source": "sensor.input",
-        "unit_prefix": "k",
-        "unit_time": "min",
-    }
-    assert config_entry.data == {}
-    assert config_entry.options == {
-        "method": "left",
-        "name": "My integration",
-        "round": 2.0,
-        "source": "sensor.input",
-        "unit_prefix": "k",
-        "unit_time": "min",
-    }
-    assert config_entry.title == "My integration"
 
-    # Check config entry is reloaded with new options
-    await hass.async_block_till_done()
+    result = await hass.config_entries.options.async_init(config_entry.entry_id)
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "init"
 
-    # Check the entity was updated, no new entity was created
-    assert len(hass.states.async_all()) == 1
-
-    # Check the state of the entity has changed as expected
-    hass.states.async_set("sensor.input", 10, {"unit_of_measurement": "dog"})
-    hass.states.async_set("sensor.input", 11, {"unit_of_measurement": "dog"})
-    await hass.async_block_till_done()
-
-    state = hass.states.get(f"{platform}.my_integration")
-    assert state.state != "unknown"
-    assert state.attributes["unit_of_measurement"] == "kdogmin"
+    source = result["data_schema"].schema["source"]
+    assert isinstance(source, selector.EntitySelector)
+    assert source.config["domain"] == ["counter", "input_number", "sensor"]
+    assert "include_entities" not in source.config

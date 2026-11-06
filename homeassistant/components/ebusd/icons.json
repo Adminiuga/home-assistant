@@ -1,0 +1,7 @@
+{
+  "services": {
+    "ebusd_write": {
+      "service": "mdi:pencil"
+    }
+  }
+}

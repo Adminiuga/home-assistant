@@ -1,35 +1,111 @@
 {
-  "title": "Demo",
-  "issues": {
-    "bad_psu": {
-      "title": "The power supply is not stable",
-      "fix_flow": {
-        "step": {
-          "confirm": {
-            "title": "The power supply needs to be replaced",
-            "description": "Press SUBMIT to confirm the power supply has been replaced"
+  "entity": {
+    "climate": {
+      "ubercool": {
+        "state_attributes": {
+          "fan_mode": {
+            "state": {
+              "auto_high": "Auto high",
+              "auto_low": "Auto low",
+              "on_high": "On high",
+              "on_low": "On low"
+            }
+          },
+          "swing_horizontal_mode": {
+            "state": {
+              "auto": "[%key:common::state::auto%]",
+              "off": "[%key:common::state::off%]",
+              "rangefull": "Full range"
+            }
+          },
+          "swing_mode": {
+            "state": {
+              "1": "1",
+              "2": "2",
+              "3": "3",
+              "auto": "[%key:common::state::auto%]",
+              "off": "[%key:common::state::off%]"
+            }
           }
         }
       }
     },
-    "out_of_blinker_fluid": {
-      "title": "The blinker fluid is empty and needs to be refilled",
-      "fix_flow": {
-        "step": {
-          "confirm": {
-            "title": "Blinker fluid needs to be refilled",
-            "description": "Press SUBMIT when blinker fluid has been refilled"
+    "cover": {
+      "living_room_window": {
+        "state_attributes": {
+          "speed": {
+            "state": {
+              "fast": "[%key:component::cover::entity_component::_::state_attributes::speed::state::fast%]",
+              "slow": "[%key:component::cover::entity_component::_::state_attributes::speed::state::slow%]"
+            }
           }
         }
       }
     },
-    "transmogrifier_deprecated": {
-      "title": "The transmogrifier component is deprecated",
-      "description": "The transmogrifier component is now deprecated due to the lack of local control available in the new API"
+    "event": {
+      "push": {
+        "state_attributes": {
+          "event_type": {
+            "state": {
+              "pressed": "Pressed"
+            }
+          }
+        }
+      }
     },
-    "unfixable_problem": {
-      "title": "This is not a fixable problem",
-      "description": "This issue is never going to give up."
+    "fan": {
+      "demo": {
+        "state_attributes": {
+          "preset_mode": {
+            "state": {
+              "auto": "[%key:common::state::auto%]",
+              "on": "[%key:common::state::on%]",
+              "sleep": "[%key:component::climate::entity_component::_::state_attributes::preset_mode::state::sleep%]",
+              "smart": "Smart"
+            }
+          }
+        }
+      }
+    },
+    "light": {
+      "bed_light": {
+        "state_attributes": {
+          "effect": {
+            "state": {
+              "rainbow": "Rainbow"
+            }
+          }
+        }
+      }
+    },
+    "select": {
+      "speed": {
+        "state": {
+          "light_speed": "Light speed",
+          "ludicrous_speed": "Ludicrous speed",
+          "ridiculous_speed": "Ridiculous speed"
+        }
+      }
+    },
+    "sensor": {
+      "thermostat_mode": {
+        "name": "Thermostat mode",
+        "state": {
+          "away": "[%key:common::state::not_home%]",
+          "comfort": "Comfort",
+          "eco": "Eco",
+          "sleep": "Sleep"
+        }
+      }
+    },
+    "vacuum": {
+      "model_s": {
+        "state_attributes": {
+          "cleaned_area": {
+            "name": "Cleaned area"
+          }
+        }
+      }
     }
   },
   "options": {
@@ -39,18 +115,26 @@
       },
       "options_1": {
         "data": {
-          "constant": "Constant",
           "bool": "Optional boolean",
+          "constant": "Constant",
           "int": "Numeric input"
-        }
+        },
+        "submit": "Save!"
       },
       "options_2": {
         "data": {
-          "string": "String value",
+          "multi": "Multiselect",
           "select": "Select an option",
-          "multi": "Multiselect"
+          "string": "String value"
         }
       }
     }
-  }
+  },
+  "services": {
+    "randomize_device_tracker_data": {
+      "description": "Demonstrates using a device tracker to see where devices are located.",
+      "name": "Randomize device tracker data"
+    }
+  },
+  "title": "Demo"
 }

@@ -1,12 +1,10 @@
 {
   "domain": "guardian",
   "name": "Elexa Guardian",
-  "config_flow": true,
-  "documentation": "https://www.home-assistant.io/integrations/guardian",
-  "requirements": ["aioguardian==2022.07.0"],
-  "zeroconf": ["_api._udp.local."],
+  "categories": ["water.meters_leak_detection"],
   "codeowners": ["@bachya"],
-  "iot_class": "local_polling",
+  "config_flow": true,
+  "connectivity": ["network"],
   "dhcp": [
     {
       "hostname": "gvc*",
@@ -21,6 +19,10 @@
       "macaddress": "30AEA4*"
     }
   ],
+  "documentation": "https://www.home-assistant.io/integrations/guardian",
+  "integration_type": "device",
+  "iot_class": "local_polling",
   "loggers": ["aioguardian"],
-  "integration_type": "device"
+  "requirements": ["aioguardian==2026.01.1"],
+  "zeroconf": ["_api._udp.local."]
 }

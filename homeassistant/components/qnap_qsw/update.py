@@ -1,14 +1,11 @@
 """Support for the QNAP QSW update."""
-from __future__ import annotations
 
-from typing import Final
+from typing import Any, Final, override
 
 from aioqsw.const import (
     QSD_DESCRIPTION,
     QSD_FIRMWARE_CHECK,
     QSD_FIRMWARE_INFO,
-    QSD_PRODUCT,
-    QSD_SYSTEM_BOARD,
     QSD_VERSION,
 )
 
@@ -16,14 +13,14 @@ from homeassistant.components.update import (
     UpdateDeviceClass,
     UpdateEntity,
     UpdateEntityDescription,
+    UpdateEntityFeature,
 )
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.entity import EntityCategory
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .const import DOMAIN, QSW_COORD_FW, QSW_UPDATE
-from .coordinator import QswFirmwareCoordinator
+from .const import QSW_UPDATE
+from .coordinator import QnapQswConfigEntry, QswFirmwareCoordinator
 from .entity import QswFirmwareEntity
 
 UPDATE_TYPES: Final[tuple[UpdateEntityDescription, ...]] = (
@@ -31,18 +28,17 @@ UPDATE_TYPES: Final[tuple[UpdateEntityDescription, ...]] = (
         device_class=UpdateDeviceClass.FIRMWARE,
         entity_category=EntityCategory.CONFIG,
         key=QSW_UPDATE,
-        name="Firmware Update",
     ),
 )
 
 
 async def async_setup_entry(
-    hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
+    hass: HomeAssistant,
+    entry: QnapQswConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Add QNAP QSW updates from a config_entry."""
-    coordinator: QswFirmwareCoordinator = hass.data[DOMAIN][entry.entry_id][
-        QSW_COORD_FW
-    ]
+    coordinator = entry.runtime_data.firmware_coordinator
     async_add_entities(
         QswUpdate(coordinator, description, entry) for description in UPDATE_TYPES
     )
@@ -51,19 +47,17 @@ async def async_setup_entry(
 class QswUpdate(QswFirmwareEntity, UpdateEntity):
     """Define a QNAP QSW update."""
 
+    _attr_supported_features = UpdateEntityFeature.INSTALL
     entity_description: UpdateEntityDescription
 
     def __init__(
         self,
         coordinator: QswFirmwareCoordinator,
         description: UpdateEntityDescription,
-        entry: ConfigEntry,
+        entry: QnapQswConfigEntry,
     ) -> None:
         """Initialize."""
         super().__init__(coordinator, entry)
-        self._attr_name = (
-            f"{self.get_device_value(QSD_SYSTEM_BOARD, QSD_PRODUCT)} {description.name}"
-        )
         self._attr_unique_id = f"{entry.unique_id}_{description.key}"
         self.entity_description = description
 
@@ -73,6 +67,7 @@ class QswUpdate(QswFirmwareEntity, UpdateEntity):
         self._async_update_attrs()
 
     @callback
+    @override
     def _handle_coordinator_update(self) -> None:
         """Update attributes when the coordinator updates."""
         self._async_update_attrs()
@@ -87,3 +82,14 @@ class QswUpdate(QswFirmwareEntity, UpdateEntity):
         self._attr_release_summary = self.get_device_value(
             QSD_FIRMWARE_CHECK, QSD_DESCRIPTION
         )
+
+    @override
+    async def async_install(
+        self, version: str | None, backup: bool, **kwargs: Any
+    ) -> None:
+        """Install an update."""
+        await self.coordinator.async_refresh()
+        await self.coordinator.qsw.live_update()
+
+        self._attr_installed_version = self.latest_version
+        self.async_write_ha_state()

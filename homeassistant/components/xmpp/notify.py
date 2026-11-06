@@ -1,4 +1,5 @@
 """Jabber (XMPP) notification service."""
+
 from concurrent.futures import TimeoutError as FutTimeoutError
 from http import HTTPStatus
 import logging
@@ -6,7 +7,9 @@ import mimetypes
 import pathlib
 import random
 import string
+from typing import Any, override
 
+import probatio
 import requests
 import slixmpp
 from slixmpp.exceptions import IqError, IqTimeout, XMPPError
@@ -16,12 +19,13 @@ from slixmpp.plugins.xep_0363.http_upload import (
     UploadServiceNotFound,
 )
 from slixmpp.xmlstream.xmlstream import NotConnectedError
-import voluptuous as vol
 
 from homeassistant.components.notify import (
+    ATTR_DATA,
+    ATTR_TARGET,
     ATTR_TITLE,
     ATTR_TITLE_DEFAULT,
-    PLATFORM_SCHEMA,
+    PLATFORM_SCHEMA as NOTIFY_PLATFORM_SCHEMA,
     BaseNotificationService,
 )
 from homeassistant.const import (
@@ -31,12 +35,12 @@ from homeassistant.const import (
     CONF_ROOM,
     CONF_SENDER,
 )
-import homeassistant.helpers.config_validation as cv
-import homeassistant.helpers.template as template_helper
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import config_validation as cv, template as template_helper
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
 _LOGGER = logging.getLogger(__name__)
 
-ATTR_DATA = "data"
 ATTR_PATH = "path"
 ATTR_PATH_TEMPLATE = "path_template"
 ATTR_TIMEOUT = "timeout"
@@ -51,20 +55,26 @@ DEFAULT_CONTENT_TYPE = "application/octet-stream"
 DEFAULT_RESOURCE = "home-assistant"
 XEP_0363_TIMEOUT = 10
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
+PLATFORM_SCHEMA = NOTIFY_PLATFORM_SCHEMA.extend(
     {
-        vol.Required(CONF_SENDER): cv.string,
-        vol.Required(CONF_PASSWORD): cv.string,
-        vol.Required(CONF_RECIPIENT): vol.All(cv.ensure_list, [cv.string]),
-        vol.Optional(CONF_RESOURCE, default=DEFAULT_RESOURCE): cv.string,
-        vol.Optional(CONF_ROOM, default=""): cv.string,
-        vol.Optional(CONF_TLS, default=True): cv.boolean,
-        vol.Optional(CONF_VERIFY, default=True): cv.boolean,
+        probatio.Required(CONF_SENDER): cv.string,
+        probatio.Required(probatio.Secret(CONF_PASSWORD)): cv.string,
+        probatio.Required(CONF_RECIPIENT): probatio.All(
+            probatio.EnsureList(), [cv.string]
+        ),
+        probatio.Optional(CONF_RESOURCE, default=DEFAULT_RESOURCE): cv.string,
+        probatio.Optional(CONF_ROOM, default=""): cv.string,
+        probatio.Optional(CONF_TLS, default=True): cv.boolean,
+        probatio.Optional(CONF_VERIFY, default=True): cv.boolean,
     }
 )
 
 
-async def async_get_service(hass, config, discovery_info=None):
+async def async_get_service(
+    hass: HomeAssistant,
+    config: ConfigType,
+    discovery_info: DiscoveryInfoType | None = None,
+) -> XmppNotificationService:
     """Get the Jabber (XMPP) notification service."""
     return XmppNotificationService(
         config.get(CONF_SENDER),
@@ -92,17 +102,19 @@ class XmppNotificationService(BaseNotificationService):
         self._verify = verify
         self._room = room
 
-    async def async_send_message(self, message="", **kwargs):
+    @override
+    async def async_send_message(self, message: str = "", **kwargs: Any) -> None:
         """Send a message to a user."""
         title = kwargs.get(ATTR_TITLE, ATTR_TITLE_DEFAULT)
         text = f"{title}: {message}" if title else message
+        targets = kwargs.get(ATTR_TARGET, self._recipients)
         data = kwargs.get(ATTR_DATA)
         timeout = data.get(ATTR_TIMEOUT, XEP_0363_TIMEOUT) if data else None
 
         await async_send_message(
             f"{self._sender}/{self._resource}",
             self._password,
-            self._recipients,
+            targets,
             self._tls,
             self._verify,
             self._room,
@@ -136,9 +148,12 @@ async def async_send_message(  # noqa: C901
 
             self.loop = hass.loop
 
-            self.force_starttls = use_tls
+            self.enable_starttls = use_tls
+            self.enable_direct_tls = use_tls
+            self.enable_plaintext = not use_tls
+            self["feature_mechanisms"].unencrypted_scram = not use_tls
             self.use_ipv6 = False
-            self.add_event_handler("failed_auth", self.disconnect_on_login_fail)
+            self.add_event_handler("failed_all_auth", self.disconnect_on_login_fail)
             self.add_event_handler("session_start", self.start)
 
             if room:
@@ -155,7 +170,7 @@ async def async_send_message(  # noqa: C901
                 self.register_plugin("xep_0128")  # Service Discovery
                 self.register_plugin("xep_0363")  # HTTP upload
 
-            self.connect(force_starttls=self.force_starttls, use_ssl=False)
+            self.connect()
 
         async def start(self, event):
             """Start the communication and sends the message."""
@@ -181,18 +196,16 @@ async def async_send_message(  # noqa: C901
                 _LOGGER.debug("Timeout set to %ss", timeout)
                 url = await self.upload_file(timeout=timeout)
 
-                _LOGGER.info("Upload success")
+                _LOGGER.debug("Upload success")
                 for recipient in recipients:
                     if room:
-                        _LOGGER.info("Sending file to %s", room)
+                        _LOGGER.debug("Sending file to %s", room)
                         message = self.Message(sto=room, stype="groupchat")
                     else:
-                        _LOGGER.info("Sending file to %s", recipient)
+                        _LOGGER.debug("Sending file to %s", recipient)
                         message = self.Message(sto=recipient, stype="chat")
                     message["body"] = url
-                    message["oob"][  # pylint: disable=invalid-sequence-index
-                        "url"
-                    ] = url
+                    message["oob"]["url"] = url
                     try:
                         message.send()
                     except (IqError, IqTimeout, XMPPError) as ex:
@@ -257,7 +270,7 @@ async def async_send_message(  # noqa: C901
 
             uploaded via XEP_0363 and HTTP and returns the resulting URL
             """
-            _LOGGER.info("Getting file from %s", url)
+            _LOGGER.debug("Getting file from %s", url)
 
             def get_url(url):
                 """Return result for GET request to url."""
@@ -288,9 +301,9 @@ async def async_send_message(  # noqa: C901
                 _LOGGER.debug("Got %s extension", extension)
                 filename = self.get_random_filename(None, extension=extension)
 
-            _LOGGER.info("Uploading file from URL, %s", filename)
+            _LOGGER.debug("Uploading file from URL, %s", filename)
 
-            url = await self["xep_0363"].upload_file(
+            return await self["xep_0363"].upload_file(
                 filename,
                 size=filesize,
                 input_file=result.content,
@@ -298,18 +311,20 @@ async def async_send_message(  # noqa: C901
                 timeout=timeout,
             )
 
-            return url
+        def _read_upload_file(self, path: str) -> bytes:
+            """Read file from path."""
+            with open(path, "rb") as upfile:
+                _LOGGER.debug("Reading file %s", path)
+                return upfile.read()
 
-        async def upload_file_from_path(self, path, timeout=None):
+        async def upload_file_from_path(self, path: str, timeout=None):
             """Upload a file from a local file path via XEP_0363."""
-            _LOGGER.info("Uploading file from path, %s", path)
+            _LOGGER.debug("Uploading file from path, %s", path)
 
             if not hass.config.is_allowed_path(path):
                 raise PermissionError("Could not access file. Path not allowed")
 
-            with open(path, "rb") as upfile:
-                _LOGGER.debug("Reading file %s", path)
-                input_file = upfile.read()
+            input_file = await hass.async_add_executor_job(self._read_upload_file, path)
             filesize = len(input_file)
             _LOGGER.debug("Filesize is %s bytes", filesize)
 
@@ -321,15 +336,13 @@ async def async_send_message(  # noqa: C901
             filename = self.get_random_filename(data.get(ATTR_PATH))
             _LOGGER.debug("Uploading file with random filename %s", filename)
 
-            url = await self["xep_0363"].upload_file(
+            return await self["xep_0363"].upload_file(
                 filename,
                 size=filesize,
                 input_file=input_file,
                 content_type=content_type,
                 timeout=timeout,
             )
-
-            return url
 
         def send_text_message(self):
             """Send a text only message to a room or a recipient."""
@@ -367,6 +380,6 @@ async def async_send_message(  # noqa: C901
         @staticmethod
         def discard_ssl_invalid_cert(event):
             """Do nothing if ssl certificate is invalid."""
-            _LOGGER.info("Ignoring invalid SSL certificate as requested")
+            _LOGGER.debug("Ignoring invalid SSL certificate as requested")
 
     SendNotificationBot()

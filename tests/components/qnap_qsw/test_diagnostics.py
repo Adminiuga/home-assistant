@@ -1,6 +1,5 @@
 """The diagnostics tests for the QNAP QSW platform."""
 
-from aiohttp import ClientSession
 from aioqsw.const import (
     API_ANOMALY,
     API_BUILD_NUMBER,
@@ -26,9 +25,11 @@ from aioqsw.const import (
     QSD_SYSTEM_TIME,
     QSD_TEMP,
     QSD_TEMP_MAX,
-    QSD_UPTIME,
+    QSD_UPTIME_SECONDS,
     QSD_VERSION,
 )
+from pytest_homeassistant.components.diagnostics import get_diagnostics_for_config_entry
+from pytest_homeassistant.typing import ClientSessionGenerator
 
 from homeassistant.components.diagnostics import REDACTED
 from homeassistant.components.qnap_qsw.const import DOMAIN
@@ -45,15 +46,12 @@ from .util import (
     async_init_integration,
 )
 
-from tests.components.diagnostics import get_diagnostics_for_config_entry
-
 
 async def test_config_entry_diagnostics(
-    hass: HomeAssistant, hass_client: ClientSession
+    hass: HomeAssistant, hass_client: ClientSessionGenerator
 ) -> None:
     """Test config entry diagnostics."""
     await async_init_integration(hass)
-    assert hass.data[DOMAIN]
 
     config_entry = hass.config_entries.async_entries(DOMAIN)[0]
     diag = await get_diagnostics_for_config_entry(hass, hass_client, config_entry)
@@ -118,6 +116,6 @@ async def test_config_entry_diagnostics(
     assert (
         sys_time_diag.items()
         >= {
-            QSD_UPTIME: sys_time_mock[API_UPTIME],
+            QSD_UPTIME_SECONDS: sys_time_mock[API_UPTIME],
         }.items()
     )

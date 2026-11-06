@@ -1,20 +1,34 @@
 """Tests for the WLED config flow."""
+
+from ipaddress import ip_address
 from unittest.mock import AsyncMock, MagicMock
 
-from wled import WLEDConnectionError
+import pytest
+from pytest_homeassistant.common import MockConfigEntry
+from wled import WLEDConnectionError, WLEDError, WLEDUnsupportedVersionError
 
-from homeassistant.components import zeroconf
-from homeassistant.components.wled.const import CONF_KEEP_MASTER_LIGHT, DOMAIN
+from homeassistant.components.wled.const import CONF_KEEP_MAIN_LIGHT, DOMAIN
 from homeassistant.config_entries import SOURCE_USER, SOURCE_ZEROCONF
 from homeassistant.const import CONF_HOST, CONF_MAC, CONF_NAME
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.helpers.service_info.zeroconf import ZeroconfServiceInfo
 
-from tests.common import MockConfigEntry
+CONFIG = {CONF_HOST: "10.10.0.10"}
 
 
+@pytest.mark.usefixtures("mock_setup_entry", "mock_wled")
+@pytest.mark.parametrize(
+    "host_input",
+    [
+        "192.168.1.123",
+        "http://192.168.1.123",
+        "https://192.168.1.123/settings",
+        "https://192.168.1.123:80/settings",
+    ],
+)
 async def test_full_user_flow_implementation(
-    hass: HomeAssistant, mock_wled_config_flow: MagicMock, mock_setup_entry: AsyncMock
+    hass: HomeAssistant, host_input: str
 ) -> None:
     """Test the full manual user flow from start to finish."""
     result = await hass.config_entries.flow.async_init(
@@ -23,31 +37,119 @@ async def test_full_user_flow_implementation(
     )
 
     assert result.get("step_id") == "user"
-    assert result.get("type") == FlowResultType.FORM
-    assert "flow_id" in result
+    assert result.get("type") is FlowResultType.FORM
 
     result = await hass.config_entries.flow.async_configure(
-        result["flow_id"], user_input={CONF_HOST: "192.168.1.123"}
+        result["flow_id"], user_input={CONF_HOST: host_input}
     )
 
     assert result.get("title") == "WLED RGB Light"
-    assert result.get("type") == FlowResultType.CREATE_ENTRY
-    assert "data" in result
+    assert result.get("type") is FlowResultType.CREATE_ENTRY
     assert result["data"][CONF_HOST] == "192.168.1.123"
-    assert "result" in result
     assert result["result"].unique_id == "aabbccddeeff"
 
 
-async def test_full_zeroconf_flow_implementation(
-    hass: HomeAssistant, mock_wled_config_flow: MagicMock, mock_setup_entry: AsyncMock
+@pytest.mark.usefixtures("mock_setup_entry", "mock_wled")
+async def test_full_reconfigure_flow_success(
+    hass: HomeAssistant, mock_config_entry: MockConfigEntry, mock_wled: MagicMock
 ) -> None:
+    """Test the full reconfigure flow from start to finish."""
+    mock_config_entry.add_to_hass(hass)
+
+    result = await mock_config_entry.start_reconfigure_flow(hass)
+
+    # Assert show form initially
+    assert result.get("step_id") == "user"
+    assert result.get("type") is FlowResultType.FORM
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input=CONFIG
+    )
+
+    # Assert show text message and close flow
+    assert result.get("type") is FlowResultType.ABORT
+    assert result.get("reason") == "reconfigure_successful"
+
+    # Assert config entry has been updated.
+    assert mock_config_entry.data[CONF_HOST] == "10.10.0.10"
+
+
+@pytest.mark.usefixtures("mock_setup_entry", "mock_wled")
+async def test_full_reconfigure_flow_unique_id_mismatch(
+    hass: HomeAssistant, mock_config_entry: MockConfigEntry, mock_wled: MagicMock
+) -> None:
+    """Test reconfiguration failure when the unique ID changes."""
+    mock_config_entry.add_to_hass(hass)
+
+    # Change mac address
+    device = mock_wled.update.return_value
+    device.info.mac_address = "invalid"
+
+    result = await mock_config_entry.start_reconfigure_flow(hass)
+
+    # Assert show form initially
+    assert result.get("step_id") == "user"
+    assert result.get("type") is FlowResultType.FORM
+
+    # Input new host value
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input=CONFIG
+    )
+
+    # Assert Show text message and close flow
+    assert result.get("type") is FlowResultType.ABORT
+    assert result.get("reason") == "unique_id_mismatch"
+
+
+@pytest.mark.usefixtures("mock_setup_entry", "mock_wled")
+async def test_full_reconfigure_flow_connection_error_and_success(
+    hass: HomeAssistant, mock_config_entry: MockConfigEntry, mock_wled: MagicMock
+) -> None:
+    """Test user form on WLED connection error allows host change."""
+    mock_config_entry.add_to_hass(hass)
+
+    # Mock connection error
+    mock_wled.update.side_effect = WLEDConnectionError
+
+    result = await mock_config_entry.start_reconfigure_flow(hass)
+
+    # Assert show form initially
+    assert result.get("step_id") == "user"
+    assert result.get("type") is FlowResultType.FORM
+
+    # Input new host value
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input=CONFIG
+    )
+
+    # Assert form with errors
+    assert result.get("type") is FlowResultType.FORM
+    assert result.get("step_id") == "user"
+    assert result.get("errors") == {"base": "cannot_connect"}
+
+    # Remove mock for connection error
+    mock_wled.update.side_effect = None
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input=CONFIG
+    )
+
+    # Assert show text message and close flow
+    assert result.get("type") is FlowResultType.ABORT
+    assert result.get("reason") == "reconfigure_successful"
+
+    # Assert config entry has been updated.
+    assert mock_config_entry.data[CONF_HOST] == "10.10.0.10"
+
+
+@pytest.mark.usefixtures("mock_setup_entry", "mock_wled")
+async def test_full_zeroconf_flow_implementation(hass: HomeAssistant) -> None:
     """Test the full manual user flow from start to finish."""
     result = await hass.config_entries.flow.async_init(
         DOMAIN,
         context={"source": SOURCE_ZEROCONF},
-        data=zeroconf.ZeroconfServiceInfo(
-            host="192.168.1.123",
-            addresses=["192.168.1.123"],
+        data=ZeroconfServiceInfo(
+            ip_address=ip_address("192.168.1.123"),
+            ip_addresses=[ip_address("192.168.1.123")],
             hostname="example.local.",
             name="mock_name",
             port=None,
@@ -64,15 +166,14 @@ async def test_full_zeroconf_flow_implementation(
     )
     assert result.get("description_placeholders") == {CONF_NAME: "WLED RGB Light"}
     assert result.get("step_id") == "zeroconf_confirm"
-    assert result.get("type") == FlowResultType.FORM
-    assert "flow_id" in result
+    assert result.get("type") is FlowResultType.FORM
 
     result2 = await hass.config_entries.flow.async_configure(
         result["flow_id"], user_input={}
     )
 
     assert result2.get("title") == "WLED RGB Light"
-    assert result2.get("type") == FlowResultType.CREATE_ENTRY
+    assert result2.get("type") is FlowResultType.CREATE_ENTRY
 
     assert "data" in result2
     assert result2["data"][CONF_HOST] == "192.168.1.123"
@@ -80,9 +181,9 @@ async def test_full_zeroconf_flow_implementation(
     assert result2["result"].unique_id == "aabbccddeeff"
 
 
+@pytest.mark.usefixtures("mock_wled")
 async def test_zeroconf_during_onboarding(
     hass: HomeAssistant,
-    mock_wled_config_flow: MagicMock,
     mock_setup_entry: AsyncMock,
     mock_onboarding: MagicMock,
 ) -> None:
@@ -90,9 +191,9 @@ async def test_zeroconf_during_onboarding(
     result = await hass.config_entries.flow.async_init(
         DOMAIN,
         context={"source": SOURCE_ZEROCONF},
-        data=zeroconf.ZeroconfServiceInfo(
-            host="192.168.1.123",
-            addresses=["192.168.1.123"],
+        data=ZeroconfServiceInfo(
+            ip_address=ip_address("192.168.1.123"),
+            ip_addresses=[ip_address("192.168.1.123")],
             hostname="example.local.",
             name="mock_name",
             port=None,
@@ -102,7 +203,7 @@ async def test_zeroconf_during_onboarding(
     )
 
     assert result.get("title") == "WLED RGB Light"
-    assert result.get("type") == FlowResultType.CREATE_ENTRY
+    assert result.get("type") is FlowResultType.CREATE_ENTRY
 
     assert result.get("data") == {CONF_HOST: "192.168.1.123"}
     assert "result" in result
@@ -112,34 +213,68 @@ async def test_zeroconf_during_onboarding(
     assert len(mock_onboarding.mock_calls) == 1
 
 
-async def test_connection_error(
-    hass: HomeAssistant, mock_wled_config_flow: MagicMock
+@pytest.mark.parametrize(
+    ("exception", "errors"),
+    [
+        (WLEDConnectionError, {"base": "cannot_connect"}),
+        (WLEDUnsupportedVersionError, {"base": "unsupported_version"}),
+        (WLEDError, {"base": "invalid_response"}),
+    ],
+)
+@pytest.mark.usefixtures("mock_setup_entry")
+async def test_form_submission_errors(
+    hass: HomeAssistant,
+    mock_wled: MagicMock,
+    exception: type[Exception],
+    errors: dict[str, str],
 ) -> None:
-    """Test we show user form on WLED connection error."""
-    mock_wled_config_flow.update.side_effect = WLEDConnectionError
+    """Test errors during form submission."""
+    mock_wled.update.side_effect = exception
     result = await hass.config_entries.flow.async_init(
         DOMAIN,
         context={"source": SOURCE_USER},
-        data={CONF_HOST: "example.com"},
     )
 
-    assert result.get("type") == FlowResultType.FORM
     assert result.get("step_id") == "user"
-    assert result.get("errors") == {"base": "cannot_connect"}
+    assert result.get("type") is FlowResultType.FORM
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input=CONFIG
+    )
+
+    assert result.get("type") is FlowResultType.FORM
+    assert result.get("step_id") == "user"
+    assert result.get("errors") == errors
+
+    mock_wled.update.side_effect = None
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input=CONFIG
+    )
+
+    assert result.get("type") is FlowResultType.CREATE_ENTRY
 
 
-async def test_zeroconf_connection_error(
-    hass: HomeAssistant, mock_wled_config_flow: MagicMock
+@pytest.mark.parametrize(
+    ("exception", "reason"),
+    [
+        (WLEDConnectionError, "cannot_connect"),
+        (WLEDUnsupportedVersionError, "unsupported_version"),
+        (WLEDError, "invalid_response"),
+    ],
+)
+async def test_zeroconf_errors(
+    hass: HomeAssistant, mock_wled: MagicMock, exception: Exception, reason: str
 ) -> None:
-    """Test we abort zeroconf flow on WLED connection error."""
-    mock_wled_config_flow.update.side_effect = WLEDConnectionError
+    """Test we abort the zeroconf flow on errors from the WLED device."""
+    mock_wled.update.side_effect = exception
 
     result = await hass.config_entries.flow.async_init(
         DOMAIN,
         context={"source": SOURCE_ZEROCONF},
-        data=zeroconf.ZeroconfServiceInfo(
-            host="192.168.1.123",
-            addresses=["192.168.1.123"],
+        data=ZeroconfServiceInfo(
+            ip_address=ip_address("192.168.1.123"),
+            ip_addresses=[ip_address("192.168.1.123")],
             hostname="example.local.",
             name="mock_name",
             port=None,
@@ -148,57 +283,49 @@ async def test_zeroconf_connection_error(
         ),
     )
 
-    assert result.get("type") == FlowResultType.ABORT
-    assert result.get("reason") == "cannot_connect"
+    assert result.get("type") is FlowResultType.ABORT
+    assert result.get("reason") == reason
 
 
+@pytest.mark.parametrize("device_mac", ["aabbccddeeff", "AABBCCDDEEFF"])
 async def test_user_device_exists_abort(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
-    mock_wled_config_flow: MagicMock,
+    mock_wled: MagicMock,
+    device_mac: str,
 ) -> None:
     """Test we abort zeroconf flow if WLED device already configured."""
+    mock_wled.update.return_value.info.mac_address = device_mac
     mock_config_entry.add_to_hass(hass)
     result = await hass.config_entries.flow.async_init(
         DOMAIN,
         context={"source": SOURCE_USER},
-        data={CONF_HOST: "192.168.1.123"},
     )
 
-    assert result.get("type") == FlowResultType.ABORT
+    assert result.get("step_id") == "user"
+    assert result.get("type") is FlowResultType.FORM
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={CONF_HOST: "192.168.1.123"}
+    )
+
+    assert result.get("type") is FlowResultType.ABORT
     assert result.get("reason") == "already_configured"
 
 
-async def test_user_with_cct_channel_abort(
-    hass: HomeAssistant,
-    mock_wled_config_flow: MagicMock,
-) -> None:
-    """Test we abort user flow if WLED device uses a CCT channel."""
-    mock_wled_config_flow.update.return_value.info.leds.cct = True
-
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN,
-        context={"source": SOURCE_USER},
-        data={CONF_HOST: "192.168.1.123"},
-    )
-
-    assert result.get("type") == FlowResultType.ABORT
-    assert result.get("reason") == "cct_unsupported"
-
-
+@pytest.mark.usefixtures("mock_wled")
 async def test_zeroconf_without_mac_device_exists_abort(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
-    mock_wled_config_flow: MagicMock,
 ) -> None:
     """Test we abort zeroconf flow if WLED device already configured."""
     mock_config_entry.add_to_hass(hass)
     result = await hass.config_entries.flow.async_init(
         DOMAIN,
         context={"source": SOURCE_ZEROCONF},
-        data=zeroconf.ZeroconfServiceInfo(
-            host="192.168.1.123",
-            addresses=["192.168.1.123"],
+        data=ZeroconfServiceInfo(
+            ip_address=ip_address("192.168.1.123"),
+            ip_addresses=[ip_address("192.168.1.123")],
             hostname="example.local.",
             name="mock_name",
             port=None,
@@ -207,23 +334,51 @@ async def test_zeroconf_without_mac_device_exists_abort(
         ),
     )
 
-    assert result.get("type") == FlowResultType.ABORT
+    assert result.get("type") is FlowResultType.ABORT
     assert result.get("reason") == "already_configured"
 
 
+@pytest.mark.parametrize("device_mac", ["aabbccddeeff", "AABBCCDDEEFF"])
 async def test_zeroconf_with_mac_device_exists_abort(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
-    mock_wled_config_flow: MagicMock,
+    mock_wled: MagicMock,
+    device_mac: str,
 ) -> None:
-    """Test we abort zeroconf flow if WLED device already configured."""
+    """Test we abort zeroconf flow, without asking the device, if already configured."""
     mock_config_entry.add_to_hass(hass)
     result = await hass.config_entries.flow.async_init(
         DOMAIN,
         context={"source": SOURCE_ZEROCONF},
-        data=zeroconf.ZeroconfServiceInfo(
-            host="192.168.1.123",
-            addresses=["192.168.1.123"],
+        data=ZeroconfServiceInfo(
+            ip_address=ip_address("192.168.1.123"),
+            ip_addresses=[ip_address("192.168.1.123")],
+            hostname="example.local.",
+            name="mock_name",
+            port=None,
+            properties={CONF_MAC: device_mac},
+            type="mock_type",
+        ),
+    )
+
+    assert result.get("type") is FlowResultType.ABORT
+    assert result.get("reason") == "already_configured"
+    assert mock_wled.update.call_count == 0
+
+
+async def test_zeroconf_with_mac_updates_host(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_wled: MagicMock,
+) -> None:
+    """Test zeroconf updates the host after the device answers on it."""
+    mock_config_entry.add_to_hass(hass)
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": SOURCE_ZEROCONF},
+        data=ZeroconfServiceInfo(
+            ip_address=ip_address("192.168.1.124"),
+            ip_addresses=[ip_address("192.168.1.124")],
             hostname="example.local.",
             name="mock_name",
             port=None,
@@ -232,23 +387,27 @@ async def test_zeroconf_with_mac_device_exists_abort(
         ),
     )
 
-    assert result.get("type") == FlowResultType.ABORT
+    assert result.get("type") is FlowResultType.ABORT
     assert result.get("reason") == "already_configured"
+    assert mock_config_entry.data[CONF_HOST] == "192.168.1.124"
+    assert mock_wled.update.call_count == 1
 
 
-async def test_zeroconf_with_cct_channel_abort(
+async def test_zeroconf_with_mac_keeps_host_for_another_device(
     hass: HomeAssistant,
-    mock_wled_config_flow: MagicMock,
+    mock_config_entry: MockConfigEntry,
+    mock_wled: MagicMock,
 ) -> None:
-    """Test we abort zeroconf flow if WLED device uses a CCT channel."""
-    mock_wled_config_flow.update.return_value.info.leds.cct = True
+    """Test zeroconf keeps the host when another device answers on the new one."""
+    mock_config_entry.add_to_hass(hass)
+    mock_wled.update.return_value.info.mac_address = "112233445566"
 
     result = await hass.config_entries.flow.async_init(
         DOMAIN,
         context={"source": SOURCE_ZEROCONF},
-        data=zeroconf.ZeroconfServiceInfo(
-            host="192.168.1.123",
-            addresses=["192.168.1.123"],
+        data=ZeroconfServiceInfo(
+            ip_address=ip_address("192.168.1.124"),
+            ip_addresses=[ip_address("192.168.1.124")],
             hostname="example.local.",
             name="mock_name",
             port=None,
@@ -257,10 +416,41 @@ async def test_zeroconf_with_cct_channel_abort(
         ),
     )
 
-    assert result.get("type") == FlowResultType.ABORT
-    assert result.get("reason") == "cct_unsupported"
+    # Offered as the new device it is, without touching the configured one.
+    assert result.get("type") is FlowResultType.FORM
+    assert result.get("step_id") == "zeroconf_confirm"
+    assert mock_config_entry.data[CONF_HOST] == "192.168.1.123"
 
 
+async def test_zeroconf_with_mac_keeps_host_when_unreachable(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_wled: MagicMock,
+) -> None:
+    """Test zeroconf keeps the host when the device doesn't answer on the new one."""
+    mock_config_entry.add_to_hass(hass)
+    mock_wled.update.side_effect = WLEDConnectionError
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": SOURCE_ZEROCONF},
+        data=ZeroconfServiceInfo(
+            ip_address=ip_address("192.168.1.124"),
+            ip_addresses=[ip_address("192.168.1.124")],
+            hostname="example.local.",
+            name="mock_name",
+            port=None,
+            properties={CONF_MAC: "aabbccddeeff"},
+            type="mock_type",
+        ),
+    )
+
+    assert result.get("type") is FlowResultType.ABORT
+    assert result.get("reason") == "cannot_connect"
+    assert mock_config_entry.data[CONF_HOST] == "192.168.1.123"
+
+
+@pytest.mark.usefixtures("mock_wled")
 async def test_options_flow(
     hass: HomeAssistant, mock_config_entry: MockConfigEntry
 ) -> None:
@@ -269,16 +459,15 @@ async def test_options_flow(
 
     result = await hass.config_entries.options.async_init(mock_config_entry.entry_id)
 
-    assert result.get("type") == FlowResultType.FORM
+    assert result.get("type") is FlowResultType.FORM
     assert result.get("step_id") == "init"
-    assert "flow_id" in result
 
     result2 = await hass.config_entries.options.async_configure(
         result["flow_id"],
-        user_input={CONF_KEEP_MASTER_LIGHT: True},
+        user_input={CONF_KEEP_MAIN_LIGHT: True},
     )
 
-    assert result2.get("type") == FlowResultType.CREATE_ENTRY
+    assert result2.get("type") is FlowResultType.CREATE_ENTRY
     assert result2.get("data") == {
-        CONF_KEEP_MASTER_LIGHT: True,
+        CONF_KEEP_MAIN_LIGHT: True,
     }

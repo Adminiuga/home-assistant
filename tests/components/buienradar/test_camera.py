@@ -1,20 +1,24 @@
 """The tests for generic camera component."""
-import asyncio
+
 from contextlib import suppress
 import copy
+from datetime import timedelta
 from http import HTTPStatus
 
 from aiohttp.client_exceptions import ClientResponseError
+from freezegun.api import FrozenDateTimeFactory
+from pytest_homeassistant.common import MockConfigEntry
+from pytest_homeassistant.test_util.aiohttp import AiohttpClientMocker
+from pytest_homeassistant.typing import ClientSessionGenerator
 
-from homeassistant.components.buienradar.const import CONF_COUNTRY, CONF_DELTA, DOMAIN
-from homeassistant.const import CONF_LATITUDE, CONF_LONGITUDE
-from homeassistant.helpers.entity_registry import async_get
+from homeassistant.components.buienradar.const import CONF_DELTA, DOMAIN
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import CONF_COUNTRY_CODE, CONF_LATITUDE, CONF_LONGITUDE
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
 from homeassistant.util import dt as dt_util
 
-from tests.common import MockConfigEntry
-
-# An infinitesimally small time-delta.
-EPSILON_DELTA = 0.0000000001
+TEST_DELTA = 10
 
 TEST_LATITUDE = 51.5288504
 TEST_LONGITUDE = 5.4002156
@@ -27,8 +31,8 @@ def radar_map_url(country_code: str = "NL") -> str:
     return f"https://api.buienradar.nl/image/1.0/RadarMap{country_code}?w=700&h=700"
 
 
-async def _setup_config_entry(hass, entry):
-    entity_registry = async_get(hass)
+async def _setup_config_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    entity_registry = er.async_get(hass)
     entity_registry.async_get_or_create(
         domain="camera",
         platform="buienradar",
@@ -42,7 +46,11 @@ async def _setup_config_entry(hass, entry):
     await hass.async_block_till_done()
 
 
-async def test_fetching_url_and_caching(aioclient_mock, hass, hass_client):
+async def test_fetching_url_and_caching(
+    aioclient_mock: AiohttpClientMocker,
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+) -> None:
     """Test that it fetches the given url."""
     aioclient_mock.get(radar_map_url(), text="hello world")
 
@@ -68,11 +76,16 @@ async def test_fetching_url_and_caching(aioclient_mock, hass, hass_client):
     assert aioclient_mock.call_count == 1
 
 
-async def test_expire_delta(aioclient_mock, hass, hass_client):
+async def test_expire_delta(
+    aioclient_mock: AiohttpClientMocker,
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    freezer: FrozenDateTimeFactory,
+) -> None:
     """Test that the cache expires after delta."""
     aioclient_mock.get(radar_map_url(), text="hello world")
 
-    options = {CONF_DELTA: EPSILON_DELTA}
+    options = {CONF_DELTA: TEST_DELTA}
 
     mock_entry = MockConfigEntry(
         domain=DOMAIN, unique_id="TEST_ID", data=TEST_CFG_DATA, options=options
@@ -91,13 +104,17 @@ async def test_expire_delta(aioclient_mock, hass, hass_client):
     body = await resp.text()
     assert body == "hello world"
 
-    await asyncio.sleep(EPSILON_DELTA)
-    # tiny delta has passed -> should immediately call again
+    freezer.tick(timedelta(seconds=TEST_DELTA + 1))
+    # delta has passed -> should immediately call again
     resp = await client.get("/api/camera_proxy/camera.buienradar_51_5288505_400216")
     assert aioclient_mock.call_count == 2
 
 
-async def test_only_one_fetch_at_a_time(aioclient_mock, hass, hass_client):
+async def test_only_one_fetch_at_a_time(
+    aioclient_mock: AiohttpClientMocker,
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+) -> None:
     """Test that it fetches with only one request at the same time."""
     aioclient_mock.get(radar_map_url(), text="hello world")
 
@@ -120,12 +137,16 @@ async def test_only_one_fetch_at_a_time(aioclient_mock, hass, hass_client):
     assert aioclient_mock.call_count == 1
 
 
-async def test_belgium_country(aioclient_mock, hass, hass_client):
+async def test_belgium_country(
+    aioclient_mock: AiohttpClientMocker,
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+) -> None:
     """Test that it actually adheres to another country like Belgium."""
     aioclient_mock.get(radar_map_url(country_code="BE"), text="hello world")
 
     data = copy.deepcopy(TEST_CFG_DATA)
-    data[CONF_COUNTRY] = "BE"
+    data[CONF_COUNTRY_CODE] = "BE"
 
     mock_entry = MockConfigEntry(domain=DOMAIN, unique_id="TEST_ID", data=data)
 
@@ -140,7 +161,11 @@ async def test_belgium_country(aioclient_mock, hass, hass_client):
     assert aioclient_mock.call_count == 1
 
 
-async def test_failure_response_not_cached(aioclient_mock, hass, hass_client):
+async def test_failure_response_not_cached(
+    aioclient_mock: AiohttpClientMocker,
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+) -> None:
     """Test that it does not cache a failure response."""
     aioclient_mock.get(radar_map_url(), text="hello world", status=401)
 
@@ -158,7 +183,12 @@ async def test_failure_response_not_cached(aioclient_mock, hass, hass_client):
     assert aioclient_mock.call_count == 2
 
 
-async def test_last_modified_updates(aioclient_mock, hass, hass_client):
+async def test_last_modified_updates(
+    aioclient_mock: AiohttpClientMocker,
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    freezer: FrozenDateTimeFactory,
+) -> None:
     """Test that it does respect HTTP not modified."""
     # Build Last-Modified header value
     now = dt_util.utcnow()
@@ -171,7 +201,7 @@ async def test_last_modified_updates(aioclient_mock, hass, hass_client):
         headers={"Last-Modified": last_modified},
     )
 
-    options = {CONF_DELTA: EPSILON_DELTA}
+    options = {CONF_DELTA: TEST_DELTA}
 
     mock_entry = MockConfigEntry(
         domain=DOMAIN, unique_id="TEST_ID", data=TEST_CFG_DATA, options=options
@@ -187,7 +217,7 @@ async def test_last_modified_updates(aioclient_mock, hass, hass_client):
     # It is not possible to check if header was sent.
     assert aioclient_mock.call_count == 1
 
-    await asyncio.sleep(EPSILON_DELTA)
+    freezer.tick(timedelta(seconds=TEST_DELTA + 1))
 
     # Content has expired, change response to a 304 NOT MODIFIED, which has no
     # text, i.e. old value should be kept
@@ -203,7 +233,11 @@ async def test_last_modified_updates(aioclient_mock, hass, hass_client):
     assert (await resp_1.read()) == (await resp_2.read())
 
 
-async def test_retries_after_error(aioclient_mock, hass, hass_client):
+async def test_retries_after_error(
+    aioclient_mock: AiohttpClientMocker,
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+) -> None:
     """Test that it does retry after an error instead of caching."""
     mock_entry = MockConfigEntry(domain=DOMAIN, unique_id="TEST_ID", data=TEST_CFG_DATA)
 
@@ -233,6 +267,6 @@ async def test_retries_after_error(aioclient_mock, hass, hass_client):
     resp_2 = await client.get("/api/camera_proxy/camera.buienradar_51_5288505_400216")
     assert aioclient_mock.call_count == 1
 
-    # Binary text can not be added as body to `aioclient_mock.get(text=...)`,
+    # Binary text cannot be added as body to `aioclient_mock.get(text=...)`,
     # while `resp.read()` returns bytes, encode the value.
     assert (await resp_2.read()) == b"DEADBEEF"

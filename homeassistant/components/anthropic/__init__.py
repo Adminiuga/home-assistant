@@ -1,0 +1,263 @@
+"""The Anthropic integration."""
+
+from functools import partial
+
+from homeassistant.config_entries import ConfigSubentry
+from homeassistant.const import CONF_API_KEY, Platform
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import (
+    config_validation as cv,
+    device_registry as dr,
+    entity_registry as er,
+    issue_registry as ir,
+)
+from homeassistant.helpers.typing import ConfigType, Undefined
+
+from .const import (
+    CONF_CHAT_MODEL,
+    CONF_EFFORT,
+    CONF_THINKING_TYPE,
+    DEFAULT_CONVERSATION_NAME,
+    DOMAIN,
+    LOGGER,
+)
+from .coordinator import AnthropicConfigEntry, AnthropicCoordinator
+
+PLATFORMS = (Platform.AI_TASK, Platform.CONVERSATION)
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Set up Anthropic."""
+    await async_migrate_integration(hass)
+    return True
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: AnthropicConfigEntry) -> None:
+    """Set up Anthropic from a config entry."""
+    coordinator = AnthropicCoordinator(hass, entry)
+    await coordinator.async_config_entry_first_refresh()
+    entry.runtime_data = coordinator
+    LOGGER.debug("Available models: %s", coordinator.data)
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    entry.async_on_unload(entry.add_update_listener(async_update_options))
+    entry.async_on_unload(
+        coordinator.async_add_listener(
+            partial(_async_check_model_lifecycle, hass, entry)
+        )
+    )
+    _async_check_model_lifecycle(hass, entry)
+
+
+@callback
+def _async_check_model_lifecycle(
+    hass: HomeAssistant, entry: AnthropicConfigEntry
+) -> None:
+    """Update the entry's repair issue for deprecated or retired models."""
+    issue_id = f"model_deprecated_{entry.entry_id}"
+    for subentry in entry.subentries.values():
+        if not (model := subentry.data.get(CONF_CHAT_MODEL)):
+            continue
+        model_info, found = entry.runtime_data.get_model_info(model)
+        if found and model_info.lifecycle in ("deprecated", "retired"):
+            ir.async_create_issue(
+                hass,
+                DOMAIN,
+                issue_id,
+                config_entry_id=entry.entry_id,
+                data={"entry_id": entry.entry_id},
+                is_fixable=True,
+                is_persistent=False,
+                learn_more_url="https://platform.claude.com/docs/en/about-claude/model-deprecations",
+                severity=ir.IssueSeverity.WARNING,
+                translation_key="model_deprecated",
+                translation_placeholders={"entry_name": entry.title},
+            )
+            return
+
+    ir.async_delete_issue(hass, DOMAIN, issue_id)
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: AnthropicConfigEntry) -> None:
+    """Unload Anthropic."""
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)
+
+
+async def async_update_options(
+    hass: HomeAssistant, entry: AnthropicConfigEntry
+) -> None:
+    """Update options."""
+    await hass.config_entries.async_reload(entry.entry_id)
+
+
+async def async_migrate_integration(hass: HomeAssistant) -> None:
+    """Migrate integration entry structure."""
+
+    # Make sure we get enabled config entries first
+    entries = sorted(
+        hass.config_entries.async_entries(DOMAIN),
+        key=lambda e: e.disabled_by is not None,
+    )
+    if not any(entry.version == 1 for entry in entries):
+        return
+
+    api_keys_entries: dict[str, tuple[AnthropicConfigEntry, bool]] = {}
+    entity_registry = er.async_get(hass)
+    device_registry = dr.async_get(hass)
+
+    for entry in entries:
+        use_existing = False
+        subentry = ConfigSubentry(
+            data=entry.options,
+            subentry_type="conversation",
+            title=entry.title,
+            unique_id=None,
+        )
+        if entry.data[CONF_API_KEY] not in api_keys_entries:
+            use_existing = True
+            all_disabled = all(
+                e.disabled_by is not None
+                for e in entries
+                if e.data[CONF_API_KEY] == entry.data[CONF_API_KEY]
+            )
+            api_keys_entries[entry.data[CONF_API_KEY]] = (entry, all_disabled)
+
+        parent_entry, all_disabled = api_keys_entries[entry.data[CONF_API_KEY]]
+
+        hass.config_entries.async_add_subentry(parent_entry, subentry)
+        conversation_entity_id = entity_registry.async_get_entity_id(
+            "conversation",
+            DOMAIN,
+            entry.entry_id,
+        )
+        device = device_registry.async_get_device_by_identifier(
+            (DOMAIN, entry.entry_id), entry.entry_id
+        )
+
+        if conversation_entity_id is not None:
+            conversation_entity_entry = entity_registry.entities[conversation_entity_id]
+            entity_disabled_by = conversation_entity_entry.disabled_by
+            if (
+                entity_disabled_by is er.RegistryEntryDisabler.CONFIG_ENTRY
+                and not all_disabled
+            ):
+                # Device and entity registries will set the disabled_by flag to None
+                # when moving a device or entity disabled by CONFIG_ENTRY to an enabled
+                # config entry, but we want to set it to DEVICE or USER instead,
+                entity_disabled_by = (
+                    er.RegistryEntryDisabler.DEVICE
+                    if device
+                    else er.RegistryEntryDisabler.USER
+                )
+            entity_registry.async_update_entity(
+                conversation_entity_id,
+                config_entry_id=parent_entry.entry_id,
+                config_subentry_id=subentry.subentry_id,
+                disabled_by=entity_disabled_by,
+                new_unique_id=subentry.subentry_id,
+            )
+
+        if device is not None:
+            # Device and entity registries will set the disabled_by flag to None
+            # when moving a device or entity disabled by CONFIG_ENTRY to an enabled
+            # config entry, but we want to set it to USER instead,
+            device_disabled_by: dr.DeviceEntryDisabler | Undefined = Undefined
+            if (
+                device.disabled_by is dr.DeviceEntryDisabler.CONFIG_ENTRY
+                and not all_disabled
+            ):
+                device_disabled_by = dr.DeviceEntryDisabler.USER
+            device_registry.async_update_device(
+                device.id,
+                disabled_by=device_disabled_by,
+                new_identifiers={(DOMAIN, subentry.subentry_id)},
+                new_config_entry_id=parent_entry.entry_id,
+                new_config_subentry_id=subentry.subentry_id,
+            )
+
+        if not use_existing:
+            await hass.config_entries.async_remove(entry.entry_id)
+        else:
+            hass.config_entries.async_update_entry(
+                entry,
+                title=DEFAULT_CONVERSATION_NAME,
+                options={},
+                version=2,
+                minor_version=3,
+            )
+
+
+async def async_migrate_entry(hass: HomeAssistant, entry: AnthropicConfigEntry) -> None:
+    """Migrate entry."""
+    LOGGER.debug("Migrating from version %s:%s", entry.version, entry.minor_version)
+
+    if entry.version == 2 and entry.minor_version == 1:
+        # Devices left in both the config entry and its subentry by Home Assistant Core
+        # 2025.7.0b0-2025.7.0b1 are collapsed onto the subentry by the device registry
+        # migration, so there's nothing to correct here.
+        hass.config_entries.async_update_entry(entry, minor_version=2)
+
+    if entry.version == 2 and entry.minor_version == 2:
+        # Fix migration where the disabled_by flag was not set correctly.
+        # We can currently only correct this for enabled config entries,
+        # because migration does not run for disabled config entries. This
+        # is asserted in tests, and if that behavior is changed, we should
+        # correct also disabled config entries.
+        device_registry = dr.async_get(hass)
+        entity_registry = er.async_get(hass)
+        devices = dr.async_entries_for_config_entry(device_registry, entry.entry_id)
+        entity_entries = er.async_entries_for_config_entry(
+            entity_registry, entry.entry_id
+        )
+        if entry.disabled_by is None:
+            # If the config entry is not disabled, we need to set the disabled_by
+            # flag on devices to USER, and on entities to DEVICE, if they are set
+            # to CONFIG_ENTRY.
+            for device in devices:
+                if device.disabled_by is not dr.DeviceEntryDisabler.CONFIG_ENTRY:
+                    continue
+                device_registry.async_update_device(
+                    device.id,
+                    disabled_by=dr.DeviceEntryDisabler.USER,
+                )
+            for entity in entity_entries:
+                if entity.disabled_by is not er.RegistryEntryDisabler.CONFIG_ENTRY:
+                    continue
+                entity_registry.async_update_entity(
+                    entity.entity_id,
+                    disabled_by=er.RegistryEntryDisabler.DEVICE,
+                )
+        hass.config_entries.async_update_entry(entry, minor_version=3)
+
+    if entry.version == 2 and entry.minor_version == 3:
+        # Remove Temperature parameter
+        temperature_key = "temperature"
+
+        for subentry in entry.subentries.values():
+            data = subentry.data.copy()
+            if temperature_key not in data:
+                continue
+            data.pop(temperature_key, None)
+            hass.config_entries.async_update_subentry(entry, subentry, data=data)
+
+        hass.config_entries.async_update_entry(entry, minor_version=4)
+
+    if entry.version == 2 and entry.minor_version == 4:
+        for subentry in entry.subentries.values():
+            data = subentry.data.copy()
+            if "thinking_effort" not in data:
+                continue
+            effort = data.pop("thinking_effort")
+            if effort == "none":
+                data[CONF_THINKING_TYPE] = "disabled"
+            else:
+                data[CONF_EFFORT] = effort
+            hass.config_entries.async_update_subentry(entry, subentry, data=data)
+
+        hass.config_entries.async_update_entry(entry, minor_version=5)
+
+    LOGGER.debug(
+        "Migration to version %s:%s successful", entry.version, entry.minor_version
+    )

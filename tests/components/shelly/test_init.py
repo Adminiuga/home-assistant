@@ -1,22 +1,91 @@
 """Test cases for the Shelly component."""
 
-from unittest.mock import AsyncMock
+import asyncio
+from collections.abc import Callable
+from datetime import timedelta
+from ipaddress import IPv4Address
+from typing import Any
+from unittest.mock import AsyncMock, Mock, call, patch
 
-from aioshelly.exceptions import DeviceConnectionError, InvalidAuthError
+from aioshelly.block_device import COAP
+from aioshelly.common import ConnectionOptions
+from aioshelly.const import (
+    DEFAULT_HTTPS_PORT,
+    MODEL_2PM_G3,
+    MODEL_BLU_GATEWAY_G3,
+    MODEL_PLUS_2PM,
+)
+from aioshelly.exceptions import (
+    DeviceConnectionError,
+    InvalidAuthError,
+    MacAddressMismatchError,
+    RpcCallError,
+)
+from aioshelly.rpc_device.utils import bluetooth_mac_from_primary_mac
+from freezegun.api import FrozenDateTimeFactory
 import pytest
+from pytest_homeassistant.common import (
+    MockConfigEntry,
+    async_capture_events,
+    async_fire_time_changed,
+    async_load_json_object_fixture,
+)
 
-from homeassistant.components.shelly.const import DOMAIN
-from homeassistant.config_entries import SOURCE_REAUTH, ConfigEntryState
-from homeassistant.const import STATE_ON, STATE_UNAVAILABLE
-from homeassistant.helpers import device_registry
+from homeassistant.components.shelly.const import (
+    BLE_SCANNER_FIRMWARE_UNSUPPORTED_ISSUE_ID,
+    BLE_SCANNER_MIN_FIRMWARE,
+    BLOCK_EXPECTED_SLEEP_PERIOD,
+    BLOCK_WRONG_SLEEP_PERIOD,
+    CONF_BLE_SCANNER_MODE,
+    CONF_GEN,
+    CONF_SLEEP_PERIOD,
+    DOMAIN,
+    ENTRY_RELOAD_COOLDOWN,
+    FIRMWARE_UNSUPPORTED_ISSUE_ID,
+    MODELS_WITH_WRONG_SLEEP_PERIOD,
+    RPC_RECONNECT_INTERVAL,
+    BLEScannerMode,
+)
+from homeassistant.components.switch import DOMAIN as SWITCH_DOMAIN
+from homeassistant.components.update import DOMAIN as UPDATE_DOMAIN
+from homeassistant.config_entries import SOURCE_REAUTH, ConfigEntry, ConfigEntryState
+from homeassistant.const import (
+    CONF_HOST,
+    CONF_MODEL,
+    CONF_PORT,
+    CONF_VERIFY_SSL,
+    STATE_ON,
+    STATE_UNAVAILABLE,
+)
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er, issue_registry as ir
+from homeassistant.helpers.device_registry import (
+    CONNECTION_NETWORK_MAC,
+    EVENT_DEVICE_REGISTRY_UPDATED,
+    AnyDeviceEntry,
+    ChildDeviceEntry,
+    DeviceRegistry,
+    format_mac,
+)
+from homeassistant.helpers.entity_registry import EntityRegistry
 from homeassistant.setup import async_setup_component
 
-from . import MOCK_MAC, init_integration
+from . import (
+    MOCK_MAC,
+    init_integration,
+    mock_rest_update,
+    mutate_rpc_device_status,
+    register_child_device,
+    register_entity,
+    register_legacy_sub_device,
+)
 
-from tests.common import MockConfigEntry
+FIRMWARE_UNSUPPORTED_ID = FIRMWARE_UNSUPPORTED_ISSUE_ID.format(unique=MOCK_MAC)
 
 
-async def test_custom_coap_port(hass, mock_block_device, caplog):
+async def test_custom_coap_port(
+    hass: HomeAssistant, mock_block_device: Mock, caplog: pytest.LogCaptureFixture
+) -> None:
     """Test custom coap port."""
     assert await async_setup_component(
         hass,
@@ -29,41 +98,107 @@ async def test_custom_coap_port(hass, mock_block_device, caplog):
     assert "Starting CoAP context with UDP port 7632" in caplog.text
 
 
-@pytest.mark.parametrize("gen", [1, 2])
+async def test_ip_address_with_only_default_interface(
+    hass: HomeAssistant, mock_block_device: Mock, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Test more local ip addresses with only the default interface.."""
+    with (
+        patch(
+            "homeassistant.components.network.async_only_default_interface_enabled",
+            return_value=True,
+        ),
+        patch(
+            "homeassistant.components.network.async_get_enabled_source_ips",
+            return_value=[IPv4Address("192.168.1.10"), IPv4Address("10.10.10.10")],
+        ),
+        patch(
+            "homeassistant.components.shelly.utils.COAP",
+            autospec=COAP,
+        ) as mock_coap_init,
+    ):
+        assert await async_setup_component(hass, DOMAIN, {DOMAIN: {"coap_port": 7632}})
+        await hass.async_block_till_done()
+
+        await init_integration(hass, 1)
+        assert "Starting CoAP context with UDP port 7632" in caplog.text
+        # Make sure COAP.initialize is called with an empty list
+        # when async_only_default_interface_enabled is True even if
+        # async_get_enabled_source_ips returns more than one address
+        assert mock_coap_init.mock_calls[1] == call().initialize(7632, [])
+
+
+async def test_ip_address_without_only_default_interface(
+    hass: HomeAssistant, mock_block_device: Mock, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Test more local ip addresses without only the default interface.."""
+    with (
+        patch(
+            "homeassistant.components.network.async_only_default_interface_enabled",
+            return_value=False,
+        ),
+        patch(
+            "homeassistant.components.network.async_get_enabled_source_ips",
+            return_value=[IPv4Address("192.168.1.10"), IPv4Address("10.10.10.10")],
+        ),
+        patch(
+            "homeassistant.components.shelly.utils.COAP",
+            autospec=COAP,
+        ) as mock_coap_init,
+    ):
+        assert await async_setup_component(hass, DOMAIN, {DOMAIN: {"coap_port": 7632}})
+        await hass.async_block_till_done()
+
+        await init_integration(hass, 1)
+        assert "Starting CoAP context with UDP port 7632" in caplog.text
+        assert mock_coap_init.mock_calls[1] == call().initialize(
+            7632, [IPv4Address("192.168.1.10"), IPv4Address("10.10.10.10")]
+        )
+
+
+@pytest.mark.parametrize("gen", [1, 2, 3])
 async def test_shared_device_mac(
-    hass, gen, mock_block_device, mock_rpc_device, device_reg, caplog
-):
+    hass: HomeAssistant,
+    gen: int,
+    mock_block_device: Mock,
+    mock_rpc_device: Mock,
+    device_registry: DeviceRegistry,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """Test first time shared device with another domain."""
-    config_entry = MockConfigEntry(domain="test", data={}, unique_id="some_id")
-    config_entry.add_to_hass(hass)
-    device_reg.async_get_or_create(
-        config_entry_id=config_entry.entry_id,
-        connections={
-            (
-                device_registry.CONNECTION_NETWORK_MAC,
-                device_registry.format_mac(MOCK_MAC),
-            )
-        },
+    other_entry = MockConfigEntry(domain="other_domain", unique_id=MOCK_MAC)
+    other_entry.add_to_hass(hass)
+    device_registry.async_get_or_create(
+        config_entry_id=other_entry.entry_id,
+        connections={(CONNECTION_NETWORK_MAC, MOCK_MAC)},
     )
+
     await init_integration(hass, gen, sleep_period=1000)
     assert "will resume when device is online" in caplog.text
 
+    other_device = device_registry.async_get_device_by_connection(
+        (CONNECTION_NETWORK_MAC, MOCK_MAC), other_entry.entry_id
+    )
+    assert other_device is not None
 
-async def test_setup_entry_not_shelly(hass, caplog):
+
+async def test_setup_entry_not_shelly(hass: HomeAssistant) -> None:
     """Test not Shelly entry."""
-    entry = MockConfigEntry(domain=DOMAIN, data={}, unique_id=DOMAIN)
-    entry.add_to_hass(hass)
+    entry = await init_integration(hass, 1, data={})
+    assert entry.state is ConfigEntryState.SETUP_ERROR
+    assert entry.reason == (
+        "The config entry Test name probably comes from a custom integration, please"
+        " remove it if you want to use core Shelly integration"
+    )
 
-    assert await hass.config_entries.async_setup(entry.entry_id) is False
-    await hass.async_block_till_done()
 
-    assert "probably comes from a custom integration" in caplog.text
-
-
-@pytest.mark.parametrize("gen", [1, 2])
+@pytest.mark.parametrize("gen", [1, 2, 3])
 async def test_device_connection_error(
-    hass, gen, mock_block_device, mock_rpc_device, monkeypatch
-):
+    hass: HomeAssistant,
+    gen: int,
+    mock_block_device: Mock,
+    mock_rpc_device: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Test device connection error."""
     monkeypatch.setattr(
         mock_block_device, "initialize", AsyncMock(side_effect=DeviceConnectionError)
@@ -73,13 +208,159 @@ async def test_device_connection_error(
     )
 
     entry = await init_integration(hass, gen)
-    assert entry.state == ConfigEntryState.SETUP_RETRY
+    assert entry.state is ConfigEntryState.SETUP_RETRY
 
 
-@pytest.mark.parametrize("gen", [1, 2])
+@pytest.mark.parametrize("gen", [1, 2, 3])
+async def test_device_unsupported_firmware(
+    hass: HomeAssistant,
+    gen: int,
+    mock_block_device: Mock,
+    mock_rpc_device: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+    issue_registry: ir.IssueRegistry,
+    entity_registry: EntityRegistry,
+) -> None:
+    """Test device init with unsupported firmware sets up only the update platform."""
+    # Old block firmware does not have CoIoT settings
+    monkeypatch.delitem(mock_block_device.settings, "coiot")
+    monkeypatch.setattr(mock_block_device, "firmware_supported", False)
+    monkeypatch.setattr(mock_rpc_device, "firmware_supported", False)
+
+    entry = await init_integration(hass, gen)
+    assert entry.state is ConfigEntryState.LOADED
+    assert {
+        entity.domain
+        for entity in er.async_entries_for_config_entry(entity_registry, entry.entry_id)
+    } == {UPDATE_DOMAIN}
+
+    assert (issue := issue_registry.async_get_issue(DOMAIN, FIRMWARE_UNSUPPORTED_ID))
+    assert issue.config_entry_id == entry.entry_id
+    assert issue.is_fixable is True
+    assert issue.translation_key == "unsupported_firmware_fixable"
+    assert issue.data == {"entry_id": entry.entry_id}
+
+    await hass.config_entries.async_remove(entry.entry_id)
+    await hass.async_block_till_done()
+    assert not issue_registry.async_get_issue(DOMAIN, FIRMWARE_UNSUPPORTED_ID)
+
+
+async def test_block_device_unsupported_firmware_updated(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    mock_block_device: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+    issue_registry: ir.IssueRegistry,
+) -> None:
+    """Test block device entry is reloaded once firmware is supported."""
+    entity_id = "switch.test_name_channel_1"
+    coiot_settings = mock_block_device.settings["coiot"]
+    # Old block firmware does not have CoIoT settings
+    monkeypatch.delitem(mock_block_device.settings, "coiot")
+    monkeypatch.setattr(mock_block_device, "firmware_supported", False)
+
+    entry = await init_integration(hass, 1)
+    assert entry.state is ConfigEntryState.LOADED
+    assert not hass.states.get(entity_id)
+    assert issue_registry.async_get_issue(DOMAIN, FIRMWARE_UNSUPPORTED_ID)
+
+    # Firmware is still unsupported, no reload
+    await mock_rest_update(hass, freezer)
+    await mock_rest_update(hass, freezer, seconds=ENTRY_RELOAD_COOLDOWN)
+    assert not hass.states.get(entity_id)
+    mock_block_device.shutdown.assert_not_called()
+    # CoAP is not polled for unsupported firmware
+    mock_block_device.update.assert_not_called()
+
+    monkeypatch.setitem(mock_block_device.settings, "coiot", coiot_settings)
+    monkeypatch.setattr(mock_block_device, "firmware_supported", True)
+    await mock_rest_update(hass, freezer)
+    await mock_rest_update(hass, freezer, seconds=ENTRY_RELOAD_COOLDOWN)
+
+    assert entry.state is ConfigEntryState.LOADED
+    assert (state := hass.states.get(entity_id))
+    assert state.state == STATE_ON
+    assert not issue_registry.async_get_issue(DOMAIN, FIRMWARE_UNSUPPORTED_ID)
+    # Device is shut down when the limited entry is unloaded for reload
+    mock_block_device.shutdown.assert_called_once()
+
+
+async def test_rpc_device_unsupported_firmware_updated(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    mock_rpc_device: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+    issue_registry: ir.IssueRegistry,
+) -> None:
+    """Test RPC device entry is reloaded once firmware is supported."""
+    entity_id = "switch.test_name_test_switch_0"
+    update_entity_id = "update.test_name_firmware"
+    monkeypatch.delitem(mock_rpc_device.status, "cover:0")
+    monkeypatch.setitem(mock_rpc_device.status["sys"], "relay_in_thermostat", False)
+    monkeypatch.setattr(mock_rpc_device, "firmware_supported", False)
+
+    entry = await init_integration(hass, 2)
+    assert entry.state is ConfigEntryState.LOADED
+    assert not hass.states.get(entity_id)
+    assert issue_registry.async_get_issue(DOMAIN, FIRMWARE_UNSUPPORTED_ID)
+
+    # Device reconnects still running unsupported firmware
+    monkeypatch.setattr(mock_rpc_device, "connected", False)
+    freezer.tick(timedelta(seconds=RPC_RECONNECT_INTERVAL))
+    async_fire_time_changed(hass)
+    await hass.async_block_till_done()
+
+    assert (state := hass.states.get(update_entity_id))
+    assert state.state != STATE_UNAVAILABLE
+
+    freezer.tick(timedelta(seconds=ENTRY_RELOAD_COOLDOWN))
+    async_fire_time_changed(hass)
+    await hass.async_block_till_done()
+    assert not hass.states.get(entity_id)
+
+    # Device reconnects after firmware update
+    monkeypatch.setattr(mock_rpc_device, "firmware_supported", True)
+    freezer.tick(timedelta(seconds=RPC_RECONNECT_INTERVAL))
+    async_fire_time_changed(hass)
+    await hass.async_block_till_done()
+    freezer.tick(timedelta(seconds=ENTRY_RELOAD_COOLDOWN))
+    async_fire_time_changed(hass)
+    await hass.async_block_till_done()
+
+    assert entry.state is ConfigEntryState.LOADED
+    assert (state := hass.states.get(entity_id))
+    assert state.state == STATE_ON
+    assert not issue_registry.async_get_issue(DOMAIN, FIRMWARE_UNSUPPORTED_ID)
+
+
+@pytest.mark.parametrize("gen", [1, 2, 3])
+async def test_mac_mismatch_error(
+    hass: HomeAssistant,
+    gen: int,
+    mock_block_device: Mock,
+    mock_rpc_device: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test device MAC address mismatch error."""
+    monkeypatch.setattr(
+        mock_block_device, "initialize", AsyncMock(side_effect=MacAddressMismatchError)
+    )
+    monkeypatch.setattr(
+        mock_rpc_device, "initialize", AsyncMock(side_effect=MacAddressMismatchError)
+    )
+
+    entry = await init_integration(hass, gen)
+    assert entry.state is ConfigEntryState.SETUP_RETRY
+
+
+@pytest.mark.parametrize("gen", [1, 2, 3])
 async def test_device_auth_error(
-    hass, gen, mock_block_device, mock_rpc_device, monkeypatch
-):
+    hass: HomeAssistant,
+    gen: int,
+    mock_block_device: Mock,
+    mock_rpc_device: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Test device authentication error."""
     monkeypatch.setattr(
         mock_block_device, "initialize", AsyncMock(side_effect=InvalidAuthError)
@@ -89,7 +370,7 @@ async def test_device_auth_error(
     )
 
     entry = await init_integration(hass, gen)
-    assert entry.state == ConfigEntryState.SETUP_ERROR
+    assert entry.state is ConfigEntryState.SETUP_ERROR
 
     flows = hass.config_entries.flow.async_progress()
     assert len(flows) == 1
@@ -103,82 +384,832 @@ async def test_device_auth_error(
     assert flow["context"].get("entry_id") == entry.entry_id
 
 
-@pytest.mark.parametrize("entry_sleep, device_sleep", [(None, 0), (1000, 1000)])
+@pytest.mark.parametrize(("entry_sleep", "device_sleep"), [(None, 0), (3600, 3600)])
 async def test_sleeping_block_device_online(
-    hass, entry_sleep, device_sleep, mock_block_device, device_reg, caplog
-):
+    hass: HomeAssistant,
+    entry_sleep: int | None,
+    device_sleep: int,
+    mock_block_device: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+    device_registry: DeviceRegistry,
+    entity_registry: EntityRegistry,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """Test sleeping block device online."""
-    config_entry = MockConfigEntry(domain=DOMAIN, data={}, unique_id="shelly")
-    config_entry.add_to_hass(hass)
-    device_reg.async_get_or_create(
-        config_entry_id=config_entry.entry_id,
-        connections={
-            (
-                device_registry.CONNECTION_NETWORK_MAC,
-                device_registry.format_mac(MOCK_MAC),
-            )
-        },
+    # A device with the same MAC owned by another entry must be ignored
+    other_entry = await init_integration(
+        hass, 1, data={}, skip_setup=True, unique_id="shelly"
+    )
+    other_device = device_registry.async_get_or_create(
+        config_entry_id=other_entry.entry_id,
+        connections={(CONNECTION_NETWORK_MAC, format_mac(MOCK_MAC))},
+    )
+    entity_registry.async_get_or_create(
+        "sensor", DOMAIN, "other", config_entry=other_entry, device_id=other_device.id
     )
 
+    monkeypatch.setitem(
+        mock_block_device.settings,
+        "sleep_mode",
+        {"period": int(device_sleep / 60), "unit": "m"},
+    )
     entry = await init_integration(hass, 1, sleep_period=entry_sleep)
     assert "will resume when device is online" in caplog.text
 
-    mock_block_device.mock_update()
+    mock_block_device.mock_online()
+    await hass.async_block_till_done(wait_background_tasks=True)
+
     assert "online, resuming setup" in caplog.text
-    assert entry.data["sleep_period"] == device_sleep
+    assert entry.data[CONF_SLEEP_PERIOD] == device_sleep
 
 
-@pytest.mark.parametrize("entry_sleep, device_sleep", [(None, 0), (1000, 1000)])
+@pytest.mark.parametrize(("entry_sleep", "device_sleep"), [(None, 0), (1000, 1000)])
 async def test_sleeping_rpc_device_online(
-    hass, entry_sleep, device_sleep, mock_rpc_device, caplog
-):
+    hass: HomeAssistant,
+    entry_sleep: int | None,
+    device_sleep: int,
+    mock_rpc_device: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """Test sleeping RPC device online."""
+    monkeypatch.setattr(mock_rpc_device, "connected", False)
+    monkeypatch.setitem(mock_rpc_device.status["sys"], "wakeup_period", device_sleep)
     entry = await init_integration(hass, 2, sleep_period=entry_sleep)
     assert "will resume when device is online" in caplog.text
 
-    mock_rpc_device.mock_update()
+    mock_rpc_device.mock_online()
+    await hass.async_block_till_done(wait_background_tasks=True)
+
     assert "online, resuming setup" in caplog.text
-    assert entry.data["sleep_period"] == device_sleep
+    assert entry.data[CONF_SLEEP_PERIOD] == device_sleep
+
+
+async def test_sleeping_rpc_device_online_new_firmware(
+    hass: HomeAssistant,
+    mock_rpc_device: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test sleeping device Gen2 with firmware 1.0.0 or later."""
+    monkeypatch.setattr(mock_rpc_device, "connected", False)
+    entry = await init_integration(hass, 2, sleep_period=None)
+    assert "will resume when device is online" in caplog.text
+
+    mutate_rpc_device_status(monkeypatch, mock_rpc_device, "sys", "wakeup_period", 1500)
+    mock_rpc_device.mock_online()
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert "online, resuming setup" in caplog.text
+    assert entry.data[CONF_SLEEP_PERIOD] == 1500
+
+
+async def test_sleeping_rpc_device_online_during_setup(
+    hass: HomeAssistant,
+    mock_sleepy_rpc_device: Mock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test sleeping device Gen2 woke up by user during setup."""
+    await init_integration(hass, 2, sleep_period=1000)
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert "will resume when device is online" in caplog.text
+    assert "is online (source: setup)" in caplog.text
+
+    assert hass.states.get("sensor.test_name_temperature")
+
+
+async def test_sleeping_rpc_device_offline_during_setup(
+    hass: HomeAssistant,
+    mock_rpc_device: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test sleeping device Gen2 woke up by user during setup."""
+    monkeypatch.setattr(mock_rpc_device, "connected", False)
+    monkeypatch.setitem(mock_rpc_device.status["sys"], "wakeup_period", 1000)
+    monkeypatch.setattr(
+        mock_rpc_device, "initialize", AsyncMock(side_effect=DeviceConnectionError)
+    )
+
+    # Init integration, should fail since device is offline
+    await init_integration(hass, 2, sleep_period=1000)
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert "will resume when device is online" in caplog.text
+    assert "is online (source: setup)" in caplog.text
+    assert hass.states.get("sensor.test_name_temperature") is None
+
+    # Create an online event and verify that device is init successfully
+    monkeypatch.setattr(mock_rpc_device, "initialize", AsyncMock())
+    mock_rpc_device.mock_online()
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert hass.states.get("sensor.test_name_temperature")
 
 
 @pytest.mark.parametrize(
-    "gen, entity_id",
+    ("gen", "entity_id"),
     [
         (1, "switch.test_name_channel_1"),
-        (2, "switch.test_switch_0"),
+        (2, "switch.test_name_test_switch_0"),
     ],
 )
-async def test_entry_unload(hass, gen, entity_id, mock_block_device, mock_rpc_device):
+async def test_entry_unload(
+    hass: HomeAssistant,
+    gen: int,
+    entity_id: str,
+    mock_block_device: Mock,
+    mock_rpc_device: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Test entry unload."""
+    monkeypatch.delitem(mock_rpc_device.status, "cover:0")
+    monkeypatch.setitem(mock_rpc_device.status["sys"], "relay_in_thermostat", False)
     entry = await init_integration(hass, gen)
 
     assert entry.state is ConfigEntryState.LOADED
-    assert hass.states.get(entity_id).state is STATE_ON
+    assert (state := hass.states.get(entity_id))
+    assert state.state == STATE_ON
 
     await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()
 
     assert entry.state is ConfigEntryState.NOT_LOADED
-    assert hass.states.get(entity_id).state is STATE_UNAVAILABLE
+    assert (state := hass.states.get(entity_id))
+    assert state.state == STATE_UNAVAILABLE
 
 
 @pytest.mark.parametrize(
-    "gen, entity_id",
+    ("gen", "entity_id"),
     [
         (1, "switch.test_name_channel_1"),
-        (2, "switch.test_switch_0"),
+        (2, "switch.test_name_test_switch_0"),
     ],
 )
 async def test_entry_unload_device_not_ready(
-    hass, gen, entity_id, mock_block_device, mock_rpc_device
-):
+    hass: HomeAssistant,
+    gen: int,
+    entity_id: str,
+    mock_block_device: Mock,
+    mock_rpc_device: Mock,
+) -> None:
     """Test entry unload when device is not ready."""
-    entry = await init_integration(hass, gen, sleep_period=1000)
-
+    assert (entry := await init_integration(hass, gen, sleep_period=1000))
     assert entry.state is ConfigEntryState.LOADED
+
     assert hass.states.get(entity_id) is None
 
     await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()
 
     assert entry.state is ConfigEntryState.NOT_LOADED
+
+
+async def test_entry_unload_not_connected(
+    hass: HomeAssistant, mock_rpc_device: Mock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test entry unload when not connected."""
+    monkeypatch.delitem(mock_rpc_device.status, "cover:0")
+    monkeypatch.setitem(mock_rpc_device.status["sys"], "relay_in_thermostat", False)
+
+    with patch(
+        "homeassistant.components.shelly.coordinator.async_stop_scanner"
+    ) as mock_stop_scanner:
+        assert (
+            entry := await init_integration(
+                hass, 2, options={CONF_BLE_SCANNER_MODE: BLEScannerMode.ACTIVE}
+            )
+        )
+        assert entry.state is ConfigEntryState.LOADED
+
+        assert (state := hass.states.get("switch.test_name_test_switch_0"))
+        assert state.state == STATE_ON
+        assert not mock_stop_scanner.call_count
+
+        monkeypatch.setattr(mock_rpc_device, "connected", False)
+
+        await hass.config_entries.async_reload(entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert not mock_stop_scanner.call_count
+    assert entry.state is ConfigEntryState.LOADED
+
+
+async def test_entry_unload_not_connected_but_we_think_we_are(
+    hass: HomeAssistant, mock_rpc_device: Mock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test entry unload when not connected but we think we are still connected."""
+    monkeypatch.delitem(mock_rpc_device.status, "cover:0")
+    monkeypatch.setitem(mock_rpc_device.status["sys"], "relay_in_thermostat", False)
+
+    with patch(
+        "homeassistant.components.shelly.coordinator.async_stop_scanner",
+        side_effect=DeviceConnectionError,
+    ) as mock_stop_scanner:
+        assert (
+            entry := await init_integration(
+                hass, 2, options={CONF_BLE_SCANNER_MODE: BLEScannerMode.ACTIVE}
+            )
+        )
+        assert entry.state is ConfigEntryState.LOADED
+
+        assert (state := hass.states.get("switch.test_name_test_switch_0"))
+        assert state.state == STATE_ON
+        assert not mock_stop_scanner.call_count
+
+        monkeypatch.setattr(mock_rpc_device, "connected", False)
+
+        await hass.config_entries.async_reload(entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert not mock_stop_scanner.call_count
+    assert entry.state is ConfigEntryState.LOADED
+
+
+async def test_no_attempt_to_stop_scanner_with_sleepy_devices(
+    hass: HomeAssistant, mock_rpc_device: Mock
+) -> None:
+    """Test we do not try to stop the scanner if its disabled with a sleepy device."""
+    with patch(
+        "homeassistant.components.shelly.coordinator.async_stop_scanner",
+    ) as mock_stop_scanner:
+        entry = await init_integration(hass, 2, sleep_period=7200)
+        assert entry.state is ConfigEntryState.LOADED
+        assert not mock_stop_scanner.call_count
+
+        mock_rpc_device.mock_update()
+        await hass.async_block_till_done()
+        assert not mock_stop_scanner.call_count
+
+
+async def test_entry_missing_gen(hass: HomeAssistant, mock_block_device: Mock) -> None:
+    """Test successful Gen1 device init when gen is missing in entry data."""
+    entry = await init_integration(hass, None)
+
+    assert entry.state is ConfigEntryState.LOADED
+
+    # num_outputs is 2, channel name is used
+    assert (state := hass.states.get("switch.test_name_channel_1"))
+    assert state.state == STATE_ON
+
+
+async def test_entry_missing_port(hass: HomeAssistant) -> None:
+    """Test successful Gen2 device init when port is missing in entry data."""
+    data = {
+        CONF_HOST: "192.168.1.37",
+        CONF_SLEEP_PERIOD: 0,
+        CONF_MODEL: MODEL_PLUS_2PM,
+        CONF_GEN: 2,
+    }
+    entry = await init_integration(hass, 2, data=data, skip_setup=True)
+    with (
+        patch("homeassistant.components.shelly.RpcDevice.initialize"),
+        patch(
+            "homeassistant.components.shelly.RpcDevice.create", return_value=Mock()
+        ) as rpc_device_mock,
+    ):
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+        assert rpc_device_mock.call_args[0][2] == ConnectionOptions(
+            ip_address="192.168.1.37",
+            device_mac="123456789ABC",
+            port=80,
+            verify_ssl=False,
+        )
+
+
+async def test_rpc_entry_custom_port(hass: HomeAssistant) -> None:
+    """Test successful Gen2 device init using custom port."""
+    data = {
+        CONF_HOST: "192.168.1.37",
+        CONF_SLEEP_PERIOD: 0,
+        CONF_MODEL: MODEL_PLUS_2PM,
+        CONF_GEN: 2,
+        CONF_PORT: 8001,
+    }
+    entry = await init_integration(hass, 2, data=data, skip_setup=True)
+    with (
+        patch("homeassistant.components.shelly.RpcDevice.initialize"),
+        patch(
+            "homeassistant.components.shelly.RpcDevice.create", return_value=Mock()
+        ) as rpc_device_mock,
+    ):
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+        assert rpc_device_mock.call_args[0][2] == ConnectionOptions(
+            ip_address="192.168.1.37",
+            device_mac="123456789ABC",
+            port=8001,
+            verify_ssl=False,
+        )
+
+
+async def test_rpc_entry_https_verify_ssl_disabled(hass: HomeAssistant) -> None:
+    """Test Gen2 HTTPS setup passes verify_ssl=False to ConnectionOptions."""
+    data = {
+        CONF_HOST: "192.168.1.37",
+        CONF_SLEEP_PERIOD: 0,
+        CONF_MODEL: MODEL_PLUS_2PM,
+        CONF_GEN: 2,
+        CONF_PORT: DEFAULT_HTTPS_PORT,
+        CONF_VERIFY_SSL: False,
+    }
+    entry = await init_integration(hass, 2, data=data, skip_setup=True)
+    with (
+        patch("homeassistant.components.shelly.RpcDevice.initialize"),
+        patch(
+            "homeassistant.components.shelly.RpcDevice.create", return_value=Mock()
+        ) as rpc_device_mock,
+    ):
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+        assert rpc_device_mock.call_args[0][2] == ConnectionOptions(
+            ip_address="192.168.1.37",
+            device_mac="123456789ABC",
+            port=DEFAULT_HTTPS_PORT,
+            verify_ssl=False,
+        )
+
+
+@pytest.mark.parametrize(("model"), MODELS_WITH_WRONG_SLEEP_PERIOD)
+async def test_sleeping_block_device_wrong_sleep_period(
+    hass: HomeAssistant, mock_block_device: Mock, model: str
+) -> None:
+    """Test sleeping block device with wrong sleep period."""
+    entry = await init_integration(
+        hass, 1, model=model, sleep_period=BLOCK_WRONG_SLEEP_PERIOD, skip_setup=True
+    )
+    assert entry.data[CONF_SLEEP_PERIOD] == BLOCK_WRONG_SLEEP_PERIOD
+    await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    assert entry.data[CONF_SLEEP_PERIOD] == BLOCK_EXPECTED_SLEEP_PERIOD
+
+
+async def test_bluetooth_cleanup_on_remove_entry(
+    hass: HomeAssistant,
+    mock_rpc_device: Mock,
+) -> None:
+    """Test bluetooth is cleaned up on entry removal."""
+    entry = await init_integration(hass, 2)
+
+    assert entry.state is ConfigEntryState.LOADED
+
+    await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+    with patch("homeassistant.components.shelly.async_remove_scanner") as remove_mock:
+        await hass.config_entries.async_remove(entry.entry_id)
+        await hass.async_block_till_done()
+
+    remove_mock.assert_called_once_with(
+        hass, format_mac(bluetooth_mac_from_primary_mac(entry.unique_id)).upper()
+    )
+
+
+async def test_device_script_getcode_error(
+    hass: HomeAssistant,
+    mock_rpc_device: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test device script get code error."""
+    monkeypatch.setattr(
+        mock_rpc_device, "script_getcode", AsyncMock(side_effect=RpcCallError(0))
+    )
+
+    entry = await init_integration(hass, 2)
+    assert entry.state is ConfigEntryState.SETUP_RETRY
+
+
+@pytest.mark.parametrize("method", ["ledstrip_list_effects", "ledstrip_list_palettes"])
+async def test_device_ledstrip_list_error(
+    hass: HomeAssistant,
+    mock_ledstrip_rpc_device: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+) -> None:
+    """Test device LED strip list error."""
+    monkeypatch.setattr(
+        mock_ledstrip_rpc_device, method, AsyncMock(side_effect=RpcCallError(0))
+    )
+
+    entry = await init_integration(hass, 2)
+    assert entry.state is ConfigEntryState.SETUP_RETRY
+
+
+async def test_ble_scanner_unsupported_firmware_fixed(
+    hass: HomeAssistant,
+    mock_rpc_device: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+    issue_registry: ir.IssueRegistry,
+) -> None:
+    """Test device init with unsupported firmware."""
+    issue_id = BLE_SCANNER_FIRMWARE_UNSUPPORTED_ISSUE_ID.format(unique=MOCK_MAC)
+    entry = await init_integration(
+        hass, 2, options={CONF_BLE_SCANNER_MODE: BLEScannerMode.AUTO}
+    )
+
+    assert issue_registry.async_get_issue(DOMAIN, issue_id)
+    assert len(issue_registry.issues) == 1
+
+    monkeypatch.setitem(mock_rpc_device.shelly, "ver", BLE_SCANNER_MIN_FIRMWARE)
+
+    await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert not issue_registry.async_get_issue(DOMAIN, issue_id)
+    assert len(issue_registry.issues) == 0
+
+
+@pytest.mark.parametrize(
+    ("starting_options", "expected_mode"),
+    [
+        ({CONF_BLE_SCANNER_MODE: BLEScannerMode.ACTIVE}, BLEScannerMode.AUTO),
+        ({CONF_BLE_SCANNER_MODE: BLEScannerMode.PASSIVE}, BLEScannerMode.PASSIVE),
+        ({CONF_BLE_SCANNER_MODE: BLEScannerMode.DISABLED}, BLEScannerMode.DISABLED),
+        ({}, None),
+    ],
+    ids=["active_to_auto", "passive_kept", "disabled_kept", "no_option"],
+)
+async def test_migrate_ble_scanner_mode(
+    hass: HomeAssistant,
+    mock_rpc_device: Mock,
+    starting_options: dict[str, Any],
+    expected_mode: BLEScannerMode | None,
+) -> None:
+    """Active migrates to Auto once; other modes stay put."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            CONF_HOST: "192.168.1.37",
+            CONF_SLEEP_PERIOD: 0,
+            CONF_MODEL: MODEL_PLUS_2PM,
+            "gen": 2,
+        },
+        unique_id=MOCK_MAC,
+        options=starting_options,
+        title="Test name",
+        minor_version=2,
+    )
+    entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert entry.minor_version == 3
+    assert entry.options.get(CONF_BLE_SCANNER_MODE) == expected_mode
+
+
+async def test_migrate_ble_scanner_mode_future_version(
+    hass: HomeAssistant,
+    mock_rpc_device: Mock,
+) -> None:
+    """Future versions are not downgraded."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            CONF_HOST: "192.168.1.37",
+            CONF_SLEEP_PERIOD: 0,
+            CONF_MODEL: MODEL_PLUS_2PM,
+            "gen": 2,
+        },
+        unique_id=MOCK_MAC,
+        options={CONF_BLE_SCANNER_MODE: BLEScannerMode.ACTIVE},
+        title="Test name",
+        version=2,
+        minor_version=1,
+    )
+    entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert entry.state is ConfigEntryState.MIGRATION_ERROR
+    assert entry.version == 2
+    assert entry.minor_version == 1
+    assert entry.options[CONF_BLE_SCANNER_MODE] == BLEScannerMode.ACTIVE
+
+
+async def test_migrate_ble_scanner_mode_future_minor_version(
+    hass: HomeAssistant,
+    mock_rpc_device: Mock,
+) -> None:
+    """Future minor versions are not downgraded."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            CONF_HOST: "192.168.1.37",
+            CONF_SLEEP_PERIOD: 0,
+            CONF_MODEL: MODEL_PLUS_2PM,
+            "gen": 2,
+        },
+        unique_id=MOCK_MAC,
+        options={CONF_BLE_SCANNER_MODE: BLEScannerMode.ACTIVE},
+        title="Test name",
+        version=1,
+        minor_version=4,
+    )
+    entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert entry.state is ConfigEntryState.LOADED
+    assert entry.version == 1
+    assert entry.minor_version == 4
+    assert entry.options[CONF_BLE_SCANNER_MODE] == BLEScannerMode.ACTIVE
+
+
+@pytest.mark.parametrize("model", [MODEL_BLU_GATEWAY_G3, MODEL_PLUS_2PM])
+async def test_blu_trv_stale_device_removal(
+    hass: HomeAssistant,
+    mock_blu_trv: Mock,
+    entity_registry: EntityRegistry,
+    device_registry: DeviceRegistry,
+    monkeypatch: pytest.MonkeyPatch,
+    model: str,
+) -> None:
+    """Test BLU TRV removal of stale a device after un-pairing."""
+    trv_200_entity_id = "climate.trv_name"
+    trv_201_entity_id = "climate.trv_201"
+
+    monkeypatch.setattr(mock_blu_trv, "model", model)
+    gw_entry = await init_integration(hass, 3, model=model)
+
+    # verify that both trv devices are present
+    assert hass.states.get(trv_200_entity_id) is not None
+    trv_200_entry = entity_registry.async_get(trv_200_entity_id)
+    assert trv_200_entry
+
+    trv_200_device_entry = device_registry.async_get(trv_200_entry.device_id)
+    assert trv_200_device_entry
+    assert trv_200_device_entry.name == "TRV-Name"
+
+    assert hass.states.get(trv_201_entity_id) is not None
+    trv_201_entry = entity_registry.async_get(trv_201_entity_id)
+    assert trv_201_entry
+
+    trv_201_device_entry = device_registry.async_get(trv_201_entry.device_id)
+    assert trv_201_device_entry
+    assert trv_201_device_entry.name == "TRV-201"
+
+    # simulate un-pairing of trv 201 device
+    monkeypatch.delitem(mock_blu_trv.config, "blutrv:201")
+    monkeypatch.delitem(mock_blu_trv.status, "blutrv:201")
+
+    await hass.config_entries.async_reload(gw_entry.entry_id)
+    await hass.async_block_till_done()
+
+    # verify that trv 201 is removed
+    assert hass.states.get(trv_200_entity_id) is not None
+    assert device_registry.async_get(trv_200_entry.device_id) is not None
+
+    assert hass.states.get(trv_201_entity_id) is None
+    assert device_registry.async_get(trv_201_entry.device_id) is None
+
+
+@pytest.mark.parametrize(
+    "register_func",
+    [
+        pytest.param(register_child_device, id="child_device"),
+        pytest.param(register_legacy_sub_device, id="legacy_via_device"),
+    ],
+)
+@pytest.mark.usefixtures("mock_rpc_device")
+async def test_empty_device_removal(
+    hass: HomeAssistant,
+    device_registry: DeviceRegistry,
+    register_func: Callable[[DeviceRegistry, ConfigEntry, str], AnyDeviceEntry],
+) -> None:
+    """Test removal of empty devices due to device configuration changes."""
+    config_entry = await init_integration(hass, 3)
+
+    # create empty sub-device
+    sub_device_entry = register_func(
+        device_registry,
+        config_entry,
+        "boolean:201-boolean",
+    )
+
+    # verify that the sub-device is created
+    assert device_registry.async_get(sub_device_entry.id) is not None
+
+    # device config change triggers a reload
+    await hass.config_entries.async_reload(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    # verify that the empty sub-device is removed
+    assert device_registry.async_get(sub_device_entry.id) is None
+
+
+async def test_sub_device_kept_on_reload(
+    hass: HomeAssistant,
+    entity_registry: EntityRegistry,
+    device_registry: DeviceRegistry,
+    mock_rpc_device: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test channel sub-devices are not removed as stale BLU TRV devices."""
+    device_fixture = await async_load_json_object_fixture(hass, "2pm_gen3.json", DOMAIN)
+    monkeypatch.setattr(mock_rpc_device, "shelly", device_fixture["shelly"])
+    monkeypatch.setattr(mock_rpc_device, "status", device_fixture["status"])
+    monkeypatch.setattr(mock_rpc_device, "config", device_fixture["config"])
+    config_entry = await init_integration(hass, gen=3, model=MODEL_2PM_G3)
+
+    sub_device_ids = set()
+    for entity_id in ("switch.test_name_output_0", "switch.test_name_output_1"):
+        entry = entity_registry.async_get(entity_id)
+        assert entry
+        device_entry = device_registry.async_get(entry.device_id)
+        assert isinstance(device_entry, ChildDeviceEntry)
+        sub_device_ids.add(device_entry.id)
+
+    events = async_capture_events(hass, EVENT_DEVICE_REGISTRY_UPDATED)
+
+    await hass.config_entries.async_reload(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert not [event for event in events if event.data["action"] == "remove"]
+    for device_id in sub_device_ids:
+        assert device_registry.async_get(device_id)
+
+
+async def test_legacy_sub_device_converted_to_child_device(
+    hass: HomeAssistant,
+    entity_registry: EntityRegistry,
+    device_registry: DeviceRegistry,
+    mock_rpc_device: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test a legacy sub-device with entities is converted to a child device."""
+    device_fixture = await async_load_json_object_fixture(hass, "2pm_gen3.json", DOMAIN)
+    monkeypatch.setattr(mock_rpc_device, "shelly", device_fixture["shelly"])
+    monkeypatch.setattr(mock_rpc_device, "status", device_fixture["status"])
+    monkeypatch.setattr(mock_rpc_device, "config", device_fixture["config"])
+    config_entry = await init_integration(
+        hass, gen=3, model=MODEL_2PM_G3, skip_setup=True
+    )
+
+    legacy_device_entry = register_legacy_sub_device(
+        device_registry, config_entry, "switch:0"
+    )
+    entity_id = register_entity(
+        hass,
+        SWITCH_DOMAIN,
+        "test_name_output_0",
+        "switch:0",
+        config_entry,
+        device_id=legacy_device_entry.id,
+    )
+    # Simulate devices loaded from storage, devices created in this session can't
+    # be converted
+    device_registry.async_config_entry_unloaded(config_entry.entry_id)
+
+    await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    # The device keeps its id, so entities and automations referencing it still work
+    device_entry = device_registry.async_get(legacy_device_entry.id)
+    assert isinstance(device_entry, ChildDeviceEntry)
+    assert device_entry.parent_device_id == legacy_device_entry.via_device_id
+
+    assert (entry := entity_registry.async_get(entity_id))
+    assert entry.device_id == legacy_device_entry.id
+
+
+async def test_rpc_waits_for_ble_scanner_at_startup(
+    hass: HomeAssistant,
+    mock_rpc_device: Mock,
+) -> None:
+    """Test setup waits for the bluetooth scanner to be registered."""
+    connect_event = asyncio.Event()
+    reached_connect = asyncio.Event()
+
+    async def _block_until_released(*args: Any, **kwargs: Any) -> Mock:
+        reached_connect.set()
+        await connect_event.wait()
+        return Mock()
+
+    entry = await init_integration(
+        hass,
+        2,
+        options={CONF_BLE_SCANNER_MODE: BLEScannerMode.ACTIVE},
+        skip_setup=True,
+    )
+
+    with patch(
+        "homeassistant.components.shelly.coordinator.async_connect_scanner",
+        _block_until_released,
+    ):
+        setup_task = hass.async_create_task(
+            hass.config_entries.async_setup(entry.entry_id)
+        )
+        async with asyncio.timeout(2):
+            await reached_connect.wait()
+
+        # Setup must still be waiting for the scanner to be registered.
+        assert not setup_task.done()
+
+        connect_event.set()
+        async with asyncio.timeout(2):
+            assert await setup_task is True
+
+    await hass.async_block_till_done()
+    assert entry.state is ConfigEntryState.LOADED
+
+
+async def test_rpc_ble_scanner_startup_wait_times_out(
+    hass: HomeAssistant,
+    mock_rpc_device: Mock,
+) -> None:
+    """Test setup finishes if the bluetooth scanner never registers."""
+    connect_event = asyncio.Event()
+
+    async def _never_returns(*args: Any, **kwargs: Any) -> Mock:
+        await connect_event.wait()
+        return Mock()
+
+    entry = await init_integration(
+        hass,
+        2,
+        options={CONF_BLE_SCANNER_MODE: BLEScannerMode.ACTIVE},
+        skip_setup=True,
+    )
+
+    with (
+        patch(
+            "homeassistant.components.shelly.coordinator.async_connect_scanner",
+            _never_returns,
+        ),
+        patch("homeassistant.components.shelly.STARTUP_SCANNER_WAIT", 0.05),
+    ):
+        async with asyncio.timeout(5):
+            assert await hass.config_entries.async_setup(entry.entry_id) is True
+
+    assert entry.state is ConfigEntryState.LOADED
+    connect_event.set()
+    await hass.async_block_till_done()
+
+
+async def test_rpc_setup_device_reconnecting_before_platforms(
+    hass: HomeAssistant,
+    mock_rpc_device: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test setup uses last known data if the device reconnects before platforms."""
+    entity_id = "sensor.test_name_voltmeter"
+
+    async def _device_reconnecting(*args: Any, **kwargs: Any) -> Mock:
+        # The device disconnected and is re-initializing, keeping last known data
+        monkeypatch.setattr(mock_rpc_device, "initialized", False)
+        return Mock()
+
+    with patch(
+        "homeassistant.components.shelly.coordinator.async_connect_scanner",
+        _device_reconnecting,
+    ):
+        entry = await init_integration(
+            hass, 2, options={CONF_BLE_SCANNER_MODE: BLEScannerMode.ACTIVE}
+        )
+
+    assert entry.state is ConfigEntryState.LOADED
+    assert (state := hass.states.get(entity_id))
+    assert state.state == STATE_UNAVAILABLE
+
+    monkeypatch.setattr(mock_rpc_device, "initialized", True)
+    mock_rpc_device.mock_initialized()
+    await hass.async_block_till_done()
+
+    assert (state := hass.states.get(entity_id))
+    assert state.state == "4.321"
+
+
+async def test_rpc_disabled_ble_scanner_does_not_wait_at_startup(
+    hass: HomeAssistant,
+    mock_rpc_device: Mock,
+) -> None:
+    """Test setup does not wait when the BLE scanner is disabled."""
+    block_event = asyncio.Event()
+
+    async def _block_forever(self: Any) -> None:
+        await block_event.wait()
+
+    entry = await init_integration(
+        hass,
+        2,
+        options={CONF_BLE_SCANNER_MODE: BLEScannerMode.DISABLED},
+        skip_setup=True,
+    )
+
+    with patch(
+        "homeassistant.components.shelly.coordinator.ShellyRpcCoordinator"
+        "._async_connect_ble_scanner",
+        _block_forever,
+    ):
+        # Scanner setup is blocked, but a disabled proxy must not wait for it.
+        async with asyncio.timeout(2):
+            assert await hass.config_entries.async_setup(entry.entry_id) is True
+
+    assert entry.state is ConfigEntryState.LOADED
+    block_event.set()
+    await hass.async_block_till_done()

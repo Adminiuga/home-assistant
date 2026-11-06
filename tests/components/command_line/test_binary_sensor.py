@@ -1,37 +1,50 @@
 """The tests for the Command line Binary sensor platform."""
-from __future__ import annotations
 
+import asyncio
+from datetime import timedelta
 from typing import Any
+from unittest.mock import patch
 
-from pytest import LogCaptureFixture
+from freezegun.api import FrozenDateTimeFactory
+import pytest
+from pytest_homeassistant.common import async_fire_time_changed
 
 from homeassistant import setup
-from homeassistant.components.binary_sensor import DOMAIN
-from homeassistant.const import STATE_OFF, STATE_ON
+from homeassistant.components.command_line.binary_sensor import CommandBinarySensor
+from homeassistant.components.command_line.const import DOMAIN
+from homeassistant.components.homeassistant import (
+    DOMAIN as HA_DOMAIN,
+    SERVICE_UPDATE_ENTITY,
+)
+from homeassistant.const import ATTR_ENTITY_ID, STATE_OFF, STATE_ON, STATE_UNAVAILABLE
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers import entity_registry
+from homeassistant.helpers import entity_registry as er, issue_registry as ir
+
+from . import mock_asyncio_subprocess_run
 
 
-async def setup_test_entity(hass: HomeAssistant, config_dict: dict[str, Any]) -> None:
-    """Set up a test command line binary_sensor entity."""
-    assert await setup.async_setup_component(
-        hass,
-        DOMAIN,
-        {DOMAIN: {"platform": "command_line", "name": "Test", **config_dict}},
-    )
-    await hass.async_block_till_done()
-
-
-async def test_setup(hass: HomeAssistant) -> None:
-    """Test sensor setup."""
-    await setup_test_entity(
-        hass,
+@pytest.mark.parametrize(
+    "get_config",
+    [
         {
-            "command": "echo 1",
-            "payload_on": "1",
-            "payload_off": "0",
-        },
-    )
+            "command_line": [
+                {
+                    "binary_sensor": {
+                        "name": "Test",
+                        "command": "echo 1",
+                        "payload_on": "1",
+                        "payload_off": "0",
+                        "command_timeout": 15,
+                    }
+                }
+            ]
+        }
+    ],
+)
+async def test_setup_integration_yaml(
+    hass: HomeAssistant, load_yaml_integration: None
+) -> None:
+    """Test sensor setup."""
 
     entity_state = hass.states.get("binary_sensor.test")
     assert entity_state
@@ -39,89 +52,520 @@ async def test_setup(hass: HomeAssistant) -> None:
     assert entity_state.name == "Test"
 
 
-async def test_template(hass: HomeAssistant) -> None:
-    """Test setting the state with a template."""
-
-    await setup_test_entity(
-        hass,
+@pytest.mark.parametrize(
+    "get_config",
+    [
         {
-            "command": "echo 10",
-            "payload_on": "1.0",
-            "payload_off": "0",
-            "value_template": "{{ value | multiply(0.1) }}",
-        },
-    )
+            "command_line": [
+                {
+                    "binary_sensor": {
+                        "name": "Test",
+                        "command": "echo 10",
+                        "payload_on": "1.0",
+                        "payload_off": "0",
+                        "value_template": "{{ value | multiply(0.1) }}",
+                        "icon": (
+                            '{% if this.attributes.icon=="mdi:icon2" %}'
+                            " mdi:icon1"
+                            " {% else %} mdi:icon2 {% endif %}"
+                        ),
+                    }
+                }
+            ]
+        }
+    ],
+)
+async def test_template(
+    hass: HomeAssistant, load_yaml_integration: None, freezer: FrozenDateTimeFactory
+) -> None:
+    """Test setting the state with a template."""
 
     entity_state = hass.states.get("binary_sensor.test")
     assert entity_state
     assert entity_state.state == STATE_ON
+    assert entity_state.attributes.get("icon") == "mdi:icon2"
+
+    freezer.tick(timedelta(seconds=30))
+    async_fire_time_changed(hass)
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    entity_state = hass.states.get("binary_sensor.test")
+    assert entity_state
+    assert entity_state.state == STATE_ON
+    assert entity_state.attributes.get("icon") == "mdi:icon1"
 
 
-async def test_sensor_off(hass: HomeAssistant) -> None:
-    """Test setting the state with a template."""
-    await setup_test_entity(
-        hass,
+@pytest.mark.parametrize(
+    "get_config",
+    [
         {
-            "command": "echo 0",
-            "payload_on": "1",
-            "payload_off": "0",
-        },
-    )
+            "command_line": [
+                {
+                    "binary_sensor": {
+                        "name": "Test",
+                        "command": "echo 0",
+                        "payload_on": "1",
+                        "payload_off": "0",
+                    }
+                }
+            ]
+        }
+    ],
+)
+async def test_sensor_off(hass: HomeAssistant, load_yaml_integration: None) -> None:
+    """Test setting the state with a template."""
+
     entity_state = hass.states.get("binary_sensor.test")
     assert entity_state
     assert entity_state.state == STATE_OFF
 
 
-async def test_unique_id(hass: HomeAssistant) -> None:
+@pytest.mark.parametrize(
+    "get_config",
+    [
+        {
+            "command_line": [
+                {
+                    "binary_sensor": {
+                        "unique_id": "unique",
+                        "command": "echo 0",
+                    }
+                },
+                {
+                    "binary_sensor": {
+                        "unique_id": "not-so-unique-anymore",
+                        "command": "echo 1",
+                    }
+                },
+                {
+                    "binary_sensor": {
+                        "unique_id": "not-so-unique-anymore",
+                        "command": "echo 2",
+                    }
+                },
+            ]
+        }
+    ],
+)
+async def test_unique_id(
+    hass: HomeAssistant, entity_registry: er.EntityRegistry, load_yaml_integration: None
+) -> None:
     """Test unique_id option and if it only creates one binary sensor per id."""
-    assert await setup.async_setup_component(
+
+    assert len(hass.states.async_all()) == 2
+
+    assert len(entity_registry.entities) == 2
+    assert entity_registry.async_get_entity_id(
+        "binary_sensor", "command_line", "unique"
+    )
+    assert entity_registry.async_get_entity_id(
+        "binary_sensor", "command_line", "not-so-unique-anymore"
+    )
+
+
+@pytest.mark.parametrize(
+    "get_config",
+    [
+        {
+            "command_line": [
+                {
+                    "binary_sensor": {
+                        "command": "exit 33",
+                    }
+                }
+            ]
+        }
+    ],
+)
+async def test_return_code(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture, get_config: dict[str, Any]
+) -> None:
+    """Test setting the state with a template."""
+    await setup.async_setup_component(
+        hass,
+        DOMAIN,
+        get_config,
+    )
+    await hass.async_block_till_done()
+    assert "return code 33" in caplog.text
+
+
+async def test_updating_to_often(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Test handling updating when command already running."""
+
+    wait_till_event = asyncio.Event()
+    wait_till_event.set()
+    called = []
+
+    class MockCommandBinarySensor(CommandBinarySensor):
+        """Mock entity that updates."""
+
+        async def _async_update(self) -> None:
+            """Update the entity."""
+            called.append(1)
+            # Wait till event is set
+            await wait_till_event.wait()
+
+    with patch(
+        "homeassistant.components.command_line.binary_sensor.CommandBinarySensor",
+        side_effect=MockCommandBinarySensor,
+    ):
+        await setup.async_setup_component(
+            hass,
+            DOMAIN,
+            {
+                "command_line": [
+                    {
+                        "binary_sensor": {
+                            "name": "Test",
+                            "command": "echo 1",
+                            "payload_on": "1",
+                            "payload_off": "0",
+                            "scan_interval": 10,
+                        }
+                    }
+                ]
+            },
+        )
+        await hass.async_block_till_done()
+
+    assert called
+    freezer.tick(timedelta(seconds=15))
+    async_fire_time_changed(hass)
+    wait_till_event.set()
+    await asyncio.sleep(0)
+    assert (
+        "Updating Command Line Binary Sensor Test took longer"
+        " than the scheduled update interval" not in caplog.text
+    )
+
+    # Simulate update takes too long
+    wait_till_event.clear()
+    freezer.tick(timedelta(seconds=10))
+    async_fire_time_changed(hass)
+    await asyncio.sleep(0)
+    freezer.tick(timedelta(seconds=10))
+    async_fire_time_changed(hass)
+    wait_till_event.set()
+    await asyncio.sleep(0)
+
+    assert (
+        "Updating Command Line Binary Sensor Test took longer"
+        " than the scheduled update interval" in caplog.text
+    )
+
+
+async def test_updating_manually(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Test handling manual updating using homeassistant udate_entity service."""
+    await setup.async_setup_component(hass, HA_DOMAIN, {})
+    called = []
+
+    class MockCommandBinarySensor(CommandBinarySensor):
+        """Mock entity that updates."""
+
+        async def _async_update(self) -> None:
+            """Update."""
+            called.append(1)
+
+    with patch(
+        "homeassistant.components.command_line.binary_sensor.CommandBinarySensor",
+        side_effect=MockCommandBinarySensor,
+    ):
+        await setup.async_setup_component(
+            hass,
+            DOMAIN,
+            {
+                "command_line": [
+                    {
+                        "binary_sensor": {
+                            "name": "Test",
+                            "command": "echo 1",
+                            "payload_on": "1",
+                            "payload_off": "0",
+                            "scan_interval": 10,
+                        }
+                    }
+                ]
+            },
+        )
+        await hass.async_block_till_done()
+
+    assert called
+    called.clear()
+
+    await hass.services.async_call(
+        HA_DOMAIN,
+        SERVICE_UPDATE_ENTITY,
+        {ATTR_ENTITY_ID: ["binary_sensor.test"]},
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+    assert called
+
+
+@pytest.mark.parametrize(
+    "get_config",
+    [
+        {
+            "command_line": [
+                {
+                    "binary_sensor": {
+                        "name": "Test",
+                        "command": "echo 10",
+                        "payload_on": "1.0",
+                        "payload_off": "0.0",
+                        "value_template": "{{ value | multiply(0.1) }}",
+                        "availability": '{{ "sensor.input1" | has_value }}',
+                        "icon": 'mdi:{{ states("sensor.input1") }}',
+                    }
+                }
+            ]
+        }
+    ],
+)
+async def test_availability(
+    hass: HomeAssistant,
+    load_yaml_integration: None,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Test availability."""
+    hass.states.async_set("sensor.input1", STATE_ON)
+    freezer.tick(timedelta(minutes=1))
+    async_fire_time_changed(hass)
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    entity_state = hass.states.get("binary_sensor.test")
+    assert entity_state
+    assert entity_state.state == STATE_ON
+    assert entity_state.attributes["icon"] == "mdi:on"
+
+    hass.states.async_set("sensor.input1", STATE_UNAVAILABLE)
+    await hass.async_block_till_done()
+    with mock_asyncio_subprocess_run(b"0"):
+        freezer.tick(timedelta(minutes=1))
+        async_fire_time_changed(hass)
+        await hass.async_block_till_done(wait_background_tasks=True)
+
+    entity_state = hass.states.get("binary_sensor.test")
+    assert entity_state
+    assert entity_state.state == STATE_UNAVAILABLE
+    assert "icon" not in entity_state.attributes
+
+    hass.states.async_set("sensor.input1", STATE_OFF)
+    await hass.async_block_till_done()
+    with mock_asyncio_subprocess_run(b"0"):
+        freezer.tick(timedelta(minutes=1))
+        async_fire_time_changed(hass)
+        await hass.async_block_till_done(wait_background_tasks=True)
+
+    entity_state = hass.states.get("binary_sensor.test")
+    assert entity_state
+    assert entity_state.state == STATE_OFF
+    assert entity_state.attributes["icon"] == "mdi:off"
+
+
+@pytest.mark.parametrize(
+    "get_config",
+    [
+        {
+            "command_line": [
+                {
+                    "binary_sensor": {
+                        "name": "Test",
+                        "command": "echo 10",
+                        "payload_on": "1.0",
+                        "payload_off": "0.0",
+                        "value_template": "{{ x - 1 }}",
+                        "availability": "{{ value == '50' }}",
+                    }
+                }
+            ]
+        }
+    ],
+)
+async def test_availability_blocks_value_template(
+    hass: HomeAssistant,
+    load_yaml_integration: None,
+    freezer: FrozenDateTimeFactory,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test availability blocks value_template from rendering."""
+    error = "Error parsing value for binary_sensor.test: 'x' is undefined"
+    await hass.async_block_till_done()
+    with mock_asyncio_subprocess_run(b"51\n"):
+        freezer.tick(timedelta(minutes=1))
+        async_fire_time_changed(hass)
+        await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert error not in caplog.text
+
+    entity_state = hass.states.get("binary_sensor.test")
+    assert entity_state
+    assert entity_state.state == STATE_UNAVAILABLE
+
+    await hass.async_block_till_done()
+    with mock_asyncio_subprocess_run(b"50\n"):
+        freezer.tick(timedelta(minutes=1))
+        async_fire_time_changed(hass)
+        await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert error in caplog.text
+
+
+async def test_template_with_shell_features_uses_shell_and_creates_issue(
+    hass: HomeAssistant,
+    issue_registry: ir.IssueRegistry,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Templated command with shell metacharacters keeps shell path and creates a repair issue."""
+    hass.states.async_set("sensor.input_sensor", "1")
+    await setup.async_setup_component(
         hass,
         DOMAIN,
         {
-            DOMAIN: [
+            "command_line": [
                 {
-                    "platform": "command_line",
-                    "unique_id": "unique",
-                    "command": "echo 0",
-                },
-                {
-                    "platform": "command_line",
-                    "unique_id": "not-so-unique-anymore",
-                    "command": "echo 1",
-                },
-                {
-                    "platform": "command_line",
-                    "unique_id": "not-so-unique-anymore",
-                    "command": "echo 2",
-                },
+                    "binary_sensor": {
+                        "name": "Test",
+                        "command": "echo {{ states.sensor.input_sensor.state }} | cat",
+                        "payload_on": "1",
+                        "payload_off": "0",
+                    }
+                }
             ]
         },
     )
     await hass.async_block_till_done()
 
-    assert len(hass.states.async_all()) == 2
+    with mock_asyncio_subprocess_run(b"1\n") as mock_shell:
+        freezer.tick(timedelta(minutes=1))
+        async_fire_time_changed(hass)
+        await hass.async_block_till_done(wait_background_tasks=True)
 
-    ent_reg = entity_registry.async_get(hass)
-
-    assert len(ent_reg.entities) == 2
-    assert (
-        ent_reg.async_get_entity_id("binary_sensor", "command_line", "unique")
-        is not None
+    mock_shell.assert_called_once_with(
+        "echo 1 | cat",
+        stdin=None,
+        stdout=-1,
+        close_fds=False,
     )
-    assert (
-        ent_reg.async_get_entity_id(
-            "binary_sensor", "command_line", "not-so-unique-anymore"
-        )
-        is not None
-    )
+    issues = [
+        issue
+        for issue in issue_registry.issues.values()
+        if issue.translation_key == "shell_command_template_deprecation"
+    ]
+    assert len(issues) == 1
+    assert issues[0].breaks_in_ha_version == "2027.4.0"
+    assert issues[0].severity == ir.IssueSeverity.WARNING
+    assert issues[0].translation_placeholders == {
+        "program": "echo",
+        "platform": "binary_sensor",
+        "name": "Test",
+    }
 
 
-async def test_return_code(caplog: LogCaptureFixture, hass: HomeAssistant) -> None:
-    """Test setting the state with a template."""
-    await setup_test_entity(
-        hass,
+@pytest.mark.parametrize(
+    "get_config",
+    [
         {
-            "command": "exit 33",
-        },
-    )
-    assert "return code 33" in caplog.text
+            "command_line": [
+                {
+                    "binary_sensor": {
+                        "name": "Test",
+                        "command": (
+                            'echo \'{"state": "on", "battery": 87, "rssi": -60}\''
+                        ),
+                        "value_template": "{{ value_json.state }}",
+                        "payload_on": "on",
+                        "payload_off": "off",
+                        "json_attributes": ["battery", "rssi", "missing"],
+                    }
+                }
+            ]
+        }
+    ],
+)
+async def test_update_with_json_attrs(
+    hass: HomeAssistant, load_yaml_integration: None
+) -> None:
+    """Test json_attributes are set while the state comes from value_template."""
+
+    entity_state = hass.states.get("binary_sensor.test")
+    assert entity_state
+    assert entity_state.state == STATE_ON
+    assert entity_state.attributes["battery"] == 87
+    assert entity_state.attributes["rssi"] == -60
+    assert "missing" not in entity_state.attributes
+    assert "state" not in entity_state.attributes
+
+
+@pytest.mark.parametrize(
+    "get_config",
+    [
+        {
+            "command_line": [
+                {
+                    "binary_sensor": {
+                        "name": "Test",
+                        "command": (
+                            'echo \'{"device": {"open": false,'
+                            ' "details": {"battery": 50}}}\''
+                        ),
+                        "value_template": (
+                            "{{ 'on' if value_json.device.open else 'off' }}"
+                        ),
+                        "payload_on": "on",
+                        "payload_off": "off",
+                        "json_attributes": ["battery"],
+                        "json_attributes_path": "$.device.details",
+                    }
+                }
+            ]
+        }
+    ],
+)
+async def test_update_with_json_attrs_path(
+    hass: HomeAssistant, load_yaml_integration: None
+) -> None:
+    """Test json_attributes_path selects a different root."""
+
+    entity_state = hass.states.get("binary_sensor.test")
+    assert entity_state
+    assert entity_state.state == STATE_OFF
+    assert entity_state.attributes["battery"] == 50
+    assert "device" not in entity_state.attributes
+
+
+@pytest.mark.parametrize(
+    "get_config",
+    [
+        {
+            "command_line": [
+                {
+                    "binary_sensor": {
+                        "name": "Test",
+                        "command": "echo ON",
+                        "json_attributes": ["battery"],
+                    }
+                }
+            ]
+        }
+    ],
+)
+async def test_update_with_json_attrs_bad_json(
+    caplog: pytest.LogCaptureFixture, hass: HomeAssistant, get_config: dict[str, Any]
+) -> None:
+    """Test a non JSON output keeps the state and sets no attributes."""
+    await setup.async_setup_component(hass, DOMAIN, get_config)
+    await hass.async_block_till_done()
+
+    entity_state = hass.states.get("binary_sensor.test")
+    assert entity_state
+    assert entity_state.state == STATE_ON
+    assert "battery" not in entity_state.attributes
+    assert "Unable to parse output as JSON" in caplog.text

@@ -1,15 +1,15 @@
 """Support for Vanderbilt (formerly Siemens) SPC alarm systems."""
+
 import logging
 
+import probatio
 from pyspcwebgw import SpcWebGateway
 from pyspcwebgw.area import Area
 from pyspcwebgw.zone import Zone
-import voluptuous as vol
 
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers import aiohttp_client, discovery
-import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers import aiohttp_client, config_validation as cv, discovery
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.typing import ConfigType
 
@@ -24,24 +24,23 @@ DATA_API = "spc_api"
 SIGNAL_UPDATE_ALARM = "spc_update_alarm_{}"
 SIGNAL_UPDATE_SENSOR = "spc_update_sensor_{}"
 
-CONFIG_SCHEMA = vol.Schema(
+CONFIG_SCHEMA = probatio.Schema(
     {
-        DOMAIN: vol.Schema(
+        DOMAIN: probatio.Schema(
             {
-                vol.Required(CONF_WS_URL): cv.string,
-                vol.Required(CONF_API_URL): cv.string,
+                probatio.Required(CONF_WS_URL): cv.string,
+                probatio.Required(CONF_API_URL): cv.string,
             }
         )
     },
-    extra=vol.ALLOW_EXTRA,
+    extra=probatio.ALLOW_EXTRA,
 )
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the SPC component."""
 
-    async def async_upate_callback(spc_object):
-
+    async def async_update_callback(spc_object):
         if isinstance(spc_object, Area):
             async_dispatcher_send(hass, SIGNAL_UPDATE_ALARM.format(spc_object.id))
         elif isinstance(spc_object, Zone):
@@ -54,7 +53,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         session=session,
         api_url=config[DOMAIN].get(CONF_API_URL),
         ws_url=config[DOMAIN].get(CONF_WS_URL),
-        async_callback=async_upate_callback,
+        async_callback=async_update_callback,
     )
 
     hass.data[DATA_API] = spc

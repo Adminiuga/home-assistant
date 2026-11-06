@@ -1,9 +1,12 @@
 {
   "domain": "sinch",
   "name": "Sinch SMS",
-  "documentation": "https://www.home-assistant.io/integrations/sinch",
+  "categories": ["messaging_notifications.email_sms_calls"],
   "codeowners": ["@bendikrb"],
-  "requirements": ["clx-sdk-xms==1.0.0"],
+  "connectivity": ["cloud"],
+  "documentation": "https://www.home-assistant.io/integrations/sinch",
   "iot_class": "cloud_push",
-  "loggers": ["clx"]
+  "loggers": ["clx"],
+  "quality_scale": "legacy",
+  "requirements": ["clx-sdk-xms==1.0.0"]
 }

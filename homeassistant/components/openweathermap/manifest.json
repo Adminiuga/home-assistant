@@ -1,10 +1,16 @@
 {
   "domain": "openweathermap",
   "name": "OpenWeatherMap",
+  "categories": [
+    "weather_alerts.forecasts",
+    "weather_alerts.air_quality_pollen"
+  ],
+  "codeowners": ["@fabaff", "@freekode", "@nzapponi", "@wittypluck"],
   "config_flow": true,
+  "connectivity": ["cloud"],
   "documentation": "https://www.home-assistant.io/integrations/openweathermap",
-  "requirements": ["pyowm==3.2.0"],
-  "codeowners": ["@fabaff", "@freekode", "@nzapponi"],
+  "integration_type": "service",
   "iot_class": "cloud_polling",
-  "loggers": ["geojson", "pyowm", "pysocks"]
+  "loggers": ["pyopenweathermap"],
+  "requirements": ["pyopenweathermap==0.3.0"]
 }

@@ -1,0 +1,106 @@
+"""Common fixtures for the LibreHardwareMonitor tests."""
+
+from collections.abc import Generator
+from dataclasses import replace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from librehardwaremonitor_api.parser import LibreHardwareMonitorParser
+import pytest
+from pytest_homeassistant.common import MockConfigEntry, load_json_object_fixture
+
+from homeassistant.components.libre_hardware_monitor.const import DOMAIN
+from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_PORT, CONF_USERNAME
+
+VALID_CONFIG = {CONF_HOST: "192.168.0.20", CONF_PORT: 8085}
+
+AUTH_INPUT = {
+    CONF_USERNAME: "lhm-user",
+    CONF_PASSWORD: "lhm-password",
+}
+
+VALID_CONFIG_WITH_AUTH = {
+    **VALID_CONFIG,
+    **AUTH_INPUT,
+}
+
+REAUTH_INPUT = {
+    CONF_USERNAME: "new-username",
+    CONF_PASSWORD: "new-password",
+}
+
+RECONFIGURE_INPUT = {CONF_HOST: "192.168.0.21", CONF_PORT: 8086}
+RECONFIGURED_TITLE = "GAMING-PC (192.168.0.21:8086)"
+
+
+@pytest.fixture
+def mock_setup_entry() -> Generator[AsyncMock]:
+    """Override async_setup_entry."""
+    with patch(
+        "homeassistant.components.libre_hardware_monitor.async_setup_entry",
+        return_value=None,
+    ) as mock_setup_entry:
+        yield mock_setup_entry
+
+
+@pytest.fixture
+def mock_config_entry() -> MockConfigEntry:
+    """Config entry fixture."""
+    return MockConfigEntry(
+        domain=DOMAIN,
+        title="192.168.0.20:8085",
+        data=VALID_CONFIG,
+        entry_id="test_entry_id",
+        version=2,
+        minor_version=2,
+    )
+
+
+@pytest.fixture
+def mock_auth_config_entry() -> MockConfigEntry:
+    """Config entry fixture."""
+    return MockConfigEntry(
+        domain=DOMAIN,
+        title="192.168.0.20:8085",
+        data=VALID_CONFIG_WITH_AUTH,
+        entry_id="test_entry_id",
+        version=2,
+        minor_version=2,
+    )
+
+
+@pytest.fixture
+def mock_lhm_client_class() -> Generator[MagicMock]:
+    """Mock the LibreHardwareMonitor client class."""
+    with (
+        patch(
+            "homeassistant.components.libre_hardware_monitor.config_flow.LibreHardwareMonitorClient",
+            autospec=True,
+        ) as mock_client,
+        patch(
+            "homeassistant.components.libre_hardware_monitor.coordinator.LibreHardwareMonitorClient",
+            new=mock_client,
+        ),
+    ):
+        yield mock_client
+
+
+@pytest.fixture
+def mock_lhm_client(mock_lhm_client_class: MagicMock) -> AsyncMock:
+    """Mock a LibreHardwareMonitor client."""
+    client = mock_lhm_client_class.return_value
+    test_data_json = load_json_object_fixture(
+        "libre_hardware_monitor.json", "libre_hardware_monitor"
+    )
+    test_data = LibreHardwareMonitorParser().parse_data(test_data_json)
+    client.get_data.return_value = test_data
+
+    return client
+
+
+@pytest.fixture
+def mock_deprecated_lhm_client(mock_lhm_client: AsyncMock) -> AsyncMock:
+    """Mock a LibreHardwareMonitor client reporting a deprecated version."""
+    mock_lhm_client.get_data.return_value = replace(
+        mock_lhm_client.get_data.return_value, is_deprecated_version=True
+    )
+    return mock_lhm_client

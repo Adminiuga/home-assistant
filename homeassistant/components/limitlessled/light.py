@@ -1,8 +1,8 @@
 """Support for LimitlessLED bulbs."""
-from __future__ import annotations
 
+from collections.abc import Callable
 import logging
-from typing import Any
+from typing import Any, Concatenate, cast, override
 
 from limitlessled import Color
 from limitlessled.bridge import Bridge
@@ -13,11 +13,11 @@ from limitlessled.group.rgbww import RgbwwGroup
 from limitlessled.group.white import WhiteGroup
 from limitlessled.pipeline import Pipeline
 from limitlessled.presets import COLORLOOP
-import voluptuous as vol
+import probatio
 
 from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
-    ATTR_COLOR_TEMP,
+    ATTR_COLOR_TEMP_KELVIN,
     ATTR_EFFECT,
     ATTR_FLASH,
     ATTR_HS_COLOR,
@@ -25,18 +25,19 @@ from homeassistant.components.light import (
     EFFECT_COLORLOOP,
     EFFECT_WHITE,
     FLASH_LONG,
-    PLATFORM_SCHEMA,
+    PLATFORM_SCHEMA as LIGHT_PLATFORM_SCHEMA,
     ColorMode,
     LightEntity,
     LightEntityFeature,
+    LightEntityStateAttribute,
 )
 from homeassistant.const import CONF_HOST, CONF_NAME, CONF_PORT, CONF_TYPE, STATE_ON
 from homeassistant.core import HomeAssistant
-import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
-from homeassistant.util.color import color_hs_to_RGB, color_temperature_mired_to_kelvin
+from homeassistant.util.color import color_hs_to_RGB
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -73,27 +74,27 @@ SUPPORT_LIMITLESSLED_RGBWW = (
     LightEntityFeature.EFFECT | LightEntityFeature.FLASH | LightEntityFeature.TRANSITION
 )
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
+PLATFORM_SCHEMA = LIGHT_PLATFORM_SCHEMA.extend(
     {
-        vol.Required(CONF_BRIDGES): vol.All(
-            cv.ensure_list,
+        probatio.Required(CONF_BRIDGES): probatio.All(
+            probatio.EnsureList(),
             [
                 {
-                    vol.Required(CONF_HOST): cv.string,
-                    vol.Optional(
+                    probatio.Required(CONF_HOST): cv.string,
+                    probatio.Optional(
                         CONF_VERSION, default=DEFAULT_VERSION
                     ): cv.positive_int,
-                    vol.Optional(CONF_PORT, default=DEFAULT_PORT): cv.port,
-                    vol.Required(CONF_GROUPS): vol.All(
-                        cv.ensure_list,
+                    probatio.Optional(CONF_PORT, default=DEFAULT_PORT): probatio.Port(),
+                    probatio.Required(CONF_GROUPS): probatio.All(
+                        probatio.EnsureList(),
                         [
                             {
-                                vol.Required(CONF_NAME): cv.string,
-                                vol.Optional(
+                                probatio.Required(CONF_NAME): cv.string,
+                                probatio.Optional(
                                     CONF_TYPE, default=DEFAULT_LED_TYPE
-                                ): vol.In(LED_TYPE),
-                                vol.Required(CONF_NUMBER): cv.positive_int,
-                                vol.Optional(
+                                ): probatio.In(LED_TYPE),
+                                probatio.Required(CONF_NUMBER): cv.positive_int,
+                                probatio.Optional(
                                     CONF_FADE, default=DEFAULT_FADE
                                 ): cv.boolean,
                             }
@@ -117,13 +118,13 @@ def rewrite_legacy(config: ConfigType) -> ConfigType:
         else:
             _LOGGER.warning("Legacy configuration format detected")
             for i in range(1, 5):
-                name_key = "group_%d_name" % i
+                name_key = f"group_{i}_name"
                 if name_key in bridge_conf:
                     groups.append(
                         {
                             "number": i,
                             "type": bridge_conf.get(
-                                "group_%d_type" % i, DEFAULT_LED_TYPE
+                                f"group_{i}_type", DEFAULT_LED_TYPE
                             ),
                             "name": bridge_conf.get(name_key),
                         }
@@ -171,32 +172,39 @@ def setup_platform(
     add_entities(lights)
 
 
-def state(new_state):
+def state[_LimitlessLEDGroupT: LimitlessLEDGroup, **_P](
+    new_state: bool,
+) -> Callable[
+    [Callable[Concatenate[_LimitlessLEDGroupT, int, Pipeline, _P], Any]],
+    Callable[Concatenate[_LimitlessLEDGroupT, _P], None],
+]:
     """State decorator.
 
     Specify True (turn on) or False (turn off).
     """
 
-    def decorator(function):
+    def decorator(
+        function: Callable[Concatenate[_LimitlessLEDGroupT, int, Pipeline, _P], Any],
+    ) -> Callable[Concatenate[_LimitlessLEDGroupT, _P], None]:
         """Set up the decorator function."""
 
-        def wrapper(self: LimitlessLEDGroup, **kwargs: Any) -> None:
+        def wrapper(
+            self: _LimitlessLEDGroupT, *args: _P.args, **kwargs: _P.kwargs
+        ) -> None:
             """Wrap a group state change."""
-            # pylint: disable=protected-access
-
             pipeline = Pipeline()
             transition_time = DEFAULT_TRANSITION
             if self.effect == EFFECT_COLORLOOP:
-                self.group.stop()
+                self.led_group.stop()
             self._attr_effect = None
             # Set transition time.
             if ATTR_TRANSITION in kwargs:
-                transition_time = int(kwargs[ATTR_TRANSITION])
+                transition_time = int(cast(float, kwargs[ATTR_TRANSITION]))
             # Do group type-specific work.
-            function(self, transition_time, pipeline, **kwargs)
+            function(self, transition_time, pipeline, *args, **kwargs)
             # Update state.
             self._attr_is_on = new_state
-            self.group.enqueue(pipeline)
+            self.led_group.enqueue(pipeline)
             self.schedule_update_ha_state()
 
         return wrapper
@@ -208,8 +216,8 @@ class LimitlessLEDGroup(LightEntity, RestoreEntity):
     """Representation of a LimitessLED group."""
 
     _attr_assumed_state = True
-    _attr_max_mireds = 370
-    _attr_min_mireds = 154
+    _attr_min_color_temp_kelvin = 2700  # 370 Mireds
+    _attr_max_color_temp_kelvin = 6500  # 154 Mireds
     _attr_should_poll = False
 
     def __init__(self, group: Group, config: dict[str, Any]) -> None:
@@ -241,21 +249,29 @@ class LimitlessLEDGroup(LightEntity, RestoreEntity):
                 ColorMode.HS,
             }
 
-        self.group = group
+        self.led_group = group
         self._attr_name = group.name
         self.config = config
         self._attr_is_on = False
 
+    @override
     async def async_added_to_hass(self) -> None:
         """Handle entity about to be added to hass event."""
         await super().async_added_to_hass()
         if last_state := await self.async_get_last_state():
             self._attr_is_on = last_state.state == STATE_ON
-            self._attr_brightness = last_state.attributes.get("brightness")
-            self._attr_color_temp = last_state.attributes.get("color_temp")
-            self._attr_hs_color = last_state.attributes.get("hs_color")
+            self._attr_brightness = last_state.attributes.get(
+                LightEntityStateAttribute.BRIGHTNESS
+            )
+            self._attr_color_temp_kelvin = last_state.attributes.get(
+                LightEntityStateAttribute.COLOR_TEMP_KELVIN
+            )
+            self._attr_hs_color = last_state.attributes.get(
+                LightEntityStateAttribute.HS_COLOR
+            )
 
     @property
+    @override
     def brightness(self) -> int | None:
         """Return the brightness property."""
         if self.effect == EFFECT_NIGHT:
@@ -264,7 +280,8 @@ class LimitlessLEDGroup(LightEntity, RestoreEntity):
         return self._attr_brightness
 
     @property
-    def color_mode(self) -> str | None:
+    @override
+    def color_mode(self) -> ColorMode:
         """Return the color mode of the light."""
         if self._fixed_color_mode:
             return self._fixed_color_mode
@@ -278,16 +295,16 @@ class LimitlessLEDGroup(LightEntity, RestoreEntity):
             return ColorMode.COLOR_TEMP
         return ColorMode.HS
 
-    # pylint: disable=arguments-differ
     @state(False)
+    @override
     def turn_off(self, transition_time: int, pipeline: Pipeline, **kwargs: Any) -> None:
         """Turn off a group."""
         if self.config[CONF_FADE]:
             pipeline.transition(transition_time, brightness=0.0)
         pipeline.off()
 
-    # pylint: disable=arguments-differ
     @state(True)
+    @override
     def turn_on(self, transition_time: int, pipeline: Pipeline, **kwargs: Any) -> None:
         """Turn on (or adjust property of) a group."""
         # The night effect does not need a turned on light
@@ -318,12 +335,12 @@ class LimitlessLEDGroup(LightEntity, RestoreEntity):
             else:
                 args["color"] = self.limitlessled_color()
 
-        if ATTR_COLOR_TEMP in kwargs:
+        if ATTR_COLOR_TEMP_KELVIN in kwargs:
             assert self.supported_color_modes
             if ColorMode.HS in self.supported_color_modes:
                 pipeline.white()
             self._attr_hs_color = WHITE
-            self._attr_color_temp = kwargs[ATTR_COLOR_TEMP]
+            self._attr_color_temp_kelvin = kwargs[ATTR_COLOR_TEMP_KELVIN]
             args["temperature"] = self.limitlessled_temperature()
 
         if args:
@@ -347,12 +364,9 @@ class LimitlessLEDGroup(LightEntity, RestoreEntity):
 
     def limitlessled_temperature(self) -> float:
         """Convert Home Assistant color temperature units to percentage."""
-        max_kelvin = color_temperature_mired_to_kelvin(self.min_mireds)
-        min_kelvin = color_temperature_mired_to_kelvin(self.max_mireds)
-        width = max_kelvin - min_kelvin
-        assert self.color_temp is not None
-        kelvin = color_temperature_mired_to_kelvin(self.color_temp)
-        temperature = (kelvin - min_kelvin) / width
+        width = self.max_color_temp_kelvin - self.min_color_temp_kelvin
+        assert self.color_temp_kelvin is not None
+        temperature = (self.color_temp_kelvin - self.min_color_temp_kelvin) / width
         return max(0, min(1, temperature))
 
     def limitlessled_brightness(self) -> float:

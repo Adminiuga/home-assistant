@@ -1,10 +1,13 @@
 {
   "domain": "atag",
   "name": "Atag",
-  "config_flow": true,
-  "documentation": "https://www.home-assistant.io/integrations/atag/",
-  "requirements": ["pyatag==0.3.5.3"],
+  "categories": ["climate.thermostats_heating"],
   "codeowners": ["@MatsNL"],
+  "config_flow": true,
+  "connectivity": ["network"],
+  "documentation": "https://www.home-assistant.io/integrations/atag",
+  "integration_type": "device",
   "iot_class": "local_polling",
-  "loggers": ["pyatag"]
+  "loggers": ["pyatag"],
+  "requirements": ["pyatag==0.3.7.1"]
 }

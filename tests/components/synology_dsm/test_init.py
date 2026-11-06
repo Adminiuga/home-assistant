@@ -1,31 +1,45 @@
 """Tests for the Synology DSM component."""
-from unittest.mock import patch
+
+from unittest.mock import MagicMock, patch
 
 import pytest
-from synology_dsm.exceptions import SynologyDSMLoginInvalidException
+from pytest_homeassistant.common import MockConfigEntry
+from synology_dsm.exceptions import (
+    SynologyDSMLogin2SAForcedException,
+    SynologyDSMLoginInvalidException,
+)
 
-from homeassistant import data_entry_flow
-from homeassistant.components.synology_dsm.const import DOMAIN, SERVICES
+from homeassistant.components.synology_dsm.const import (
+    CONF_BACKUP_PATH,
+    CONF_BACKUP_SHARE,
+    DEFAULT_VERIFY_SSL,
+    DOMAIN,
+    SERVICES,
+)
+from homeassistant.config_entries import SOURCE_REAUTH, ConfigEntryState
 from homeassistant.const import (
     CONF_HOST,
     CONF_MAC,
     CONF_PASSWORD,
     CONF_PORT,
+    CONF_SCAN_INTERVAL,
     CONF_SSL,
     CONF_USERNAME,
+    CONF_VERIFY_SSL,
 )
 from homeassistant.core import HomeAssistant
 
 from .consts import HOST, MACS, PASSWORD, PORT, USE_SSL, USERNAME
 
-from tests.common import MockConfigEntry
 
-
-@pytest.mark.no_bypass_setup
-async def test_services_registered(hass: HomeAssistant):
+async def test_services_registered(hass: HomeAssistant, mock_dsm: MagicMock) -> None:
     """Test if all services are registered."""
-    with patch("homeassistant.components.synology_dsm.common.SynologyDSM"), patch(
-        "homeassistant.components.synology_dsm.PLATFORMS", return_value=[]
+    with (
+        patch(
+            "homeassistant.components.synology_dsm.common.SynologyDSM",
+            return_value=mock_dsm,
+        ),
+        patch("homeassistant.components.synology_dsm.PLATFORMS", return_value=[]),
     ):
         entry = MockConfigEntry(
             domain=DOMAIN,
@@ -44,16 +58,19 @@ async def test_services_registered(hass: HomeAssistant):
             assert hass.services.has_service(DOMAIN, service)
 
 
-@pytest.mark.no_bypass_setup
-async def test_reauth_triggered(hass: HomeAssistant):
+@pytest.mark.parametrize(
+    "side_effect",
+    [
+        pytest.param(SynologyDSMLoginInvalidException(USERNAME), id="invalid_auth"),
+        pytest.param(SynologyDSMLogin2SAForcedException(USERNAME), id="otp_enforced"),
+    ],
+)
+async def test_reauth_triggered(hass: HomeAssistant, side_effect: Exception) -> None:
     """Test if reauthentication flow is triggered."""
     with patch(
         "homeassistant.components.synology_dsm.SynoApi.async_setup",
-        side_effect=SynologyDSMLoginInvalidException(USERNAME),
-    ), patch(
-        "homeassistant.components.synology_dsm.config_flow.SynologyDSMFlowHandler.async_step_reauth",
-        return_value={"type": data_entry_flow.FlowResultType.FORM},
-    ) as mock_async_step_reauth:
+        side_effect=side_effect,
+    ):
         entry = MockConfigEntry(
             domain=DOMAIN,
             data={
@@ -67,4 +84,43 @@ async def test_reauth_triggered(hass: HomeAssistant):
         )
         entry.add_to_hass(hass)
         assert not await hass.config_entries.async_setup(entry.entry_id)
-        mock_async_step_reauth.assert_called_once()
+        await hass.async_block_till_done()
+        assert entry.state is ConfigEntryState.SETUP_ERROR
+        assert any(entry.async_get_active_flows(hass, {SOURCE_REAUTH}))
+
+
+async def test_config_entry_migrations(
+    hass: HomeAssistant, mock_dsm: MagicMock
+) -> None:
+    """Test if reauthentication flow is triggered."""
+    with (
+        patch(
+            "homeassistant.components.synology_dsm.common.SynologyDSM",
+            return_value=mock_dsm,
+        ),
+        patch("homeassistant.components.synology_dsm.PLATFORMS", return_value=[]),
+    ):
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            data={
+                CONF_HOST: HOST,
+                CONF_PORT: PORT,
+                CONF_SSL: USE_SSL,
+                CONF_USERNAME: USERNAME,
+                CONF_PASSWORD: PASSWORD,
+                CONF_MAC: MACS[0],
+            },
+            options={CONF_SCAN_INTERVAL: 30},
+        )
+        entry.add_to_hass(hass)
+
+        assert CONF_VERIFY_SSL not in entry.data
+        assert CONF_BACKUP_SHARE not in entry.options
+        assert CONF_BACKUP_PATH not in entry.options
+
+        assert await hass.config_entries.async_setup(entry.entry_id)
+
+        assert entry.data[CONF_VERIFY_SSL] == DEFAULT_VERIFY_SSL
+        assert CONF_SCAN_INTERVAL not in entry.options
+        assert entry.options[CONF_BACKUP_SHARE] is None
+        assert entry.options[CONF_BACKUP_PATH] is None

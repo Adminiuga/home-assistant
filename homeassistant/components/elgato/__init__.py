@@ -1,69 +1,63 @@
 """Support for Elgato Lights."""
-from typing import NamedTuple
 
-from elgato import Elgato, ElgatoConnectionError, Info, State
-
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_HOST, CONF_PORT, Platform
+from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.typing import ConfigType
+from homeassistant.util.hass_dict import HassKey
 
-from .const import DOMAIN, LOGGER, SCAN_INTERVAL
+from .const import DOMAIN
+from .coordinator import (
+    ElgatoConfigEntry,
+    ElgatoDataUpdateCoordinator,
+    ElgatoFirmwareCoordinator,
+)
+from .services import async_setup_services
 
-PLATFORMS = [Platform.BUTTON, Platform.LIGHT]
+ELGATO_KEY: HassKey[ElgatoFirmwareCoordinator] = HassKey(DOMAIN)
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+PLATFORMS = [
+    Platform.BUTTON,
+    Platform.LIGHT,
+    Platform.NUMBER,
+    Platform.SELECT,
+    Platform.SENSOR,
+    Platform.SWITCH,
+    Platform.UPDATE,
+]
 
 
-class HomeAssistantElgatoData(NamedTuple):
-    """Elgato data stored in the Home Assistant data object."""
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Set up the component.
 
-    coordinator: DataUpdateCoordinator[State]
-    client: Elgato
-    info: Info
+    Elgato publishes one firmware catalog covering every model, so a single
+    coordinator serves every device rather than each config entry fetching
+    the same thing.
+    """
+    async_setup_services(hass)
 
+    coordinator = ElgatoFirmwareCoordinator(hass)
+    hass.data[ELGATO_KEY] = coordinator
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Set up Elgato Light from a config entry."""
-    session = async_get_clientsession(hass)
-    elgato = Elgato(
-        entry.data[CONF_HOST],
-        port=entry.data[CONF_PORT],
-        session=session,
+    # Elgato's servers are not on the local network and a request to them can
+    # sit there for its full timeout, so nothing waits on this. The update
+    # entities fill themselves in once the answer arrives.
+    hass.async_create_background_task(
+        coordinator.async_refresh(), f"{DOMAIN}_firmware_refresh"
     )
-
-    async def _async_update_data() -> State:
-        """Fetch Elgato data."""
-        try:
-            return await elgato.state()
-        except ElgatoConnectionError as err:
-            raise UpdateFailed(err) from err
-
-    coordinator: DataUpdateCoordinator[State] = DataUpdateCoordinator(
-        hass,
-        LOGGER,
-        name=f"{DOMAIN}_{entry.data[CONF_HOST]}",
-        update_interval=SCAN_INTERVAL,
-        update_method=_async_update_data,
-    )
-    await coordinator.async_config_entry_first_refresh()
-
-    info = await elgato.info()
-    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = HomeAssistantElgatoData(
-        client=elgato,
-        coordinator=coordinator,
-        info=info,
-    )
-
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     return True
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_setup_entry(hass: HomeAssistant, entry: ElgatoConfigEntry) -> None:
+    """Set up Elgato Light from a config entry."""
+    coordinator = ElgatoDataUpdateCoordinator(hass, entry)
+    await coordinator.async_config_entry_first_refresh()
+
+    entry.runtime_data = coordinator
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: ElgatoConfigEntry) -> None:
     """Unload Elgato Light config entry."""
-    if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
-        # Cleanup
-        del hass.data[DOMAIN][entry.entry_id]
-        if not hass.data[DOMAIN]:
-            del hass.data[DOMAIN]
-    return unload_ok
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)

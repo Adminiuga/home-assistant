@@ -1,16 +1,14 @@
 """Tests for the Android IP Webcam integration."""
 
-
 from unittest.mock import Mock
 
 import aiohttp
+from pytest_homeassistant.common import MockConfigEntry
+from pytest_homeassistant.test_util.aiohttp import AiohttpClientMocker
 
 from homeassistant.components.android_ip_webcam.const import DOMAIN
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant
-
-from tests.common import MockConfigEntry
-from tests.test_util.aiohttp import AiohttpClientMocker
 
 MOCK_CONFIG_DATA = {
     "name": "IP Webcam",
@@ -31,7 +29,7 @@ async def test_successful_config_entry(
 
     await hass.config_entries.async_setup(entry.entry_id)
 
-    assert entry.state == ConfigEntryState.LOADED
+    assert entry.state is ConfigEntryState.LOADED
 
 
 async def test_setup_failed_connection_error(
@@ -48,7 +46,7 @@ async def test_setup_failed_connection_error(
 
     await hass.config_entries.async_setup(entry.entry_id)
 
-    assert entry.state == ConfigEntryState.SETUP_RETRY
+    assert entry.state is ConfigEntryState.SETUP_RETRY
 
 
 async def test_setup_failed_invalid_auth(
@@ -65,7 +63,7 @@ async def test_setup_failed_invalid_auth(
 
     await hass.config_entries.async_setup(entry.entry_id)
 
-    assert entry.state == ConfigEntryState.SETUP_RETRY
+    assert entry.state is ConfigEntryState.SETUP_RETRY
 
 
 async def test_unload_entry(hass: HomeAssistant, aioclient_mock_fixture) -> None:
@@ -80,4 +78,3 @@ async def test_unload_entry(hass: HomeAssistant, aioclient_mock_fixture) -> None
     await hass.async_block_till_done()
 
     assert entry.state is ConfigEntryState.NOT_LOADED
-    assert entry.entry_id not in hass.data[DOMAIN]

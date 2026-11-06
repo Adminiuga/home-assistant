@@ -1,17 +1,15 @@
 """Support for Aranet sensors."""
-from __future__ import annotations
 
-from typing import Optional, Union
+from dataclasses import dataclass
+from typing import Any, override
 
-from aranet4.client import Aranet4Advertisement
+from aranet4.client import Aranet4Advertisement, Color
 from bleak.backends.device import BLEDevice
 
-from homeassistant import config_entries
 from homeassistant.components.bluetooth.passive_update_processor import (
     PassiveBluetoothDataProcessor,
     PassiveBluetoothDataUpdate,
     PassiveBluetoothEntityKey,
-    PassiveBluetoothProcessorCoordinator,
     PassiveBluetoothProcessorEntity,
 )
 from homeassistant.components.sensor import (
@@ -21,62 +19,112 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.const import (
-    ATTR_NAME,
-    ATTR_SW_VERSION,
-    CONCENTRATION_PARTS_PER_MILLION,
-    PERCENTAGE,
-    PRESSURE_HPA,
-    TEMP_CELSIUS,
-    TIME_SECONDS,
+    EntityCategory,
+    UnitOfPressure,
+    UnitOfRadiationConcentration,
+    UnitOfRatio,
+    UnitOfTemperature,
+    UnitOfTime,
 )
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity import DeviceInfo
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.device_registry import CONNECTION_BLUETOOTH, DeviceInfo
+from homeassistant.helpers.entity import EntityDescription
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .const import DOMAIN
+from . import AranetConfigEntry
+from .const import ARANET_MANUFACTURER_NAME
+
+
+@dataclass(frozen=True)
+class AranetSensorEntityDescription(SensorEntityDescription):
+    """Class to describe an Aranet sensor entity."""
+
+    # PassiveBluetoothDataUpdate does not support Undefined
+    # Restrict the type to satisfy the type checker and catch attempts
+    # to use Undefined in the entity descriptions.
+    name: str | None = None
+    scale: float | int = 1
+
 
 SENSOR_DESCRIPTIONS = {
-    "temperature": SensorEntityDescription(
+    "temperature": AranetSensorEntityDescription(
         key="temperature",
         name="Temperature",
         device_class=SensorDeviceClass.TEMPERATURE,
-        native_unit_of_measurement=TEMP_CELSIUS,
+        native_unit_of_measurement=UnitOfTemperature.CELSIUS,
         state_class=SensorStateClass.MEASUREMENT,
     ),
-    "humidity": SensorEntityDescription(
+    "humidity": AranetSensorEntityDescription(
         key="humidity",
         name="Humidity",
         device_class=SensorDeviceClass.HUMIDITY,
-        native_unit_of_measurement=PERCENTAGE,
+        native_unit_of_measurement=UnitOfRatio.PERCENTAGE,
         state_class=SensorStateClass.MEASUREMENT,
     ),
-    "pressure": SensorEntityDescription(
+    "pressure": AranetSensorEntityDescription(
         key="pressure",
         name="Pressure",
         device_class=SensorDeviceClass.PRESSURE,
-        native_unit_of_measurement=PRESSURE_HPA,
+        native_unit_of_measurement=UnitOfPressure.HPA,
         state_class=SensorStateClass.MEASUREMENT,
     ),
-    "co2": SensorEntityDescription(
+    "status": AranetSensorEntityDescription(
+        key="threshold",
+        translation_key="threshold",
+        name="Threshold",
+        device_class=SensorDeviceClass.ENUM,
+        options=[status.name.lower() for status in Color],
+    ),
+    "co2": AranetSensorEntityDescription(
         key="co2",
         name="Carbon Dioxide",
         device_class=SensorDeviceClass.CO2,
-        native_unit_of_measurement=CONCENTRATION_PARTS_PER_MILLION,
+        native_unit_of_measurement=UnitOfRatio.PARTS_PER_MILLION,
         state_class=SensorStateClass.MEASUREMENT,
     ),
-    "battery": SensorEntityDescription(
+    "radiation_rate": AranetSensorEntityDescription(
+        key="radiation_rate",
+        translation_key="radiation_rate",
+        name="Radiation Dose Rate",
+        native_unit_of_measurement="μSv/h",
+        state_class=SensorStateClass.MEASUREMENT,
+        suggested_display_precision=2,
+        scale=0.001,
+    ),
+    "radiation_total": AranetSensorEntityDescription(
+        key="radiation_total",
+        translation_key="radiation_total",
+        name="Radiation Total Dose",
+        native_unit_of_measurement="mSv",
+        state_class=SensorStateClass.MEASUREMENT,
+        suggested_display_precision=4,
+        scale=0.000001,
+    ),
+    "radon_concentration": AranetSensorEntityDescription(
+        key="radon_concentration",
+        translation_key="radon_concentration",
+        name="Radon Concentration",
+        device_class=SensorDeviceClass.RADON,
+        native_unit_of_measurement=UnitOfRadiationConcentration.BECQUEREL_PER_CUBIC_METER,
+        state_class=SensorStateClass.MEASUREMENT,
+    ),
+    "battery": AranetSensorEntityDescription(
         key="battery",
         name="Battery",
         device_class=SensorDeviceClass.BATTERY,
-        native_unit_of_measurement=PERCENTAGE,
+        native_unit_of_measurement=UnitOfRatio.PERCENTAGE,
         state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
     ),
-    "interval": SensorEntityDescription(
+    "interval": AranetSensorEntityDescription(
         key="update_interval",
         name="Update Interval",
         device_class=SensorDeviceClass.DURATION,
-        native_unit_of_measurement=TIME_SECONDS,
+        native_unit_of_measurement=UnitOfTime.SECONDS,
         state_class=SensorStateClass.MEASUREMENT,
+        # The interval setting is not a generally useful entity for most users.
+        entity_registry_enabled_default=False,
+        entity_category=EntityCategory.DIAGNOSTIC,
     ),
 }
 
@@ -93,64 +141,85 @@ def _sensor_device_info_to_hass(
     adv: Aranet4Advertisement,
 ) -> DeviceInfo:
     """Convert a sensor device info to hass device info."""
-    hass_device_info = DeviceInfo({})
+    hass_device_info = DeviceInfo(
+        connections={(CONNECTION_BLUETOOTH, adv.device.address)}
+    )
     if adv.readings and adv.readings.name:
-        hass_device_info[ATTR_NAME] = adv.readings.name
+        hass_device_info.name = adv.readings.name
+        hass_device_info.manufacturer = ARANET_MANUFACTURER_NAME
+        hass_device_info.model = adv.readings.type.model
     if adv.manufacturer_data:
-        hass_device_info[ATTR_SW_VERSION] = str(adv.manufacturer_data.version)
+        hass_device_info.sw_version = str(adv.manufacturer_data.version)
     return hass_device_info
 
 
 def sensor_update_to_bluetooth_data_update(
     adv: Aranet4Advertisement,
-) -> PassiveBluetoothDataUpdate:
+) -> PassiveBluetoothDataUpdate[Any]:
     """Convert a sensor update to a Bluetooth data update."""
+    data: dict[PassiveBluetoothEntityKey, Any] = {}
+    names: dict[PassiveBluetoothEntityKey, str | None] = {}
+    descs: dict[PassiveBluetoothEntityKey, EntityDescription] = {}
+    for key, desc in SENSOR_DESCRIPTIONS.items():
+        tag = _device_key_to_bluetooth_entity_key(adv.device, key)
+        val = getattr(adv.readings, key)
+        if val == -1:
+            continue
+        if key == "status":
+            val = val.name.lower()
+        else:
+            val *= desc.scale
+        data[tag] = val
+        names[tag] = desc.name
+        descs[tag] = desc
     return PassiveBluetoothDataUpdate(
         devices={adv.device.address: _sensor_device_info_to_hass(adv)},
-        entity_descriptions={
-            _device_key_to_bluetooth_entity_key(adv.device, key): desc
-            for key, desc in SENSOR_DESCRIPTIONS.items()
-        },
-        entity_data={
-            _device_key_to_bluetooth_entity_key(adv.device, key): getattr(
-                adv.readings, key, None
-            )
-            for key in SENSOR_DESCRIPTIONS
-        },
-        entity_names={
-            _device_key_to_bluetooth_entity_key(adv.device, key): desc.name
-            for key, desc in SENSOR_DESCRIPTIONS.items()
-        },
+        entity_descriptions=descs,
+        entity_data=data,
+        entity_names=names,
     )
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    entry: config_entries.ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    entry: AranetConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up the Aranet sensors."""
-    coordinator: PassiveBluetoothProcessorCoordinator = hass.data[DOMAIN][
-        entry.entry_id
-    ]
     processor = PassiveBluetoothDataProcessor(sensor_update_to_bluetooth_data_update)
     entry.async_on_unload(
         processor.async_add_entities_listener(
             Aranet4BluetoothSensorEntity, async_add_entities
         )
     )
-    entry.async_on_unload(coordinator.async_register_processor(processor))
+    entry.async_on_unload(
+        entry.runtime_data.async_register_processor(
+            processor, AranetSensorEntityDescription
+        )
+    )
 
 
 class Aranet4BluetoothSensorEntity(
     PassiveBluetoothProcessorEntity[
-        PassiveBluetoothDataProcessor[Optional[Union[float, int]]]
+        PassiveBluetoothDataProcessor[float | int | None, Aranet4Advertisement],
     ],
     SensorEntity,
 ):
     """Representation of an Aranet sensor."""
 
+    def __init__(
+        self,
+        processor: PassiveBluetoothDataProcessor[
+            float | int | None, Aranet4Advertisement
+        ],
+        entity_key: PassiveBluetoothEntityKey,
+        description: EntityDescription,
+    ) -> None:
+        """Initialize with current metadata instead of a cached description."""
+        super().__init__(processor, entity_key, SENSOR_DESCRIPTIONS[entity_key.key])
+
     @property
+    @override
     def available(self) -> bool:
         """Return whether the entity was available in the last update."""
         # Our superclass covers "did the device disappear entirely", but if the
@@ -164,6 +233,7 @@ class Aranet4BluetoothSensorEntity(
         )
 
     @property
+    @override
     def native_value(self) -> int | float | None:
         """Return the native value."""
         return self.processor.entity_data.get(self.entity_key)

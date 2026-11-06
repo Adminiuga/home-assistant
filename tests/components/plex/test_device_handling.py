@@ -1,16 +1,24 @@
 """Tests for handling the device registry."""
 
+import requests_mock
+
 from homeassistant.components.plex.const import DOMAIN
 from homeassistant.const import Platform
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr, entity_registry as er
 
 
-async def test_cleanup_orphaned_devices(hass, entry, setup_plex_server):
+async def test_cleanup_orphaned_devices(
+    hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
+    entity_registry: er.EntityRegistry,
+    entry,
+    setup_plex_server,
+) -> None:
     """Test cleaning up orphaned devices on startup."""
     test_device_id = {(DOMAIN, "temporary_device_123")}
 
-    device_registry = dr.async_get(hass)
-    entity_registry = er.async_get(hass)
+    entry.add_to_hass(hass)
 
     test_device = device_registry.async_get_or_create(
         config_entry_id=entry.entry_id,
@@ -25,7 +33,9 @@ async def test_cleanup_orphaned_devices(hass, entry, setup_plex_server):
 
     # Ensure device is not removed with an entity
     await setup_plex_server()
-    device = device_registry.async_get_device(identifiers=test_device_id)
+    device = device_registry.async_get_device_by_identifier(
+        (DOMAIN, "temporary_device_123"), entry.entry_id
+    )
     assert device is not None
 
     await hass.config_entries.async_unload(entry.entry_id)
@@ -33,20 +43,26 @@ async def test_cleanup_orphaned_devices(hass, entry, setup_plex_server):
     # Ensure device is removed without an entity
     entity_registry.async_remove(test_entity.entity_id)
     await setup_plex_server()
-    device = device_registry.async_get_device(identifiers=test_device_id)
+    device = device_registry.async_get_device_by_identifier(
+        (DOMAIN, "temporary_device_123"), entry.entry_id
+    )
     assert device is None
 
 
 async def test_migrate_transient_devices(
-    hass, entry, setup_plex_server, requests_mock, player_plexweb_resources
-):
+    hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
+    entity_registry: er.EntityRegistry,
+    entry,
+    setup_plex_server,
+    requests_mock: requests_mock.Mocker,
+    player_plexweb_resources,
+) -> None:
     """Test cleaning up transient devices on startup."""
     plexweb_device_id = {(DOMAIN, "plexweb_id")}
     non_plexweb_device_id = {(DOMAIN, "1234567890123456-com-plexapp-android")}
-    plex_client_service_device_id = {(DOMAIN, "plex.tv-clients")}
 
-    device_registry = dr.async_get(hass)
-    entity_registry = er.async_get(hass)
+    entry.add_to_hass(hass)
 
     # Pre-create devices and entities to test device migration
     plexweb_device = device_registry.async_get_or_create(
@@ -79,12 +95,14 @@ async def test_migrate_transient_devices(
     # Ensure the Plex Web client is available
     requests_mock.get("/resources", text=player_plexweb_resources)
 
-    plexweb_device = device_registry.async_get_device(identifiers=plexweb_device_id)
-    non_plexweb_device = device_registry.async_get_device(
-        identifiers=non_plexweb_device_id
+    plexweb_device = device_registry.async_get_device_by_identifier(
+        (DOMAIN, "plexweb_id"), entry.entry_id
     )
-    plex_service_device = device_registry.async_get_device(
-        identifiers=plex_client_service_device_id
+    non_plexweb_device = device_registry.async_get_device_by_identifier(
+        (DOMAIN, "1234567890123456-com-plexapp-android"), entry.entry_id
+    )
+    plex_service_device = device_registry.async_get_device_by_identifier(
+        (DOMAIN, "plex.tv-clients"), entry.entry_id
     )
 
     assert (
@@ -104,8 +122,8 @@ async def test_migrate_transient_devices(
     # Ensure Plex Web entity is migrated to a service
     await setup_plex_server()
 
-    plex_service_device = device_registry.async_get_device(
-        identifiers=plex_client_service_device_id
+    plex_service_device = device_registry.async_get_device_by_identifier(
+        (DOMAIN, "plex.tv-clients"), entry.entry_id
     )
 
     assert (

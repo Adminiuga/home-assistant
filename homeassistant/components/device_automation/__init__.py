@@ -1,23 +1,23 @@
 """Helpers for device automations."""
-from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Coroutine, Iterable, Mapping
+from dataclasses import dataclass
 from enum import Enum
 from functools import wraps
 import logging
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Union, overload
+from typing import TYPE_CHECKING, Any, Literal, overload
 
-import voluptuous as vol
-import voluptuous_serialize
+import probatio
 
 from homeassistant.components import websocket_api
-from homeassistant.components.websocket_api.connection import ActiveConnection
+from homeassistant.components.websocket_api import ActiveConnection
 from homeassistant.const import (
     ATTR_ENTITY_ID,
     CONF_DEVICE_ID,
     CONF_DOMAIN,
+    CONF_ENTITY_ID,
     CONF_PLATFORM,
 )
 from homeassistant.core import HomeAssistant, callback
@@ -26,43 +26,72 @@ from homeassistant.helpers import (
     device_registry as dr,
     entity_registry as er,
 )
-from homeassistant.helpers.typing import ConfigType
+from homeassistant.helpers.typing import ConfigType, VolSchemaType
 from homeassistant.loader import IntegrationNotFound
-from homeassistant.requirements import async_get_integration_with_requirements
+from homeassistant.requirements import (
+    RequirementsNotFound,
+    async_get_integration_with_requirements,
+)
 
-from .const import (  # noqa: F401
+from .const import (
     CONF_IS_OFF,
     CONF_IS_ON,
+    CONF_TOGGLE,
+    CONF_TURN_OFF,
+    CONF_TURN_ON,
     CONF_TURNED_OFF,
     CONF_TURNED_ON,
 )
-from .exceptions import DeviceNotFound, InvalidDeviceAutomationConfig
+from .exceptions import DeviceNotFound, EntityNotFound, InvalidDeviceAutomationConfig
 
 if TYPE_CHECKING:
     from .action import DeviceAutomationActionProtocol
     from .condition import DeviceAutomationConditionProtocol
     from .trigger import DeviceAutomationTriggerProtocol
 
-    DeviceAutomationPlatformType = Union[
-        ModuleType,
-        DeviceAutomationTriggerProtocol,
-        DeviceAutomationConditionProtocol,
-        DeviceAutomationActionProtocol,
-    ]
+    type DeviceAutomationPlatformType = (
+        ModuleType
+        | DeviceAutomationTriggerProtocol
+        | DeviceAutomationConditionProtocol
+        | DeviceAutomationActionProtocol
+    )
+
 
 DOMAIN = "device_automation"
 
-DEVICE_TRIGGER_BASE_SCHEMA: vol.Schema = cv.TRIGGER_BASE_SCHEMA.extend(
+CONFIG_SCHEMA = cv.empty_config_schema(DOMAIN)
+
+DEVICE_TRIGGER_BASE_SCHEMA: probatio.Schema = cv.TRIGGER_BASE_SCHEMA.extend(
     {
-        vol.Required(CONF_PLATFORM): "device",
-        vol.Required(CONF_DOMAIN): str,
-        vol.Required(CONF_DEVICE_ID): str,
-        vol.Remove("metadata"): dict,
+        probatio.Required(CONF_PLATFORM): "device",
+        probatio.Required(CONF_DOMAIN): str,
+        probatio.Required(CONF_DEVICE_ID): str,
+        probatio.Remove("metadata"): dict,
     }
 )
 
+__all__ = [
+    "CONF_IS_OFF",
+    "CONF_IS_ON",
+    "CONF_TOGGLE",
+    "CONF_TURNED_OFF",
+    "CONF_TURNED_ON",
+    "CONF_TURN_OFF",
+    "CONF_TURN_ON",
+    "DEVICE_TRIGGER_BASE_SCHEMA",
+    "DOMAIN",
+    "DeviceAutomationType",
+    "DeviceNotFound",
+    "InvalidDeviceAutomationConfig",
+    "async_get_device_automation_platform",
+    "async_get_device_automations",
+    "async_get_entity_registry_entry_or_raise",
+    "async_validate_entity_schema",
+]
 
-class DeviceAutomationDetails(NamedTuple):
+
+@dataclass
+class DeviceAutomationDetails:
     """Details for device automation."""
 
     section: str
@@ -120,53 +149,54 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
 
 
 @overload
-async def async_get_device_automation_platform(  # noqa: D103
+async def async_get_device_automation_platform(
     hass: HomeAssistant,
     domain: str,
     automation_type: Literal[DeviceAutomationType.TRIGGER],
-) -> DeviceAutomationTriggerProtocol:
-    ...
+) -> DeviceAutomationTriggerProtocol: ...
 
 
 @overload
-async def async_get_device_automation_platform(  # noqa: D103
+async def async_get_device_automation_platform(
     hass: HomeAssistant,
     domain: str,
     automation_type: Literal[DeviceAutomationType.CONDITION],
-) -> DeviceAutomationConditionProtocol:
-    ...
+) -> DeviceAutomationConditionProtocol: ...
 
 
 @overload
-async def async_get_device_automation_platform(  # noqa: D103
+async def async_get_device_automation_platform(
     hass: HomeAssistant,
     domain: str,
     automation_type: Literal[DeviceAutomationType.ACTION],
-) -> DeviceAutomationActionProtocol:
-    ...
+) -> DeviceAutomationActionProtocol: ...
 
 
 @overload
-async def async_get_device_automation_platform(  # noqa: D103
+async def async_get_device_automation_platform(
     hass: HomeAssistant, domain: str, automation_type: DeviceAutomationType
-) -> "DeviceAutomationPlatformType":
-    ...
+) -> DeviceAutomationPlatformType: ...
 
 
 async def async_get_device_automation_platform(
     hass: HomeAssistant, domain: str, automation_type: DeviceAutomationType
-) -> "DeviceAutomationPlatformType":
+) -> DeviceAutomationPlatformType:
     """Load device automation platform for integration.
 
-    Throws InvalidDeviceAutomationConfig if the integration is not found or does not support device automation.
+    Throws InvalidDeviceAutomationConfig if the integration is not found
+    or does not support device automation.
     """
     platform_name = automation_type.value.section
     try:
         integration = await async_get_integration_with_requirements(hass, domain)
-        platform = integration.get_platform(platform_name)
+        platform = await integration.async_get_platform(platform_name)
     except IntegrationNotFound as err:
         raise InvalidDeviceAutomationConfig(
             f"Integration '{domain}' not found"
+        ) from err
+    except RequirementsNotFound as err:
+        raise InvalidDeviceAutomationConfig(
+            f"Integration '{domain}' could not be loaded"
         ) from err
     except ImportError as err:
         raise InvalidDeviceAutomationConfig(
@@ -231,18 +261,24 @@ async def async_get_device_automations(
     entity_registry = er.async_get(hass)
     domain_devices: dict[str, set[str]] = {}
     device_entities_domains: dict[str, set[str]] = {}
-    match_device_ids = set(device_ids or device_registry.devices)
+    match_device_ids = set(device_ids or device_registry._devices)  # noqa: SLF001
     combined_results: dict[str, list[dict[str, Any]]] = {}
 
-    for entry in entity_registry.entities.values():
-        if not entry.disabled_by and entry.device_id in match_device_ids:
-            device_entities_domains.setdefault(entry.device_id, set()).add(entry.domain)
+    for device_id in match_device_ids:
+        for entry in entity_registry.entities.get_entries_for_device_id(device_id):
+            device_entities_domains.setdefault(device_id, set()).add(entry.domain)
 
     for device_id in match_device_ids:
         combined_results[device_id] = []
         if (device := device_registry.async_get(device_id)) is None:
             raise DeviceNotFound
-        for entry_id in device.config_entries:
+        if device.is_composite_device:
+            # A restored composite has no single owning config entry; the union
+            # of the split devices' config entries covers every owning domain.
+            entry_ids = device.config_entries
+        else:
+            entry_ids = {device.config_entry_id}
+        for entry_id in entry_ids:
             if config_entry := hass.config_entries.async_get_entry(entry_id):
                 domain_devices.setdefault(config_entry.domain, set()).add(device_id)
         for domain in device_entities_domains.get(device_id, []):
@@ -301,7 +337,7 @@ async def _async_get_device_automation_capabilities(
 
     try:
         capabilities = await getattr(platform, function_name)(hass, automation)
-    except InvalidDeviceAutomationConfig:
+    except EntityNotFound, InvalidDeviceAutomationConfig:
         return {}
 
     capabilities = capabilities.copy()
@@ -309,15 +345,43 @@ async def _async_get_device_automation_capabilities(
     if (extra_fields := capabilities.get("extra_fields")) is None:
         capabilities["extra_fields"] = []
     else:
-        capabilities["extra_fields"] = voluptuous_serialize.convert(
+        capabilities["extra_fields"] = probatio.to_field_list(
             extra_fields, custom_serializer=cv.custom_serializer
         )
 
     return capabilities  # type: ignore[no-any-return]
 
 
+@callback
+def async_get_entity_registry_entry_or_raise(
+    hass: HomeAssistant, entity_registry_id: str
+) -> er.RegistryEntry:
+    """Get an entity registry entry from entry ID or raise."""
+    entity_registry = er.async_get(hass)
+    entry = entity_registry.async_get(entity_registry_id)
+    if entry is None:
+        raise EntityNotFound
+    return entry
+
+
+@callback
+def async_validate_entity_schema(
+    hass: HomeAssistant, config: ConfigType, schema: VolSchemaType
+) -> ConfigType:
+    """Validate schema and resolve entity registry entry id to entity_id."""
+    config = schema(config)
+
+    registry = er.async_get(hass)
+    if CONF_ENTITY_ID in config:
+        config[CONF_ENTITY_ID] = er.async_resolve_entity_id(
+            registry, config[CONF_ENTITY_ID]
+        )
+
+    return config
+
+
 def handle_device_errors(
-    func: Callable[[HomeAssistant, ActiveConnection, dict[str, Any]], Awaitable[None]]
+    func: Callable[[HomeAssistant, ActiveConnection, dict[str, Any]], Awaitable[None]],
 ) -> Callable[
     [HomeAssistant, ActiveConnection, dict[str, Any]], Coroutine[Any, Any, None]
 ]:
@@ -331,7 +395,7 @@ def handle_device_errors(
             await func(hass, connection, msg)
         except DeviceNotFound:
             connection.send_error(
-                msg["id"], websocket_api.const.ERR_NOT_FOUND, "Device not found"
+                msg["id"], websocket_api.ERR_NOT_FOUND, "Device not found"
             )
 
     return with_error_handling
@@ -339,8 +403,8 @@ def handle_device_errors(
 
 @websocket_api.websocket_command(
     {
-        vol.Required("type"): "device_automation/action/list",
-        vol.Required("device_id"): str,
+        probatio.Required("type"): "device_automation/action/list",
+        probatio.Required("device_id"): str,
     }
 )
 @websocket_api.async_response
@@ -360,8 +424,8 @@ async def websocket_device_automation_list_actions(
 
 @websocket_api.websocket_command(
     {
-        vol.Required("type"): "device_automation/condition/list",
-        vol.Required("device_id"): str,
+        probatio.Required("type"): "device_automation/condition/list",
+        probatio.Required("device_id"): str,
     }
 )
 @websocket_api.async_response
@@ -381,8 +445,8 @@ async def websocket_device_automation_list_conditions(
 
 @websocket_api.websocket_command(
     {
-        vol.Required("type"): "device_automation/trigger/list",
-        vol.Required("device_id"): str,
+        probatio.Required("type"): "device_automation/trigger/list",
+        probatio.Required("device_id"): str,
     }
 )
 @websocket_api.async_response
@@ -402,8 +466,8 @@ async def websocket_device_automation_list_triggers(
 
 @websocket_api.websocket_command(
     {
-        vol.Required("type"): "device_automation/action/capabilities",
-        vol.Required("action"): dict,
+        probatio.Required("type"): "device_automation/action/capabilities",
+        probatio.Required("action"): dict,
     }
 )
 @websocket_api.async_response
@@ -421,9 +485,9 @@ async def websocket_device_automation_get_action_capabilities(
 
 @websocket_api.websocket_command(
     {
-        vol.Required("type"): "device_automation/condition/capabilities",
-        vol.Required("condition"): cv.DEVICE_CONDITION_BASE_SCHEMA.extend(
-            {}, extra=vol.ALLOW_EXTRA
+        probatio.Required("type"): "device_automation/condition/capabilities",
+        probatio.Required("condition"): cv.DEVICE_CONDITION_BASE_SCHEMA.extend(
+            {}, extra=probatio.ALLOW_EXTRA
         ),
     }
 )
@@ -442,9 +506,12 @@ async def websocket_device_automation_get_condition_capabilities(
 
 @websocket_api.websocket_command(
     {
-        vol.Required("type"): "device_automation/trigger/capabilities",
-        vol.Required("trigger"): DEVICE_TRIGGER_BASE_SCHEMA.extend(
-            {}, extra=vol.ALLOW_EXTRA
+        probatio.Required("type"): "device_automation/trigger/capabilities",
+        # The frontend responds with `trigger` as key, while the
+        # `DEVICE_TRIGGER_BASE_SCHEMA` expects `platform1` as key.
+        probatio.Required("trigger"): probatio.All(
+            cv._trigger_pre_validator,  # noqa: SLF001
+            DEVICE_TRIGGER_BASE_SCHEMA.extend({}, extra=probatio.ALLOW_EXTRA),
         ),
     }
 )

@@ -1,33 +1,41 @@
 """Support for custom shell commands to retrieve values."""
-from __future__ import annotations
 
-from datetime import timedelta
-
-import voluptuous as vol
+import asyncio
+from datetime import datetime, timedelta
+from typing import Any, override
 
 from homeassistant.components.binary_sensor import (
-    DEVICE_CLASSES_SCHEMA,
-    PLATFORM_SCHEMA,
+    DOMAIN as BINARY_SENSOR_DOMAIN,
     BinarySensorEntity,
 )
 from homeassistant.const import (
     CONF_COMMAND,
-    CONF_DEVICE_CLASS,
     CONF_NAME,
     CONF_PAYLOAD_OFF,
     CONF_PAYLOAD_ON,
-    CONF_UNIQUE_ID,
+    CONF_SCAN_INTERVAL,
     CONF_VALUE_TEMPLATE,
 )
 from homeassistant.core import HomeAssistant
-import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.reload import setup_reload_service
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.template import Template
+from homeassistant.helpers.trigger_template_entity import (
+    ManualTriggerEntity,
+    ValueTemplate,
+)
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
+from homeassistant.util import dt as dt_util
 
-from .const import CONF_COMMAND_TIMEOUT, DEFAULT_TIMEOUT, DOMAIN, PLATFORMS
+from .const import (
+    CONF_COMMAND_TIMEOUT,
+    CONF_JSON_ATTRIBUTES,
+    CONF_JSON_ATTRIBUTES_PATH,
+    LOGGER,
+    TRIGGER_ENTITY_OPTIONS,
+)
 from .sensor import CommandSensorData
+from .utils import create_platform_yaml_not_supported_issue, parse_json_attributes
 
 DEFAULT_NAME = "Binary Command Sensor"
 DEFAULT_PAYLOAD_ON = "ON"
@@ -36,89 +44,159 @@ DEFAULT_PAYLOAD_OFF = "OFF"
 SCAN_INTERVAL = timedelta(seconds=60)
 
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
-    {
-        vol.Required(CONF_COMMAND): cv.string,
-        vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
-        vol.Optional(CONF_PAYLOAD_OFF, default=DEFAULT_PAYLOAD_OFF): cv.string,
-        vol.Optional(CONF_PAYLOAD_ON, default=DEFAULT_PAYLOAD_ON): cv.string,
-        vol.Optional(CONF_DEVICE_CLASS): DEVICE_CLASSES_SCHEMA,
-        vol.Optional(CONF_VALUE_TEMPLATE): cv.template,
-        vol.Optional(CONF_COMMAND_TIMEOUT, default=DEFAULT_TIMEOUT): cv.positive_int,
-        vol.Optional(CONF_UNIQUE_ID): cv.string,
-    }
-)
-
-
-def setup_platform(
+async def async_setup_platform(
     hass: HomeAssistant,
     config: ConfigType,
-    add_entities: AddEntitiesCallback,
+    async_add_entities: AddEntitiesCallback,
     discovery_info: DiscoveryInfoType | None = None,
 ) -> None:
     """Set up the Command line Binary Sensor."""
+    if not discovery_info:
+        create_platform_yaml_not_supported_issue(hass, BINARY_SENSOR_DOMAIN)
+        return
 
-    setup_reload_service(hass, DOMAIN, PLATFORMS)
+    binary_sensor_config = discovery_info
+    command: str = binary_sensor_config[CONF_COMMAND]
+    payload_off: str = binary_sensor_config[CONF_PAYLOAD_OFF]
+    payload_on: str = binary_sensor_config[CONF_PAYLOAD_ON]
+    command_timeout: int = binary_sensor_config[CONF_COMMAND_TIMEOUT]
+    scan_interval: timedelta = binary_sensor_config.get(
+        CONF_SCAN_INTERVAL, SCAN_INTERVAL
+    )
+    value_template: ValueTemplate | None = binary_sensor_config.get(CONF_VALUE_TEMPLATE)
+    json_attributes: list[str] | None = binary_sensor_config.get(CONF_JSON_ATTRIBUTES)
+    json_attributes_path: str | None = binary_sensor_config.get(
+        CONF_JSON_ATTRIBUTES_PATH
+    )
 
-    name: str = config[CONF_NAME]
-    command: str = config[CONF_COMMAND]
-    payload_off: str = config[CONF_PAYLOAD_OFF]
-    payload_on: str = config[CONF_PAYLOAD_ON]
-    device_class: str | None = config.get(CONF_DEVICE_CLASS)
-    value_template: Template | None = config.get(CONF_VALUE_TEMPLATE)
-    command_timeout: int = config[CONF_COMMAND_TIMEOUT]
-    unique_id: str | None = config.get(CONF_UNIQUE_ID)
-    if value_template is not None:
-        value_template.hass = hass
-    data = CommandSensorData(hass, command, command_timeout)
+    data = CommandSensorData(
+        hass,
+        command,
+        command_timeout,
+        BINARY_SENSOR_DOMAIN,
+        binary_sensor_config.get(CONF_NAME, DEFAULT_NAME),
+    )
 
-    add_entities(
+    trigger_entity_config = {
+        CONF_NAME: Template(binary_sensor_config.get(CONF_NAME, DEFAULT_NAME), hass),
+        **{
+            k: v for k, v in binary_sensor_config.items() if k in TRIGGER_ENTITY_OPTIONS
+        },
+    }
+
+    async_add_entities(
         [
             CommandBinarySensor(
                 data,
-                name,
-                device_class,
+                trigger_entity_config,
                 payload_on,
                 payload_off,
                 value_template,
-                unique_id,
+                json_attributes,
+                json_attributes_path,
+                scan_interval,
             )
         ],
-        True,
     )
 
 
-class CommandBinarySensor(BinarySensorEntity):
+class CommandBinarySensor(ManualTriggerEntity, BinarySensorEntity):
     """Representation of a command line binary sensor."""
+
+    _attr_should_poll = False
 
     def __init__(
         self,
         data: CommandSensorData,
-        name: str,
-        device_class: str | None,
+        config: ConfigType,
         payload_on: str,
         payload_off: str,
-        value_template: Template | None,
-        unique_id: str | None,
+        value_template: ValueTemplate | None,
+        json_attributes: list[str] | None,
+        json_attributes_path: str | None,
+        scan_interval: timedelta,
     ) -> None:
         """Initialize the Command line binary sensor."""
+        super().__init__(self.hass, config)
         self.data = data
-        self._attr_name = name
-        self._attr_device_class = device_class
         self._attr_is_on = None
+        self._attr_extra_state_attributes: dict[str, Any] = {}
         self._payload_on = payload_on
         self._payload_off = payload_off
         self._value_template = value_template
-        self._attr_unique_id = unique_id
+        self._json_attributes = json_attributes
+        self._json_attributes_path = json_attributes_path
+        self._scan_interval = scan_interval
+        self._process_updates: asyncio.Lock | None = None
 
-    def update(self) -> None:
+    @property
+    @override
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return extra state attributes."""
+        return self._attr_extra_state_attributes
+
+    @override
+    async def async_added_to_hass(self) -> None:
+        """Call when entity about to be added to hass."""
+        await super().async_added_to_hass()
+        await self._update_entity_state()
+        self.async_on_remove(
+            async_track_time_interval(
+                self.hass,
+                self._update_entity_state,
+                self._scan_interval,
+                name=f"Command Line Binary Sensor - {self.name}",
+                cancel_on_shutdown=True,
+            ),
+        )
+
+    async def _update_entity_state(self, now: datetime | None = None) -> None:
+        """Update the state of the entity."""
+        if self._process_updates is None:
+            self._process_updates = asyncio.Lock()
+        if self._process_updates.locked():
+            LOGGER.warning(
+                "Updating Command Line Binary Sensor %s took longer"
+                " than the scheduled update interval %s",
+                self.name,
+                self._scan_interval,
+            )
+            return
+
+        async with self._process_updates:
+            await self._async_update()
+
+    async def _async_update(self) -> None:
         """Get the latest data and updates the state."""
-        self.data.update()
+        await self.data.async_update()
         value = self.data.value
 
+        variables = self._template_variables_with_value(value)
+        if not self._render_availability_template(variables):
+            self.async_write_ha_state()
+            return
+
+        if self._json_attributes:
+            self._attr_extra_state_attributes = parse_json_attributes(
+                value, self._json_attributes, self._json_attributes_path
+            )
+
         if self._value_template is not None:
-            value = self._value_template.render_with_possible_json_value(value, False)
+            value = self._value_template.async_render_as_value_template(
+                self.entity_id, variables, None
+            )
+        self._attr_is_on = None
         if value == self._payload_on:
             self._attr_is_on = True
         elif value == self._payload_off:
             self._attr_is_on = False
+
+        self._process_manual_data(variables)
+        self.async_write_ha_state()
+
+    async def async_update(self) -> None:
+        """Update the entity.
+
+        Only used by the generic entity update service.
+        """
+        await self._update_entity_state(dt_util.now())

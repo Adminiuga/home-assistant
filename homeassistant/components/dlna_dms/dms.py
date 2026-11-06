@@ -1,11 +1,11 @@
 """Wrapper for media_source around async_upnp_client's DmsDevice ."""
-from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
+from enum import StrEnum
 import functools
-from typing import Any, TypeVar, cast
+from typing import Any
 
 from async_upnp_client.aiohttp import AiohttpSessionRequester
 from async_upnp_client.client import UpnpRequester
@@ -14,16 +14,20 @@ from async_upnp_client.const import NotificationSubType
 from async_upnp_client.exceptions import UpnpActionError, UpnpConnectionError, UpnpError
 from async_upnp_client.profiles.dlna import ContentDirectoryErrorCode, DmsDevice
 from didl_lite import didl_lite
+from propcache.api import cached_property
 
-from homeassistant.backports.enum import StrEnum
 from homeassistant.components import ssdp
 from homeassistant.components.media_player import BrowseError, MediaClass
-from homeassistant.components.media_source.error import Unresolvable
-from homeassistant.components.media_source.models import BrowseMediaSource, PlayMedia
+from homeassistant.components.media_source import (
+    BrowseMediaSource,
+    PlayMedia,
+    Unresolvable,
+)
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_DEVICE_ID, CONF_URL
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import aiohttp_client
+from homeassistant.helpers.service_info.ssdp import SsdpServiceInfo
 
 from .const import (
     CONF_SOURCE_ID,
@@ -32,6 +36,7 @@ from .const import (
     DLNA_RESOLVE_FILTER,
     DLNA_SORT_CRITERIA,
     DOMAIN,
+    DOMAIN_DATA,
     LOGGER,
     MEDIA_CLASS_MAP,
     PATH_OBJECT_ID_FLAG,
@@ -40,9 +45,6 @@ from .const import (
     ROOT_OBJECT_ID,
     STREAMABLE_PROTOCOLS,
 )
-
-_DlnaDmsDeviceMethod = TypeVar("_DlnaDmsDeviceMethod", bound="DmsDeviceSource")
-_R = TypeVar("_R")
 
 
 class DlnaDmsData:
@@ -89,12 +91,17 @@ class DlnaDmsData:
 
 @callback
 def get_domain_data(hass: HomeAssistant) -> DlnaDmsData:
-    """Obtain this integration's domain data, creating it if needed."""
-    if DOMAIN in hass.data:
-        return cast(DlnaDmsData, hass.data[DOMAIN])
+    """Obtain this integration's domain data, creating it if needed.
 
-    data = DlnaDmsData(hass)
-    hass.data[DOMAIN] = data
+    Creation is deferred to the first caller rather than done at setup, to
+    avoid building DlnaDmsData and its dependencies until a device is
+    actually connected to. This module is imported to run the config flow
+    for any DMS device discovered on the network, including ignored ones.
+    """
+    if (data := hass.data.get(DOMAIN_DATA)) is not None:
+        return data
+
+    data = hass.data[DOMAIN_DATA] = DlnaDmsData(hass)
     return data
 
 
@@ -122,8 +129,8 @@ class ActionError(DlnaDmsDeviceError):
     """Error when calling a UPnP Action on the device."""
 
 
-def catch_request_errors(
-    func: Callable[[_DlnaDmsDeviceMethod, str], Coroutine[Any, Any, _R]]
+def catch_request_errors[_DlnaDmsDeviceMethod: DmsDeviceSource, _R](
+    func: Callable[[_DlnaDmsDeviceMethod, str], Coroutine[Any, Any, _R]],
 ) -> Callable[[_DlnaDmsDeviceMethod, str], Coroutine[Any, Any, _R]]:
     """Catch UpnpError errors."""
 
@@ -218,7 +225,7 @@ class DmsDeviceSource:
         await self.device_disconnect()
 
     async def async_ssdp_callback(
-        self, info: ssdp.SsdpServiceInfo, change: ssdp.SsdpChange
+        self, info: SsdpServiceInfo, change: ssdp.SsdpChange
     ) -> None:
         """Handle notification from SSDP of device state change."""
         LOGGER.debug(
@@ -231,10 +238,10 @@ class DmsDeviceSource:
         try:
             bootid_str = info.ssdp_headers[ssdp.ATTR_SSDP_BOOTID]
             bootid: int | None = int(bootid_str, 10)
-        except (KeyError, ValueError):
+        except KeyError, ValueError:
             bootid = None
 
-        if change == ssdp.SsdpChange.UPDATE:
+        if change is ssdp.SsdpChange.UPDATE:
             # This is an announcement that bootid is about to change
             if self._bootid is not None and self._bootid == bootid:
                 # Store the new value (because our old value matches) so that we
@@ -242,7 +249,7 @@ class DmsDeviceSource:
                 try:
                     next_bootid_str = info.ssdp_headers[ssdp.ATTR_SSDP_NEXTBOOTID]
                     self._bootid = int(next_bootid_str, 10)
-                except (KeyError, ValueError):
+                except KeyError, ValueError:
                     pass
             # Nothing left to do until ssdp:alive comes through
             return
@@ -256,7 +263,7 @@ class DmsDeviceSource:
                 await self.device_disconnect()
         self._bootid = bootid
 
-        if change == ssdp.SsdpChange.BYEBYE:
+        if change is ssdp.SsdpChange.BYEBYE:
             # Device is going away
             if self._device:
                 # Disconnect from gone device
@@ -265,7 +272,7 @@ class DmsDeviceSource:
             self._ssdp_connect_failed = False
 
         if (
-            change == ssdp.SsdpChange.ALIVE
+            change is ssdp.SsdpChange.ALIVE
             and not self._device
             and not self._ssdp_connect_failed
         ):
@@ -331,7 +338,7 @@ class DmsDeviceSource:
     @property
     def usn(self) -> str:
         """Get the USN (Unique Service Name) for the wrapped UPnP device end-point."""
-        return self.config_entry.data[CONF_DEVICE_ID]
+        return self.config_entry.data[CONF_DEVICE_ID]  # type: ignore[no-any-return]
 
     @property
     def udn(self) -> str:
@@ -346,7 +353,12 @@ class DmsDeviceSource:
     @property
     def source_id(self) -> str:
         """Return a unique ID (slug) for this source for people to use in URLs."""
-        return self.config_entry.data[CONF_SOURCE_ID]
+        return self.config_entry.data[CONF_SOURCE_ID]  # type: ignore[no-any-return]
+
+    @property
+    def device(self) -> DmsDevice | None:
+        """Return the connected DMS device, if any."""
+        return self._device
 
     @property
     def icon(self) -> str | None:
@@ -514,7 +526,7 @@ class DmsDeviceSource:
             if isinstance(child, didl_lite.DidlObject)
         ]
 
-        media_source = BrowseMediaSource(
+        return BrowseMediaSource(
             domain=DOMAIN,
             identifier=self._make_identifier(Action.SEARCH, query),
             media_class=MediaClass.DIRECTORY,
@@ -524,8 +536,6 @@ class DmsDeviceSource:
             can_expand=True,
             children=children,
         )
-
-        return media_source
 
     def _didl_to_play_media(self, item: didl_lite.DidlObject) -> DidlPlayMedia:
         """Return the first playable resource from a DIDL-Lite object."""
@@ -566,7 +576,7 @@ class DmsDeviceSource:
         # can_play is False).
         try:
             child_count = int(item.child_count)
-        except (AttributeError, TypeError, ValueError):
+        except AttributeError, TypeError, ValueError:
             child_count = 0
         can_expand = (
             bool(children) or child_count > 0 or isinstance(item, didl_lite.Container)
@@ -581,7 +591,7 @@ class DmsDeviceSource:
         mime_type = _resource_mime_type(item.res[0]) if item.res else None
         media_content_type = mime_type or item.upnp_class
 
-        media_source = BrowseMediaSource(
+        return BrowseMediaSource(
             domain=DOMAIN,
             identifier=self._make_identifier(Action.OBJECT, item.id),
             media_class=MEDIA_CLASS_MAP.get(item.upnp_class, ""),
@@ -592,8 +602,6 @@ class DmsDeviceSource:
             children=children,
             thumbnail=self._didl_thumbnail_url(item),
         )
-
-        return media_source
 
     def _didl_thumbnail_url(self, item: didl_lite.DidlObject) -> str | None:
         """Return absolute URL of a thumbnail for a DIDL-Lite object.
@@ -619,7 +627,7 @@ class DmsDeviceSource:
         """Make an identifier for BrowseMediaSource."""
         return f"{self.source_id}/{action}{object_id}"
 
-    @functools.cached_property
+    @cached_property
     def _sort_criteria(self) -> list[str]:
         """Return criteria to be used for sorting results.
 

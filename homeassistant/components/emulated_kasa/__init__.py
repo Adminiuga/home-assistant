@@ -1,8 +1,9 @@
-"""Support for local power state reporting of entities by emulating TP-Link Kasa smart plugs."""
+"""Support for local power state reporting by emulating TP-Link Kasa plugs."""
+
 import logging
 
+import probatio
 from sense_energy import PlugInstance, SenseLink
-import voluptuous as vol
 
 from homeassistant.components.sensor import DOMAIN as SENSOR_DOMAIN
 from homeassistant.const import (
@@ -14,8 +15,7 @@ from homeassistant.const import (
     STATE_ON,
 )
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers import entity_registry as er
-import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers import config_validation as cv, entity_registry as er
 from homeassistant.helpers.template import Template, is_template_string
 from homeassistant.helpers.typing import ConfigType
 
@@ -23,28 +23,28 @@ from .const import CONF_POWER, CONF_POWER_ENTITY, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
-CONFIG_ENTITY_SCHEMA = vol.Schema(
+CONFIG_ENTITY_SCHEMA = probatio.Schema(
     {
-        vol.Optional(CONF_NAME): cv.string,
-        vol.Optional(CONF_POWER): vol.Any(
-            vol.Coerce(float),
+        probatio.Optional(CONF_NAME): cv.string,
+        probatio.Optional(CONF_POWER): probatio.Any(
+            probatio.Coerce(float),
             cv.template,
         ),
-        vol.Optional(CONF_POWER_ENTITY): cv.string,
+        probatio.Optional(CONF_POWER_ENTITY): cv.string,
     }
 )
 
-CONFIG_SCHEMA = vol.Schema(
+CONFIG_SCHEMA = probatio.Schema(
     {
-        DOMAIN: vol.Schema(
+        DOMAIN: probatio.Schema(
             {
-                vol.Required(CONF_ENTITIES): vol.Schema(
+                probatio.Required(CONF_ENTITIES): probatio.Schema(
                     {cv.entity_id: CONFIG_ENTITY_SCHEMA}
                 ),
             }
         )
     },
-    extra=vol.ALLOW_EXTRA,
+    extra=probatio.ALLOW_EXTRA,
 )
 
 
@@ -94,8 +94,6 @@ async def validate_configs(hass, entity_configs):
             power_val = entity_config[CONF_POWER]
             if isinstance(power_val, str) and is_template_string(power_val):
                 entity_config[CONF_POWER] = Template(power_val, hass)
-            elif isinstance(power_val, Template):
-                entity_config[CONF_POWER].hass = hass
         elif CONF_POWER_ENTITY in entity_config:
             power_val = entity_config[CONF_POWER_ENTITY]
             if hass.states.get(power_val) is None:

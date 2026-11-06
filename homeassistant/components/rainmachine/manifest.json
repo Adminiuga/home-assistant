@@ -1,20 +1,22 @@
 {
   "domain": "rainmachine",
   "name": "RainMachine",
-  "config_flow": true,
-  "documentation": "https://www.home-assistant.io/integrations/rainmachine",
-  "requirements": ["regenmaschine==2022.10.0"],
+  "categories": ["garden_plants"],
   "codeowners": ["@bachya"],
-  "iot_class": "local_polling",
+  "config_flow": true,
+  "connectivity": ["network"],
+  "documentation": "https://www.home-assistant.io/integrations/rainmachine",
   "homekit": {
     "models": ["Touch HD", "SPK5"]
   },
+  "integration_type": "device",
+  "iot_class": "local_polling",
+  "loggers": ["regenmaschine"],
+  "requirements": ["regenmaschine==2024.03.0"],
   "zeroconf": [
     {
-      "type": "_http._tcp.local.",
-      "name": "rainmachine*"
+      "name": "rainmachine*",
+      "type": "_http._tcp.local."
     }
-  ],
-  "loggers": ["regenmaschine"],
-  "integration_type": "device"
+  ]
 }

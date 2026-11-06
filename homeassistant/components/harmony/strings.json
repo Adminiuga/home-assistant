@@ -1,36 +1,88 @@
 {
   "config": {
-    "flow_title": "{name}",
-    "step": {
-      "user": {
-        "title": "Setup Logitech Harmony Hub",
-        "data": {
-          "host": "[%key:common::config_flow::data::host%]",
-          "name": "Hub Name"
-        }
-      },
-      "link": {
-        "title": "Setup Logitech Harmony Hub",
-        "description": "Do you want to setup {name} ({host})?"
-      }
+    "abort": {
+      "already_configured": "[%key:common::config_flow::abort::already_configured_device%]",
+      "unique_id_mismatch": "The host you entered belongs to a different Harmony Hub."
     },
     "error": {
       "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]",
       "unknown": "[%key:common::config_flow::error::unknown%]"
     },
-    "abort": {
-      "already_configured": "[%key:common::config_flow::abort::already_configured_device%]"
+    "flow_title": "{name}",
+    "step": {
+      "link": {
+        "description": "Do you want to set up {name} ({host})?",
+        "title": "[%key:component::harmony::config::step::user::title%]"
+      },
+      "reconfigure": {
+        "data": {
+          "host": "[%key:common::config_flow::data::host%]"
+        },
+        "data_description": {
+          "host": "[%key:component::harmony::config::step::user::data_description::host%]"
+        },
+        "title": "Reconfigure Logitech Harmony Hub"
+      },
+      "user": {
+        "data": {
+          "host": "[%key:common::config_flow::data::host%]"
+        },
+        "data_description": {
+          "host": "The hostname or IP address of your Logitech Harmony Hub."
+        },
+        "title": "Set up Logitech Harmony Hub"
+      }
+    }
+  },
+  "entity": {
+    "select": {
+      "activities": {
+        "name": "Activities",
+        "state": {
+          "power_off": "Power Off"
+        }
+      }
+    }
+  },
+  "exceptions": {
+    "cannot_connect": {
+      "message": "{name}: Unable to connect to hub at {address}:8088"
+    },
+    "connection_error": {
+      "message": "{name}: An error occurred while connecting to hub at {address}:8088"
+    },
+    "connection_timeout": {
+      "message": "{name}: Connection timed out to hub at {address}:8088"
     }
   },
   "options": {
+    "abort": {
+      "entry_not_loaded": "The options can be changed once the hub has been set up."
+    },
     "step": {
       "init": {
-        "description": "Adjust Harmony Hub Options",
         "data": {
           "activity": "The default activity to execute when none is specified.",
           "delay_secs": "The delay between sending commands."
-        }
+        },
+        "description": "Adjust Harmony Hub options"
       }
+    }
+  },
+  "services": {
+    "change_channel": {
+      "description": "Sends a change channel command to the Harmony Hub.",
+      "fields": {
+        "channel": {
+          "description": "Channel number to change to.",
+          "name": "Channel"
+        }
+      },
+      "name": "Change channel"
+    },
+    "sync": {
+      "description": "Syncs the remote's configuration.",
+      "name": "Sync"
     }
   }
 }

@@ -1,10 +1,14 @@
 {
   "domain": "growatt_server",
   "name": "Growatt",
+  "categories": ["energy.solar_batteries"],
+  "codeowners": ["@johanzander"],
   "config_flow": true,
-  "documentation": "https://www.home-assistant.io/integrations/growatt_server/",
-  "requirements": ["growattServer==1.2.3"],
-  "codeowners": ["@indykoning", "@muppet3000", "@JasperPlant"],
+  "connectivity": ["cloud"],
+  "documentation": "https://www.home-assistant.io/integrations/growatt_server",
+  "integration_type": "hub",
   "iot_class": "cloud_polling",
-  "loggers": ["growattServer"]
+  "loggers": ["growattServer"],
+  "quality_scale": "gold",
+  "requirements": ["growattServer==2.2.0"]
 }

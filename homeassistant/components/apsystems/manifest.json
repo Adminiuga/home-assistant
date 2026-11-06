@@ -1,0 +1,13 @@
+{
+  "domain": "apsystems",
+  "name": "APsystems",
+  "categories": ["energy.solar_batteries"],
+  "codeowners": ["@mawoka-myblock", "@SonnenladenGmbH"],
+  "config_flow": true,
+  "connectivity": ["network"],
+  "documentation": "https://www.home-assistant.io/integrations/apsystems",
+  "integration_type": "device",
+  "iot_class": "local_polling",
+  "loggers": ["APsystemsEZ1"],
+  "requirements": ["apsystems-ez1==2.7.0"]
+}

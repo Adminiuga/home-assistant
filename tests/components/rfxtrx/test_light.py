@@ -1,23 +1,20 @@
 """The tests for the Rfxtrx light platform."""
+
 from unittest.mock import call
 
 import pytest
+from pytest_homeassistant.common import mock_restore_cache
 
 from homeassistant.components.light import ATTR_BRIGHTNESS
-from homeassistant.components.rfxtrx import DOMAIN
 from homeassistant.const import STATE_UNKNOWN
-from homeassistant.core import State
+from homeassistant.core import HomeAssistant, State
 
-from .conftest import create_rfx_test_cfg
-
-from tests.common import MockConfigEntry, mock_restore_cache
+from .conftest import create_rfx_test_entry
 
 
-async def test_one_light(hass, rfxtrx):
+async def test_one_light(hass: HomeAssistant, rfxtrx) -> None:
     """Test with 1 light."""
-    entry_data = create_rfx_test_cfg(devices={"0b1100cd0213c7f210020f51": {}})
-    mock_entry = MockConfigEntry(domain="rfxtrx", unique_id=DOMAIN, data=entry_data)
-
+    mock_entry = create_rfx_test_entry(devices={"0b1100cd0213c7f210020f51": {}})
     mock_entry.add_to_hass(hass)
 
     await hass.config_entries.async_setup(mock_entry.entry_id)
@@ -89,8 +86,10 @@ async def test_one_light(hass, rfxtrx):
     ]
 
 
-@pytest.mark.parametrize("state,brightness", [["on", 100], ["on", 50], ["off", None]])
-async def test_state_restore(hass, rfxtrx, state, brightness):
+@pytest.mark.parametrize(
+    ("state", "brightness"), [("on", 100), ("on", 50), ("off", None)]
+)
+async def test_state_restore(hass: HomeAssistant, rfxtrx, state, brightness) -> None:
     """State restoration."""
 
     entity_id = "light.ac_213c7f2_16"
@@ -99,9 +98,7 @@ async def test_state_restore(hass, rfxtrx, state, brightness):
         hass, [State(entity_id, state, attributes={ATTR_BRIGHTNESS: brightness})]
     )
 
-    entry_data = create_rfx_test_cfg(devices={"0b1100cd0213c7f210020f51": {}})
-    mock_entry = MockConfigEntry(domain="rfxtrx", unique_id=DOMAIN, data=entry_data)
-
+    mock_entry = create_rfx_test_entry(devices={"0b1100cd0213c7f210020f51": {}})
     mock_entry.add_to_hass(hass)
 
     await hass.config_entries.async_setup(mock_entry.entry_id)
@@ -111,17 +108,15 @@ async def test_state_restore(hass, rfxtrx, state, brightness):
     assert hass.states.get(entity_id).attributes.get(ATTR_BRIGHTNESS) == brightness
 
 
-async def test_several_lights(hass, rfxtrx):
+async def test_several_lights(hass: HomeAssistant, rfxtrx) -> None:
     """Test with 3 lights."""
-    entry_data = create_rfx_test_cfg(
+    mock_entry = create_rfx_test_entry(
         devices={
             "0b1100cd0213c7f230020f71": {},
             "0b1100100118cdea02020f70": {},
             "0b1100101118cdea02050f70": {},
         }
     )
-    mock_entry = MockConfigEntry(domain="rfxtrx", unique_id=DOMAIN, data=entry_data)
-
     mock_entry.add_to_hass(hass)
 
     await hass.config_entries.async_setup(mock_entry.entry_id)
@@ -160,7 +155,7 @@ async def test_several_lights(hass, rfxtrx):
     assert state.attributes.get("brightness") == 255
 
 
-async def test_discover_light(hass, rfxtrx_automatic):
+async def test_discover_light(hass: HomeAssistant, rfxtrx_automatic) -> None:
     """Test with discovery of lights."""
     rfxtrx = rfxtrx_automatic
 

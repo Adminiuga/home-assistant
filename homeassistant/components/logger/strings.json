@@ -1,0 +1,36 @@
+{
+  "issues": {
+    "renamed_loggers": {
+      "description": "Home Assistant now uses httpx2 instead of httpx. The `logger` configuration in your `configuration.yaml` file sets a level or filter for loggers that no longer receive log messages:\n\n{loggers}\n\nRename them as shown in your `logger` configuration and restart Home Assistant to fix this issue.",
+      "title": "Logger configuration uses renamed logger names"
+    }
+  },
+  "selector": {
+    "level": {
+      "options": {
+        "critical": "Critical",
+        "debug": "Debug",
+        "error": "Error",
+        "fatal": "Fatal",
+        "info": "Info",
+        "warning": "Warning"
+      }
+    }
+  },
+  "services": {
+    "set_default_level": {
+      "description": "Sets the default log level for integrations.",
+      "fields": {
+        "level": {
+          "description": "Default severity level for all integrations.",
+          "name": "Level"
+        }
+      },
+      "name": "Set logger default level"
+    },
+    "set_level": {
+      "description": "Sets the log level for one or more integrations.",
+      "name": "Set logger level"
+    }
+  }
+}

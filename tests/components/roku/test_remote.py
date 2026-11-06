@@ -1,5 +1,8 @@
 """The tests for the Roku remote platform."""
+
 from unittest.mock import MagicMock
+
+from pytest_homeassistant.common import MockConfigEntry
 
 from homeassistant.components.remote import (
     ATTR_COMMAND,
@@ -12,11 +15,7 @@ from homeassistant.helpers import entity_registry as er
 
 from . import UPNP_SERIAL
 
-from tests.common import MockConfigEntry
-
 MAIN_ENTITY_ID = f"{REMOTE_DOMAIN}.my_roku_3"
-
-# pylint: disable=redefined-outer-name
 
 
 async def test_setup(hass: HomeAssistant, init_integration: MockConfigEntry) -> None:
@@ -25,11 +24,11 @@ async def test_setup(hass: HomeAssistant, init_integration: MockConfigEntry) -> 
 
 
 async def test_unique_id(
-    hass: HomeAssistant, init_integration: MockConfigEntry
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    init_integration: MockConfigEntry,
 ) -> None:
     """Test unique id."""
-    entity_registry = er.async_get(hass)
-
     main = entity_registry.async_get(MAIN_ENTITY_ID)
     assert main.unique_id == UPNP_SERIAL
 

@@ -1,5 +1,4 @@
 """The SensorPush Bluetooth integration."""
-from __future__ import annotations
 
 import logging
 
@@ -13,37 +12,30 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 
-from .const import DOMAIN
-
 PLATFORMS: list[Platform] = [Platform.SENSOR]
 
 _LOGGER = logging.getLogger(__name__)
 
+type SensorPushConfigEntry = ConfigEntry[PassiveBluetoothProcessorCoordinator]
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+
+async def async_setup_entry(hass: HomeAssistant, entry: SensorPushConfigEntry) -> None:
     """Set up SensorPush BLE device from a config entry."""
     address = entry.unique_id
     assert address is not None
-    data = SensorPushBluetoothDeviceData()
-    coordinator = hass.data.setdefault(DOMAIN, {})[
-        entry.entry_id
-    ] = PassiveBluetoothProcessorCoordinator(
+    coordinator = PassiveBluetoothProcessorCoordinator(
         hass,
         _LOGGER,
         address=address,
         mode=BluetoothScanningMode.PASSIVE,
-        update_method=data.update,
+        update_method=SensorPushBluetoothDeviceData().update,
     )
+    entry.runtime_data = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-    entry.async_on_unload(
-        coordinator.async_start()
-    )  # only start after all platforms have had a chance to subscribe
-    return True
+    # only start after all platforms have had a chance to subscribe
+    entry.async_on_unload(coordinator.async_start())
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_unload_entry(hass: HomeAssistant, entry: SensorPushConfigEntry) -> None:
     """Unload a config entry."""
-    if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
-        hass.data[DOMAIN].pop(entry.entry_id)
-
-    return unload_ok
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)

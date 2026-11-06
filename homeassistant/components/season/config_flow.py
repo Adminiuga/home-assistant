@@ -1,13 +1,16 @@
 """Config flow to configure the Season integration."""
-from __future__ import annotations
 
-from typing import Any
+from typing import Any, override
 
-import voluptuous as vol
+import probatio
 
-from homeassistant.config_entries import ConfigFlow
-from homeassistant.const import CONF_NAME, CONF_TYPE
-from homeassistant.data_entry_flow import FlowResult
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.const import CONF_TYPE
+from homeassistant.helpers.selector import (
+    SelectSelector,
+    SelectSelectorConfig,
+    SelectSelectorMode,
+)
 
 from .const import DEFAULT_NAME, DOMAIN, TYPE_ASTRONOMICAL, TYPE_METEOROLOGICAL
 
@@ -17,32 +20,35 @@ class SeasonConfigFlow(ConfigFlow, domain=DOMAIN):
 
     VERSION = 1
 
+    @override
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle a flow initialized by the user."""
         if user_input is not None:
             await self.async_set_unique_id(user_input[CONF_TYPE])
             self._abort_if_unique_id_configured()
             return self.async_create_entry(
-                title=user_input.get(CONF_NAME, DEFAULT_NAME),
+                title=DEFAULT_NAME,
                 data={CONF_TYPE: user_input[CONF_TYPE]},
             )
 
         return self.async_show_form(
             step_id="user",
-            data_schema=vol.Schema(
+            data_schema=probatio.Schema(
                 {
-                    vol.Required(CONF_TYPE, default=TYPE_ASTRONOMICAL): vol.In(
-                        {
-                            TYPE_ASTRONOMICAL: "Astronomical",
-                            TYPE_METEOROLOGICAL: "Meteorological",
-                        }
+                    probatio.Required(
+                        CONF_TYPE, default=TYPE_ASTRONOMICAL
+                    ): SelectSelector(
+                        SelectSelectorConfig(
+                            translation_key="season_type",
+                            mode=SelectSelectorMode.LIST,
+                            options=[
+                                TYPE_ASTRONOMICAL,
+                                TYPE_METEOROLOGICAL,
+                            ],
+                        )
                     )
                 },
             ),
         )
-
-    async def async_step_import(self, user_input: dict[str, Any]) -> FlowResult:
-        """Handle import from configuration.yaml."""
-        return await self.async_step_user(user_input)

@@ -1,31 +1,23 @@
 """Config flow for MySensors."""
-from __future__ import annotations
 
 import os
-from typing import Any
+from typing import Any, override
 
 from awesomeversion import (
     AwesomeVersion,
     AwesomeVersionStrategy,
     AwesomeVersionStrategyException,
 )
-import voluptuous as vol
+import probatio
 
-from homeassistant import config_entries
-from homeassistant.components.mqtt import (
-    DOMAIN as MQTT_DOMAIN,
-    valid_publish_topic,
-    valid_subscribe_topic,
-)
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.const import CONF_DEVICE
 from homeassistant.core import callback
-from homeassistant.data_entry_flow import FlowResult
-from homeassistant.helpers import selector
-import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers import config_validation as cv, selector
+from homeassistant.helpers.typing import VolDictType
 
 from .const import (
     CONF_BAUD_RATE,
-    CONF_DEVICE,
     CONF_GATEWAY_TYPE,
     CONF_GATEWAY_TYPE_MQTT,
     CONF_GATEWAY_TYPE_SERIAL,
@@ -37,21 +29,23 @@ from .const import (
     CONF_TOPIC_OUT_PREFIX,
     CONF_VERSION,
     DOMAIN,
+    MQTT_DOMAIN,
     ConfGatewayType,
 )
 from .gateway import MQTT_COMPONENT, is_serial_port, is_socket_address, try_connect
+from .models import MySensorsConfigEntry
 
 DEFAULT_BAUD_RATE = 115200
 DEFAULT_TCP_PORT = 5003
 DEFAULT_VERSION = "1.4"
 
-_PORT_SELECTOR = vol.All(
+_PORT_SELECTOR = probatio.All(
     selector.NumberSelector(
         selector.NumberSelectorConfig(
             min=1, max=65535, mode=selector.NumberSelectorMode.BOX
         ),
     ),
-    vol.Coerce(int),
+    probatio.Coerce(int),
 )
 
 
@@ -59,21 +53,20 @@ def is_persistence_file(value: str) -> str:
     """Validate that persistence file path ends in either .pickle or .json."""
     if value.endswith((".json", ".pickle")):
         return value
-    raise vol.Invalid(f"{value} does not end in either `.json` or `.pickle`")
+    raise probatio.Invalid(f"{value} does not end in either `.json` or `.pickle`")
 
 
 def _get_schema_common(user_input: dict[str, str]) -> dict:
     """Create a schema with options common to all gateway types."""
-    schema = {
-        vol.Required(
+    return {
+        probatio.Required(
             CONF_VERSION,
             description={
                 "suggested_value": user_input.get(CONF_VERSION, DEFAULT_VERSION)
             },
         ): str,
-        vol.Optional(CONF_PERSISTENCE_FILE): str,
+        probatio.Optional(CONF_PERSISTENCE_FILE): str,
     }
-    return schema
 
 
 def _validate_version(version: str) -> dict[str, str]:
@@ -96,11 +89,12 @@ def _validate_version(version: str) -> dict[str, str]:
 
 
 def _is_same_device(
-    gw_type: ConfGatewayType, user_input: dict[str, Any], entry: ConfigEntry
+    gw_type: ConfGatewayType, user_input: dict[str, Any], entry: MySensorsConfigEntry
 ) -> bool:
     """Check if another ConfigDevice is actually the same as user_input.
 
-    This function only compares addresses and tcp ports, so it is possible to fool it with tricks like port forwarding.
+    This function only compares addresses and tcp ports, so it is possible
+    to fool it with tricks like port forwarding.
     """
     if entry.data[CONF_DEVICE] != user_input[CONF_DEVICE]:
         return False
@@ -120,17 +114,24 @@ def _is_same_device(
     return True
 
 
-class MySensorsConfigFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
+class MySensorsConfigFlowHandler(ConfigFlow, domain=DOMAIN):
     """Handle a config flow."""
 
     def __init__(self) -> None:
         """Set up config flow."""
         self._gw_type: str | None = None
 
+    @override
     async def async_step_user(
         self, user_input: dict[str, str] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Create a config entry from frontend user input."""
+        return await self.async_step_select_gateway_type()
+
+    async def async_step_select_gateway_type(
+        self, user_input: dict[str, str] | None = None
+    ) -> ConfigFlowResult:
+        """Show the select gateway type menu."""
         return self.async_show_menu(
             step_id="select_gateway_type",
             menu_options=["gw_serial", "gw_tcp", "gw_mqtt"],
@@ -138,7 +139,7 @@ class MySensorsConfigFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
 
     async def async_step_gw_serial(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Create config entry for a serial gateway."""
         gw_type = self._gw_type = CONF_GATEWAY_TYPE_SERIAL
         errors: dict[str, str] = {}
@@ -149,25 +150,24 @@ class MySensorsConfigFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
                 return self._async_create_entry(user_input)
 
         user_input = user_input or {}
-        schema = {
-            vol.Required(
+        schema: VolDictType = {
+            probatio.Required(
                 CONF_DEVICE, default=user_input.get(CONF_DEVICE, "/dev/ttyACM0")
             ): str,
-            vol.Required(
+            probatio.Required(
                 CONF_BAUD_RATE,
                 default=user_input.get(CONF_BAUD_RATE, DEFAULT_BAUD_RATE),
             ): cv.positive_int,
         }
         schema.update(_get_schema_common(user_input))
 
-        schema = vol.Schema(schema)
         return self.async_show_form(
-            step_id="gw_serial", data_schema=schema, errors=errors
+            step_id="gw_serial", data_schema=probatio.Schema(schema), errors=errors
         )
 
     async def async_step_gw_tcp(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Create a config entry for a tcp gateway."""
         gw_type = self._gw_type = CONF_GATEWAY_TYPE_TCP
         errors: dict[str, str] = {}
@@ -178,18 +178,19 @@ class MySensorsConfigFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
                 return self._async_create_entry(user_input)
 
         user_input = user_input or {}
-        schema = {
-            vol.Required(
+        schema: VolDictType = {
+            probatio.Required(
                 CONF_DEVICE, default=user_input.get(CONF_DEVICE, "127.0.0.1")
             ): str,
-            vol.Optional(
+            probatio.Optional(
                 CONF_TCP_PORT, default=user_input.get(CONF_TCP_PORT, DEFAULT_TCP_PORT)
             ): _PORT_SELECTOR,
         }
         schema.update(_get_schema_common(user_input))
 
-        schema = vol.Schema(schema)
-        return self.async_show_form(step_id="gw_tcp", data_schema=schema, errors=errors)
+        return self.async_show_form(
+            step_id="gw_tcp", data_schema=probatio.Schema(schema), errors=errors
+        )
 
     def _check_topic_exists(self, topic: str) -> bool:
         for other_config in self._async_current_entries():
@@ -201,11 +202,16 @@ class MySensorsConfigFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
 
     async def async_step_gw_mqtt(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Create a config entry for a mqtt gateway."""
         # Naive check that doesn't consider config entry state.
         if MQTT_DOMAIN not in self.hass.config.components:
             return self.async_abort(reason="mqtt_required")
+
+        from homeassistant.components.mqtt import (  # noqa: PLC0415
+            valid_publish_topic,
+            valid_subscribe_topic,
+        )
 
         gw_type = self._gw_type = CONF_GATEWAY_TYPE_MQTT
         errors: dict[str, str] = {}
@@ -215,7 +221,7 @@ class MySensorsConfigFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
 
             try:
                 valid_subscribe_topic(user_input[CONF_TOPIC_IN_PREFIX])
-            except vol.Invalid:
+            except probatio.Invalid:
                 errors[CONF_TOPIC_IN_PREFIX] = "invalid_subscribe_topic"
             else:
                 if self._check_topic_exists(user_input[CONF_TOPIC_IN_PREFIX]):
@@ -223,7 +229,7 @@ class MySensorsConfigFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
 
             try:
                 valid_publish_topic(user_input[CONF_TOPIC_OUT_PREFIX])
-            except vol.Invalid:
+            except probatio.Invalid:
                 errors[CONF_TOPIC_OUT_PREFIX] = "invalid_publish_topic"
             if not errors:
                 if (
@@ -239,24 +245,25 @@ class MySensorsConfigFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
                 return self._async_create_entry(user_input)
 
         user_input = user_input or {}
-        schema = {
-            vol.Required(
+        schema: VolDictType = {
+            probatio.Required(
                 CONF_TOPIC_IN_PREFIX, default=user_input.get(CONF_TOPIC_IN_PREFIX, "")
             ): str,
-            vol.Required(
+            probatio.Required(
                 CONF_TOPIC_OUT_PREFIX, default=user_input.get(CONF_TOPIC_OUT_PREFIX, "")
             ): str,
-            vol.Required(CONF_RETAIN, default=user_input.get(CONF_RETAIN, True)): bool,
+            probatio.Required(
+                CONF_RETAIN, default=user_input.get(CONF_RETAIN, True)
+            ): bool,
         }
         schema.update(_get_schema_common(user_input))
 
-        schema = vol.Schema(schema)
         return self.async_show_form(
-            step_id="gw_mqtt", data_schema=schema, errors=errors
+            step_id="gw_mqtt", data_schema=probatio.Schema(schema), errors=errors
         )
 
     @callback
-    def _async_create_entry(self, user_input: dict[str, Any]) -> FlowResult:
+    def _async_create_entry(self, user_input: dict[str, Any]) -> ConfigFlowResult:
         """Create the config entry."""
         return self.async_create_entry(
             title=f"{user_input[CONF_DEVICE]}",
@@ -285,7 +292,7 @@ class MySensorsConfigFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
                 await self.hass.async_add_executor_job(
                     verification_func, user_input[CONF_DEVICE]
                 )
-            except vol.Invalid:
+            except probatio.Invalid:
                 errors[CONF_DEVICE] = (
                     "invalid_ip"
                     if gw_type == CONF_GATEWAY_TYPE_TCP
@@ -294,12 +301,12 @@ class MySensorsConfigFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         if CONF_PERSISTENCE_FILE in user_input:
             try:
                 is_persistence_file(user_input[CONF_PERSISTENCE_FILE])
-            except vol.Invalid:
+            except probatio.Invalid:
                 errors[CONF_PERSISTENCE_FILE] = "invalid_persistence_file"
             else:
-                real_persistence_path = user_input[
-                    CONF_PERSISTENCE_FILE
-                ] = self._normalize_persistence_file(user_input[CONF_PERSISTENCE_FILE])
+                real_persistence_path = user_input[CONF_PERSISTENCE_FILE] = (
+                    self._normalize_persistence_file(user_input[CONF_PERSISTENCE_FILE])
+                )
                 for other_entry in self._async_current_entries():
                     if CONF_PERSISTENCE_FILE not in other_entry.data:
                         continue

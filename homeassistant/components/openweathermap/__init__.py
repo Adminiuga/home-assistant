@@ -1,115 +1,102 @@
 """The openweathermap component."""
-from __future__ import annotations
 
+from dataclasses import dataclass
 import logging
-from typing import Any
 
-from pyowm import OWM
-from pyowm.utils.config import get_default_config
+from pyopenweathermap import create_owm_client
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import (
-    CONF_API_KEY,
-    CONF_LATITUDE,
-    CONF_LONGITUDE,
-    CONF_MODE,
-    CONF_NAME,
-)
+from homeassistant.const import CONF_API_KEY, CONF_LANGUAGE, CONF_MODE
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.typing import ConfigType
 
-from .const import (
-    CONF_LANGUAGE,
-    CONFIG_FLOW_VERSION,
-    DOMAIN,
-    ENTRY_NAME,
-    ENTRY_WEATHER_COORDINATOR,
-    FORECAST_MODE_FREE_DAILY,
-    FORECAST_MODE_ONECALL_DAILY,
-    PLATFORMS,
-    UPDATE_LISTENER,
-)
-from .weather_update_coordinator import WeatherUpdateCoordinator
+from .const import CONFIG_FLOW_VERSION, DEFAULT_OWM_MODE, DOMAIN, OWM_MODES, PLATFORMS
+from .coordinator import OWMUpdateCoordinator, get_owm_update_coordinator
+from .repairs import async_create_issue, async_delete_issue
+from .services import async_setup_services
+from .utils import build_data_and_options
 
 _LOGGER = logging.getLogger(__name__)
 
+type OpenweathermapConfigEntry = ConfigEntry[OpenweathermapData]
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Set up OpenWeatherMap as config entry."""
-    name = entry.data[CONF_NAME]
-    api_key = entry.data[CONF_API_KEY]
-    latitude = entry.data.get(CONF_LATITUDE, hass.config.latitude)
-    longitude = entry.data.get(CONF_LONGITUDE, hass.config.longitude)
-    forecast_mode = _get_config_value(entry, CONF_MODE)
-    language = _get_config_value(entry, CONF_LANGUAGE)
 
-    config_dict = _get_owm_config(language)
+@dataclass
+class OpenweathermapData:
+    """Runtime data definition."""
 
-    owm = OWM(api_key, config_dict).weather_manager()
-    weather_coordinator = WeatherUpdateCoordinator(
-        owm, latitude, longitude, forecast_mode, hass
-    )
+    mode: str
+    coordinator: OWMUpdateCoordinator
 
-    await weather_coordinator.async_config_entry_first_refresh()
 
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = {
-        ENTRY_NAME: name,
-        ENTRY_WEATHER_COORDINATOR: weather_coordinator,
-    }
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    update_listener = entry.add_update_listener(async_update_options)
-    hass.data[DOMAIN][entry.entry_id][UPDATE_LISTENER] = update_listener
-
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Set up the OpenWeatherMap integration."""
+    async_setup_services(hass)
     return True
 
 
-async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_setup_entry(
+    hass: HomeAssistant, entry: OpenweathermapConfigEntry
+) -> None:
+    """Set up OpenWeatherMap as config entry."""
+    api_key = entry.data[CONF_API_KEY]
+    language = entry.options[CONF_LANGUAGE]
+    mode = entry.options[CONF_MODE]
+
+    if mode not in OWM_MODES:
+        async_create_issue(hass, entry.entry_id)
+    else:
+        async_delete_issue(hass, entry.entry_id)
+
+    owm_client = create_owm_client(api_key, mode, lang=language)
+    owm_coordinator = get_owm_update_coordinator(mode)(hass, entry, owm_client)
+
+    await owm_coordinator.async_config_entry_first_refresh()
+
+    entry.async_on_unload(entry.add_update_listener(async_update_options))
+
+    entry.runtime_data = OpenweathermapData(mode, owm_coordinator)
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+
+async def async_migrate_entry(
+    hass: HomeAssistant, entry: OpenweathermapConfigEntry
+) -> None:
     """Migrate old entry."""
     config_entries = hass.config_entries
     data = entry.data
+    options = entry.options
     version = entry.version
 
     _LOGGER.debug("Migrating OpenWeatherMap entry from version %s", version)
 
-    if version == 1:
-        if (mode := data[CONF_MODE]) == FORECAST_MODE_FREE_DAILY:
-            mode = FORECAST_MODE_ONECALL_DAILY
+    if version < 5:
+        combined_data = {**data, **options, CONF_MODE: DEFAULT_OWM_MODE}
+        new_data, new_options = build_data_and_options(combined_data)
+        config_entries.async_update_entry(
+            entry,
+            data=new_data,
+            options=new_options,
+            version=CONFIG_FLOW_VERSION,
+        )
 
-        new_data = {**data, CONF_MODE: mode}
-        version = entry.version = CONFIG_FLOW_VERSION
-        config_entries.async_update_entry(entry, data=new_data)
-
-    _LOGGER.info("Migration to version %s successful", version)
-
-    return True
+    _LOGGER.debug("Migration to version %s successful", CONFIG_FLOW_VERSION)
 
 
-async def async_update_options(hass: HomeAssistant, entry: ConfigEntry) -> None:
+async def async_update_options(
+    hass: HomeAssistant, entry: OpenweathermapConfigEntry
+) -> None:
     """Update options."""
     await hass.config_entries.async_reload(entry.entry_id)
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_unload_entry(
+    hass: HomeAssistant, entry: OpenweathermapConfigEntry
+) -> None:
     """Unload a config entry."""
-    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-    if unload_ok:
-        update_listener = hass.data[DOMAIN][entry.entry_id][UPDATE_LISTENER]
-        update_listener()
-        hass.data[DOMAIN].pop(entry.entry_id)
-
-    return unload_ok
-
-
-def _get_config_value(config_entry: ConfigEntry, key: str) -> Any:
-    if config_entry.options:
-        return config_entry.options[key]
-    return config_entry.data[key]
-
-
-def _get_owm_config(language: str) -> dict[str, Any]:
-    """Get OpenWeatherMap configuration and add language to it."""
-    config_dict = get_default_config()
-    config_dict["language"] = language
-    return config_dict
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)

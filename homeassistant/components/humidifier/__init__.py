@@ -1,78 +1,117 @@
 """Provides functionality to interact with humidifier devices."""
-from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import timedelta
 import logging
-from typing import Any, final
 
-import voluptuous as vol
-
-from homeassistant.backports.enum import StrEnum
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     ATTR_MODE,
     SERVICE_TOGGLE,
     SERVICE_TURN_OFF,
     SERVICE_TURN_ON,
+    STATE_OFF,
     STATE_ON,
 )
-from homeassistant.core import HomeAssistant
-import homeassistant.helpers.config_validation as cv
-from homeassistant.helpers.config_validation import (  # noqa: F401
-    PLATFORM_SCHEMA,
-    PLATFORM_SCHEMA_BASE,
-)
-from homeassistant.helpers.entity import ToggleEntity, ToggleEntityDescription
+from homeassistant.core import DOMAIN as HOMEASSISTANT_DOMAIN, HomeAssistant
+from homeassistant.exceptions import ConfigEntryError
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.entity_component import EntityComponent
 from homeassistant.helpers.typing import ConfigType
-from homeassistant.loader import bind_hass
 
-from .const import (  # noqa: F401
+from .const import (
+    ATTR_ACTION,
     ATTR_AVAILABLE_MODES,
+    ATTR_CURRENT_HUMIDITY,
     ATTR_HUMIDITY,
     ATTR_MAX_HUMIDITY,
     ATTR_MIN_HUMIDITY,
+    ATTR_TARGET_HUMIDITY_STEP,
+    DATA_COMPONENT,
     DEFAULT_MAX_HUMIDITY,
     DEFAULT_MIN_HUMIDITY,
-    DEVICE_CLASS_DEHUMIDIFIER,
-    DEVICE_CLASS_HUMIDIFIER,
+    DEVICE_CLASSES_SCHEMA,
     DOMAIN,
     MODE_AUTO,
     MODE_AWAY,
+    MODE_BABY,
+    MODE_BOOST,
+    MODE_COMFORT,
+    MODE_ECO,
+    MODE_HOME,
     MODE_NORMAL,
+    MODE_SLEEP,
     SERVICE_SET_HUMIDITY,
     SERVICE_SET_MODE,
-    SUPPORT_MODES,
+    HumidifierAction,
+    HumidifierDeviceClass,
+    HumidifierEntityCapabilityAttribute,
     HumidifierEntityFeature,
+    HumidifierEntityStateAttribute,
+    HumidifierService,
+    HumidifierServiceArgument,
 )
+from .entity import HumidifierEntity, HumidifierEntityDescription
+from .services import async_setup_services
 
 _LOGGER = logging.getLogger(__name__)
 
-
+ENTITY_ID_FORMAT = DOMAIN + ".{}"
+PLATFORM_SCHEMA = cv.PLATFORM_SCHEMA
+PLATFORM_SCHEMA_BASE = cv.PLATFORM_SCHEMA_BASE
 SCAN_INTERVAL = timedelta(seconds=60)
 
-ENTITY_ID_FORMAT = DOMAIN + ".{}"
-
-
-class HumidifierDeviceClass(StrEnum):
-    """Device class for humidifiers."""
-
-    HUMIDIFIER = "humidifier"
-    DEHUMIDIFIER = "dehumidifier"
-
-
-DEVICE_CLASSES_SCHEMA = vol.All(vol.Lower, vol.Coerce(HumidifierDeviceClass))
 
 # DEVICE_CLASSES below is deprecated as of 2021.12
 # use the HumidifierDeviceClass enum instead.
 DEVICE_CLASSES = [cls.value for cls in HumidifierDeviceClass]
 
+__all__ = [
+    "ATTR_ACTION",
+    "ATTR_AVAILABLE_MODES",
+    "ATTR_CURRENT_HUMIDITY",
+    "ATTR_HUMIDITY",
+    "ATTR_MAX_HUMIDITY",
+    "ATTR_MIN_HUMIDITY",
+    "ATTR_MODE",
+    "ATTR_TARGET_HUMIDITY_STEP",
+    "DEFAULT_MAX_HUMIDITY",
+    "DEFAULT_MIN_HUMIDITY",
+    "DEVICE_CLASSES_SCHEMA",
+    "DOMAIN",
+    "ENTITY_ID_FORMAT",
+    "MODE_AUTO",
+    "MODE_AWAY",
+    "MODE_BABY",
+    "MODE_BOOST",
+    "MODE_COMFORT",
+    "MODE_ECO",
+    "MODE_HOME",
+    "MODE_NORMAL",
+    "MODE_SLEEP",
+    "PLATFORM_SCHEMA",
+    "PLATFORM_SCHEMA_BASE",
+    "SERVICE_SET_HUMIDITY",
+    "SERVICE_SET_MODE",
+    "SERVICE_TOGGLE",
+    "SERVICE_TURN_OFF",
+    "SERVICE_TURN_ON",
+    "STATE_OFF",
+    "STATE_ON",
+    "HumidifierAction",
+    "HumidifierDeviceClass",
+    "HumidifierEntity",
+    "HumidifierEntityCapabilityAttribute",
+    "HumidifierEntityDescription",
+    "HumidifierEntityFeature",
+    "HumidifierEntityStateAttribute",
+    "HumidifierService",
+    "HumidifierServiceArgument",
+]
+
 # mypy: disallow-any-generics
 
 
-@bind_hass
-def is_on(hass, entity_id):
+def is_on(hass: HomeAssistant, entity_id: str) -> bool:
     """Return if the humidifier is on based on the statemachine.
 
     Async friendly.
@@ -82,144 +121,26 @@ def is_on(hass, entity_id):
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up humidifier devices."""
-    component = hass.data[DOMAIN] = EntityComponent[HumidifierEntity](
+    component = hass.data[DATA_COMPONENT] = EntityComponent[HumidifierEntity](
         _LOGGER, DOMAIN, hass, SCAN_INTERVAL
     )
     await component.async_setup(config)
 
-    component.async_register_entity_service(SERVICE_TURN_ON, {}, "async_turn_on")
-    component.async_register_entity_service(SERVICE_TURN_OFF, {}, "async_turn_off")
-    component.async_register_entity_service(SERVICE_TOGGLE, {}, "async_toggle")
-    component.async_register_entity_service(
-        SERVICE_SET_MODE,
-        {vol.Required(ATTR_MODE): cv.string},
-        "async_set_mode",
-        [HumidifierEntityFeature.MODES],
-    )
-    component.async_register_entity_service(
-        SERVICE_SET_HUMIDITY,
-        {
-            vol.Required(ATTR_HUMIDITY): vol.All(
-                vol.Coerce(int), vol.Range(min=0, max=100)
-            )
-        },
-        "async_set_humidity",
-    )
+    async_setup_services(hass)
 
     return True
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Set up a config entry."""
-    component: EntityComponent[HumidifierEntity] = hass.data[DOMAIN]
-    return await component.async_setup_entry(entry)
+    if not await hass.data[DATA_COMPONENT].async_setup_entry(entry):
+        raise ConfigEntryError(
+            translation_domain=HOMEASSISTANT_DOMAIN,
+            translation_key="platform_setup_failed",
+            translation_placeholders={"platform": entry.domain, "domain": DOMAIN},
+        )
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Unload a config entry."""
-    component: EntityComponent[HumidifierEntity] = hass.data[DOMAIN]
-    return await component.async_unload_entry(entry)
-
-
-@dataclass
-class HumidifierEntityDescription(ToggleEntityDescription):
-    """A class that describes humidifier entities."""
-
-    device_class: HumidifierDeviceClass | str | None = None
-
-
-class HumidifierEntity(ToggleEntity):
-    """Base class for humidifier entities."""
-
-    entity_description: HumidifierEntityDescription
-    _attr_available_modes: list[str] | None
-    _attr_device_class: HumidifierDeviceClass | str | None
-    _attr_max_humidity: int = DEFAULT_MAX_HUMIDITY
-    _attr_min_humidity: int = DEFAULT_MIN_HUMIDITY
-    _attr_mode: str | None
-    _attr_target_humidity: int | None = None
-
-    @property
-    def capability_attributes(self) -> dict[str, Any]:
-        """Return capability attributes."""
-        supported_features = self.supported_features or 0
-        data: dict[str, int | list[str] | None] = {
-            ATTR_MIN_HUMIDITY: self.min_humidity,
-            ATTR_MAX_HUMIDITY: self.max_humidity,
-        }
-
-        if supported_features & HumidifierEntityFeature.MODES:
-            data[ATTR_AVAILABLE_MODES] = self.available_modes
-
-        return data
-
-    @property
-    def device_class(self) -> HumidifierDeviceClass | str | None:
-        """Return the class of this entity."""
-        if hasattr(self, "_attr_device_class"):
-            return self._attr_device_class
-        if hasattr(self, "entity_description"):
-            return self.entity_description.device_class
-        return None
-
-    @final
-    @property
-    def state_attributes(self) -> dict[str, Any]:
-        """Return the optional state attributes."""
-        supported_features = self.supported_features or 0
-        data: dict[str, int | str | None] = {}
-
-        if self.target_humidity is not None:
-            data[ATTR_HUMIDITY] = self.target_humidity
-
-        if supported_features & HumidifierEntityFeature.MODES:
-            data[ATTR_MODE] = self.mode
-
-        return data
-
-    @property
-    def target_humidity(self) -> int | None:
-        """Return the humidity we try to reach."""
-        return self._attr_target_humidity
-
-    @property
-    def mode(self) -> str | None:
-        """Return the current mode, e.g., home, auto, baby.
-
-        Requires HumidifierEntityFeature.MODES.
-        """
-        return self._attr_mode
-
-    @property
-    def available_modes(self) -> list[str] | None:
-        """Return a list of available modes.
-
-        Requires HumidifierEntityFeature.MODES.
-        """
-        return self._attr_available_modes
-
-    def set_humidity(self, humidity: int) -> None:
-        """Set new target humidity."""
-        raise NotImplementedError()
-
-    async def async_set_humidity(self, humidity: int) -> None:
-        """Set new target humidity."""
-        await self.hass.async_add_executor_job(self.set_humidity, humidity)
-
-    def set_mode(self, mode: str) -> None:
-        """Set new mode."""
-        raise NotImplementedError()
-
-    async def async_set_mode(self, mode: str) -> None:
-        """Set new mode."""
-        await self.hass.async_add_executor_job(self.set_mode, mode)
-
-    @property
-    def min_humidity(self) -> int:
-        """Return the minimum humidity."""
-        return self._attr_min_humidity
-
-    @property
-    def max_humidity(self) -> int:
-        """Return the maximum humidity."""
-        return self._attr_max_humidity
+    await hass.data[DATA_COMPONENT].async_unload_entry(entry)

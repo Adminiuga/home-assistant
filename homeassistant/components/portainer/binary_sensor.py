@@ -1,0 +1,230 @@
+"""Binary sensor platform for Portainer."""
+
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import override
+
+from pyportainer import DockerContainerState, EndpointStatus, StackStatus
+
+from homeassistant.components.binary_sensor import (
+    BinarySensorDeviceClass,
+    BinarySensorEntity,
+    BinarySensorEntityDescription,
+)
+from homeassistant.const import EntityCategory
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+
+from . import PortainerConfigEntry
+from .coordinator import (
+    PortainerContainerData,
+    PortainerCoordinatorData,
+    PortainerStackData,
+)
+from .entity import (
+    PortainerContainerEntity,
+    PortainerEndpointEntity,
+    PortainerStackEntity,
+)
+from .util import async_add_entities_by_subentry
+
+PARALLEL_UPDATES = 0
+
+
+@dataclass(frozen=True, kw_only=True)
+class PortainerContainerBinarySensorEntityDescription(BinarySensorEntityDescription):
+    """Class to hold Portainer container binary sensor description."""
+
+    state_fn: Callable[[PortainerContainerData], bool | None]
+    supported_fn: Callable[[PortainerContainerData], bool]
+
+
+@dataclass(frozen=True, kw_only=True)
+class PortainerEndpointBinarySensorEntityDescription(BinarySensorEntityDescription):
+    """Class to hold Portainer endpoint binary sensor description."""
+
+    state_fn: Callable[[PortainerCoordinatorData], bool | None]
+
+
+@dataclass(frozen=True, kw_only=True)
+class PortainerStackBinarySensorEntityDescription(BinarySensorEntityDescription):
+    """Class to hold Portainer stack binary sensor description."""
+
+    state_fn: Callable[[PortainerStackData], bool | None]
+
+
+CONTAINER_SENSORS: tuple[PortainerContainerBinarySensorEntityDescription, ...] = (
+    PortainerContainerBinarySensorEntityDescription(
+        key="status",
+        translation_key="status",
+        state_fn=lambda data: data.container.state == DockerContainerState.RUNNING,
+        supported_fn=lambda data: data.container.state == DockerContainerState.RUNNING,
+        device_class=BinarySensorDeviceClass.RUNNING,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    PortainerContainerBinarySensorEntityDescription(
+        key="container_out_of_memory",
+        translation_key="container_out_of_memory",
+        state_fn=lambda data: (
+            state.oom_killed if (state := data.container_inspect.state) else None
+        ),
+        supported_fn=lambda data: data.container_inspect.state is not None,
+        device_class=BinarySensorDeviceClass.PROBLEM,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+)
+
+ENDPOINT_SENSORS: tuple[PortainerEndpointBinarySensorEntityDescription, ...] = (
+    PortainerEndpointBinarySensorEntityDescription(
+        key="status",
+        translation_key="status",
+        state_fn=lambda data: data.endpoint.status == EndpointStatus.UP,
+        device_class=BinarySensorDeviceClass.RUNNING,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+)
+
+STACK_SENSORS: tuple[PortainerStackBinarySensorEntityDescription, ...] = (
+    PortainerStackBinarySensorEntityDescription(
+        key="stack_status",
+        translation_key="status",
+        state_fn=lambda data: data.stack.status == StackStatus.ACTIVE,
+        device_class=BinarySensorDeviceClass.RUNNING,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+)
+
+
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: PortainerConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up Portainer binary sensors."""
+    coordinator = entry.runtime_data
+
+    def _async_add_new_endpoints(endpoints: list[PortainerCoordinatorData]) -> None:
+        """Add new endpoint binary sensors."""
+        async_add_entities_by_subentry(
+            async_add_entities,
+            coordinator.subentry_id_for_endpoint,
+            (
+                (
+                    PortainerEndpointSensor(
+                        coordinator,
+                        entity_description,
+                        endpoint,
+                    ),
+                    endpoint.id,
+                )
+                for entity_description in ENDPOINT_SENSORS
+                for endpoint in endpoints
+                if entity_description.state_fn(endpoint)
+            ),
+        )
+
+    def _async_add_new_containers(
+        containers: list[tuple[PortainerCoordinatorData, PortainerContainerData]],
+    ) -> None:
+        """Add new container binary sensors."""
+        async_add_entities_by_subentry(
+            async_add_entities,
+            coordinator.subentry_id_for_endpoint,
+            (
+                (
+                    PortainerContainerSensor(
+                        coordinator,
+                        entity_description,
+                        container,
+                        endpoint,
+                    ),
+                    endpoint.id,
+                )
+                for (endpoint, container) in containers
+                for entity_description in CONTAINER_SENSORS
+                if entity_description.supported_fn(container)
+            ),
+        )
+
+    def _async_add_new_stacks(
+        stacks: list[tuple[PortainerCoordinatorData, PortainerStackData]],
+    ) -> None:
+        """Add new stack sensors."""
+        async_add_entities_by_subentry(
+            async_add_entities,
+            coordinator.subentry_id_for_endpoint,
+            (
+                (
+                    PortainerStackSensor(
+                        coordinator,
+                        entity_description,
+                        stack,
+                        endpoint,
+                    ),
+                    endpoint.id,
+                )
+                for (endpoint, stack) in stacks
+                for entity_description in STACK_SENSORS
+            ),
+        )
+
+    coordinator.new_endpoints_callbacks.append(_async_add_new_endpoints)
+    coordinator.new_containers_callbacks.append(_async_add_new_containers)
+    coordinator.new_stacks_callbacks.append(_async_add_new_stacks)
+    _async_add_new_endpoints(
+        [
+            endpoint
+            for endpoint in coordinator.data.values()
+            if endpoint.id in coordinator.known_endpoints
+        ]
+    )
+    _async_add_new_containers(
+        [
+            (endpoint, container)
+            for endpoint in coordinator.data.values()
+            for container in endpoint.containers.values()
+        ]
+    )
+    _async_add_new_stacks(
+        [
+            (endpoint, stack)
+            for endpoint in coordinator.data.values()
+            for stack in endpoint.stacks.values()
+        ]
+    )
+
+
+class PortainerEndpointSensor(PortainerEndpointEntity, BinarySensorEntity):
+    """Representation of a Portainer endpoint binary sensor entity."""
+
+    entity_description: PortainerEndpointBinarySensorEntityDescription
+
+    @property
+    @override
+    def is_on(self) -> bool | None:
+        """Return true if the binary sensor is on."""
+        return self.entity_description.state_fn(self.coordinator.data[self.device_id])
+
+
+class PortainerContainerSensor(PortainerContainerEntity, BinarySensorEntity):
+    """Representation of a Portainer container sensor."""
+
+    entity_description: PortainerContainerBinarySensorEntityDescription
+
+    @property
+    @override
+    def is_on(self) -> bool | None:
+        """Return true if the binary sensor is on."""
+        return self.entity_description.state_fn(self.container_data)
+
+
+class PortainerStackSensor(PortainerStackEntity, BinarySensorEntity):
+    """Representation of a Portainer stack sensor."""
+
+    entity_description: PortainerStackBinarySensorEntityDescription
+
+    @property
+    @override
+    def is_on(self) -> bool | None:
+        """Return true if the binary sensor is on."""
+        return self.entity_description.state_fn(self.stack_data)

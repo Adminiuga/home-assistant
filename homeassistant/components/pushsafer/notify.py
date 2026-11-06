@@ -1,23 +1,27 @@
 """Pushsafer platform for notify component."""
+
 import base64
 from http import HTTPStatus
 import logging
 import mimetypes
+from typing import Any, override
 
+import probatio
 import requests
 from requests.auth import HTTPBasicAuth
-import voluptuous as vol
 
 from homeassistant.components.notify import (
     ATTR_DATA,
     ATTR_TARGET,
     ATTR_TITLE,
     ATTR_TITLE_DEFAULT,
-    PLATFORM_SCHEMA,
+    PLATFORM_SCHEMA as NOTIFY_PLATFORM_SCHEMA,
     BaseNotificationService,
 )
 from homeassistant.const import ATTR_ICON
-import homeassistant.helpers.config_validation as cv
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
 _LOGGER = logging.getLogger(__name__)
 _RESOURCE = "https://www.pushsafer.com/api"
@@ -36,7 +40,10 @@ ATTR_TIME2LIVE = "time2live"
 ATTR_PRIORITY = "priority"
 ATTR_RETRY = "retry"
 ATTR_EXPIRE = "expire"
+ATTR_CONFIRM = "confirm"
 ATTR_ANSWER = "answer"
+ATTR_ANSWEROPTIONS = "answeroptions"
+ATTR_ANSWERFORCE = "answerforce"
 ATTR_PICTURE1 = "picture1"
 
 # Attributes contained in picture1
@@ -46,35 +53,39 @@ ATTR_PICTURE1_USERNAME = "username"
 ATTR_PICTURE1_PASSWORD = "password"
 ATTR_PICTURE1_AUTH = "auth"
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({vol.Required(CONF_DEVICE_KEY): cv.string})
+PLATFORM_SCHEMA = NOTIFY_PLATFORM_SCHEMA.extend(
+    {probatio.Required(probatio.Secret(CONF_DEVICE_KEY)): cv.string}
+)
 
 
-def get_service(hass, config, discovery_info=None):
+def get_service(
+    hass: HomeAssistant,
+    config: ConfigType,
+    discovery_info: DiscoveryInfoType | None = None,
+) -> PushsaferNotificationService:
     """Get the Pushsafer.com notification service."""
-    return PushsaferNotificationService(
-        config.get(CONF_DEVICE_KEY), hass.config.is_allowed_path
-    )
+    return PushsaferNotificationService(config[CONF_DEVICE_KEY])
 
 
 class PushsaferNotificationService(BaseNotificationService):
     """Implementation of the notification service for Pushsafer.com."""
 
-    def __init__(self, private_key, is_allowed_path):
+    def __init__(self, private_key: str) -> None:
         """Initialize the service."""
         self._private_key = private_key
-        self.is_allowed_path = is_allowed_path
 
-    def send_message(self, message="", **kwargs):
+    @override
+    def send_message(self, message: str = "", **kwargs: Any) -> None:
         """Send a message to specified target."""
-        if kwargs.get(ATTR_TARGET) is None:
+        targets: list[str] | None
+        if (targets := kwargs.get(ATTR_TARGET)) is None:
             targets = ["a"]
             _LOGGER.debug("No target specified. Sending push to all")
         else:
-            targets = kwargs.get(ATTR_TARGET)
             _LOGGER.debug("%s target(s) specified", len(targets))
 
         title = kwargs.get(ATTR_TITLE, ATTR_TITLE_DEFAULT)
-        data = kwargs.get(ATTR_DATA, {})
+        data = kwargs.get(ATTR_DATA) or {}
 
         # Converting the specified image to base64
         picture1 = data.get(ATTR_PICTURE1)
@@ -112,7 +123,10 @@ class PushsaferNotificationService(BaseNotificationService):
             "pr": data.get(ATTR_PRIORITY, ""),
             "re": data.get(ATTR_RETRY, ""),
             "ex": data.get(ATTR_EXPIRE, ""),
+            "cr": data.get(ATTR_CONFIRM, ""),
             "a": data.get(ATTR_ANSWER, ""),
+            "ao": data.get(ATTR_ANSWEROPTIONS, ""),
+            "af": data.get(ATTR_ANSWERFORCE, ""),
             "p": picture1_encoded,
         }
 
@@ -122,7 +136,7 @@ class PushsaferNotificationService(BaseNotificationService):
             if response.status_code != HTTPStatus.OK:
                 _LOGGER.error("Pushsafer failed with: %s", response.text)
             else:
-                _LOGGER.debug("Push send: %s", response.json())
+                _LOGGER.debug("Push send: %s", response.text)
 
     @classmethod
     def get_base64(cls, filebyte, mimetype):
@@ -153,7 +167,7 @@ class PushsaferNotificationService(BaseNotificationService):
         try:
             if local_path is not None:
                 _LOGGER.debug("Loading image from local path")
-                if self.is_allowed_path(local_path):
+                if self.hass.config.is_allowed_path(local_path):
                     file_mimetype = mimetypes.guess_type(local_path)
                     _LOGGER.debug("Detected mimetype %s", file_mimetype)
                     with open(local_path, "rb") as binary_file:

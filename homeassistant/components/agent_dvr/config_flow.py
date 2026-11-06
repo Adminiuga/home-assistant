@@ -1,9 +1,13 @@
 """Config flow to configure Agent devices."""
+
+from contextlib import suppress
+from typing import Any, override
+
 from agent import AgentConnectionError, AgentError
 from agent.a import Agent
-import voluptuous as vol
+import probatio
 
-from homeassistant import config_entries
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_HOST, CONF_PORT
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
@@ -13,14 +17,13 @@ from .helpers import generate_url
 DEFAULT_PORT = 8090
 
 
-class AgentFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
+class AgentFlowHandler(ConfigFlow, domain=DOMAIN):
     """Handle an Agent config flow."""
 
-    def __init__(self):
-        """Initialize the Agent config flow."""
-        self.device_config = {}
-
-    async def async_step_user(self, user_input=None):
+    @override
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle an Agent config flow."""
         errors = {}
 
@@ -31,10 +34,8 @@ class AgentFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             server_origin = generate_url(host, port)
             agent_client = Agent(server_origin, async_get_clientsession(self.hass))
 
-            try:
+            with suppress(AgentConnectionError, AgentError):
                 await agent_client.update()
-            except (AgentConnectionError, AgentError):
-                pass
 
             await agent_client.close()
 
@@ -49,28 +50,25 @@ class AgentFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
                     }
                 )
 
-                self.device_config = {
+                device_config = {
                     CONF_HOST: host,
                     CONF_PORT: port,
                     SERVER_URL: server_origin,
                 }
 
-                return await self._create_entry(agent_client.name)
+                return self.async_create_entry(
+                    title=agent_client.name, data=device_config
+                )
 
             errors["base"] = "cannot_connect"
 
         data = {
-            vol.Required(CONF_HOST): str,
-            vol.Required(CONF_PORT, default=DEFAULT_PORT): int,
+            probatio.Required(CONF_HOST): str,
+            probatio.Required(CONF_PORT, default=DEFAULT_PORT): int,
         }
 
         return self.async_show_form(
             step_id="user",
-            description_placeholders=self.device_config,
-            data_schema=vol.Schema(data),
+            data_schema=probatio.Schema(data),
             errors=errors,
         )
-
-    async def _create_entry(self, server_name):
-        """Create entry for device."""
-        return self.async_create_entry(title=server_name, data=self.device_config)

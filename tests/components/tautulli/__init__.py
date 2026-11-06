@@ -2,6 +2,9 @@
 
 from unittest.mock import AsyncMock, patch
 
+from pytest_homeassistant.common import MockConfigEntry, load_fixture
+from pytest_homeassistant.test_util.aiohttp import AiohttpClientMocker
+
 from homeassistant.components.tautulli.const import DOMAIN
 from homeassistant.const import (
     CONF_API_KEY,
@@ -10,9 +13,6 @@ from homeassistant.const import (
     CONTENT_TYPE_JSON,
 )
 from homeassistant.core import HomeAssistant
-
-from tests.common import MockConfigEntry, load_fixture
-from tests.test_util.aiohttp import AiohttpClientMocker
 
 API_KEY = "abcd"
 URL = "http://1.2.3.4:8181/test"
@@ -72,7 +72,7 @@ async def setup_integration(
     aioclient_mock: AiohttpClientMocker,
     url: str = URL,
     api_key: str = API_KEY,
-    unique_id: str = None,
+    unique_id: str | None = None,
     skip_entry_setup: bool = False,
     invalid_auth: bool = False,
 ) -> MockConfigEntry:

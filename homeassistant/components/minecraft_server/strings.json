@@ -1,22 +1,79 @@
 {
   "config": {
-    "step": {
-      "user": {
-        "title": "Link your Minecraft Server",
-        "description": "Set up your Minecraft Server instance to allow monitoring.",
-        "data": {
-          "name": "[%key:common::config_flow::data::name%]",
-          "host": "[%key:common::config_flow::data::host%]"
-        }
-      }
-    },
-    "error": {
-      "invalid_port": "Port must be in range from 1024 to 65535. Please correct it and try again.",
-      "cannot_connect": "Failed to connect to server. Please check the host and port and try again. Also ensure that you are running at least Minecraft version 1.7 on your server.",
-      "invalid_ip": "IP address is invalid (MAC address could not be determined). Please correct it and try again."
-    },
     "abort": {
       "already_configured": "[%key:common::config_flow::abort::already_configured_service%]"
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to server. Please re-check the server edition and server address and try again."
+    },
+    "step": {
+      "reconfigure": {
+        "data": {
+          "address": "[%key:component::minecraft_server::config::step::user::data::address%]",
+          "type": "[%key:component::minecraft_server::config::step::user::data::type%]"
+        },
+        "data_description": {
+          "address": "[%key:component::minecraft_server::config::step::user::data_description::address%]",
+          "type": "[%key:component::minecraft_server::config::step::user::data_description::type%]"
+        },
+        "description": "Update the configuration for your Minecraft server."
+      },
+      "user": {
+        "data": {
+          "address": "Server address",
+          "type": "Server edition"
+        },
+        "data_description": {
+          "address": "The hostname, IP address or SRV record of your Minecraft server, optionally including the port.",
+          "type": "For Java Edition beta version 1.8 till release version 1.6.4, select 'Legacy Java Edition'.\nFor Java Edition release version 1.7+, select 'Java Edition'.\nFor all Bedrock Edition versions, select 'Bedrock Edition'."
+        },
+        "description": "Set up your Minecraft Server instance to allow monitoring.\n\nSelect the server edition and server address.",
+        "title": "Link your Minecraft Server"
+      }
+    }
+  },
+  "entity": {
+    "binary_sensor": {
+      "status": {
+        "name": "Status"
+      }
+    },
+    "sensor": {
+      "edition": {
+        "name": "Edition"
+      },
+      "game_mode": {
+        "name": "Game mode"
+      },
+      "latency": {
+        "name": "Latency"
+      },
+      "map_name": {
+        "name": "Map name"
+      },
+      "motd": {
+        "name": "World message"
+      },
+      "players_max": {
+        "name": "Players max"
+      },
+      "players_online": {
+        "name": "Players online"
+      },
+      "protocol_version": {
+        "name": "Protocol version"
+      },
+      "version": {
+        "name": "Version"
+      }
+    }
+  },
+  "exceptions": {
+    "address_lookup_failed": {
+      "message": "Unable to look up the address of the Minecraft server {address}."
+    },
+    "data_update_failed": {
+      "message": "A connection error occurred while updating the data for the Minecraft server {address}."
     }
   }
 }

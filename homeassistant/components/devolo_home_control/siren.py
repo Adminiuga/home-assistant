@@ -1,37 +1,38 @@
 """Platform for siren integration."""
-from typing import Any
+
+from typing import Any, override
 
 from devolo_home_control_api.devices.zwave import Zwave
 from devolo_home_control_api.homecontrol import HomeControl
 
 from homeassistant.components.siren import ATTR_TONE, SirenEntity, SirenEntityFeature
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
+from . import DevoloHomeControlConfigEntry
 from .const import DOMAIN
-from .devolo_multi_level_switch import DevoloMultiLevelSwitchDeviceEntity
+from .entity import DevoloMultiLevelSwitchDeviceEntity
 
 
 async def async_setup_entry(
-    hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
+    hass: HomeAssistant,
+    entry: DevoloHomeControlConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    """Get all binary sensor and multi level sensor devices and setup them via config entry."""
-    entities = []
+    """Get all binary sensor and multi level sensor devices."""
 
-    for gateway in hass.data[DOMAIN][entry.entry_id]["gateways"]:
-        for device in gateway.multi_level_switch_devices:
-            for multi_level_switch in device.multi_level_switch_property:
-                if multi_level_switch.startswith("devolo.SirenMultiLevelSwitch"):
-                    entities.append(
-                        DevoloSirenDeviceEntity(
-                            homecontrol=gateway,
-                            device_instance=device,
-                            element_uid=multi_level_switch,
-                        )
-                    )
-
-    async_add_entities(entities)
+    async_add_entities(
+        DevoloSirenDeviceEntity(
+            homecontrol=gateway,
+            device_instance=device,
+            element_uid=multi_level_switch,
+        )
+        for gateway in entry.runtime_data
+        for device in gateway.multi_level_switch_devices
+        for multi_level_switch in device.multi_level_switch_property
+        if multi_level_switch.startswith("devolo.SirenMultiLevelSwitch")
+    )
 
 
 class DevoloSirenDeviceEntity(DevoloMultiLevelSwitchDeviceEntity, SirenEntity):
@@ -61,19 +62,31 @@ class DevoloSirenDeviceEntity(DevoloMultiLevelSwitchDeviceEntity, SirenEntity):
         self._default_tone = device_instance.settings_property["tone"].tone
 
     @property
+    @override
     def is_on(self) -> bool:
         """Whether the device is on or off."""
         return self._value != 0
 
+    @override
     def turn_on(self, **kwargs: Any) -> None:
-        """Turn the device off."""
+        """Turn the device on."""
         tone = kwargs.get(ATTR_TONE) or self._default_tone
-        self._multi_level_switch_property.set(tone)
+        self._set_tone(tone)
 
+    @override
     def turn_off(self, **kwargs: Any) -> None:
         """Turn the device off."""
-        self._multi_level_switch_property.set(0)
+        self._set_tone(0)
 
+    def _set_tone(self, tone: int) -> None:
+        """Set the siren's tone."""
+        if not self._multi_level_switch_property.set(tone):
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="set_failed",
+            )
+
+    @override
     def _generic_message(self, message: tuple) -> None:
         """Handle generic messages."""
         if message[0].startswith("mss"):

@@ -1,9 +1,13 @@
 """Provide the device automations for Humidifier."""
-from __future__ import annotations
 
-import voluptuous as vol
+import probatio
 
-from homeassistant.components.device_automation import toggle_entity
+from homeassistant.components.device_automation import (
+    CONF_IS_OFF,
+    CONF_IS_ON,
+    async_get_entity_registry_entry_or_raise,
+    toggle_entity,
+)
 from homeassistant.const import (
     ATTR_ENTITY_ID,
     ATTR_MODE,
@@ -15,49 +19,70 @@ from homeassistant.const import (
 )
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers import condition, config_validation as cv, entity_registry
+from homeassistant.helpers import (
+    condition,
+    config_validation as cv,
+    entity_registry as er,
+)
 from homeassistant.helpers.config_validation import DEVICE_CONDITION_BASE_SCHEMA
 from homeassistant.helpers.entity import get_capability, get_supported_features
 from homeassistant.helpers.typing import ConfigType, TemplateVarsType
 
-from . import DOMAIN, const
+from .const import (
+    DOMAIN,
+    HumidifierEntityCapabilityAttribute,
+    HumidifierEntityFeature,
+    HumidifierEntityStateAttribute,
+)
 
 TOGGLE_CONDITION = toggle_entity.CONDITION_SCHEMA.extend(
-    {vol.Required(CONF_DOMAIN): DOMAIN}
+    {probatio.Required(CONF_DOMAIN): DOMAIN}
 )
 
 MODE_CONDITION = DEVICE_CONDITION_BASE_SCHEMA.extend(
     {
-        vol.Required(CONF_ENTITY_ID): cv.entity_id,
-        vol.Required(CONF_TYPE): "is_mode",
-        vol.Required(ATTR_MODE): str,
+        probatio.Required(CONF_ENTITY_ID): cv.entity_id_or_uuid,
+        probatio.Required(CONF_TYPE): "is_mode",
+        probatio.Required(ATTR_MODE): str,
     }
 )
 
-CONDITION_SCHEMA = vol.Any(TOGGLE_CONDITION, MODE_CONDITION)
+CONDITION_SCHEMA = probatio.TaggedUnion(
+    CONF_TYPE,
+    {
+        CONF_IS_OFF: TOGGLE_CONDITION,
+        CONF_IS_ON: TOGGLE_CONDITION,
+        "is_mode": MODE_CONDITION,
+    },
+)
+
+# Maps a state attribute to the condition config key used to compare against it.
+_STATE_ATTRIBUTE_TO_CONFIG_KEY = {
+    HumidifierEntityStateAttribute.MODE: ATTR_MODE,
+}
 
 
 async def async_get_conditions(
     hass: HomeAssistant, device_id: str
 ) -> list[dict[str, str]]:
     """List device conditions for Humidifier devices."""
-    registry = entity_registry.async_get(hass)
+    registry = er.async_get(hass)
     conditions = await toggle_entity.async_get_conditions(hass, device_id, DOMAIN)
 
     # Get all the integrations entities for this device
-    for entry in entity_registry.async_entries_for_device(registry, device_id):
+    for entry in er.async_entries_for_device(registry, device_id):
         if entry.domain != DOMAIN:
             continue
 
         supported_features = get_supported_features(hass, entry.entity_id)
 
-        if supported_features & const.HumidifierEntityFeature.MODES:
+        if supported_features & HumidifierEntityFeature.MODES:
             conditions.append(
                 {
                     CONF_CONDITION: "device",
                     CONF_DEVICE_ID: device_id,
                     CONF_DOMAIN: DOMAIN,
-                    CONF_ENTITY_ID: entry.entity_id,
+                    CONF_ENTITY_ID: entry.id,
                     CONF_TYPE: "is_mode",
                 }
             )
@@ -71,15 +96,20 @@ def async_condition_from_config(
 ) -> condition.ConditionCheckerType:
     """Create a function to test a device condition."""
     if config[CONF_TYPE] == "is_mode":
-        attribute = ATTR_MODE
+        attribute = HumidifierEntityStateAttribute.MODE
     else:
         return toggle_entity.async_condition_from_config(hass, config)
 
+    registry = er.async_get(hass)
+    entity_id = er.async_resolve_entity_id(registry, config[ATTR_ENTITY_ID])
+
     def test_is_state(hass: HomeAssistant, variables: TemplateVarsType) -> bool:
         """Test if an entity is a certain state."""
-        state = hass.states.get(config[ATTR_ENTITY_ID])
         return (
-            state is not None and state.attributes.get(attribute) == config[attribute]
+            entity_id is not None
+            and (state := hass.states.get(entity_id)) is not None
+            and state.attributes.get(attribute)
+            == config[_STATE_ATTRIBUTE_TO_CONFIG_KEY[attribute]]
         )
 
     return test_is_state
@@ -87,7 +117,7 @@ def async_condition_from_config(
 
 async def async_get_condition_capabilities(
     hass: HomeAssistant, config: ConfigType
-) -> dict[str, vol.Schema]:
+) -> dict[str, probatio.Schema]:
     """List condition capabilities."""
     condition_type = config[CONF_TYPE]
 
@@ -95,15 +125,22 @@ async def async_get_condition_capabilities(
 
     if condition_type == "is_mode":
         try:
+            entry = async_get_entity_registry_entry_or_raise(
+                hass, config[CONF_ENTITY_ID]
+            )
             modes = (
-                get_capability(hass, config[ATTR_ENTITY_ID], const.ATTR_AVAILABLE_MODES)
+                get_capability(
+                    hass,
+                    entry.entity_id,
+                    HumidifierEntityCapabilityAttribute.AVAILABLE_MODES,
+                )
                 or []
             )
         except HomeAssistantError:
             modes = []
 
-        fields[vol.Required(ATTR_MODE)] = vol.In(modes)
+        fields[probatio.Required(ATTR_MODE)] = probatio.In(modes)
 
-        return {"extra_fields": vol.Schema(fields)}
+        return {"extra_fields": probatio.Schema(fields)}
 
     return await toggle_entity.async_get_condition_capabilities(hass, config)

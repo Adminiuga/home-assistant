@@ -1,15 +1,18 @@
 {
   "domain": "control4",
   "name": "Control4",
+  "categories": ["hubs_protocols.smart_home_hubs"],
+  "codeowners": ["@lawtancool", "@davidrecordon"],
   "config_flow": true,
+  "connectivity": ["network"],
   "documentation": "https://www.home-assistant.io/integrations/control4",
-  "requirements": ["pyControl4==0.0.6"],
+  "integration_type": "hub",
+  "iot_class": "local_polling",
+  "loggers": ["pyControl4"],
+  "requirements": ["pyControl4==2.0.2"],
   "ssdp": [
     {
       "st": "c4:director"
     }
-  ],
-  "codeowners": ["@lawtancool"],
-  "iot_class": "local_polling",
-  "loggers": ["pyControl4"]
+  ]
 }

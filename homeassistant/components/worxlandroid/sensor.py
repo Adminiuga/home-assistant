@@ -1,18 +1,20 @@
 """Support for Worx Landroid mower."""
-from __future__ import annotations
 
 import asyncio
 import logging
+from typing import override
 
 import aiohttp
-import async_timeout
-import voluptuous as vol
+import probatio
 
-from homeassistant.components.sensor import PLATFORM_SCHEMA, SensorEntity
+from homeassistant.components.sensor import (
+    PLATFORM_SCHEMA as SENSOR_PLATFORM_SCHEMA,
+    SensorEntity,
+)
 from homeassistant.const import CONF_HOST, CONF_PIN, CONF_TIMEOUT, PERCENTAGE
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
@@ -22,12 +24,12 @@ CONF_ALLOW_UNREACHABLE = "allow_unreachable"
 
 DEFAULT_TIMEOUT = 5
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
+PLATFORM_SCHEMA = SENSOR_PLATFORM_SCHEMA.extend(
     {
-        vol.Required(CONF_HOST): cv.string,
-        vol.Required(CONF_PIN): vol.All(vol.Coerce(str), vol.Match(r"\d{4}")),
-        vol.Optional(CONF_ALLOW_UNREACHABLE, default=True): cv.boolean,
-        vol.Optional(CONF_TIMEOUT, default=DEFAULT_TIMEOUT): cv.positive_int,
+        probatio.Required(CONF_HOST): cv.string,
+        probatio.Required(probatio.Secret(CONF_PIN)): cv.string,
+        probatio.Optional(CONF_ALLOW_UNREACHABLE, default=True): cv.boolean,
+        probatio.Optional(CONF_TIMEOUT, default=DEFAULT_TIMEOUT): cv.positive_int,
     }
 )
 
@@ -73,16 +75,19 @@ class WorxLandroidSensor(SensorEntity):
         self.url = f"http://{self.host}/jsondata.cgi"
 
     @property
+    @override
     def name(self):
         """Return the name of the sensor."""
         return f"worxlandroid-{self.sensor}"
 
     @property
+    @override
     def native_value(self):
         """Return the state of the sensor."""
         return self._state
 
     @property
+    @override
     def native_unit_of_measurement(self):
         """Return the unit of measurement of the sensor."""
         if self.sensor == "battery":
@@ -95,10 +100,10 @@ class WorxLandroidSensor(SensorEntity):
 
         try:
             session = async_get_clientsession(self.hass)
-            async with async_timeout.timeout(self.timeout):
+            async with asyncio.timeout(self.timeout):
                 auth = aiohttp.helpers.BasicAuth("admin", self.pin)
                 mower_response = await session.get(self.url, auth=auth)
-        except (asyncio.TimeoutError, aiohttp.ClientError):
+        except TimeoutError, aiohttp.ClientError:
             if self.allow_unreachable is False:
                 _LOGGER.error("Error connecting to mower at %s", self.url)
 
@@ -129,9 +134,8 @@ class WorxLandroidSensor(SensorEntity):
             elif self.sensor == "state":
                 self._state = self.get_state(data)
 
-        else:
-            if self.sensor == "error":
-                self._state = "no"
+        elif self.sensor == "error":
+            self._state = "no"
 
     @staticmethod
     def get_error(obj):

@@ -1,10 +1,14 @@
 {
   "domain": "trafikverket_weatherstation",
   "name": "Trafikverket Weather Station",
-  "documentation": "https://www.home-assistant.io/integrations/trafikverket_weatherstation",
-  "requirements": ["pytrafikverket==0.2.1"],
-  "codeowners": ["@endor-force", "@gjohansson-ST"],
+  "categories": ["weather_alerts"],
+  "codeowners": ["@gjohansson-ST"],
   "config_flow": true,
+  "connectivity": ["cloud"],
+  "documentation": "https://www.home-assistant.io/integrations/trafikverket_weatherstation",
+  "integration_type": "service",
   "iot_class": "cloud_polling",
-  "loggers": ["pytrafikverket"]
+  "loggers": ["pytrafikverket"],
+  "quality_scale": "bronze",
+  "requirements": ["pytrafikverket==2.0.0"]
 }

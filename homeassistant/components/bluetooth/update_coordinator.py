@@ -1,24 +1,24 @@
 """Update coordinator for the Bluetooth integration."""
-from __future__ import annotations
 
-from abc import abstractmethod
+from abc import ABC, abstractmethod
 import logging
+
+from habluetooth import BluetoothScanningMode
+from home_assistant_bluetooth import BluetoothServiceInfoBleak
 
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 
-from . import (
-    BluetoothCallbackMatcher,
-    BluetoothChange,
-    BluetoothScanningMode,
-    BluetoothServiceInfoBleak,
+from .api import (
     async_address_present,
     async_last_service_info,
     async_register_callback,
     async_track_unavailable,
 )
+from .match import BluetoothCallbackMatcher
+from .models import BluetoothChange
 
 
-class BasePassiveBluetoothCoordinator:
+class BasePassiveBluetoothCoordinator(ABC):
     """Base class for passive bluetooth coordinator for bluetooth advertisements.
 
     The coordinator is responsible for tracking devices.
@@ -31,28 +31,29 @@ class BasePassiveBluetoothCoordinator:
         address: str,
         mode: BluetoothScanningMode,
         connectable: bool,
+        scan_interval: float | None = None,
+        scan_duration: float | None = None,
     ) -> None:
         """Initialize the coordinator."""
         self.hass = hass
         self.logger = logger
         self.address = address
         self.connectable = connectable
-        self._cancel_track_unavailable: CALLBACK_TYPE | None = None
-        self._cancel_bluetooth_advertisements: CALLBACK_TYPE | None = None
+        self._on_stop: list[CALLBACK_TYPE] = []
         self.mode = mode
+        self._scan_interval = scan_interval
+        self._scan_duration = scan_duration
         self._last_unavailable_time = 0.0
         self._last_name = address
+        # Subclasses are responsible for setting _available to True
+        # when the abstractmethod _async_handle_bluetooth_event is called.
+        self._available = async_address_present(hass, address, connectable)
 
     @callback
     def async_start(self) -> CALLBACK_TYPE:
         """Start the data updater."""
         self._async_start()
-
-        @callback
-        def _async_cancel() -> None:
-            self._async_stop()
-
-        return _async_cancel
+        return self._async_stop
 
     @callback
     @abstractmethod
@@ -85,35 +86,36 @@ class BasePassiveBluetoothCoordinator:
         # was set when the unavailable callback was called.
         return self._last_unavailable_time
 
-    @property
-    def available(self) -> bool:
-        """Return if the device is available."""
-        return async_address_present(self.hass, self.address, self.connectable)
-
     @callback
     def _async_start(self) -> None:
         """Start the callbacks."""
-        self._cancel_bluetooth_advertisements = async_register_callback(
-            self.hass,
-            self._async_handle_bluetooth_event,
-            BluetoothCallbackMatcher(
-                address=self.address, connectable=self.connectable
-            ),
-            self.mode,
+        self._on_stop.append(
+            async_register_callback(
+                self.hass,
+                self._async_handle_bluetooth_event,
+                BluetoothCallbackMatcher(
+                    address=self.address, connectable=self.connectable
+                ),
+                self.mode,
+                scan_interval=self._scan_interval,
+                scan_duration=self._scan_duration,
+            )
         )
-        self._cancel_track_unavailable = async_track_unavailable(
-            self.hass, self._async_handle_unavailable, self.address, self.connectable
+        self._on_stop.append(
+            async_track_unavailable(
+                self.hass,
+                self._async_handle_unavailable,
+                self.address,
+                self.connectable,
+            )
         )
 
     @callback
     def _async_stop(self) -> None:
         """Stop the callbacks."""
-        if self._cancel_bluetooth_advertisements is not None:
-            self._cancel_bluetooth_advertisements()
-            self._cancel_bluetooth_advertisements = None
-        if self._cancel_track_unavailable is not None:
-            self._cancel_track_unavailable()
-            self._cancel_track_unavailable = None
+        for unsub in self._on_stop:
+            unsub()
+        self._on_stop.clear()
 
     @callback
     def _async_handle_unavailable(
@@ -122,3 +124,4 @@ class BasePassiveBluetoothCoordinator:
         """Handle the device going unavailable."""
         self._last_unavailable_time = service_info.time
         self._last_name = service_info.name
+        self._available = False

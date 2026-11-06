@@ -1,5 +1,4 @@
 """Provide info to system health for mysql."""
-from __future__ import annotations
 
 from sqlalchemy import text
 from sqlalchemy.orm.session import Session
@@ -14,7 +13,7 @@ def db_size_bytes(session: Session, database_name: str) -> float | None:
             "TABLE_SCHEMA=:database_name"
         ),
         {"database_name": database_name},
-    ).first()[0]
+    ).scalar()
 
     if size is None:
         return None

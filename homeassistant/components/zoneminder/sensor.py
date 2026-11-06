@@ -1,24 +1,24 @@
 """Support for ZoneMinder sensors."""
-from __future__ import annotations
 
 import logging
 
-import voluptuous as vol
+import probatio
 from zoneminder.monitor import Monitor, TimePeriod
 from zoneminder.zm import ZoneMinder
 
 from homeassistant.components.sensor import (
-    PLATFORM_SCHEMA,
+    PLATFORM_SCHEMA as SENSOR_PLATFORM_SCHEMA,
     SensorEntity,
     SensorEntityDescription,
 )
 from homeassistant.const import CONF_MONITORED_CONDITIONS
 from homeassistant.core import HomeAssistant
-import homeassistant.helpers.config_validation as cv
+from homeassistant.exceptions import PlatformNotReady
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
-from . import DOMAIN as ZONEMINDER_DOMAIN
+from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -51,13 +51,13 @@ SENSOR_TYPES: tuple[SensorEntityDescription, ...] = (
 
 SENSOR_KEYS: list[str] = [desc.key for desc in SENSOR_TYPES]
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
+PLATFORM_SCHEMA = SENSOR_PLATFORM_SCHEMA.extend(
     {
-        vol.Optional(
+        probatio.Optional(
             CONF_INCLUDE_ARCHIVED, default=DEFAULT_INCLUDE_ARCHIVED
         ): cv.boolean,
-        vol.Optional(CONF_MONITORED_CONDITIONS, default=["all"]): vol.All(
-            cv.ensure_list, [vol.In(SENSOR_KEYS)]
+        probatio.Optional(CONF_MONITORED_CONDITIONS, default=["all"]): probatio.All(
+            probatio.EnsureList(), [probatio.In(SENSOR_KEYS)]
         ),
     }
 )
@@ -75,9 +75,11 @@ def setup_platform(
 
     sensors: list[SensorEntity] = []
     zm_client: ZoneMinder
-    for zm_client in hass.data[ZONEMINDER_DOMAIN].values():
+    for zm_client in hass.data[DOMAIN].values():
         if not (monitors := zm_client.get_monitors()):
-            _LOGGER.warning("Could not fetch any monitors from ZoneMinder")
+            raise PlatformNotReady(
+                "Sensor could not fetch any monitors from ZoneMinder"
+            )
 
         for monitor in monitors:
             sensors.append(ZMSensorMonitors(monitor))
@@ -105,6 +107,7 @@ class ZMSensorMonitors(SensorEntity):
 
     def update(self) -> None:
         """Update the sensor."""
+        self._monitor.update_monitor()
         if not (state := self._monitor.function):
             self._attr_native_value = None
         else:

@@ -1,36 +1,27 @@
 """Pushbullet platform for notify component."""
-from __future__ import annotations
 
 import logging
 import mimetypes
-from typing import Any
+from typing import TYPE_CHECKING, Any, override
 
 from pushbullet import PushBullet, PushError
 from pushbullet.channel import Channel
 from pushbullet.device import Device
-import voluptuous as vol
 
 from homeassistant.components.notify import (
     ATTR_DATA,
     ATTR_TARGET,
     ATTR_TITLE,
     ATTR_TITLE_DEFAULT,
-    PLATFORM_SCHEMA,
     BaseNotificationService,
 )
-from homeassistant.config_entries import SOURCE_IMPORT
-from homeassistant.const import CONF_API_KEY
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
-import homeassistant.helpers.config_validation as cv
-from homeassistant.helpers.issue_registry import IssueSeverity, async_create_issue
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
-from .const import ATTR_FILE, ATTR_FILE_URL, ATTR_URL, DOMAIN
+from .const import ATTR_FILE, ATTR_FILE_URL, ATTR_URL
 
 _LOGGER = logging.getLogger(__name__)
-
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({vol.Required(CONF_API_KEY): cv.string})
 
 
 async def async_get_service(
@@ -39,27 +30,12 @@ async def async_get_service(
     discovery_info: DiscoveryInfoType | None = None,
 ) -> PushBulletNotificationService | None:
     """Get the Pushbullet notification service."""
-    if discovery_info is None:
-        async_create_issue(
-            hass,
-            DOMAIN,
-            "deprecated_yaml",
-            breaks_in_ha_version="2023.2.0",
-            is_fixable=False,
-            severity=IssueSeverity.WARNING,
-            translation_key="deprecated_yaml",
-        )
-        hass.async_create_task(
-            hass.config_entries.flow.async_init(
-                DOMAIN,
-                context={"source": SOURCE_IMPORT},
-                data=config,
-            )
-        )
-        return None
-
-    pushbullet: PushBullet = hass.data[DOMAIN][discovery_info["entry_id"]].pushbullet
-    return PushBulletNotificationService(hass, pushbullet)
+    if TYPE_CHECKING:
+        assert discovery_info is not None
+    entry = hass.config_entries.async_get_entry(discovery_info["entry_id"])
+    if TYPE_CHECKING:
+        assert entry is not None
+    return PushBulletNotificationService(hass, entry.runtime_data.pushbullet)
 
 
 class PushBulletNotificationService(BaseNotificationService):
@@ -80,6 +56,7 @@ class PushBulletNotificationService(BaseNotificationService):
             },
         }
 
+    @override
     def send_message(self, message: str, **kwargs: Any) -> None:
         """Send a message to a specified target.
 
@@ -112,7 +89,7 @@ class PushBulletNotificationService(BaseNotificationService):
             # This also seems to work to send to all devices in own account.
             if ttype == "email":
                 self._push_data(message, title, data, self.pushbullet, email=tname)
-                _LOGGER.info("Sent notification to email %s", tname)
+                _LOGGER.debug("Sent notification to email %s", tname)
                 continue
 
             # Target is sms, send directly, don't use a target object.
@@ -120,7 +97,7 @@ class PushBulletNotificationService(BaseNotificationService):
                 self._push_data(
                     message, title, data, self.pushbullet, phonenumber=tname
                 )
-                _LOGGER.info("Sent sms notification to %s", tname)
+                _LOGGER.debug("Sent sms notification to %s", tname)
                 continue
 
             if ttype not in self.pbtargets:
@@ -144,7 +121,7 @@ class PushBulletNotificationService(BaseNotificationService):
         pusher: PushBullet,
         email: str | None = None,
         phonenumber: str | None = None,
-    ):
+    ) -> None:
         """Create the message content."""
         kwargs = {"body": message, "title": title}
         if email:
@@ -166,7 +143,7 @@ class PushBulletNotificationService(BaseNotificationService):
                     raise ValueError("Cannot send an empty file")
                 kwargs.update(filedata)
                 pusher.push_file(**kwargs)
-            elif (file_url := data.get(ATTR_FILE_URL)) and vol.Url(file_url):
+            elif file_url := data.get(ATTR_FILE_URL):
                 pusher.push_file(
                     file_name=file_url,
                     file_url=file_url,

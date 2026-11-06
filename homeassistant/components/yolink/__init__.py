@@ -1,132 +1,181 @@
 """The yolink integration."""
-from __future__ import annotations
 
 import asyncio
 from datetime import timedelta
+from typing import Any
 
-import async_timeout
-from yolink.client import YoLinkClient
+from yolink.const import ATTR_DEVICE_SMART_REMOTER, ATTR_DEVICE_SWITCH
 from yolink.device import YoLinkDevice
 from yolink.exception import YoLinkAuthFailError, YoLinkClientError
-from yolink.model import BRDP
-from yolink.mqtt_client import MqttClient
+from yolink.home_manager import YoLinkHome
+from yolink.message_listener import MessageListener
 
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP, Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
-from homeassistant.helpers import aiohttp_client, config_entry_oauth2_flow
+from homeassistant.helpers import (
+    aiohttp_client,
+    config_validation as cv,
+    device_registry as dr,
+)
+from homeassistant.helpers.config_entry_oauth2_flow import (
+    OAuth2Session,
+    async_get_config_entry_implementation,
+)
+from homeassistant.helpers.typing import ConfigType
 
 from . import api
-from .const import ATTR_CLIENT, ATTR_COORDINATORS, ATTR_DEVICE, ATTR_MQTT_CLIENT, DOMAIN
-from .coordinator import YoLinkCoordinator
+from .const import ATTR_LORA_INFO, DOMAIN, SUPPORTED_REMOTERS, YOLINK_EVENT
+from .coordinator import YoLinkConfigEntry, YoLinkCoordinator, YoLinkHomeStore
+from .device_trigger import CONF_LONG_PRESS, CONF_SHORT_PRESS
+from .services import async_setup_services
 
 SCAN_INTERVAL = timedelta(minutes=5)
+
+CONFIG_SCHEMA = cv.empty_config_schema(DOMAIN)
 
 
 PLATFORMS = [
     Platform.BINARY_SENSOR,
     Platform.CLIMATE,
     Platform.COVER,
+    Platform.LIGHT,
     Platform.LOCK,
+    Platform.NUMBER,
+    Platform.SELECT,
     Platform.SENSOR,
     Platform.SIREN,
     Platform.SWITCH,
+    Platform.VALVE,
 ]
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Set up yolink from a config entry."""
-    hass.data.setdefault(DOMAIN, {})
-    implementation = (
-        await config_entry_oauth2_flow.async_get_config_entry_implementation(
-            hass, entry
-        )
-    )
+class YoLinkHomeMessageListener(MessageListener):
+    """YoLink home message listener."""
 
-    session = config_entry_oauth2_flow.OAuth2Session(hass, entry, implementation)
+    def __init__(self, hass: HomeAssistant, entry: YoLinkConfigEntry) -> None:
+        """Init YoLink home message listener."""
+        self._hass = hass
+        self._entry = entry
+
+    def on_message(self, device: YoLinkDevice, msg_data: dict[str, Any]) -> None:
+        """On YoLink home message received."""
+        if self._entry.state is not ConfigEntryState.LOADED or not (
+            device_coordinator := self._entry.runtime_data.device_coordinators.get(
+                device.device_id
+            )
+        ):
+            return
+
+        device_coordinator.dev_online = True
+        if (lora_info := msg_data.get(ATTR_LORA_INFO)) is not None:
+            device_coordinator.dev_net_type = lora_info.get("devNetType")
+        device_coordinator.async_set_updated_data(msg_data)
+        # handling events
+        if (
+            device_coordinator.device.device_type
+            in [ATTR_DEVICE_SMART_REMOTER, ATTR_DEVICE_SWITCH]
+            and msg_data.get("event") is not None
+        ):
+            device_registry = dr.async_get(self._hass)
+            device_entry = device_registry.async_get_device_by_identifier(
+                (DOMAIN, device_coordinator.device.device_id), self._entry.entry_id
+            )
+            if device_entry is None:
+                return
+            key_press_type = None
+            if msg_data["event"]["type"] == "Press":
+                key_press_type = CONF_SHORT_PRESS
+            else:
+                key_press_type = CONF_LONG_PRESS
+            button_idx = msg_data["event"]["keyMask"]
+            event_data = {
+                "type": f"button_{button_idx}_{key_press_type}",
+                "device_id": device_entry.id,
+            }
+            self._hass.bus.async_fire(YOLINK_EVENT, event_data)
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Set up YoLink."""
+
+    async_setup_services(hass)
+
+    return True
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: YoLinkConfigEntry) -> None:
+    """Set up yolink from a config entry."""
+    implementation = await async_get_config_entry_implementation(hass, entry)
+
+    session = OAuth2Session(hass, entry, implementation)
 
     auth_mgr = api.ConfigEntryAuth(
         hass, aiohttp_client.async_get_clientsession(hass), session
     )
-
-    yolink_http_client = YoLinkClient(auth_mgr)
-    yolink_mqtt_client = MqttClient(auth_mgr)
-
-    def on_message_callback(message: tuple[str, BRDP]) -> None:
-        data = message[1]
-        device_id = message[0]
-        if data.event is None:
-            return
-        event_param = data.event.split(".")
-        event_type = event_param[len(event_param) - 1]
-        if event_type not in (
-            "Report",
-            "Alert",
-            "StatusChange",
-            "getState",
-        ):
-            return
-        resolved_state = data.data
-        if resolved_state is None:
-            return
-        entry_data = hass.data[DOMAIN].get(entry.entry_id)
-        if entry_data is None:
-            return
-        device_coordinators = entry_data.get(ATTR_COORDINATORS)
-        if device_coordinators is None:
-            return
-        device_coordinator = device_coordinators.get(device_id)
-        if device_coordinator is None:
-            return
-        device_coordinator.async_set_updated_data(resolved_state)
-
+    yolink_home = YoLinkHome()
     try:
-        async with async_timeout.timeout(10):
-            device_response = await yolink_http_client.get_auth_devices()
-            home_info = await yolink_http_client.get_general_info()
-            await yolink_mqtt_client.init_home_connection(
-                home_info.data["id"], on_message_callback
+        async with asyncio.timeout(10):
+            await yolink_home.async_setup(
+                auth_mgr, YoLinkHomeMessageListener(hass, entry)
             )
     except YoLinkAuthFailError as yl_auth_err:
         raise ConfigEntryAuthFailed from yl_auth_err
-    except (YoLinkClientError, asyncio.TimeoutError) as err:
+    except (YoLinkClientError, TimeoutError) as err:
         raise ConfigEntryNotReady from err
 
-    hass.data[DOMAIN][entry.entry_id] = {
-        ATTR_CLIENT: yolink_http_client,
-        ATTR_MQTT_CLIENT: yolink_mqtt_client,
-    }
-    auth_devices = device_response.data[ATTR_DEVICE]
     device_coordinators = {}
-    for device_info in auth_devices:
-        device = YoLinkDevice(device_info, yolink_http_client)
-        device_coordinator = YoLinkCoordinator(hass, device)
+
+    # revese mapping
+    device_pairing_mapping = {}
+    for device in yolink_home.get_devices():
+        if (parent_id := device.get_paired_device_id()) is not None:
+            device_pairing_mapping[parent_id] = device.device_id
+
+    for device in yolink_home.get_devices():
+        if (
+            device.device_type == ATTR_DEVICE_SMART_REMOTER
+            and device.device_model_name not in SUPPORTED_REMOTERS
+        ):
+            continue
+        paried_device: YoLinkDevice | None = None
+        if (
+            paried_device_id := device_pairing_mapping.get(device.device_id)
+        ) is not None:
+            paried_device = yolink_home.get_device(paried_device_id)
+        device_coordinator = YoLinkCoordinator(hass, entry, device, paried_device)
         try:
             await device_coordinator.async_config_entry_first_refresh()
         except ConfigEntryNotReady:
             # Not failure by fetching device state
             device_coordinator.data = {}
         device_coordinators[device.device_id] = device_coordinator
-    hass.data[DOMAIN][entry.entry_id][ATTR_COORDINATORS] = device_coordinators
+    entry.runtime_data = YoLinkHomeStore(yolink_home, device_coordinators)
+
+    # Clean up yolink devices which are not associated to the account anymore.
+    device_registry = dr.async_get(hass)
+    device_entries = dr.async_entries_for_config_entry(device_registry, entry.entry_id)
+    for device_entry in device_entries:
+        for identifier in device_entry.identifiers:
+            if (
+                identifier[0] == DOMAIN
+                and device_coordinators.get(identifier[1]) is None
+            ):
+                device_registry.async_remove_device(device_entry.id)
+
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    async def shutdown_subscription(event) -> None:
-        """Shutdown mqtt message subscription."""
-        await yolink_mqtt_client.shutdown_home_subscription()
+    async def async_yolink_unload(event) -> None:
+        """Unload yolink."""
+        await yolink_home.async_unload()
 
     entry.async_on_unload(
-        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, shutdown_subscription)
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, async_yolink_unload)
     )
 
-    return True
 
-
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_unload_entry(hass: HomeAssistant, entry: YoLinkConfigEntry) -> None:
     """Unload a config entry."""
-    if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
-        await hass.data[DOMAIN][entry.entry_id][
-            ATTR_MQTT_CLIENT
-        ].shutdown_home_subscription()
-        hass.data[DOMAIN].pop(entry.entry_id)
-    return unload_ok
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)
+    await entry.runtime_data.home_instance.async_unload()

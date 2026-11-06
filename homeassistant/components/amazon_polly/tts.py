@@ -1,21 +1,28 @@
 """Support for the Amazon Polly text to speech service."""
-from __future__ import annotations
 
+from collections import defaultdict
+from enum import StrEnum
 import logging
-from typing import Final
+from typing import Any, Final, override
 
 import boto3
 import botocore
-import voluptuous as vol
+import probatio
 
 from homeassistant.components.tts import (
-    PLATFORM_SCHEMA as BASE_PLATFORM_SCHEMA,
+    PLATFORM_SCHEMA as TTS_PLATFORM_SCHEMA,
     Provider,
+    TextToSpeechCommonOption,
     TtsAudioType,
 )
 from homeassistant.const import ATTR_CREDENTIALS, CONF_PROFILE_NAME
 from homeassistant.core import HomeAssistant
-import homeassistant.helpers.config_validation as cv
+from homeassistant.generated.amazon_polly import (
+    SUPPORTED_ENGINES,
+    SUPPORTED_REGIONS,
+    SUPPORTED_VOICES,
+)
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
 from .const import (
@@ -37,32 +44,44 @@ from .const import (
     DEFAULT_SAMPLE_RATES,
     DEFAULT_TEXT_TYPE,
     DEFAULT_VOICE,
-    SUPPORTED_ENGINES,
     SUPPORTED_OUTPUT_FORMATS,
-    SUPPORTED_REGIONS,
     SUPPORTED_SAMPLE_RATES,
     SUPPORTED_SAMPLE_RATES_MAP,
     SUPPORTED_TEXT_TYPES,
-    SUPPORTED_VOICES,
 )
 
 _LOGGER: Final = logging.getLogger(__name__)
 
-PLATFORM_SCHEMA: Final = BASE_PLATFORM_SCHEMA.extend(
+
+class AmazonPollyTextToSpeechOption(StrEnum):
+    """Store keys for the Amazon Polly text-to-speech options."""
+
+    ENGINE = "engine"
+
+
+PLATFORM_SCHEMA: Final = TTS_PLATFORM_SCHEMA.extend(
     {
-        vol.Optional(CONF_REGION, default=DEFAULT_REGION): vol.In(SUPPORTED_REGIONS),
-        vol.Inclusive(CONF_ACCESS_KEY_ID, ATTR_CREDENTIALS): cv.string,
-        vol.Inclusive(CONF_SECRET_ACCESS_KEY, ATTR_CREDENTIALS): cv.string,
-        vol.Exclusive(CONF_PROFILE_NAME, ATTR_CREDENTIALS): cv.string,
-        vol.Optional(CONF_VOICE, default=DEFAULT_VOICE): vol.In(SUPPORTED_VOICES),
-        vol.Optional(CONF_ENGINE, default=DEFAULT_ENGINE): vol.In(SUPPORTED_ENGINES),
-        vol.Optional(CONF_OUTPUT_FORMAT, default=DEFAULT_OUTPUT_FORMAT): vol.In(
-            SUPPORTED_OUTPUT_FORMATS
+        probatio.Optional(CONF_REGION, default=DEFAULT_REGION): probatio.In(
+            SUPPORTED_REGIONS
         ),
-        vol.Optional(CONF_SAMPLE_RATE): vol.All(
-            cv.string, vol.In(SUPPORTED_SAMPLE_RATES)
+        probatio.Inclusive(CONF_ACCESS_KEY_ID, ATTR_CREDENTIALS): cv.string,
+        probatio.Inclusive(
+            probatio.Secret(CONF_SECRET_ACCESS_KEY), ATTR_CREDENTIALS
+        ): cv.string,
+        probatio.Exclusive(CONF_PROFILE_NAME, ATTR_CREDENTIALS): cv.string,
+        probatio.Optional(CONF_VOICE, default=DEFAULT_VOICE): probatio.In(
+            SUPPORTED_VOICES
         ),
-        vol.Optional(CONF_TEXT_TYPE, default=DEFAULT_TEXT_TYPE): vol.In(
+        probatio.Optional(CONF_ENGINE, default=DEFAULT_ENGINE): probatio.In(
+            SUPPORTED_ENGINES
+        ),
+        probatio.Optional(
+            CONF_OUTPUT_FORMAT, default=DEFAULT_OUTPUT_FORMAT
+        ): probatio.In(SUPPORTED_OUTPUT_FORMATS),
+        probatio.Optional(CONF_SAMPLE_RATE): probatio.All(
+            cv.string, probatio.In(SUPPORTED_SAMPLE_RATES)
+        ),
+        probatio.Optional(CONF_TEXT_TYPE, default=DEFAULT_TEXT_TYPE): probatio.In(
             SUPPORTED_TEXT_TYPES
         ),
     }
@@ -111,6 +130,8 @@ def get_engine(
 
     all_voices: dict[str, dict[str, str]] = {}
 
+    all_engines: dict[str, set[str]] = defaultdict(set)
+
     all_voices_req = polly_client.describe_voices()
 
     for voice in all_voices_req.get("Voices", []):
@@ -121,8 +142,12 @@ def get_engine(
         language_code: str | None = voice.get("LanguageCode")
         if language_code is not None and language_code not in supported_languages:
             supported_languages.append(language_code)
+        for engine in voice.get("SupportedEngines"):
+            all_engines[engine].add(voice_id)
 
-    return AmazonPollyProvider(polly_client, config, supported_languages, all_voices)
+    return AmazonPollyProvider(
+        polly_client, config, supported_languages, all_voices, all_engines
+    )
 
 
 class AmazonPollyProvider(Provider):
@@ -134,54 +159,67 @@ class AmazonPollyProvider(Provider):
         config: ConfigType,
         supported_languages: list[str],
         all_voices: dict[str, dict[str, str]],
+        all_engines: dict[str, set[str]],
     ) -> None:
         """Initialize Amazon Polly provider for TTS."""
         self.client = polly_client
         self.config = config
         self.supported_langs = supported_languages
         self.all_voices = all_voices
+        self.all_engines = all_engines
         self.default_voice: str = self.config[CONF_VOICE]
+        self.default_engine: str = self.config[CONF_ENGINE]
         self.name = "Amazon Polly"
 
     @property
+    @override
     def supported_languages(self) -> list[str]:
         """Return a list of supported languages."""
         return self.supported_langs
 
     @property
+    @override
     def default_language(self) -> str | None:
         """Return the default language."""
         return self.all_voices.get(self.default_voice, {}).get("LanguageCode")
 
     @property
+    @override
     def default_options(self) -> dict[str, str]:
         """Return dict include default options."""
-        return {CONF_VOICE: self.default_voice}
+        return {
+            TextToSpeechCommonOption.VOICE: self.default_voice,
+            AmazonPollyTextToSpeechOption.ENGINE: self.default_engine,
+        }
 
     @property
+    @override
     def supported_options(self) -> list[str]:
         """Return a list of supported options."""
-        return [CONF_VOICE]
+        return [TextToSpeechCommonOption.VOICE, AmazonPollyTextToSpeechOption.ENGINE]
 
+    @override
     def get_tts_audio(
         self,
         message: str,
-        language: str | None = None,
-        options: dict[str, str] | None = None,
+        language: str,
+        options: dict[str, Any],
     ) -> TtsAudioType:
         """Request TTS file from Polly."""
-        if options is None or language is None:
-            _LOGGER.debug("language and/or options were missing")
-            return None, None
-        voice_id = options.get(CONF_VOICE, self.default_voice)
+        voice_id = options.get(TextToSpeechCommonOption.VOICE, self.default_voice)
         voice_in_dict = self.all_voices[voice_id]
         if language != voice_in_dict.get("LanguageCode"):
             _LOGGER.error("%s does not support the %s language", voice_id, language)
             return None, None
 
+        engine = options.get(AmazonPollyTextToSpeechOption.ENGINE, self.default_engine)
+        if voice_id not in self.all_engines[engine]:
+            _LOGGER.error("%s does not support the %s engine", voice_id, engine)
+            return None, None
+
         _LOGGER.debug("Requesting TTS file for text: %s", message)
         resp = self.client.synthesize_speech(
-            Engine=self.config[CONF_ENGINE],
+            Engine=engine,
             OutputFormat=self.config[CONF_OUTPUT_FORMAT],
             SampleRate=self.config[CONF_SAMPLE_RATE],
             Text=message,

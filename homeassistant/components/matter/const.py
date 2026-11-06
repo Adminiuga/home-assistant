@@ -1,0 +1,153 @@
+"""Constants for the Matter integration."""
+
+from enum import StrEnum
+import logging
+from typing import Final
+
+from chip.clusters import Objects as clusters
+
+ADDON_SLUG = "core_matter_server"
+
+CONF_INTEGRATION_CREATED_ADDON = "integration_created_addon"
+CONF_USE_ADDON = "use_addon"
+
+DOMAIN = "matter"
+LOGGER = logging.getLogger(__package__)
+
+# prefixes to identify device identifier id types
+ID_TYPE_DEVICE_ID = "deviceid"
+ID_TYPE_SERIAL = "serial"
+
+FEATUREMAP_ATTRIBUTE_ID = 65532
+CLUSTER_REVISION_ATTRIBUTE_ID = 65533
+
+# Maximum Mireds value per the Matter spec is 65279
+# Conversion between Kelvin and Mireds is 1,000,000 / Kelvin,
+# so this corresponds to a minimum color temperature of ~15.3K
+# Which is shown in UI as 15 Kelvin due to rounding.
+# But converting 15 Kelvin back to Mireds gives 66666 which is above the maximum,
+# and causes Invoke error, so cap values over maximum when sending
+MATTER_MAX_MIREDS = 65279
+
+
+class MatterService(StrEnum):
+    """Store keys for Matter services."""
+
+    CLEAR_LOCK_CREDENTIAL = "clear_lock_credential"
+    CLEAR_LOCK_USER = "clear_lock_user"
+    GET_LOCK_CREDENTIAL_STATUS = "get_lock_credential_status"
+    GET_LOCK_INFO = "get_lock_info"
+    GET_LOCK_USERS = "get_lock_users"
+    SET_LOCK_CREDENTIAL = "set_lock_credential"
+    SET_LOCK_USER = "set_lock_user"
+    WATER_HEATER_BOOST = "water_heater_boost"
+
+
+class MatterServiceArgument(StrEnum):
+    """Store keys for Matter service arguments."""
+
+    CREDENTIAL_TYPE = "credential_type"
+    CREDENTIAL_INDEX = "credential_index"
+    USER_INDEX = "user_index"
+    CREDENTIAL_DATA = "credential_data"
+    USER_STATUS = "user_status"
+    USER_TYPE = "user_type"
+    USER_NAME = "user_name"
+    CREDENTIAL_RULE = "credential_rule"
+    DURATION = "duration"
+    EMERGENCY_BOOST = "emergency_boost"
+    TEMPORARY_SETPOINT = "temporary_setpoint"
+
+
+# --- Lock domain constants ---
+
+# Shared field keys
+ATTR_MAX_CREDENTIALS_PER_USER = "max_credentials_per_user"
+ATTR_MAX_PIN_USERS = "max_pin_users"
+ATTR_MAX_RFID_USERS = "max_rfid_users"
+ATTR_MAX_USERS = "max_users"
+ATTR_SUPPORTS_USER_MGMT = "supports_user_management"
+
+# Magic values
+CLEAR_ALL_INDEX = 0xFFFE  # Matter spec: pass to ClearUser/ClearCredential to clear all
+
+# Timed request timeout for lock commands that modify state.
+# 10 seconds accounts for Thread network latency and retransmissions.
+LOCK_TIMED_REQUEST_TIMEOUT_MS = 10000
+
+
+# Credential type strings
+CRED_TYPE_FACE = "face"
+CRED_TYPE_FINGERPRINT = "fingerprint"
+CRED_TYPE_FINGER_VEIN = "finger_vein"
+CRED_TYPE_PIN = "pin"
+CRED_TYPE_RFID = "rfid"
+
+# User status mapping (Matter DoorLock UserStatusEnum)
+_UserStatus = clusters.DoorLock.Enums.UserStatusEnum
+USER_STATUS_MAP: dict[int, str] = {
+    _UserStatus.kAvailable: "available",
+    _UserStatus.kOccupiedEnabled: "occupied_enabled",
+    _UserStatus.kOccupiedDisabled: "occupied_disabled",
+}
+USER_STATUS_REVERSE_MAP: dict[str, int] = {v: k for k, v in USER_STATUS_MAP.items()}
+
+# User type mapping (Matter DoorLock UserTypeEnum)
+_UserType = clusters.DoorLock.Enums.UserTypeEnum
+USER_TYPE_MAP: dict[int, str] = {
+    _UserType.kUnrestrictedUser: "unrestricted_user",
+    _UserType.kYearDayScheduleUser: "year_day_schedule_user",
+    _UserType.kWeekDayScheduleUser: "week_day_schedule_user",
+    _UserType.kProgrammingUser: "programming_user",
+    _UserType.kNonAccessUser: "non_access_user",
+    _UserType.kForcedUser: "forced_user",
+    _UserType.kDisposableUser: "disposable_user",
+    _UserType.kExpiringUser: "expiring_user",
+    _UserType.kScheduleRestrictedUser: "schedule_restricted_user",
+    _UserType.kRemoteOnlyUser: "remote_only_user",
+}
+USER_TYPE_REVERSE_MAP: dict[str, int] = {v: k for k, v in USER_TYPE_MAP.items()}
+
+# Credential type mapping (Matter DoorLock CredentialTypeEnum)
+_CredentialType = clusters.DoorLock.Enums.CredentialTypeEnum
+CREDENTIAL_TYPE_MAP: dict[int, str] = {
+    _CredentialType.kProgrammingPIN: "programming_pin",
+    _CredentialType.kPin: CRED_TYPE_PIN,
+    _CredentialType.kRfid: CRED_TYPE_RFID,
+    _CredentialType.kFingerprint: CRED_TYPE_FINGERPRINT,
+    _CredentialType.kFingerVein: CRED_TYPE_FINGER_VEIN,
+    _CredentialType.kFace: CRED_TYPE_FACE,
+    _CredentialType.kAliroCredentialIssuerKey: "aliro_credential_issuer_key",
+    _CredentialType.kAliroEvictableEndpointKey: "aliro_evictable_endpoint_key",
+    _CredentialType.kAliroNonEvictableEndpointKey: "aliro_non_evictable_endpoint_key",
+}
+
+# Credential rule mapping (Matter DoorLock CredentialRuleEnum)
+_CredentialRule = clusters.DoorLock.Enums.CredentialRuleEnum
+CREDENTIAL_RULE_MAP: dict[int, str] = {
+    _CredentialRule.kSingle: "single",
+    _CredentialRule.kDual: "dual",
+    _CredentialRule.kTri: "tri",
+}
+CREDENTIAL_RULE_REVERSE_MAP: dict[str, int] = {
+    v: k for k, v in CREDENTIAL_RULE_MAP.items()
+}
+
+# Reverse mapping for credential types (str -> int)
+CREDENTIAL_TYPE_REVERSE_MAP: dict[str, int] = {
+    v: k for k, v in CREDENTIAL_TYPE_MAP.items()
+}
+
+# Credential types allowed in set/clear services (excludes programming_pin, aliro_*)
+SERVICE_CREDENTIAL_TYPES = [
+    CRED_TYPE_PIN,
+    CRED_TYPE_RFID,
+    CRED_TYPE_FINGERPRINT,
+    CRED_TYPE_FINGER_VEIN,
+    CRED_TYPE_FACE,
+]
+
+CONCENTRATION_BECQUERELS_PER_CUBIC_METER: Final = "Bq/m³"
+
+# Seconds from Matter 2000 epoch to Unix epoch
+MATTER_2000_TO_UNIX_EPOCH_OFFSET: Final = 946684800

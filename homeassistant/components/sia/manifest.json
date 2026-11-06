@@ -1,10 +1,13 @@
 {
   "domain": "sia",
   "name": "SIA Alarm Systems",
-  "config_flow": true,
-  "documentation": "https://www.home-assistant.io/integrations/sia",
-  "requirements": ["pysiaalarm==3.0.2"],
+  "categories": ["security_safety.alarm_systems"],
   "codeowners": ["@eavanvalkenburg"],
+  "config_flow": true,
+  "connectivity": ["network"],
+  "documentation": "https://www.home-assistant.io/integrations/sia",
+  "integration_type": "hub",
   "iot_class": "local_push",
-  "loggers": ["pysiaalarm"]
+  "loggers": ["pysiaalarm"],
+  "requirements": ["pysiaalarm==3.2.2"]
 }

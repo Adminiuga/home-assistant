@@ -1,0 +1,32 @@
+# serializer version: 1
+# name: test_entry_diagnostics
+  dict({
+    'ics': '''
+      BEGIN:VCALENDAR
+      BEGIN:VEVENT
+      SUMMARY:***
+      DTSTART:19970714T170000Z
+      DTEND:19970715T040000Z
+      END:VEVENT
+      END:VCALENDAR
+    ''',
+    'last_exception': None,
+    'last_update_success': True,
+    'now': '2023-06-04T18:00:00-06:00',
+    'system_timezone': 'tzlocal()',
+    'timezone': 'America/Regina',
+  })
+# ---
+# name: test_entry_diagnostics_setup_failed
+  dict({
+    'ics': '',
+    'last_exception': dict({
+      'translation_key': 'unable_to_fetch',
+      'type': 'UpdateFailed',
+    }),
+    'last_update_success': False,
+    'now': '2023-06-04T18:00:00-06:00',
+    'system_timezone': 'tzlocal()',
+    'timezone': 'America/Regina',
+  })
+# ---

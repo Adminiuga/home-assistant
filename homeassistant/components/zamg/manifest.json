@@ -1,9 +1,12 @@
 {
   "domain": "zamg",
-  "name": "Zentralanstalt f\u00fcr Meteorologie und Geodynamik (ZAMG)",
-  "documentation": "https://www.home-assistant.io/integrations/zamg",
-  "requirements": ["zamg==0.1.1"],
+  "name": "GeoSphere Austria",
+  "categories": ["weather_alerts"],
   "codeowners": ["@killer0071234"],
   "config_flow": true,
-  "iot_class": "cloud_polling"
+  "connectivity": ["cloud"],
+  "documentation": "https://www.home-assistant.io/integrations/zamg",
+  "integration_type": "service",
+  "iot_class": "cloud_polling",
+  "requirements": ["zamg==0.4.1"]
 }

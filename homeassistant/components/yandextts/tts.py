@@ -1,16 +1,24 @@
 """Support for the yandex speechkit tts  service."""
+
 import asyncio
+from enum import StrEnum
 from http import HTTPStatus
 import logging
+from typing import TYPE_CHECKING, Any, override
 
 import aiohttp
-import async_timeout
-import voluptuous as vol
+import probatio
 
-from homeassistant.components.tts import CONF_LANG, PLATFORM_SCHEMA, Provider
+from homeassistant.components.tts import (
+    CONF_LANG,
+    PLATFORM_SCHEMA as TTS_PLATFORM_SCHEMA,
+    Provider,
+    TextToSpeechCommonOption,
+    TtsAudioType,
+)
 from homeassistant.const import CONF_API_KEY
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-import homeassistant.helpers.config_validation as cv
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -64,20 +72,42 @@ DEFAULT_VOICE = "zahar"
 DEFAULT_EMOTION = "neutral"
 DEFAULT_SPEED = 1
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
+
+class YandexTextToSpeechOption(StrEnum):
+    """Store keys for the Yandex TTS text-to-speech options."""
+
+    CODEC = "codec"
+    EMOTION = "emotion"
+    SPEED = "speed"
+
+
+PLATFORM_SCHEMA = TTS_PLATFORM_SCHEMA.extend(
     {
-        vol.Required(CONF_API_KEY): cv.string,
-        vol.Optional(CONF_LANG, default=DEFAULT_LANG): vol.In(SUPPORT_LANGUAGES),
-        vol.Optional(CONF_CODEC, default=DEFAULT_CODEC): vol.In(SUPPORT_CODECS),
-        vol.Optional(CONF_VOICE, default=DEFAULT_VOICE): vol.In(SUPPORT_VOICES),
-        vol.Optional(CONF_EMOTION, default=DEFAULT_EMOTION): vol.In(SUPPORTED_EMOTION),
-        vol.Optional(CONF_SPEED, default=DEFAULT_SPEED): vol.Range(
+        probatio.Required(probatio.Secret(CONF_API_KEY)): cv.string,
+        probatio.Optional(CONF_LANG, default=DEFAULT_LANG): probatio.In(
+            SUPPORT_LANGUAGES
+        ),
+        probatio.Optional(CONF_CODEC, default=DEFAULT_CODEC): probatio.In(
+            SUPPORT_CODECS
+        ),
+        probatio.Optional(CONF_VOICE, default=DEFAULT_VOICE): probatio.In(
+            SUPPORT_VOICES
+        ),
+        probatio.Optional(CONF_EMOTION, default=DEFAULT_EMOTION): probatio.In(
+            SUPPORTED_EMOTION
+        ),
+        probatio.Optional(CONF_SPEED, default=DEFAULT_SPEED): probatio.Range(
             min=MIN_SPEED, max=MAX_SPEED
         ),
     }
 )
 
-SUPPORTED_OPTIONS = [CONF_CODEC, CONF_VOICE, CONF_EMOTION, CONF_SPEED]
+SUPPORTED_OPTIONS: list[str] = [
+    YandexTextToSpeechOption.CODEC,
+    TextToSpeechCommonOption.VOICE,
+    YandexTextToSpeechOption.EMOTION,
+    YandexTextToSpeechOption.SPEED,
+]
 
 
 async def async_get_engine(hass, config, discovery_info=None):
@@ -100,36 +130,47 @@ class YandexSpeechKitProvider(Provider):
         self.name = "YandexTTS"
 
     @property
-    def default_language(self):
+    @override
+    def default_language(self) -> str:
         """Return the default language."""
         return self._language
 
     @property
-    def supported_languages(self):
+    @override
+    def supported_languages(self) -> list[str]:
         """Return list of supported languages."""
         return SUPPORT_LANGUAGES
 
     @property
-    def supported_options(self):
+    @override
+    def supported_options(self) -> list[str]:
         """Return list of supported options."""
         return SUPPORTED_OPTIONS
 
-    async def async_get_tts_audio(self, message, language, options=None):
+    @override
+    async def async_get_tts_audio(
+        self, message: str, language: str, options: dict[str, Any]
+    ) -> TtsAudioType:
         """Load TTS from yandex."""
+        if TYPE_CHECKING:
+            assert self.hass
         websession = async_get_clientsession(self.hass)
         actual_language = language
-        options = options or {}
 
         try:
-            async with async_timeout.timeout(10):
+            async with asyncio.timeout(10):
                 url_param = {
                     "text": message,
                     "lang": actual_language,
                     "key": self._key,
-                    "speaker": options.get(CONF_VOICE, self._speaker),
-                    "format": options.get(CONF_CODEC, self._codec),
-                    "emotion": options.get(CONF_EMOTION, self._emotion),
-                    "speed": options.get(CONF_SPEED, self._speed),
+                    "speaker": options.get(
+                        TextToSpeechCommonOption.VOICE, self._speaker
+                    ),
+                    "format": options.get(YandexTextToSpeechOption.CODEC, self._codec),
+                    "emotion": options.get(
+                        YandexTextToSpeechOption.EMOTION, self._emotion
+                    ),
+                    "speed": options.get(YandexTextToSpeechOption.SPEED, self._speed),
                 }
 
                 request = await websession.get(YANDEX_API_URL, params=url_param)
@@ -141,7 +182,7 @@ class YandexSpeechKitProvider(Provider):
                     return (None, None)
                 data = await request.read()
 
-        except (asyncio.TimeoutError, aiohttp.ClientError):
+        except TimeoutError, aiohttp.ClientError:
             _LOGGER.error("Timeout for yandex speech kit API")
             return (None, None)
 

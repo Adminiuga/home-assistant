@@ -1,16 +1,19 @@
 """Config flow for P1 Monitor integration."""
-from __future__ import annotations
 
-from typing import Any
+from typing import Any, override
 
 from p1monitor import P1Monitor, P1MonitorError
-import voluptuous as vol
+import probatio
 
-from homeassistant.config_entries import ConfigFlow
-from homeassistant.const import CONF_HOST
-from homeassistant.data_entry_flow import FlowResult
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.const import CONF_HOST, CONF_PORT
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from homeassistant.helpers.selector import TextSelector
+from homeassistant.helpers.selector import (
+    NumberSelector,
+    NumberSelectorConfig,
+    NumberSelectorMode,
+    TextSelector,
+)
 
 from .const import DOMAIN
 
@@ -18,11 +21,12 @@ from .const import DOMAIN
 class P1MonitorFlowHandler(ConfigFlow, domain=DOMAIN):
     """Config flow for P1 Monitor."""
 
-    VERSION = 1
+    VERSION = 2
 
+    @override
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle a flow initialized by the user."""
 
         errors = {}
@@ -31,9 +35,11 @@ class P1MonitorFlowHandler(ConfigFlow, domain=DOMAIN):
             session = async_get_clientsession(self.hass)
             try:
                 async with P1Monitor(
-                    host=user_input[CONF_HOST], session=session
+                    host=user_input[CONF_HOST],
+                    port=user_input[CONF_PORT],
+                    session=session,
                 ) as client:
-                    await client.smartmeter()
+                    await client.settings()
             except P1MonitorError:
                 errors["base"] = "cannot_connect"
             else:
@@ -41,14 +47,23 @@ class P1MonitorFlowHandler(ConfigFlow, domain=DOMAIN):
                     title="P1 Monitor",
                     data={
                         CONF_HOST: user_input[CONF_HOST],
+                        CONF_PORT: user_input[CONF_PORT],
                     },
                 )
 
         return self.async_show_form(
             step_id="user",
-            data_schema=vol.Schema(
+            data_schema=probatio.Schema(
                 {
-                    vol.Required(CONF_HOST): TextSelector(),
+                    probatio.Required(CONF_HOST): TextSelector(),
+                    probatio.Required(CONF_PORT, default=80): probatio.All(
+                        NumberSelector(
+                            NumberSelectorConfig(
+                                min=1, max=65535, mode=NumberSelectorMode.BOX
+                            ),
+                        ),
+                        probatio.Coerce(int),
+                    ),
                 }
             ),
             errors=errors,

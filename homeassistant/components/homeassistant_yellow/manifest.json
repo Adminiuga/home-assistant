@@ -1,9 +1,23 @@
 {
   "domain": "homeassistant_yellow",
   "name": "Home Assistant Yellow",
-  "config_flow": false,
-  "documentation": "https://www.home-assistant.io/integrations/homeassistant_yellow",
-  "dependencies": ["hardware", "hassio"],
+  "after_dependencies": ["hassio"],
+  "categories": [
+    "hubs_protocols.smart_home_hubs",
+    "hubs_protocols.wireless_protocols"
+  ],
   "codeowners": ["@home-assistant/core"],
-  "integration_type": "hardware"
+  "config_flow": false,
+  "dependencies": ["hardware", "homeassistant_hardware", "usb"],
+  "documentation": "https://www.home-assistant.io/integrations/homeassistant_yellow",
+  "integration_type": "hardware",
+  "loggers": [
+    "bellows",
+    "universal_silabs_flasher",
+    "aiospinel",
+    "zigpy.serial",
+    "serial_asyncio_fast",
+    "serialx"
+  ],
+  "single_config_entry": true
 }

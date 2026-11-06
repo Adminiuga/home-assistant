@@ -1,14 +1,15 @@
 """Config flow to configure StarLine component."""
-from __future__ import annotations
 
+from typing import TYPE_CHECKING, override
+
+import probatio
 from starline import StarlineAuth
-import voluptuous as vol
 
-from homeassistant import config_entries, core
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
+from homeassistant.core import callback
 
 from .const import (
-    _LOGGER,
     CONF_APP_ID,
     CONF_APP_SECRET,
     CONF_CAPTCHA_CODE,
@@ -21,15 +22,21 @@ from .const import (
     ERROR_AUTH_APP,
     ERROR_AUTH_MFA,
     ERROR_AUTH_USER,
+    LOGGER,
 )
 
 
-class StarlineFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
+class StarlineFlowHandler(ConfigFlow, domain=DOMAIN):
     """Handle a StarLine config flow."""
 
     VERSION = 1
 
-    def __init__(self):
+    _app_code: str
+    _app_token: str
+    _captcha_image: str
+    _phone_number: str
+
+    def __init__(self) -> None:
         """Initialize flow."""
         self._app_id: str | None = None
         self._app_secret: str | None = None
@@ -37,77 +44,88 @@ class StarlineFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         self._password: str | None = None
         self._mfa_code: str | None = None
 
-        self._app_code = None
-        self._app_token = None
         self._user_slid = None
         self._user_id = None
         self._slnet_token = None
         self._slnet_token_expires = None
-        self._captcha_image = None
-        self._captcha_sid = None
-        self._captcha_code = None
-        self._phone_number = None
+        self._captcha_sid: str | None = None
+        self._captcha_code: str | None = None
 
         self._auth = StarlineAuth()
 
-    async def async_step_user(self, user_input=None):
+    @override
+    async def async_step_user(
+        self, user_input: dict[str, str] | None = None
+    ) -> ConfigFlowResult:
         """Handle a flow initialized by the user."""
         return await self.async_step_auth_app(user_input)
 
-    async def async_step_auth_app(self, user_input=None, error=None):
+    async def async_step_auth_app(
+        self, user_input: dict[str, str] | None = None
+    ) -> ConfigFlowResult:
         """Authenticate application step."""
         if user_input is not None:
             self._app_id = user_input[CONF_APP_ID]
             self._app_secret = user_input[CONF_APP_SECRET]
-            return await self._async_authenticate_app(error)
-        return self._async_form_auth_app(error)
+            return await self._async_authenticate_app()
+        return self._async_form_auth_app()
 
-    async def async_step_auth_user(self, user_input=None, error=None):
+    async def async_step_auth_user(
+        self, user_input: dict[str, str] | None = None
+    ) -> ConfigFlowResult:
         """Authenticate user step."""
         if user_input is not None:
             self._username = user_input[CONF_USERNAME]
             self._password = user_input[CONF_PASSWORD]
-            return await self._async_authenticate_user(error)
-        return self._async_form_auth_user(error)
+            return await self._async_authenticate_user()
+        return self._async_form_auth_user()
 
-    async def async_step_auth_mfa(self, user_input=None, error=None):
+    async def async_step_auth_mfa(
+        self, user_input: dict[str, str] | None = None
+    ) -> ConfigFlowResult:
         """Authenticate mfa step."""
         if user_input is not None:
             self._mfa_code = user_input[CONF_MFA_CODE]
-            return await self._async_authenticate_user(error)
-        return self._async_form_auth_mfa(error)
+            return await self._async_authenticate_user()
+        return self._async_form_auth_mfa()
 
-    async def async_step_auth_captcha(self, user_input=None, error=None):
+    async def async_step_auth_captcha(
+        self, user_input: dict[str, str] | None = None
+    ) -> ConfigFlowResult:
         """Captcha verification step."""
         if user_input is not None:
             self._captcha_code = user_input[CONF_CAPTCHA_CODE]
-            return await self._async_authenticate_user(error)
-        return self._async_form_auth_captcha(error)
+            return await self._async_authenticate_user()
+        return self._async_form_auth_captcha()
 
-    @core.callback
-    def _async_form_auth_app(self, error=None):
+    @callback
+    def _async_form_auth_app(self, error: str | None = None) -> ConfigFlowResult:
         """Authenticate application form."""
-        errors = {}
+        errors: dict[str, str] = {}
         if error is not None:
             errors["base"] = error
 
         return self.async_show_form(
             step_id="auth_app",
-            data_schema=vol.Schema(
+            data_schema=probatio.Schema(
                 {
-                    vol.Required(
-                        CONF_APP_ID, default=self._app_id or vol.UNDEFINED
+                    probatio.Required(
+                        CONF_APP_ID, default=self._app_id or probatio.UNDEFINED
                     ): str,
-                    vol.Required(
-                        CONF_APP_SECRET, default=self._app_secret or vol.UNDEFINED
+                    probatio.Required(
+                        probatio.Secret(CONF_APP_SECRET),
+                        default=self._app_secret or probatio.UNDEFINED,
                     ): str,
                 }
             ),
             errors=errors,
+            description_placeholders={
+                "developer_account_url": "https://my.starline.ru/developer",
+            },
         )
 
-    @core.callback
-    def _async_form_auth_user(self, error=None):
+    @callback
+    def _async_form_auth_user(self, error: str | None = None) -> ConfigFlowResult:
         """Authenticate user form."""
         errors = {}
         if error is not None:
@@ -115,21 +133,22 @@ class StarlineFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="auth_user",
-            data_schema=vol.Schema(
+            data_schema=probatio.Schema(
                 {
-                    vol.Required(
-                        CONF_USERNAME, default=self._username or vol.UNDEFINED
+                    probatio.Required(
+                        CONF_USERNAME, default=self._username or probatio.UNDEFINED
                     ): str,
-                    vol.Required(
-                        CONF_PASSWORD, default=self._password or vol.UNDEFINED
+                    probatio.Required(
+                        probatio.Secret(CONF_PASSWORD),
+                        default=self._password or probatio.UNDEFINED,
                     ): str,
                 }
             ),
             errors=errors,
         )
 
-    @core.callback
-    def _async_form_auth_mfa(self, error=None):
+    @callback
+    def _async_form_auth_mfa(self, error: str | None = None) -> ConfigFlowResult:
         """Authenticate mfa form."""
         errors = {}
         if error is not None:
@@ -137,10 +156,10 @@ class StarlineFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="auth_mfa",
-            data_schema=vol.Schema(
+            data_schema=probatio.Schema(
                 {
-                    vol.Required(
-                        CONF_MFA_CODE, default=self._mfa_code or vol.UNDEFINED
+                    probatio.Required(
+                        CONF_MFA_CODE, default=self._mfa_code or probatio.UNDEFINED
                     ): str
                 }
             ),
@@ -148,8 +167,8 @@ class StarlineFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             description_placeholders={"phone_number": self._phone_number},
         )
 
-    @core.callback
-    def _async_form_auth_captcha(self, error=None):
+    @callback
+    def _async_form_auth_captcha(self, error: str | None = None) -> ConfigFlowResult:
         """Captcha verification form."""
         errors = {}
         if error is not None:
@@ -157,10 +176,11 @@ class StarlineFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="auth_captcha",
-            data_schema=vol.Schema(
+            data_schema=probatio.Schema(
                 {
-                    vol.Required(
-                        CONF_CAPTCHA_CODE, default=self._captcha_code or vol.UNDEFINED
+                    probatio.Required(
+                        CONF_CAPTCHA_CODE,
+                        default=self._captcha_code or probatio.UNDEFINED,
                     ): str
                 }
             ),
@@ -170,21 +190,31 @@ class StarlineFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             },
         )
 
-    async def _async_authenticate_app(self, error=None):
+    async def _async_authenticate_app(
+        self, error: str | None = None
+    ) -> ConfigFlowResult:
         """Authenticate application."""
         try:
-            self._app_code = await self.hass.async_add_executor_job(
-                self._auth.get_app_code, self._app_id, self._app_secret
-            )
-            self._app_token = await self.hass.async_add_executor_job(
-                self._auth.get_app_token, self._app_id, self._app_secret, self._app_code
-            )
+
+            def _get_app_token() -> str:
+                if TYPE_CHECKING:
+                    assert self._app_id is not None
+                    assert self._app_secret is not None
+
+                app_code = self._auth.get_app_code(self._app_id, self._app_secret)
+                return self._auth.get_app_token(
+                    self._app_id, self._app_secret, app_code
+                )
+
+            self._app_token = await self.hass.async_add_executor_job(_get_app_token)
             return self._async_form_auth_user(error)
-        except Exception as err:  # pylint: disable=broad-except
-            _LOGGER.error("Error auth StarLine: %s", err)
+        except Exception as err:  # noqa: BLE001
+            LOGGER.error("Error auth StarLine: %s", err)
             return self._async_form_auth_app(ERROR_AUTH_APP)
 
-    async def _async_authenticate_user(self, error=None):
+    async def _async_authenticate_user(
+        self, error: str | None = None
+    ) -> ConfigFlowResult:
         """Authenticate user."""
         try:
             state, data = await self.hass.async_add_executor_job(
@@ -212,12 +242,12 @@ class StarlineFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
                 self._captcha_image = data["captchaImg"]
                 return self._async_form_auth_captcha(error)
 
-            raise Exception(data)
-        except Exception as err:  # pylint: disable=broad-except
-            _LOGGER.error("Error auth user: %s", err)
+            raise Exception(data)  # noqa: TRY002, TRY301
+        except Exception as err:  # noqa: BLE001
+            LOGGER.error("Error auth user: %s", err)
             return self._async_form_auth_user(ERROR_AUTH_USER)
 
-    async def _async_get_entry(self):
+    async def _async_get_entry(self) -> ConfigFlowResult:
         """Create entry."""
         (
             self._slnet_token,

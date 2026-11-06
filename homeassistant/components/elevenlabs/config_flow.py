@@ -1,0 +1,300 @@
+"""Config flow for ElevenLabs text-to-speech integration."""
+
+from collections.abc import Mapping
+import logging
+from typing import Any, override
+
+from elevenlabs import AsyncElevenLabs
+from elevenlabs.core import ApiError
+from httpx2 import ConnectError
+import probatio
+
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult, OptionsFlow
+from homeassistant.const import CONF_API_KEY, CONF_MODEL
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.httpx_client import get_async_client
+from homeassistant.helpers.selector import (
+    SelectOptionDict,
+    SelectSelector,
+    SelectSelectorConfig,
+)
+
+from . import ElevenLabsConfigEntry
+from .const import (
+    CONF_CONFIGURE_VOICE,
+    CONF_SIMILARITY,
+    CONF_STABILITY,
+    CONF_STT_AUTO_LANGUAGE,
+    CONF_STT_MODEL,
+    CONF_STYLE,
+    CONF_USE_SPEAKER_BOOST,
+    CONF_VOICE,
+    DEFAULT_SIMILARITY,
+    DEFAULT_STABILITY,
+    DEFAULT_STT_AUTO_LANGUAGE,
+    DEFAULT_STT_MODEL,
+    DEFAULT_STYLE,
+    DEFAULT_TTS_MODEL,
+    DEFAULT_USE_SPEAKER_BOOST,
+    DOMAIN,
+    STT_MODELS,
+)
+
+USER_STEP_SCHEMA = probatio.Schema(
+    {probatio.Required(probatio.Secret(CONF_API_KEY)): str}
+)
+
+
+_LOGGER = logging.getLogger(__name__)
+
+
+async def get_voices_models(
+    hass: HomeAssistant, api_key: str
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Get available voices and models as dicts."""
+    httpx_client = get_async_client(hass)
+    client = AsyncElevenLabs(api_key=api_key, httpx_client=httpx_client)
+    voices = (await client.voices.get_all()).voices
+    models = await client.models.list()
+
+    voices_dict = {
+        voice.voice_id: voice.name
+        for voice in sorted(voices, key=lambda v: v.name or "")
+        if voice.name
+    }
+    models_dict = {
+        model.model_id: model.name
+        for model in sorted(models, key=lambda m: m.name or "")
+        if model.name and model.can_do_text_to_speech
+    }
+    return voices_dict, models_dict
+
+
+class ElevenLabsConfigFlow(ConfigFlow, domain=DOMAIN):
+    """Handle a config flow for ElevenLabs text-to-speech."""
+
+    VERSION = 1
+    MINOR_VERSION = 2
+
+    async def _validate_api_key(
+        self, api_key: str
+    ) -> tuple[dict[str, str], dict[str, str]]:
+        """Validate the API key and return the available voices and errors."""
+        errors: dict[str, str] = {}
+        try:
+            voices, _ = await get_voices_models(self.hass, api_key)
+        except ConnectError:
+            errors["base"] = "cannot_connect"
+            return {}, errors
+        except ApiError as exc:
+            details = getattr(exc, "body", {}).get("detail", {})
+            if details.get("status") == "api_key_id_used_as_api_key":
+                errors["base"] = "api_key_id_used"
+            elif "invalid_api_key" in (details.get("status"), details.get("code")):
+                errors["base"] = "invalid_api_key"
+            else:
+                _LOGGER.exception("Unexpected error validating ElevenLabs API key")
+                errors["base"] = "unknown"
+            return {}, errors
+        return voices, errors
+
+    @override
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle the initial step."""
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            voices, errors = await self._validate_api_key(user_input[CONF_API_KEY])
+            if not errors:
+                return self.async_create_entry(
+                    title="ElevenLabs",
+                    data=user_input,
+                    options={
+                        CONF_MODEL: DEFAULT_TTS_MODEL,
+                        CONF_VOICE: list(voices)[0],
+                        CONF_STT_MODEL: DEFAULT_STT_MODEL,
+                        CONF_STT_AUTO_LANGUAGE: False,
+                    },
+                )
+        return self.async_show_form(
+            step_id="user", data_schema=USER_STEP_SCHEMA, errors=errors
+        )
+
+    async def async_step_reauth(
+        self, entry_data: Mapping[str, Any]
+    ) -> ConfigFlowResult:
+        """Handle re-authentication."""
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Confirm re-authentication."""
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            _, errors = await self._validate_api_key(user_input[CONF_API_KEY])
+            if not errors:
+                return self.async_update_reload_and_abort(
+                    self._get_reauth_entry(),
+                    data_updates={CONF_API_KEY: user_input[CONF_API_KEY]},
+                )
+        return self.async_show_form(
+            step_id="reauth_confirm", data_schema=USER_STEP_SCHEMA, errors=errors
+        )
+
+    @staticmethod
+    @override
+    def async_get_options_flow(
+        config_entry: ElevenLabsConfigEntry,
+    ) -> OptionsFlow:
+        """Create the options flow."""
+        return ElevenLabsOptionsFlow(config_entry)
+
+
+class ElevenLabsOptionsFlow(OptionsFlow):
+    """ElevenLabs options flow."""
+
+    def __init__(self, config_entry: ElevenLabsConfigEntry) -> None:
+        """Initialize options flow."""
+        self.api_key: str = config_entry.data[CONF_API_KEY]
+        # id -> name
+        self.voices: dict[str, str] = {}
+        self.models: dict[str, str] = {}
+        self.model: str | None = None
+        self.voice: str | None = None
+        self.stt_models: dict[str, str] = STT_MODELS
+        self.stt_model: str | None = None
+        self.auto_language: bool | None = None
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Manage the options."""
+        if not self.voices or not self.models:
+            self.voices, self.models = await get_voices_models(self.hass, self.api_key)
+
+        assert self.models and self.voices
+
+        if user_input is not None:
+            self.model = user_input[CONF_MODEL]
+            self.voice = user_input[CONF_VOICE]
+            self.stt_model = user_input[CONF_STT_MODEL]
+            self.auto_language = user_input[CONF_STT_AUTO_LANGUAGE]
+            configure_voice = user_input.pop(CONF_CONFIGURE_VOICE)
+            if configure_voice:
+                return await self.async_step_voice_settings()
+            return self.async_create_entry(
+                title="ElevenLabs",
+                data=user_input,
+            )
+
+        schema = self.elevenlabs_config_option_schema()
+        return self.async_show_form(
+            step_id="init",
+            data_schema=schema,
+        )
+
+    def elevenlabs_config_option_schema(self) -> probatio.Schema:
+        """Elevenlabs options schema."""
+        return self.add_suggested_values_to_schema(
+            probatio.Schema(
+                {
+                    probatio.Required(
+                        CONF_MODEL,
+                    ): SelectSelector(
+                        SelectSelectorConfig(
+                            options=[
+                                SelectOptionDict(label=model_name, value=model_id)
+                                for model_id, model_name in self.models.items()
+                            ]
+                        )
+                    ),
+                    probatio.Required(
+                        CONF_VOICE,
+                    ): SelectSelector(
+                        SelectSelectorConfig(
+                            options=[
+                                SelectOptionDict(label=voice_name, value=voice_id)
+                                for voice_id, voice_name in self.voices.items()
+                            ]
+                        )
+                    ),
+                    probatio.Required(
+                        CONF_STT_MODEL,
+                    ): SelectSelector(
+                        SelectSelectorConfig(
+                            options=[
+                                SelectOptionDict(label=model_name, value=model_id)
+                                for model_id, model_name in self.stt_models.items()
+                            ]
+                        )
+                    ),
+                    probatio.Required(
+                        CONF_STT_AUTO_LANGUAGE,
+                        default=self.config_entry.options.get(
+                            CONF_STT_AUTO_LANGUAGE, DEFAULT_STT_AUTO_LANGUAGE
+                        ),
+                    ): bool,
+                    probatio.Required(CONF_CONFIGURE_VOICE, default=False): bool,
+                }
+            ),
+            self.config_entry.options,
+        )
+
+    async def async_step_voice_settings(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle voice settings."""
+        assert self.voices and self.models
+        if user_input is not None:
+            user_input[CONF_MODEL] = self.model
+            user_input[CONF_VOICE] = self.voice
+            user_input[CONF_STT_MODEL] = self.stt_model
+            user_input[CONF_STT_AUTO_LANGUAGE] = self.auto_language
+            return self.async_create_entry(
+                title="ElevenLabs",
+                data=user_input,
+            )
+        return self.async_show_form(
+            step_id="voice_settings",
+            data_schema=self.elevenlabs_config_options_voice_schema(),
+        )
+
+    def elevenlabs_config_options_voice_schema(self) -> probatio.Schema:
+        """Elevenlabs options voice schema."""
+        return probatio.Schema(
+            {
+                probatio.Optional(
+                    CONF_STABILITY,
+                    default=self.config_entry.options.get(
+                        CONF_STABILITY, DEFAULT_STABILITY
+                    ),
+                ): probatio.All(
+                    probatio.Coerce(float),
+                    probatio.Range(min=0, max=1),
+                ),
+                probatio.Optional(
+                    CONF_SIMILARITY,
+                    default=self.config_entry.options.get(
+                        CONF_SIMILARITY, DEFAULT_SIMILARITY
+                    ),
+                ): probatio.All(
+                    probatio.Coerce(float),
+                    probatio.Range(min=0, max=1),
+                ),
+                probatio.Optional(
+                    CONF_STYLE,
+                    default=self.config_entry.options.get(CONF_STYLE, DEFAULT_STYLE),
+                ): probatio.All(
+                    probatio.Coerce(float),
+                    probatio.Range(min=0, max=1),
+                ),
+                probatio.Optional(
+                    CONF_USE_SPEAKER_BOOST,
+                    default=self.config_entry.options.get(
+                        CONF_USE_SPEAKER_BOOST, DEFAULT_USE_SPEAKER_BOOST
+                    ),
+                ): bool,
+            }
+        )

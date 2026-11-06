@@ -1,33 +1,23 @@
 """Support for AquaLogic sensors."""
-from __future__ import annotations
 
 from dataclasses import dataclass
-
-import voluptuous as vol
+from typing import override
 
 from homeassistant.components.sensor import (
-    PLATFORM_SCHEMA,
     SensorDeviceClass,
     SensorEntity,
     SensorEntityDescription,
 )
-from homeassistant.const import (
-    CONF_MONITORED_CONDITIONS,
-    PERCENTAGE,
-    POWER_WATT,
-    TEMP_CELSIUS,
-    TEMP_FAHRENHEIT,
-)
+from homeassistant.const import PERCENTAGE, UnitOfPower, UnitOfTemperature
 from homeassistant.core import HomeAssistant, callback
-import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from . import DOMAIN, UPDATE_TOPIC, AquaLogicProcessor
+from . import AquaLogicConfigEntry, AquaLogicProcessor
+from .const import UPDATE_TOPIC
 
 
-@dataclass
+@dataclass(frozen=True)
 class AquaLogicSensorEntityDescription(SensorEntityDescription):
     """Describes AquaLogic sensor entity."""
 
@@ -40,23 +30,23 @@ SENSOR_TYPES: tuple[AquaLogicSensorEntityDescription, ...] = (
     AquaLogicSensorEntityDescription(
         key="air_temp",
         name="Air Temperature",
-        unit_metric=TEMP_CELSIUS,
-        unit_imperial=TEMP_FAHRENHEIT,
+        unit_metric=UnitOfTemperature.CELSIUS,
+        unit_imperial=UnitOfTemperature.FAHRENHEIT,
         device_class=SensorDeviceClass.TEMPERATURE,
     ),
     AquaLogicSensorEntityDescription(
         key="pool_temp",
         name="Pool Temperature",
-        unit_metric=TEMP_CELSIUS,
-        unit_imperial=TEMP_FAHRENHEIT,
+        unit_metric=UnitOfTemperature.CELSIUS,
+        unit_imperial=UnitOfTemperature.FAHRENHEIT,
         icon="mdi:oil-temperature",
         device_class=SensorDeviceClass.TEMPERATURE,
     ),
     AquaLogicSensorEntityDescription(
         key="spa_temp",
         name="Spa Temperature",
-        unit_metric=TEMP_CELSIUS,
-        unit_imperial=TEMP_FAHRENHEIT,
+        unit_metric=UnitOfTemperature.CELSIUS,
+        unit_imperial=UnitOfTemperature.FAHRENHEIT,
         icon="mdi:oil-temperature",
         device_class=SensorDeviceClass.TEMPERATURE,
     ),
@@ -91,9 +81,9 @@ SENSOR_TYPES: tuple[AquaLogicSensorEntityDescription, ...] = (
     AquaLogicSensorEntityDescription(
         key="pump_power",
         name="Pump Power",
-        unit_metric=POWER_WATT,
-        unit_imperial=POWER_WATT,
-        icon="mdi:gauge",
+        unit_metric=UnitOfPower.WATT,
+        unit_imperial=UnitOfPower.WATT,
+        device_class=SensorDeviceClass.POWER,
     ),
     AquaLogicSensorEntityDescription(
         key="status",
@@ -102,34 +92,18 @@ SENSOR_TYPES: tuple[AquaLogicSensorEntityDescription, ...] = (
     ),
 )
 
-SENSOR_KEYS: list[str] = [desc.key for desc in SENSOR_TYPES]
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
-    {
-        vol.Required(CONF_MONITORED_CONDITIONS, default=SENSOR_KEYS): vol.All(
-            cv.ensure_list, [vol.In(SENSOR_KEYS)]
-        )
-    }
-)
-
-
-async def async_setup_platform(
+async def async_setup_entry(
     hass: HomeAssistant,
-    config: ConfigType,
-    async_add_entities: AddEntitiesCallback,
-    discovery_info: DiscoveryInfoType | None = None,
+    entry: AquaLogicConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    """Set up the sensor platform."""
-    processor: AquaLogicProcessor = hass.data[DOMAIN]
-    monitored_conditions = config[CONF_MONITORED_CONDITIONS]
+    """Set up the sensor entities."""
+    processor = entry.runtime_data
 
-    entities = [
-        AquaLogicSensor(processor, description)
-        for description in SENSOR_TYPES
-        if description.key in monitored_conditions
-    ]
-
-    async_add_entities(entities)
+    async_add_entities(
+        AquaLogicSensor(processor, description) for description in SENSOR_TYPES
+    )
 
 
 class AquaLogicSensor(SensorEntity):
@@ -148,6 +122,7 @@ class AquaLogicSensor(SensorEntity):
         self._processor = processor
         self._attr_name = f"AquaLogic {description.name}"
 
+    @override
     async def async_added_to_hass(self) -> None:
         """Register callbacks."""
         self.async_on_remove(
@@ -172,4 +147,5 @@ class AquaLogicSensor(SensorEntity):
             self._attr_native_value = getattr(panel, self.entity_description.key)
             self.async_write_ha_state()
         else:
-            self._attr_native_unit_of_measurement = None
+            self._attr_native_value = None
+            self.async_write_ha_state()

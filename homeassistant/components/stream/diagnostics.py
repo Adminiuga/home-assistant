@@ -4,8 +4,6 @@ The stream component does not have config entries itself, and all diagnostics
 information is managed by dependent components (e.g. camera)
 """
 
-from __future__ import annotations
-
 from collections import Counter
 from typing import Any
 
@@ -19,7 +17,7 @@ class Diagnostics:
         self._values: dict[str, Any] = {}
 
     def increment(self, key: str) -> None:
-        """Increment a counter for the spcified key/event."""
+        """Increment a counter for the specified key/event."""
         self._counter.update(Counter({key: 1}))
 
     def set_value(self, key: str, value: Any) -> None:

@@ -1,81 +1,84 @@
 """Support for consuming values for the Volkszaehler API."""
-from __future__ import annotations
 
-from datetime import timedelta
-import logging
+from typing import override
 
-from volkszaehler import Volkszaehler
-from volkszaehler.exceptions import VolkszaehlerApiConnectionError
-import voluptuous as vol
+import probatio
 
 from homeassistant.components.sensor import (
-    PLATFORM_SCHEMA,
+    PLATFORM_SCHEMA as SENSOR_PLATFORM_SCHEMA,
+    SensorDeviceClass,
     SensorEntity,
     SensorEntityDescription,
 )
+from homeassistant.config_entries import SOURCE_IMPORT
 from homeassistant.const import (
     CONF_HOST,
     CONF_MONITORED_CONDITIONS,
     CONF_NAME,
     CONF_PORT,
-    ENERGY_WATT_HOUR,
-    POWER_WATT,
+    CONF_UUID,
+    UnitOfEnergy,
+    UnitOfPower,
 )
-from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import PlatformNotReady
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
-import homeassistant.helpers.config_validation as cv
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.core import DOMAIN as HOMEASSISTANT_DOMAIN, HomeAssistant
+from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.helpers import config_validation as cv, issue_registry as ir
+from homeassistant.helpers.entity_platform import (
+    AddConfigEntryEntitiesCallback,
+    AddEntitiesCallback,
+)
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
-from homeassistant.util import Throttle
 
-_LOGGER = logging.getLogger(__name__)
-
-CONF_UUID = "uuid"
-
-DEFAULT_HOST = "localhost"
-DEFAULT_NAME = "Volkszaehler"
-DEFAULT_PORT = 80
-
-MIN_TIME_BETWEEN_UPDATES = timedelta(minutes=1)
+from . import VolkszaehlerConfigEntry, VolkszaehlerData
+from .const import (
+    DEFAULT_HOST,
+    DEFAULT_NAME,
+    DEFAULT_PORT,
+    DOMAIN,
+    SUBENTRY_TYPE_CHANNEL,
+)
 
 SENSOR_TYPES: tuple[SensorEntityDescription, ...] = (
     SensorEntityDescription(
         key="average",
         name="Average",
-        native_unit_of_measurement=POWER_WATT,
+        native_unit_of_measurement=UnitOfPower.WATT,
+        device_class=SensorDeviceClass.POWER,
         icon="mdi:power-off",
     ),
     SensorEntityDescription(
         key="consumption",
         name="Consumption",
-        native_unit_of_measurement=ENERGY_WATT_HOUR,
+        native_unit_of_measurement=UnitOfEnergy.WATT_HOUR,
+        device_class=SensorDeviceClass.ENERGY,
         icon="mdi:power-plug",
     ),
     SensorEntityDescription(
         key="max",
         name="Max",
-        native_unit_of_measurement=POWER_WATT,
+        native_unit_of_measurement=UnitOfPower.WATT,
+        device_class=SensorDeviceClass.POWER,
         icon="mdi:arrow-up",
     ),
     SensorEntityDescription(
         key="min",
         name="Min",
-        native_unit_of_measurement=POWER_WATT,
+        native_unit_of_measurement=UnitOfPower.WATT,
+        device_class=SensorDeviceClass.POWER,
         icon="mdi:arrow-down",
     ),
 )
 
 SENSOR_KEYS: list[str] = [desc.key for desc in SENSOR_TYPES]
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
+PLATFORM_SCHEMA = SENSOR_PLATFORM_SCHEMA.extend(
     {
-        vol.Required(CONF_UUID): cv.string,
-        vol.Optional(CONF_HOST, default=DEFAULT_HOST): cv.string,
-        vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
-        vol.Optional(CONF_PORT, default=DEFAULT_PORT): cv.port,
-        vol.Optional(CONF_MONITORED_CONDITIONS, default=["average"]): vol.All(
-            cv.ensure_list, [vol.In(SENSOR_KEYS)]
+        probatio.Required(CONF_UUID): cv.string,
+        probatio.Optional(CONF_HOST, default=DEFAULT_HOST): cv.string,
+        probatio.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
+        probatio.Optional(CONF_PORT, default=DEFAULT_PORT): probatio.Port(),
+        probatio.Optional(CONF_MONITORED_CONDITIONS, default=["average"]): probatio.All(
+            probatio.EnsureList(), [probatio.In(SENSOR_KEYS)]
         ),
     }
 )
@@ -87,42 +90,99 @@ async def async_setup_platform(
     async_add_entities: AddEntitiesCallback,
     discovery_info: DiscoveryInfoType | None = None,
 ) -> None:
-    """Set up the Volkszaehler sensors."""
+    """Import Volkszaehler sensor YAML config into config flow."""
+    validated = PLATFORM_SCHEMA(config)
+    data = {
+        CONF_HOST: validated[CONF_HOST],
+        CONF_NAME: validated[CONF_NAME],
+        CONF_PORT: validated[CONF_PORT],
+        CONF_UUID: validated[CONF_UUID],
+    }
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": SOURCE_IMPORT},
+        data=data,
+    )
+    if result["type"] is FlowResultType.ABORT and result["reason"] not in (
+        "already_configured",
+        "subentry_added",
+    ):
+        ir.async_create_issue(
+            hass,
+            DOMAIN,
+            f"deprecated_yaml_import_issue_{result['reason']}",
+            is_fixable=False,
+            issue_domain=DOMAIN,
+            severity=ir.IssueSeverity.WARNING,
+            translation_key=f"deprecated_yaml_import_issue_{result['reason']}",
+            translation_placeholders={
+                "domain": DOMAIN,
+                "integration_title": DEFAULT_NAME,
+            },
+            breaks_in_ha_version="2027.3.0",
+        )
+        return
 
-    host = config[CONF_HOST]
-    name = config[CONF_NAME]
-    port = config[CONF_PORT]
-    uuid = config[CONF_UUID]
-    conditions = config[CONF_MONITORED_CONDITIONS]
+    ir.async_create_issue(
+        hass,
+        HOMEASSISTANT_DOMAIN,
+        f"deprecated_yaml_{DOMAIN}",
+        is_fixable=False,
+        issue_domain=DOMAIN,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key="deprecated_yaml",
+        translation_placeholders={
+            "domain": DOMAIN,
+            "integration_title": DEFAULT_NAME,
+        },
+        breaks_in_ha_version="2027.3.0",
+    )
 
-    session = async_get_clientsession(hass)
-    vz_api = VolkszaehlerData(Volkszaehler(session, uuid, host=host, port=port))
 
-    await vz_api.async_update()
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: VolkszaehlerConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up Volkszaehler sensors from a config entry."""
+    conditions = SENSOR_KEYS
 
-    if vz_api.api.data is None:
-        raise PlatformNotReady
+    for subentry in entry.get_subentries_of_type(SUBENTRY_TYPE_CHANNEL):
+        vz_api = entry.runtime_data[subentry.subentry_id]
 
-    entities = [
-        VolkszaehlerSensor(vz_api, name, description)
-        for description in SENSOR_TYPES
-        if description.key in conditions
-    ]
+        entities = [
+            VolkszaehlerSensor(
+                vz_api,
+                subentry.title,
+                subentry.data[CONF_UUID],
+                description,
+            )
+            for description in SENSOR_TYPES
+            if description.key in conditions
+        ]
 
-    async_add_entities(entities, True)
+        async_add_entities(entities, False, config_subentry_id=subentry.subentry_id)
 
 
 class VolkszaehlerSensor(SensorEntity):
     """Implementation of a Volkszaehler sensor."""
 
-    def __init__(self, vz_api, name, description: SensorEntityDescription):
+    def __init__(
+        self,
+        vz_api: VolkszaehlerData,
+        name: str,
+        uuid: str,
+        description: SensorEntityDescription,
+    ) -> None:
         """Initialize the Volkszaehler sensor."""
         self.entity_description = description
         self.vz_api = vz_api
 
         self._attr_name = f"{name} {description.name}"
+        self._attr_unique_id = f"{uuid}_{description.key}"
 
     @property
+    @override
     def available(self) -> bool:
         """Could the device be accessed during the last update call."""
         return self.vz_api.available
@@ -135,23 +195,3 @@ class VolkszaehlerSensor(SensorEntity):
             self._attr_native_value = round(
                 getattr(self.vz_api.api, self.entity_description.key), 2
             )
-
-
-class VolkszaehlerData:
-    """The class for handling the data retrieval from the Volkszaehler API."""
-
-    def __init__(self, api):
-        """Initialize the data object."""
-        self.api = api
-        self.available = True
-
-    @Throttle(MIN_TIME_BETWEEN_UPDATES)
-    async def async_update(self):
-        """Get the latest data from the Volkszaehler REST API."""
-
-        try:
-            await self.api.get_data()
-            self.available = True
-        except VolkszaehlerApiConnectionError:
-            _LOGGER.error("Unable to fetch data from the Volkszaehler API")
-            self.available = False

@@ -1,13 +1,13 @@
 """Tests for the devolo Home Control light platform."""
+
 from unittest.mock import patch
 
-from homeassistant.components.light import (
-    ATTR_BRIGHTNESS,
-    ATTR_COLOR_MODE,
-    ATTR_SUPPORTED_COLOR_MODES,
-    DOMAIN,
-    ColorMode,
-)
+from devolo_home_control_api.exceptions import SwitchingProtected
+import pytest
+from syrupy.assertion import SnapshotAssertion
+
+from homeassistant.components.devolo_home_control.const import DOMAIN
+from homeassistant.components.light import ATTR_BRIGHTNESS, DOMAIN as LIGHT_DOMAIN
 from homeassistant.const import (
     ATTR_ENTITY_ID,
     SERVICE_TURN_OFF,
@@ -17,13 +17,17 @@ from homeassistant.const import (
     STATE_UNAVAILABLE,
 )
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
+from homeassistant.helpers import entity_registry as er
 
 from . import configure_integration
 from .mocks import BinarySwitchPropertyMock, HomeControlMock, HomeControlMockLight
 
 
-async def test_light_without_binary_sensor(hass: HomeAssistant):
-    """Test setup and state change of a light device that does not have an additional binary sensor."""
+async def test_light_without_binary_sensor(
+    hass: HomeAssistant, entity_registry: er.EntityRegistry, snapshot: SnapshotAssertion
+) -> None:
+    """Test setup and state change of a light without an additional binary sensor."""
     entry = configure_integration(hass)
     test_gateway = HomeControlMockLight()
     with patch(
@@ -33,27 +37,18 @@ async def test_light_without_binary_sensor(hass: HomeAssistant):
         await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
-    state = hass.states.get(f"{DOMAIN}.test")
-    assert state is not None
-    assert state.state == STATE_ON
-    assert state.attributes[ATTR_COLOR_MODE] == ColorMode.BRIGHTNESS
-    assert state.attributes[ATTR_SUPPORTED_COLOR_MODES] == [ColorMode.BRIGHTNESS]
-    assert state.attributes[ATTR_BRIGHTNESS] == round(
-        test_gateway.devices["Test"]
-        .multi_level_switch_property["devolo.Dimmer:Test"]
-        .value
-        / 100
-        * 255
-    )
+    state = hass.states.get(f"{LIGHT_DOMAIN}.test_test")
+    assert state == snapshot
+    assert entity_registry.async_get(f"{LIGHT_DOMAIN}.test_test") == snapshot
 
     # Emulate websocket message: brightness changed
     test_gateway.publisher.dispatch("Test", ("devolo.Dimmer:Test", 0.0))
     await hass.async_block_till_done()
-    state = hass.states.get(f"{DOMAIN}.test")
+    state = hass.states.get(f"{LIGHT_DOMAIN}.test_test")
     assert state.state == STATE_OFF
     test_gateway.publisher.dispatch("Test", ("devolo.Dimmer:Test", 100.0))
     await hass.async_block_till_done()
-    state = hass.states.get(f"{DOMAIN}.test")
+    state = hass.states.get(f"{LIGHT_DOMAIN}.test_test")
     assert state.state == STATE_ON
     assert state.attributes[ATTR_BRIGHTNESS] == 255
 
@@ -62,40 +57,58 @@ async def test_light_without_binary_sensor(hass: HomeAssistant):
         "devolo_home_control_api.properties.multi_level_switch_property.MultiLevelSwitchProperty.set"
     ) as set_value:
         await hass.services.async_call(
-            DOMAIN,
+            LIGHT_DOMAIN,
             SERVICE_TURN_ON,
-            {ATTR_ENTITY_ID: f"{DOMAIN}.test"},
+            {ATTR_ENTITY_ID: f"{LIGHT_DOMAIN}.test_test"},
             blocking=True,
         )  # In reality, this leads to a websocket message like already tested above
         set_value.assert_called_once_with(100)
 
         set_value.reset_mock()
         await hass.services.async_call(
-            DOMAIN,
+            LIGHT_DOMAIN,
             SERVICE_TURN_OFF,
-            {ATTR_ENTITY_ID: f"{DOMAIN}.test"},
+            {ATTR_ENTITY_ID: f"{LIGHT_DOMAIN}.test_test"},
             blocking=True,
         )  # In reality, this leads to a websocket message like already tested above
         set_value.assert_called_once_with(0)
 
         set_value.reset_mock()
         await hass.services.async_call(
-            DOMAIN,
+            LIGHT_DOMAIN,
             SERVICE_TURN_ON,
-            {ATTR_ENTITY_ID: f"{DOMAIN}.test", ATTR_BRIGHTNESS: 50},
+            {ATTR_ENTITY_ID: f"{LIGHT_DOMAIN}.test_test", ATTR_BRIGHTNESS: 50},
             blocking=True,
         )  # In reality, this leads to a websocket message like already tested above
         set_value.assert_called_once_with(round(50 / 255 * 100))
+
+    with (
+        patch(
+            "devolo_home_control_api.properties.multi_level_switch_property.MultiLevelSwitchProperty.set",
+            return_value=False,
+        ),
+        pytest.raises(HomeAssistantError) as error,
+    ):
+        await hass.services.async_call(
+            LIGHT_DOMAIN,
+            SERVICE_TURN_ON,
+            {ATTR_ENTITY_ID: f"{LIGHT_DOMAIN}.test_test", ATTR_BRIGHTNESS: 50},
+            blocking=True,
+        )
+    assert error.value.translation_key == "set_failed"
+    assert error.value.translation_domain == DOMAIN
 
     # Emulate websocket message: device went offline
     test_gateway.devices["Test"].status = 1
     test_gateway.publisher.dispatch("Test", ("Status", False, "status"))
     await hass.async_block_till_done()
-    assert hass.states.get(f"{DOMAIN}.test").state == STATE_UNAVAILABLE
+    assert hass.states.get(f"{LIGHT_DOMAIN}.test_test").state == STATE_UNAVAILABLE
 
 
-async def test_light_with_binary_sensor(hass: HomeAssistant):
-    """Test setup and state change of a light device that has an additional binary sensor."""
+async def test_light_with_binary_sensor(
+    hass: HomeAssistant, entity_registry: er.EntityRegistry, snapshot: SnapshotAssertion
+) -> None:
+    """Test setup and state change of a light with an additional binary sensor."""
     entry = configure_integration(hass)
     test_gateway = HomeControlMockLight()
     test_gateway.devices["Test"].binary_switch_property = {
@@ -108,18 +121,18 @@ async def test_light_with_binary_sensor(hass: HomeAssistant):
         await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
-    state = hass.states.get(f"{DOMAIN}.test")
-    assert state is not None
-    assert state.state == STATE_ON
+    state = hass.states.get(f"{LIGHT_DOMAIN}.test_test")
+    assert state == snapshot
+    assert entity_registry.async_get(f"{LIGHT_DOMAIN}.test_test") == snapshot
 
     # Emulate websocket message: brightness changed
     test_gateway.publisher.dispatch("Test", ("devolo.Dimmer:Test", 0.0))
     await hass.async_block_till_done()
-    state = hass.states.get(f"{DOMAIN}.test")
+    state = hass.states.get(f"{LIGHT_DOMAIN}.test_test")
     assert state.state == STATE_OFF
     test_gateway.publisher.dispatch("Test", ("devolo.Dimmer:Test", 100.0))
     await hass.async_block_till_done()
-    state = hass.states.get(f"{DOMAIN}.test")
+    state = hass.states.get(f"{LIGHT_DOMAIN}.test_test")
     assert state.state == STATE_ON
     assert state.attributes[ATTR_BRIGHTNESS] == 255
 
@@ -128,24 +141,56 @@ async def test_light_with_binary_sensor(hass: HomeAssistant):
         "devolo_home_control_api.properties.binary_switch_property.BinarySwitchProperty.set"
     ) as set_value:
         await hass.services.async_call(
-            DOMAIN,
+            LIGHT_DOMAIN,
             SERVICE_TURN_ON,
-            {ATTR_ENTITY_ID: f"{DOMAIN}.test"},
+            {ATTR_ENTITY_ID: f"{LIGHT_DOMAIN}.test_test"},
             blocking=True,
         )  # In reality, this leads to a websocket message like already tested above
         set_value.assert_called_once_with(True)
 
         set_value.reset_mock()
         await hass.services.async_call(
-            DOMAIN,
+            LIGHT_DOMAIN,
             SERVICE_TURN_OFF,
-            {ATTR_ENTITY_ID: f"{DOMAIN}.test"},
+            {ATTR_ENTITY_ID: f"{LIGHT_DOMAIN}.test_test"},
             blocking=True,
         )  # In reality, this leads to a websocket message like already tested above
         set_value.assert_called_once_with(False)
 
+    with (
+        patch(
+            "devolo_home_control_api.properties.binary_switch_property.BinarySwitchProperty.set",
+            return_value=False,
+        ),
+        pytest.raises(HomeAssistantError) as error,
+    ):
+        await hass.services.async_call(
+            LIGHT_DOMAIN,
+            SERVICE_TURN_OFF,
+            {ATTR_ENTITY_ID: f"{LIGHT_DOMAIN}.test_test"},
+            blocking=True,
+        )
+    assert error.value.translation_key == "set_failed"
+    assert error.value.translation_domain == DOMAIN
 
-async def test_remove_from_hass(hass: HomeAssistant):
+    with (
+        patch(
+            "devolo_home_control_api.properties.binary_switch_property.BinarySwitchProperty.set",
+            side_effect=SwitchingProtected,
+        ),
+        pytest.raises(ServiceValidationError) as error,
+    ):
+        await hass.services.async_call(
+            LIGHT_DOMAIN,
+            SERVICE_TURN_OFF,
+            {ATTR_ENTITY_ID: f"{LIGHT_DOMAIN}.test_test"},
+            blocking=True,
+        )
+    assert error.value.translation_key == "switch_protected"
+    assert error.value.translation_domain == DOMAIN
+
+
+async def test_remove_from_hass(hass: HomeAssistant) -> None:
     """Test removing entity."""
     entry = configure_integration(hass)
     test_gateway = HomeControlMockLight()
@@ -156,7 +201,7 @@ async def test_remove_from_hass(hass: HomeAssistant):
         await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
-    state = hass.states.get(f"{DOMAIN}.test")
+    state = hass.states.get(f"{LIGHT_DOMAIN}.test_test")
     assert state is not None
     await hass.config_entries.async_remove(entry.entry_id)
     await hass.async_block_till_done()

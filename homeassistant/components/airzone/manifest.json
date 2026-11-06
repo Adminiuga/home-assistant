@@ -1,10 +1,18 @@
 {
   "domain": "airzone",
   "name": "Airzone",
-  "config_flow": true,
-  "documentation": "https://www.home-assistant.io/integrations/airzone",
-  "requirements": ["aioairzone==0.4.8"],
+  "categories": ["climate.heat_pumps_air_conditioning"],
   "codeowners": ["@Noltari"],
+  "config_flow": true,
+  "connectivity": ["network"],
+  "dhcp": [
+    {
+      "macaddress": "E84F25*"
+    }
+  ],
+  "documentation": "https://www.home-assistant.io/integrations/airzone",
+  "integration_type": "hub",
   "iot_class": "local_polling",
-  "loggers": ["aioairzone"]
+  "loggers": ["aioairzone"],
+  "requirements": ["aioairzone==1.0.5"]
 }

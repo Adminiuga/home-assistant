@@ -1,10 +1,14 @@
 {
   "domain": "omnilogic",
   "name": "Hayward Omnilogic",
+  "categories": ["water.pools_spas"],
+  "codeowners": [],
   "config_flow": true,
+  "connectivity": ["cloud"],
   "documentation": "https://www.home-assistant.io/integrations/omnilogic",
-  "requirements": ["omnilogic==0.4.5"],
-  "codeowners": ["@oliver84", "@djtimca", "@gentoosu"],
+  "integration_type": "hub",
   "iot_class": "cloud_polling",
-  "loggers": ["config", "omnilogic"]
+  "loggers": ["config", "omnilogic"],
+  "requirements": ["omnilogic==0.4.9"],
+  "single_config_entry": true
 }

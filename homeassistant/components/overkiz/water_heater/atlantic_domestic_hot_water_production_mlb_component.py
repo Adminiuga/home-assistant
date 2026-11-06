@@ -1,0 +1,245 @@
+"""Support for AtlanticDomesticHotWaterProductionMBLComponent."""
+
+from typing import Any, cast, override
+
+from pyoverkiz.enums import OverkizCommand, OverkizCommandParam, OverkizState
+from pyoverkiz.models import Command
+
+from homeassistant.components.water_heater import (
+    STATE_ECO,
+    STATE_ELECTRIC,
+    STATE_OFF,
+    STATE_PERFORMANCE,
+    WaterHeaterEntity,
+    WaterHeaterEntityFeature,
+)
+from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
+from homeassistant.util import dt as dt_util
+
+from ..coordinator import OverkizDataUpdateCoordinator
+from ..entity import OverkizEntity
+
+
+class AtlanticDomesticHotWaterProductionMBLComponent(OverkizEntity, WaterHeaterEntity):
+    """Representation of AtlanticDomesticHotWaterProductionMBLComponent (modbuslink)."""
+
+    _attr_native_temperature_unit = UnitOfTemperature.CELSIUS
+    _attr_supported_features = (
+        WaterHeaterEntityFeature.TARGET_TEMPERATURE
+        | WaterHeaterEntityFeature.OPERATION_MODE
+        | WaterHeaterEntityFeature.AWAY_MODE
+        | WaterHeaterEntityFeature.ON_OFF
+    )
+    _attr_operation_list = [
+        STATE_ECO,
+        STATE_OFF,
+        STATE_PERFORMANCE,
+        STATE_ELECTRIC,
+    ]
+
+    def __init__(
+        self, device_url: str, coordinator: OverkizDataUpdateCoordinator
+    ) -> None:
+        """Init method."""
+        super().__init__(device_url, coordinator)
+        self._attr_max_temp = cast(
+            float,
+            self.device.states.get_value(
+                OverkizState.CORE_MAXIMAL_TEMPERATURE_MANUAL_MODE
+            ),
+        )
+        self._attr_min_temp = cast(
+            float,
+            self.device.states.get_value(
+                OverkizState.CORE_MINIMAL_TEMPERATURE_MANUAL_MODE
+            ),
+        )
+
+    @property
+    @override
+    def native_current_temperature(self) -> float:
+        """Return the current temperature."""
+        return cast(
+            float,
+            self.device.states.get_value(
+                OverkizState.MODBUSLINK_MIDDLE_WATER_TEMPERATURE
+            ),
+        )
+
+    @property
+    @override
+    def native_target_temperature(self) -> float:
+        """Return the temperature corresponding to the PRESET."""
+        return cast(
+            float,
+            self.device.states.get_value(OverkizState.CORE_WATER_TARGET_TEMPERATURE),
+        )
+
+    @override
+    async def async_set_temperature(self, **kwargs: Any) -> None:
+        """Set new temperature."""
+        temperature = kwargs[ATTR_TEMPERATURE]
+        await self.executor.async_execute_command(
+            OverkizCommand.SET_TARGET_DHW_TEMPERATURE, temperature
+        )
+
+    @property
+    def is_boost_mode_on(self) -> bool:
+        """Return true if boost mode is on."""
+        return self.device.states.get_value(OverkizState.MODBUSLINK_DHW_BOOST_MODE) in (
+            OverkizCommandParam.ON,
+            OverkizCommandParam.PROG,
+        )
+
+    @property
+    def is_eco_mode_on(self) -> bool:
+        """Return true if eco mode is on."""
+        return self.device.states.get_value(OverkizState.MODBUSLINK_DHW_MODE) in (
+            OverkizCommandParam.MANUAL_ECO_ACTIVE,
+            OverkizCommandParam.AUTO_MODE,
+        )
+
+    @property
+    @override
+    def is_away_mode_on(self) -> bool:
+        """Return true if away mode is on."""
+        return self.device.states.get_value(
+            OverkizState.MODBUSLINK_DHW_ABSENCE_MODE
+        ) in (
+            OverkizCommandParam.ON,
+            OverkizCommandParam.PROG,
+        )
+
+    @property
+    @override
+    def current_operation(self) -> str:
+        """Return current operation."""
+        if self.is_away_mode_on:
+            return STATE_OFF
+
+        if self.is_boost_mode_on:
+            return STATE_PERFORMANCE
+
+        if self.is_eco_mode_on:
+            return STATE_ECO
+
+        if (
+            cast(str, self.device.states.get_value(OverkizState.MODBUSLINK_DHW_MODE))
+            == OverkizCommandParam.MANUAL_ECO_INACTIVE
+        ):
+            # STATE_ELECTRIC is a substitution for OverkizCommandParam.MANUAL
+            # to keep up with the conventional state usage only
+            # https://contributors.home-assistant.io/core/entities/water-heater/#states
+            return STATE_ELECTRIC
+
+        return STATE_OFF
+
+    @override
+    async def async_set_operation_mode(self, operation_mode: str) -> None:
+        """Set new operation mode."""
+        if operation_mode == STATE_OFF:
+            await self.async_turn_away_mode_on()
+            return
+
+        commands: list[Command] = []
+
+        if operation_mode == STATE_PERFORMANCE:
+            if self.is_away_mode_on:
+                commands.extend(self._away_mode_off_commands())
+            commands.extend(self._boost_mode_commands(OverkizCommandParam.ON))
+        elif operation_mode == STATE_ECO:
+            if self.is_away_mode_on:
+                commands.extend(self._away_mode_off_commands())
+            if self.is_boost_mode_on:
+                commands.extend(self._boost_mode_commands(OverkizCommandParam.OFF))
+            commands.append(
+                Command(
+                    name=OverkizCommand.SET_DHW_MODE,
+                    parameters=[OverkizCommandParam.AUTO_MODE],
+                )
+            )
+        elif operation_mode == STATE_ELECTRIC:
+            if self.is_away_mode_on:
+                commands.extend(self._away_mode_off_commands())
+            if self.is_boost_mode_on:
+                commands.extend(self._boost_mode_commands(OverkizCommandParam.OFF))
+            commands.append(
+                Command(
+                    name=OverkizCommand.SET_DHW_MODE,
+                    parameters=[OverkizCommandParam.MANUAL_ECO_INACTIVE],
+                )
+            )
+
+        await self.executor.async_execute_commands(commands)
+
+    @override
+    async def async_turn_away_mode_on(self) -> None:
+        """Turn away mode on.
+
+        This requires the start date and the end date to be
+        also set, and those dates have to match the device
+        datetime. The API accepts setting dates in the format
+        of the core:DateTimeState state for the DHW:
+        {"day": 11, "hour": 21, "minute": 12, "month": 7,
+        "second": 53, "weekday": 3, "year": 2024}.
+        The dict is then passed as an actual device date, the
+        away mode start date, and then as an end date, but with
+        the year incremented by 1, so the away mode is getting
+        turned on for the next year.
+
+        The weekday number seems to have no effect so the
+        calculation of the future date's weekday number is
+        redundant, but possible via homeassistant dt_util to
+        form both start and end dates dictionaries from
+        scratch based on datetime.now() and
+        datetime.timedelta into the future.
+
+        All commands are sent as a single execution. Sent one
+        by one, each followed by a polling update, the API
+        answers with "too many requests" and the device
+        becomes unavailable until the API is available again.
+        """
+        now = dt_util.now()
+        now_date = {
+            "month": now.month,
+            "hour": now.hour,
+            "year": now.year,
+            "weekday": now.weekday(),
+            "day": now.day,
+            "minute": now.minute,
+            "second": now.second,
+        }
+        end_date = {**now_date, "year": now.year + 1}
+        await self.executor.async_execute_commands(
+            [
+                Command(name=OverkizCommand.SET_DATE_TIME, parameters=[now_date]),
+                Command(
+                    name=OverkizCommand.SET_ABSENCE_START_DATE, parameters=[now_date]
+                ),
+                Command(
+                    name=OverkizCommand.SET_ABSENCE_END_DATE, parameters=[end_date]
+                ),
+                Command(
+                    name=OverkizCommand.SET_ABSENCE_MODE,
+                    parameters=[OverkizCommandParam.PROG],
+                ),
+            ]
+        )
+
+    @override
+    async def async_turn_away_mode_off(self) -> None:
+        """Turn away mode off."""
+        await self.executor.async_execute_commands(self._away_mode_off_commands())
+
+    def _away_mode_off_commands(self) -> list[Command]:
+        """Return the commands that turn away mode off."""
+        return [
+            Command(
+                name=OverkizCommand.SET_ABSENCE_MODE,
+                parameters=[OverkizCommandParam.OFF],
+            )
+        ]
+
+    def _boost_mode_commands(self, boost: OverkizCommandParam) -> list[Command]:
+        """Return the commands that turn boost mode on or off."""
+        return [Command(name=OverkizCommand.SET_BOOST_MODE, parameters=[boost])]

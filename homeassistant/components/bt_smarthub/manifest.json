@@ -1,9 +1,15 @@
 {
   "domain": "bt_smarthub",
   "name": "BT Smart Hub",
-  "documentation": "https://www.home-assistant.io/integrations/bt_smarthub",
-  "requirements": ["btsmarthub_devicelist==0.2.3"],
+  "categories": [
+    "presence_location.network_presence",
+    "computers_network.routers_network"
+  ],
   "codeowners": ["@typhoon2099"],
+  "connectivity": ["network"],
+  "documentation": "https://www.home-assistant.io/integrations/bt_smarthub",
   "iot_class": "local_polling",
-  "loggers": ["btsmarthub_devicelist"]
+  "loggers": ["btsmarthub_devicelist"],
+  "quality_scale": "legacy",
+  "requirements": ["btsmarthub-devicelist==0.2.3"]
 }

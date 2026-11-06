@@ -1,5 +1,4 @@
-"""
-Manage allocation of accessory ID's.
+"""Manage allocation of accessory ID's.
 
 HomeKit needs to allocate unique numbers to each accessory. These need to
 be stable between reboots and upgrades.
@@ -9,12 +8,11 @@ can't change the hash without causing breakages for HA users.
 
 This module generates and stores them in a HA storage.
 """
-from __future__ import annotations
 
 from collections.abc import Generator
 import random
 
-from fnvhash import fnv1a_32
+from fnv_hash_fast import fnv1a_32
 
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import entity_registry as er
@@ -27,6 +25,7 @@ AID_MANAGER_SAVE_DELAY = 2
 
 ALLOCATIONS_KEY = "allocations"
 UNIQUE_IDS_KEY = "unique_ids"
+ACCESSORY_TYPES_KEY = "accessory_types"
 
 INVALID_AIDS = (0, 1)
 
@@ -34,12 +33,12 @@ AID_MIN = 2
 AID_MAX = 18446744073709551615
 
 
-def get_system_unique_id(entity: er.RegistryEntry) -> str:
+def get_system_unique_id(entity: er.RegistryEntry, entity_unique_id: str) -> str:
     """Determine the system wide unique_id for an entity."""
-    return f"{entity.platform}.{entity.domain}.{entity.unique_id}"
+    return f"{entity.platform}.{entity.domain}.{entity_unique_id}"
 
 
-def _generate_aids(unique_id: str | None, entity_id: str) -> Generator[int, None, None]:
+def _generate_aids(unique_id: str | None, entity_id: str) -> Generator[int]:
     """Generate accessory aid."""
 
     if unique_id:
@@ -60,8 +59,7 @@ def _generate_aids(unique_id: str | None, entity_id: str) -> Generator[int, None
 
 
 class AccessoryAidStorage:
-    """
-    Holds a map of entity ID to HomeKit ID.
+    """Holds a map of entity ID to HomeKit ID.
 
     Will generate new ID's, ensure they are unique and store them to make sure they
     persist over reboots.
@@ -72,32 +70,106 @@ class AccessoryAidStorage:
         self.hass = hass
         self.allocations: dict[str, int] = {}
         self.allocated_aids: set[int] = set()
+        self.accessory_types: dict[str, str] = {}
         self._entry_id = entry_id
         self.store: Store | None = None
-        self._entity_registry: er.EntityRegistry | None = None
+        self._entity_registry = er.async_get(hass)
 
     async def async_initialize(self) -> None:
         """Load the latest AID data."""
-        self._entity_registry = er.async_get(self.hass)
         aidstore = get_aid_storage_filename_for_entry_id(self._entry_id)
         self.store = Store(self.hass, AID_MANAGER_STORAGE_VERSION, aidstore)
 
         if not (raw_storage := await self.store.async_load()):
             # There is no data about aid allocations yet
             return
-
         assert isinstance(raw_storage, dict)
         self.allocations = raw_storage.get(ALLOCATIONS_KEY, {})
         self.allocated_aids = set(self.allocations.values())
+        self.accessory_types = raw_storage.get(ACCESSORY_TYPES_KEY, {})
+
+    def _stable_storage_keys(self, entity_id: str) -> tuple[str, ...]:
+        """Return the keys the entity's stable identity can resolve to.
+
+        The preferred key comes first, matching the aid allocation
+        preference for the system unique id over the entity id.
+        """
+        if not (entry := self._entity_registry.async_get(entity_id)):
+            return (entity_id,)
+        keys = [get_system_unique_id(entry, entry.unique_id)]
+        if previous_unique_id := entry.previous_unique_id:
+            keys.append(get_system_unique_id(entry, previous_unique_id))
+        keys.append(entity_id)
+        return tuple(keys)
+
+    @callback
+    def async_set_accessory_type(
+        self, entity_id: str, accessory_type: str | None
+    ) -> None:
+        """Persist the accessory type an entity resolved to, None clears it.
+
+        The choice is stored by the same stable identity as the aid
+        allocation, so it survives entity id renames and unique id changes.
+        """
+        if accessory_type == self.get_accessory_type(entity_id):
+            return
+        types = self.accessory_types
+        keys = self._stable_storage_keys(entity_id)
+        for key in keys:
+            types.pop(key, None)
+        if accessory_type is not None:
+            types[keys[0]] = accessory_type
+        self.async_schedule_save()
+
+    @callback
+    def get_accessory_type(self, entity_id: str) -> str | None:
+        """Return the stored accessory type for the entity, if any.
+
+        A type found under an outdated identity moves to the current one
+        and schedules a save, since only the latest previous unique id
+        stays resolvable; the read is loop bound because of that.
+        """
+        types = self.accessory_types
+        keys = self._stable_storage_keys(entity_id)
+        for key in keys:
+            if (accessory_type := types.get(key)) is not None:
+                if key != keys[0]:
+                    del types[key]
+                    types[keys[0]] = accessory_type
+                    self.async_schedule_save()
+                return accessory_type
+        return None
 
     def get_or_allocate_aid_for_entity_id(self, entity_id: str) -> int:
         """Generate a stable aid for an entity id."""
-        assert self._entity_registry is not None
-        if not (entity := self._entity_registry.async_get(entity_id)):
+        if not (entry := self._entity_registry.async_get(entity_id)):
             return self.get_or_allocate_aid(None, entity_id)
 
-        sys_unique_id = get_system_unique_id(entity)
+        sys_unique_id = get_system_unique_id(entry, entry.unique_id)
+        self._migrate_unique_id_aid_assignment_if_needed(sys_unique_id, entry)
         return self.get_or_allocate_aid(sys_unique_id, entity_id)
+
+    def entity_is_allocated(self, entity_id: str) -> bool:
+        """Return True when the entity already has an allocated aid.
+
+        Checks every key get_or_allocate_aid_for_entity_id could resolve to,
+        without allocating, so callers can tell a previously bridged entity
+        from a new one.
+        """
+        return self.get_allocated_aid_for_entity_id(entity_id) is not None
+
+    def _migrate_unique_id_aid_assignment_if_needed(
+        self, sys_unique_id: str, entry: er.RegistryEntry
+    ) -> None:
+        """Migrate the unique id aid assignment if its changed."""
+        if sys_unique_id in self.allocations or not (
+            previous_unique_id := entry.previous_unique_id
+        ):
+            return
+        old_sys_unique_id = get_system_unique_id(entry, previous_unique_id)
+        if aid := self.allocations.pop(old_sys_unique_id, None):
+            self.allocations[sys_unique_id] = aid
+            self.async_schedule_save()
 
     def get_or_allocate_aid(self, unique_id: str | None, entity_id: str) -> int:
         """Allocate (and return) a new aid for an accessory."""
@@ -121,6 +193,24 @@ class AccessoryAidStorage:
             f"Unable to generate unique aid allocation for {entity_id} [{unique_id}]"
         )
 
+    def get_allocated_aid_for_entity_id(self, entity_id: str) -> int | None:
+        """Return the entity's allocated aid without allocating one."""
+        allocations = self.allocations
+        return next(
+            (
+                allocations[key]
+                for key in self._stable_storage_keys(entity_id)
+                if key in allocations
+            ),
+            None,
+        )
+
+    @callback
+    def async_delete_aid_for_entity_id(self, entity_id: str) -> None:
+        """Remove the aid allocation for an entity."""
+        for key in self._stable_storage_keys(entity_id):
+            self.delete_aid(key)
+
     def delete_aid(self, storage_key: str) -> None:
         """Delete an aid allocation."""
         if storage_key not in self.allocations:
@@ -142,6 +232,11 @@ class AccessoryAidStorage:
         return await self.store.async_save(self._data_to_save())
 
     @callback
-    def _data_to_save(self) -> dict:
+    def _data_to_save(self) -> dict[str, dict[str, int] | dict[str, str]]:
         """Return data of entity map to store in a file."""
-        return {ALLOCATIONS_KEY: self.allocations}
+        data: dict[str, dict[str, int] | dict[str, str]] = {
+            ALLOCATIONS_KEY: self.allocations
+        }
+        if self.accessory_types:
+            data[ACCESSORY_TYPES_KEY] = self.accessory_types
+        return data

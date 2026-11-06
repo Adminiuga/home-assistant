@@ -1,42 +1,26 @@
 """Reproduce an Alarm control panel state."""
-from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterable
 import logging
 from typing import Any, Final
 
-from homeassistant.const import (
-    ATTR_ENTITY_ID,
-    SERVICE_ALARM_ARM_AWAY,
-    SERVICE_ALARM_ARM_CUSTOM_BYPASS,
-    SERVICE_ALARM_ARM_HOME,
-    SERVICE_ALARM_ARM_NIGHT,
-    SERVICE_ALARM_ARM_VACATION,
-    SERVICE_ALARM_DISARM,
-    SERVICE_ALARM_TRIGGER,
-    STATE_ALARM_ARMED_AWAY,
-    STATE_ALARM_ARMED_CUSTOM_BYPASS,
-    STATE_ALARM_ARMED_HOME,
-    STATE_ALARM_ARMED_NIGHT,
-    STATE_ALARM_ARMED_VACATION,
-    STATE_ALARM_DISARMED,
-    STATE_ALARM_TRIGGERED,
-)
+from homeassistant.const import ATTR_ENTITY_ID
 from homeassistant.core import Context, HomeAssistant, State
 
-from . import DOMAIN
+from . import AlarmControlPanelState
+from .const import DOMAIN, AlarmControlPanelService
 
 _LOGGER: Final = logging.getLogger(__name__)
 
 VALID_STATES: Final[set[str]] = {
-    STATE_ALARM_ARMED_AWAY,
-    STATE_ALARM_ARMED_CUSTOM_BYPASS,
-    STATE_ALARM_ARMED_HOME,
-    STATE_ALARM_ARMED_NIGHT,
-    STATE_ALARM_ARMED_VACATION,
-    STATE_ALARM_DISARMED,
-    STATE_ALARM_TRIGGERED,
+    AlarmControlPanelState.ARMED_AWAY,
+    AlarmControlPanelState.ARMED_CUSTOM_BYPASS,
+    AlarmControlPanelState.ARMED_HOME,
+    AlarmControlPanelState.ARMED_NIGHT,
+    AlarmControlPanelState.ARMED_VACATION,
+    AlarmControlPanelState.DISARMED,
+    AlarmControlPanelState.TRIGGERED,
 }
 
 
@@ -64,20 +48,20 @@ async def _async_reproduce_state(
 
     service_data = {ATTR_ENTITY_ID: state.entity_id}
 
-    if state.state == STATE_ALARM_ARMED_AWAY:
-        service = SERVICE_ALARM_ARM_AWAY
-    elif state.state == STATE_ALARM_ARMED_CUSTOM_BYPASS:
-        service = SERVICE_ALARM_ARM_CUSTOM_BYPASS
-    elif state.state == STATE_ALARM_ARMED_HOME:
-        service = SERVICE_ALARM_ARM_HOME
-    elif state.state == STATE_ALARM_ARMED_NIGHT:
-        service = SERVICE_ALARM_ARM_NIGHT
-    elif state.state == STATE_ALARM_ARMED_VACATION:
-        service = SERVICE_ALARM_ARM_VACATION
-    elif state.state == STATE_ALARM_DISARMED:
-        service = SERVICE_ALARM_DISARM
-    elif state.state == STATE_ALARM_TRIGGERED:
-        service = SERVICE_ALARM_TRIGGER
+    if state.state == AlarmControlPanelState.ARMED_AWAY:
+        service = AlarmControlPanelService.ARM_AWAY
+    elif state.state == AlarmControlPanelState.ARMED_CUSTOM_BYPASS:
+        service = AlarmControlPanelService.ARM_CUSTOM_BYPASS
+    elif state.state == AlarmControlPanelState.ARMED_HOME:
+        service = AlarmControlPanelService.ARM_HOME
+    elif state.state == AlarmControlPanelState.ARMED_NIGHT:
+        service = AlarmControlPanelService.ARM_NIGHT
+    elif state.state == AlarmControlPanelState.ARMED_VACATION:
+        service = AlarmControlPanelService.ARM_VACATION
+    elif state.state == AlarmControlPanelState.DISARMED:
+        service = AlarmControlPanelService.DISARM
+    elif state.state == AlarmControlPanelState.TRIGGERED:
+        service = AlarmControlPanelService.TRIGGER
 
     await hass.services.async_call(
         DOMAIN, service, service_data, context=context, blocking=True

@@ -1,17 +1,23 @@
 """Test reproduce state for Alert."""
-from homeassistant.core import State
+
+import pytest
+from pytest_homeassistant.common import async_mock_service
+
+from homeassistant.components.alert import DOMAIN
+from homeassistant.components.alert.const import AlertService
+from homeassistant.core import HomeAssistant, State
 from homeassistant.helpers.state import async_reproduce_state
 
-from tests.common import async_mock_service
 
-
-async def test_reproducing_states(hass, caplog):
+async def test_reproducing_states(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
     """Test reproducing Alert states."""
     hass.states.async_set("alert.entity_off", "off", {})
     hass.states.async_set("alert.entity_on", "on", {})
 
-    turn_on_calls = async_mock_service(hass, "alert", "turn_on")
-    turn_off_calls = async_mock_service(hass, "alert", "turn_off")
+    turn_on_calls = async_mock_service(hass, DOMAIN, AlertService.TURN_ON)
+    turn_off_calls = async_mock_service(hass, DOMAIN, AlertService.TURN_OFF)
 
     # These calls should do nothing as entities already in desired state
     await async_reproduce_state(

@@ -1,53 +1,76 @@
-"""This component provides Lights for UniFi Protect."""
-from __future__ import annotations
+"""Component providing Lights for UniFi Protect."""
 
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast, override
 
-from pyunifiprotect.data import (
+from uiprotect.data import (
     Light,
     ModelType,
     ProtectAdoptableDeviceModel,
-    ProtectModelWithId,
+    PublicDeviceModel,
 )
+from uiprotect.data.public_devices import PublicLight
 
 from homeassistant.components.light import ATTR_BRIGHTNESS, ColorMode, LightEntity
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .const import DISPATCH_ADOPT, DOMAIN
-from .data import ProtectData
+from .const import DOMAIN
+from .data import ProtectData, ProtectDeviceType, UFPConfigEntry
 from .entity import ProtectDeviceEntity
-from .utils import async_dispatch_id as _ufpd
+from .utils import async_ufp_instance_command
 
 _LOGGER = logging.getLogger(__name__)
+PARALLEL_UPDATES = 0
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    entry: UFPConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up lights for UniFi Protect integration."""
-    data: ProtectData = hass.data[DOMAIN][entry.entry_id]
+    data = entry.runtime_data
 
-    async def _add_new_device(device: ProtectAdoptableDeviceModel) -> None:
-        if device.model == ModelType.LIGHT and device.can_write(
-            data.api.bootstrap.auth_user
-        ):
-            async_add_entities([ProtectLight(data, device)])
+    @callback
+    def _add_new_device(device: ProtectAdoptableDeviceModel) -> None:
+        if device.model is ModelType.LIGHT:
+            light = cast(Light, device)
+            public = data.async_get_public_device(light)
+            async_add_entities(
+                [
+                    ProtectLight(
+                        data,
+                        public if isinstance(public, PublicLight) else None,
+                        light,
+                    )
+                ]
+            )
 
+    @callback
+    def _add_new_public_device(device: PublicDeviceModel) -> None:
+        if isinstance(device, PublicLight):
+            async_add_entities([ProtectLight(data, device, None)])
+
+    data.async_subscribe_adopt(_add_new_device)
     entry.async_on_unload(
-        async_dispatcher_connect(hass, _ufpd(entry, DISPATCH_ADOPT), _add_new_device)
+        async_dispatcher_connect(hass, data.public_add_signal, _add_new_public_device)
     )
 
-    entities = []
-    for device in data.get_by_types({ModelType.LIGHT}):
-        if device.can_write(data.api.bootstrap.auth_user):
-            entities.append(ProtectLight(data, device))
-
+    entities: list[ProtectLight] = []
+    for public, private in data.get_public_lights():
+        if private is None:
+            # Public-only creates from the public object; hybrid defers to the
+            # adopt dispatch (its private fill would clash on unique_id).
+            if data.api.is_public_only:
+                entities.append(ProtectLight(data, public, None))
+            continue
+        # Created even without a public mirror; unavailable until one arrives.
+        # It writes through the API key, so the local user's permission does
+        # not gate it.
+        entities.append(ProtectLight(data, public, private))
     async_add_entities(entities)
 
 
@@ -64,29 +87,77 @@ def hass_to_unifi_brightness(value: int) -> int:
 class ProtectLight(ProtectDeviceEntity, LightEntity):
     """A Ubiquiti UniFi Protect Light Entity."""
 
-    device: Light
+    device: Light | PublicLight
 
     _attr_icon = "mdi:spotlight-beam"
     _attr_color_mode = ColorMode.BRIGHTNESS
     _attr_supported_color_modes = {ColorMode.BRIGHTNESS}
+    _state_attrs = ("_attr_available", "_attr_is_on", "_attr_brightness")
+    # State comes from the public API; the base class primes the object and
+    # subscribes to the public devices websocket on this flag.
+    _ufp_uses_public = True
+
+    def __init__(
+        self,
+        data: ProtectData,
+        public: PublicLight | None,
+        private: Light | None,
+    ) -> None:
+        """Initialize the light."""
+        self._ufp_public_obj = public
+        # unique_id and device info derive from the base device, so hybrid must
+        # keep the private one to leave existing entities unchanged.
+        device = private or public
+        if TYPE_CHECKING:
+            # The platform only builds a light when at least one side exists.
+            assert device is not None
+        super().__init__(data, device)
 
     @callback
-    def _async_update_device_from_protect(self, device: ProtectModelWithId) -> None:
+    @override
+    def _async_update_device_from_protect(self, device: ProtectDeviceType) -> None:
         super()._async_update_device_from_protect(device)
-        self._attr_is_on = self.device.is_light_on
-        self._attr_brightness = unifi_brightness_to_hass(
-            self.device.light_device_settings.led_level
+        if (public := self._ufp_public_obj) is None:
+            return
+        light = cast(PublicLight, public)
+        self._attr_is_on = light.is_light_on
+        led_level = light.light_device_settings.led_level
+        self._attr_brightness = (
+            None if led_level is None else unifi_brightness_to_hass(led_level)
         )
 
+    def _public_or_raise(self) -> PublicLight:
+        """Return the public object, or raise if it vanished mid-command."""
+        if (public := self._ufp_public_obj) is None:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="light_not_available",
+                translation_placeholders={"light_name": self.device.display_name},
+            )
+        return cast(PublicLight, public)
+
+    @async_ufp_instance_command
+    @override
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn the light on."""
-        hass_brightness = kwargs.get(ATTR_BRIGHTNESS, self.brightness)
-        unifi_brightness = hass_to_unifi_brightness(hass_brightness)
+        brightness = kwargs.get(ATTR_BRIGHTNESS)
+        led_level: int | None = None
+        if brightness is not None:
+            led_level = hass_to_unifi_brightness(brightness)
+            _LOGGER.debug(
+                "Turning on light with brightness %s (led_level=%s)",
+                brightness,
+                led_level,
+            )
+        else:
+            _LOGGER.debug("Turning on light")
 
-        _LOGGER.debug("Turning on light with brightness %s", unifi_brightness)
-        await self.device.set_light(True, unifi_brightness)
+        # led_level is range-checked by the setter, not by HA.
+        await self._public_or_raise().set_light(True, led_level)
 
+    @async_ufp_instance_command
+    @override
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn the light off."""
         _LOGGER.debug("Turning off light")
-        await self.device.set_light(False)
+        await self._public_or_raise().set_light(False)

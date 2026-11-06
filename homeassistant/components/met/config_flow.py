@@ -1,95 +1,124 @@
 """Config flow to configure Met component."""
-from __future__ import annotations
 
-from typing import Any
+from collections.abc import Mapping
+from typing import Any, override
 
-import voluptuous as vol
+import probatio
 
-from homeassistant import config_entries
-from homeassistant.const import CONF_ELEVATION, CONF_LATITUDE, CONF_LONGITUDE, CONF_NAME
+from homeassistant.config_entries import (
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlowWithReload,
+)
+from homeassistant.const import (
+    CONF_ELEVATION,
+    CONF_LATITUDE,
+    CONF_LOCATION,
+    CONF_LONGITUDE,
+    UnitOfLength,
+)
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.data_entry_flow import FlowResult
-import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers.selector import (
+    LocationSelector,
+    LocationSelectorConfig,
+    NumberSelector,
+    NumberSelectorConfig,
+    NumberSelectorMode,
+)
 
 from .const import (
     CONF_TRACK_HOME,
     DEFAULT_HOME_LATITUDE,
     DEFAULT_HOME_LONGITUDE,
+    DEFAULT_NAME,
     DOMAIN,
     HOME_LOCATION_NAME,
+)
+from .coordinator import MetWeatherConfigEntry
+
+STEP_USER_DATA_SCHEMA = probatio.Schema(
+    {
+        probatio.Required(CONF_LOCATION): LocationSelector(
+            LocationSelectorConfig(radius=False)
+        ),
+        probatio.Required(CONF_ELEVATION): NumberSelector(
+            NumberSelectorConfig(
+                mode=NumberSelectorMode.BOX, unit_of_measurement=UnitOfLength.METERS
+            )
+        ),
+    }
 )
 
 
 @callback
 def configured_instances(hass: HomeAssistant) -> set[str]:
-    """Return a set of configured SimpliSafe instances."""
+    """Return a set of configured met.no instances."""
     entries = []
     for entry in hass.config_entries.async_entries(DOMAIN):
         if entry.data.get("track_home"):
             entries.append("home")
             continue
-        entries.append(
-            f"{entry.data.get(CONF_LATITUDE)}-{entry.data.get(CONF_LONGITUDE)}"
-        )
+        location = entry.data.get(CONF_LOCATION, entry.data)
+        entries.append(f"{location[CONF_LATITUDE]}-{location[CONF_LONGITUDE]}")
     return set(entries)
 
 
-class MetFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
+def _fixed_location_title(data: Mapping[str, Any]) -> str:
+    """Return the generated title for a fixed location."""
+    return f"{DEFAULT_NAME} ({data[CONF_LATITUDE]}, {data[CONF_LONGITUDE]})"
+
+
+def _has_generated_title(config_entry: MetWeatherConfigEntry) -> bool:
+    """Return if the entry title still matches an integration-generated title."""
+    if config_entry.data.get(CONF_TRACK_HOME, False):
+        return config_entry.title == HOME_LOCATION_NAME
+
+    return config_entry.title == _fixed_location_title(config_entry.data[CONF_LOCATION])
+
+
+class MetConfigFlowHandler(ConfigFlow, domain=DOMAIN):
     """Config flow for Met component."""
 
-    VERSION = 1
+    VERSION = 2
+    MINOR_VERSION = 1
 
-    def __init__(self) -> None:
-        """Init MetFlowHandler."""
-        self._errors: dict[str, Any] = {}
-
+    @override
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle a flow initialized by the user."""
-        self._errors = {}
+        errors = {}
 
         if user_input is not None:
+            location = user_input[CONF_LOCATION]
             if (
-                f"{user_input.get(CONF_LATITUDE)}-{user_input.get(CONF_LONGITUDE)}"
+                f"{location[CONF_LATITUDE]}-{location[CONF_LONGITUDE]}"
                 not in configured_instances(self.hass)
             ):
                 return self.async_create_entry(
-                    title=user_input[CONF_NAME], data=user_input
+                    title=_fixed_location_title(location), data=user_input
                 )
-            self._errors[CONF_NAME] = "already_configured"
+            errors["base"] = "already_configured"
 
-        return await self._show_config_form(
-            name=HOME_LOCATION_NAME,
-            latitude=self.hass.config.latitude,
-            longitude=self.hass.config.longitude,
-            elevation=self.hass.config.elevation,
-        )
-
-    async def _show_config_form(
-        self,
-        name: str | None = None,
-        latitude: float | None = None,
-        longitude: float | None = None,
-        elevation: int | None = None,
-    ) -> FlowResult:
-        """Show the configuration form to edit location data."""
         return self.async_show_form(
             step_id="user",
-            data_schema=vol.Schema(
-                {
-                    vol.Required(CONF_NAME, default=name): str,
-                    vol.Required(CONF_LATITUDE, default=latitude): cv.latitude,
-                    vol.Required(CONF_LONGITUDE, default=longitude): cv.longitude,
-                    vol.Required(CONF_ELEVATION, default=elevation): int,
-                }
+            data_schema=self.add_suggested_values_to_schema(
+                STEP_USER_DATA_SCHEMA,
+                user_input
+                or {
+                    CONF_LOCATION: {
+                        CONF_LATITUDE: self.hass.config.latitude,
+                        CONF_LONGITUDE: self.hass.config.longitude,
+                    },
+                    CONF_ELEVATION: self.hass.config.elevation,
+                },
             ),
-            errors=self._errors,
+            errors=errors,
         )
 
     async def async_step_onboarding(
         self, data: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle a flow initialized by onboarding."""
         # Don't create entry if latitude or longitude isn't set.
         # Also, filters out our onboarding default location.
@@ -101,4 +130,52 @@ class MetFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
 
         return self.async_create_entry(
             title=HOME_LOCATION_NAME, data={CONF_TRACK_HOME: True}
+        )
+
+    @staticmethod
+    @callback
+    @override
+    def async_get_options_flow(
+        config_entry: MetWeatherConfigEntry,
+    ) -> MetOptionsFlowHandler:
+        """Get the options flow for Met."""
+        return MetOptionsFlowHandler()
+
+
+class MetOptionsFlowHandler(OptionsFlowWithReload):
+    """Options flow for Met component."""
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Configure options for Met."""
+
+        if user_input is not None:
+            title = (
+                _fixed_location_title(user_input[CONF_LOCATION])
+                if _has_generated_title(self.config_entry)
+                else self.config_entry.title
+            )
+            self.hass.config_entries.async_update_entry(
+                self.config_entry, data=user_input, title=title
+            )
+            return self.async_create_entry(title=title, data=user_input)
+
+        return self.async_show_form(
+            step_id="init",
+            data_schema=self.add_suggested_values_to_schema(
+                STEP_USER_DATA_SCHEMA,
+                user_input
+                or (
+                    self.config_entry.data
+                    if not self.config_entry.data.get(CONF_TRACK_HOME, False)
+                    else {
+                        CONF_LOCATION: {
+                            CONF_LATITUDE: self.hass.config.latitude,
+                            CONF_LONGITUDE: self.hass.config.longitude,
+                        },
+                        CONF_ELEVATION: self.hass.config.elevation,
+                    }
+                ),
+            ),
         )

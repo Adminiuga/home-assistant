@@ -1,9 +1,12 @@
 {
   "domain": "nilu",
   "name": "Norwegian Institute for Air Research (NILU)",
-  "documentation": "https://www.home-assistant.io/integrations/nilu",
-  "requirements": ["niluclient==0.1.2"],
+  "categories": ["weather_alerts.air_quality_pollen"],
   "codeowners": ["@hfurubotten"],
+  "connectivity": ["cloud"],
+  "documentation": "https://www.home-assistant.io/integrations/nilu",
   "iot_class": "cloud_polling",
-  "loggers": ["niluclient"]
+  "loggers": ["niluclient"],
+  "quality_scale": "legacy",
+  "requirements": ["niluclient==0.1.2"]
 }

@@ -1,8 +1,9 @@
 """Support for w800rf32 devices."""
+
 import logging
 
+import probatio
 import W800rf32 as w800
-import voluptuous as vol
 
 from homeassistant.const import (
     CONF_DEVICE,
@@ -10,7 +11,7 @@ from homeassistant.const import (
     EVENT_HOMEASSISTANT_STOP,
 )
 from homeassistant.core import HomeAssistant
-import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.dispatcher import dispatcher_send
 from homeassistant.helpers.typing import ConfigType
 
@@ -21,8 +22,9 @@ W800RF32_DEVICE = "w800rf32_{}"
 
 _LOGGER = logging.getLogger(__name__)
 
-CONFIG_SCHEMA = vol.Schema(
-    {DOMAIN: vol.Schema({vol.Required(CONF_DEVICE): cv.string})}, extra=vol.ALLOW_EXTRA
+CONFIG_SCHEMA = probatio.Schema(
+    {DOMAIN: probatio.Schema({probatio.Required(CONF_DEVICE): cv.string})},
+    extra=probatio.ALLOW_EXTRA,
 )
 
 

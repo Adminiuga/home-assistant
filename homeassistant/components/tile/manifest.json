@@ -1,11 +1,13 @@
 {
   "domain": "tile",
   "name": "Tile",
-  "config_flow": true,
-  "documentation": "https://www.home-assistant.io/integrations/tile",
-  "requirements": ["pytile==2022.02.0"],
+  "categories": ["presence_location.trackers"],
   "codeowners": ["@bachya"],
+  "config_flow": true,
+  "connectivity": ["cloud"],
+  "documentation": "https://www.home-assistant.io/integrations/tile",
+  "integration_type": "hub",
   "iot_class": "cloud_polling",
   "loggers": ["pytile"],
-  "integration_type": "hub"
+  "requirements": ["pytile==2024.12.0"]
 }

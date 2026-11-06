@@ -1,8 +1,12 @@
 {
   "domain": "spaceapi",
-  "name": "Space API",
-  "documentation": "https://www.home-assistant.io/integrations/spaceapi",
-  "dependencies": ["http"],
+  "name": "SpaceAPI",
+  "categories": ["diy_makers.web_data_connectors"],
   "codeowners": ["@fabaff"],
-  "iot_class": "cloud_polling"
+  "config_flow": false,
+  "dependencies": ["http"],
+  "documentation": "https://www.home-assistant.io/integrations/spaceapi",
+  "integration_type": "service",
+  "iot_class": "calculated",
+  "quality_scale": "legacy"
 }

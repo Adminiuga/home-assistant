@@ -1,19 +1,22 @@
 """Tests for tag triggers."""
 
-import pytest
+from typing import Any
 
-import homeassistant.components.automation as automation
+import attr
+import pytest
+from pytest_homeassistant.common import MockConfigEntry
+
+from homeassistant.components import automation
 from homeassistant.components.tag import async_scan_tag
 from homeassistant.components.tag.const import DEVICE_ID, DOMAIN, TAG_ID
 from homeassistant.const import ATTR_ENTITY_ID, SERVICE_TURN_OFF
+from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.helpers import device_registry as dr
 from homeassistant.setup import async_setup_component
-
-from tests.common import async_mock_service
-from tests.components.blueprint.conftest import stub_blueprint_populate  # noqa: F401
 
 
 @pytest.fixture
-def tag_setup(hass, hass_storage):
+def tag_setup(hass: HomeAssistant, hass_storage: dict[str, Any]):
     """Tag setup."""
 
     async def _storage(items=None):
@@ -21,7 +24,8 @@ def tag_setup(hass, hass_storage):
             hass_storage[DOMAIN] = {
                 "key": DOMAIN,
                 "version": 1,
-                "data": {"items": [{"id": "test tag"}]},
+                "minor_version": 2,
+                "data": {"items": [{"id": "test tag", "tag_id": "test tag"}]},
             }
         else:
             hass_storage[DOMAIN] = items
@@ -31,13 +35,9 @@ def tag_setup(hass, hass_storage):
     return _storage
 
 
-@pytest.fixture
-def calls(hass):
-    """Track calls to a mock service."""
-    return async_mock_service(hass, "test", "automation")
-
-
-async def test_triggers(hass, tag_setup, calls):
+async def test_triggers(
+    hass: HomeAssistant, tag_setup, service_calls: list[ServiceCall]
+) -> None:
     """Test tag triggers."""
     assert await tag_setup()
     assert await async_setup_component(
@@ -65,9 +65,9 @@ async def test_triggers(hass, tag_setup, calls):
     await async_scan_tag(hass, "abc123", None)
     await hass.async_block_till_done()
 
-    assert len(calls) == 1
-    assert calls[0].data["message"] == "service called"
-    assert calls[0].data["id"] == 0
+    assert len(service_calls) == 1
+    assert service_calls[0].data["message"] == "service called"
+    assert service_calls[0].data["id"] == 0
 
     await hass.services.async_call(
         automation.DOMAIN,
@@ -75,14 +75,17 @@ async def test_triggers(hass, tag_setup, calls):
         {ATTR_ENTITY_ID: "automation.test"},
         blocking=True,
     )
+    assert len(service_calls) == 2
 
     await async_scan_tag(hass, "abc123", None)
     await hass.async_block_till_done()
 
-    assert len(calls) == 1
+    assert len(service_calls) == 2
 
 
-async def test_exception_bad_trigger(hass, calls, caplog):
+async def test_exception_bad_trigger(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
     """Test for exception on event triggers firing."""
 
     await async_setup_component(
@@ -101,10 +104,12 @@ async def test_exception_bad_trigger(hass, calls, caplog):
         },
     )
     await hass.async_block_till_done()
-    assert "Invalid config for [automation]" in caplog.text
+    assert "Unnamed automation could not be validated" in caplog.text
 
 
-async def test_multiple_tags_and_devices_trigger(hass, tag_setup, calls):
+async def test_multiple_tags_and_devices_trigger(
+    hass: HomeAssistant, tag_setup, service_calls: list[ServiceCall]
+) -> None:
     """Test multiple tags and devices triggers."""
     assert await tag_setup()
     assert await async_setup_component(
@@ -144,8 +149,92 @@ async def test_multiple_tags_and_devices_trigger(hass, tag_setup, calls):
     await async_scan_tag(hass, "def456", device_id="jkl0123")
     await hass.async_block_till_done()
 
-    assert len(calls) == 4
-    assert calls[0].data["message"] == "service called"
-    assert calls[1].data["message"] == "service called"
-    assert calls[2].data["message"] == "service called"
-    assert calls[3].data["message"] == "service called"
+    assert len(service_calls) == 4
+    assert service_calls[0].data["message"] == "service called"
+    assert service_calls[1].data["message"] == "service called"
+    assert service_calls[2].data["message"] == "service called"
+    assert service_calls[3].data["message"] == "service called"
+
+
+COMPOSITE_ID = "composite00000000000000000000ab"
+
+
+@pytest.fixture
+def split_devices(
+    hass: HomeAssistant, device_registry: dr.DeviceRegistry
+) -> tuple[dr.DeviceEntry, dr.DeviceEntry]:
+    """Create two devices which are splits of a pre-migration composite device."""
+    entry_1 = MockConfigEntry(domain="itg1")
+    entry_1.add_to_hass(hass)
+    entry_2 = MockConfigEntry(domain="itg2")
+    entry_2.add_to_hass(hass)
+    device_1 = device_registry.async_get_or_create(
+        config_entry_id=entry_1.entry_id,
+        identifiers={("itg1", "1")},
+        name="Split device 1",
+    )
+    device_2 = device_registry.async_get_or_create(
+        config_entry_id=entry_2.entry_id,
+        identifiers={("itg2", "1")},
+        name="Split device 2",
+    )
+    device_registry._devices[device_1.id] = attr.evolve(
+        device_1, composite_device_id=COMPOSITE_ID
+    )
+    device_registry._devices[device_2.id] = attr.evolve(
+        device_2, composite_device_id=COMPOSITE_ID
+    )
+    return device_registry._devices[device_1.id], device_registry._devices[device_2.id]
+
+
+async def test_composite_device_trigger(
+    hass: HomeAssistant,
+    tag_setup,
+    service_calls: list[ServiceCall],
+    split_devices: tuple[dr.DeviceEntry, dr.DeviceEntry],
+) -> None:
+    """Test a tag trigger configured with a pre-migration composite device id.
+
+    The composite device id no longer refers to a registered device; it is expanded to
+    the ids of the devices it was split into, so a tag scanned by either split device
+    fires the trigger.
+    """
+    device_1, device_2 = split_devices
+    assert await tag_setup()
+    assert await async_setup_component(
+        hass,
+        automation.DOMAIN,
+        {
+            automation.DOMAIN: [
+                {
+                    "trigger": {
+                        "platform": DOMAIN,
+                        TAG_ID: "abc123",
+                        DEVICE_ID: COMPOSITE_ID,
+                    },
+                    "action": {
+                        "service": "test.automation",
+                        "data": {"message": "service called"},
+                    },
+                }
+            ]
+        },
+    )
+
+    await hass.async_block_till_done()
+
+    # A scan by the composite id or an unrelated device should not fire
+    await async_scan_tag(hass, tag_id="abc123", device_id=COMPOSITE_ID)
+    await async_scan_tag(hass, tag_id="abc123", device_id="other_device")
+    await hass.async_block_till_done()
+    assert len(service_calls) == 0
+
+    # A scan by either split device should fire
+    await async_scan_tag(hass, tag_id="abc123", device_id=device_1.id)
+    await hass.async_block_till_done()
+    await async_scan_tag(hass, tag_id="abc123", device_id=device_2.id)
+    await hass.async_block_till_done()
+
+    assert len(service_calls) == 2
+    assert service_calls[0].data["message"] == "service called"
+    assert service_calls[1].data["message"] == "service called"

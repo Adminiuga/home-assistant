@@ -1,9 +1,9 @@
 """Config flow to configure the IPP integration."""
-from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, override
 
+import probatio
 from pyipp import (
     IPP,
     IPPConnectionError,
@@ -13,24 +13,35 @@ from pyipp import (
     IPPResponseError,
     IPPVersionNotSupportedError,
 )
-import voluptuous as vol
 
-from homeassistant.components import zeroconf
-from homeassistant.config_entries import ConfigFlow
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import (
     CONF_HOST,
     CONF_NAME,
     CONF_PORT,
     CONF_SSL,
+    CONF_UUID,
     CONF_VERIFY_SSL,
 )
 from homeassistant.core import HomeAssistant
-from homeassistant.data_entry_flow import FlowResult
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.service_info.zeroconf import ZeroconfServiceInfo
 
-from .const import CONF_BASE_PATH, CONF_SERIAL, CONF_UUID, DOMAIN
+from .const import CONF_BASE_PATH, CONF_SERIAL, DOMAIN, REQUEST_TIMEOUT
+from .coordinator import IPPConfigEntry
 
 _LOGGER = logging.getLogger(__name__)
+
+DATA_SCHEMA = probatio.Schema(
+    {
+        probatio.Required(CONF_HOST): str,
+        probatio.Required(CONF_PORT, default=631): int,
+        probatio.Required(CONF_BASE_PATH, default="/ipp/print"): str,
+        probatio.Required(CONF_SSL, default=False): bool,
+        probatio.Required(CONF_VERIFY_SSL, default=False): bool,
+    }
+)
 
 
 async def validate_input(hass: HomeAssistant, data: dict) -> dict[str, Any]:
@@ -46,6 +57,7 @@ async def validate_input(hass: HomeAssistant, data: dict) -> dict[str, Any]:
         tls=data[CONF_SSL],
         verify_ssl=data[CONF_VERIFY_SSL],
         session=session,
+        request_timeout=REQUEST_TIMEOUT,
     )
 
     printer = await ipp.printer()
@@ -58,13 +70,14 @@ class IPPFlowHandler(ConfigFlow, domain=DOMAIN):
 
     VERSION = 1
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Set up the instance."""
-        self.discovery_info = {}
+        self.discovery_info: dict[str, Any] = {}
 
+    @override
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle a flow initiated by the user."""
         if user_input is None:
             return self._show_setup_form()
@@ -73,11 +86,11 @@ class IPPFlowHandler(ConfigFlow, domain=DOMAIN):
             info = await validate_input(self.hass, user_input)
         except IPPConnectionUpgradeRequired:
             return self._show_setup_form({"base": "connection_upgrade"})
-        except (IPPConnectionError, IPPResponseError):
+        except IPPConnectionError, IPPResponseError:
             _LOGGER.debug("IPP Connection/Response Error", exc_info=True)
             return self._show_setup_form({"base": "cannot_connect"})
         except IPPParseError:
-            _LOGGER.debug("IPP Parse Error", exc_info=True)
+            _LOGGER.warning("IPP Parse Error", exc_info=True)
             return self.async_abort(reason="parse_error")
         except IPPVersionNotSupportedError:
             return self.async_abort(reason="ipp_version_error")
@@ -89,7 +102,8 @@ class IPPFlowHandler(ConfigFlow, domain=DOMAIN):
 
         if not unique_id and info[CONF_SERIAL]:
             _LOGGER.debug(
-                "Printer UUID is missing from IPP response. Falling back to IPP serial number"
+                "Printer UUID is missing from IPP response. Falling back to IPP serial"
+                " number"
             )
             unique_id = info[CONF_SERIAL]
         elif not unique_id:
@@ -100,9 +114,10 @@ class IPPFlowHandler(ConfigFlow, domain=DOMAIN):
 
         return self.async_create_entry(title=user_input[CONF_HOST], data=user_input)
 
+    @override
     async def async_step_zeroconf(
-        self, discovery_info: zeroconf.ZeroconfServiceInfo
-    ) -> FlowResult:
+        self, discovery_info: ZeroconfServiceInfo
+    ) -> ConfigFlowResult:
         """Handle zeroconf discovery."""
         host = discovery_info.host
 
@@ -114,8 +129,7 @@ class IPPFlowHandler(ConfigFlow, domain=DOMAIN):
         name = discovery_info.name.replace(f".{zctype}", "")
         tls = zctype == "_ipps._tcp.local."
         base_path = discovery_info.properties.get("rp", "ipp/print")
-
-        self.context.update({"title_placeholders": {"name": name}})
+        unique_id = discovery_info.properties.get("UUID")
 
         self.discovery_info.update(
             {
@@ -125,19 +139,27 @@ class IPPFlowHandler(ConfigFlow, domain=DOMAIN):
                 CONF_VERIFY_SSL: False,
                 CONF_BASE_PATH: f"/{base_path}",
                 CONF_NAME: name,
-                CONF_UUID: discovery_info.properties.get("UUID"),
+                CONF_UUID: unique_id,
             }
         )
+
+        if unique_id:
+            # If we already have the unique id, try to set it now
+            # so we can avoid probing the device if its already
+            # configured or ignored
+            await self._async_set_unique_id_and_abort_if_already_configured(unique_id)
+
+        self.context.update({"title_placeholders": {"name": name}})
 
         try:
             info = await validate_input(self.hass, self.discovery_info)
         except IPPConnectionUpgradeRequired:
             return self.async_abort(reason="connection_upgrade")
-        except (IPPConnectionError, IPPResponseError):
+        except IPPConnectionError, IPPResponseError:
             _LOGGER.debug("IPP Connection/Response Error", exc_info=True)
             return self.async_abort(reason="cannot_connect")
         except IPPParseError:
-            _LOGGER.debug("IPP Parse Error", exc_info=True)
+            _LOGGER.warning("IPP Parse Error", exc_info=True)
             return self.async_abort(reason="parse_error")
         except IPPVersionNotSupportedError:
             return self.async_abort(reason="ipp_version_error")
@@ -145,7 +167,6 @@ class IPPFlowHandler(ConfigFlow, domain=DOMAIN):
             _LOGGER.debug("IPP Error", exc_info=True)
             return self.async_abort(reason="ipp_error")
 
-        unique_id = self.discovery_info[CONF_UUID]
         if not unique_id and info[CONF_UUID]:
             _LOGGER.debug(
                 "Printer UUID is missing from discovery info. Falling back to IPP UUID"
@@ -153,7 +174,8 @@ class IPPFlowHandler(ConfigFlow, domain=DOMAIN):
             unique_id = self.discovery_info[CONF_UUID] = info[CONF_UUID]
         elif not unique_id and info[CONF_SERIAL]:
             _LOGGER.debug(
-                "Printer UUID is missing from discovery info and IPP response. Falling back to IPP serial number"
+                "Printer UUID is missing from discovery info and IPP response. Falling"
+                " back to IPP serial number"
             )
             unique_id = info[CONF_SERIAL]
         elif not unique_id:
@@ -161,21 +183,27 @@ class IPPFlowHandler(ConfigFlow, domain=DOMAIN):
                 "Unable to determine unique id from discovery info and IPP response"
             )
 
-        if unique_id:
-            await self.async_set_unique_id(unique_id)
-            self._abort_if_unique_id_configured(
-                updates={
-                    CONF_HOST: self.discovery_info[CONF_HOST],
-                    CONF_NAME: self.discovery_info[CONF_NAME],
-                },
-            )
+        if unique_id and self.unique_id != unique_id:
+            await self._async_set_unique_id_and_abort_if_already_configured(unique_id)
 
         await self._async_handle_discovery_without_unique_id()
         return await self.async_step_zeroconf_confirm()
 
+    async def _async_set_unique_id_and_abort_if_already_configured(
+        self, unique_id: str
+    ) -> None:
+        """Set the unique ID and abort if already configured."""
+        await self.async_set_unique_id(unique_id)
+        self._abort_if_unique_id_configured(
+            updates={
+                CONF_HOST: self.discovery_info[CONF_HOST],
+                CONF_NAME: self.discovery_info[CONF_NAME],
+            },
+        )
+
     async def async_step_zeroconf_confirm(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle a confirmation flow initiated by zeroconf."""
         if user_input is None:
             return self.async_show_form(
@@ -189,18 +217,59 @@ class IPPFlowHandler(ConfigFlow, domain=DOMAIN):
             data=self.discovery_info,
         )
 
-    def _show_setup_form(self, errors: dict | None = None) -> FlowResult:
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle reconfiguration of an IPP printer."""
+        errors: dict[str, str] = {}
+        reconfigure_entry = self._get_reconfigure_entry()
+
+        if user_input is not None:
+            try:
+                info = await validate_input(self.hass, user_input)
+            except IPPConnectionUpgradeRequired:
+                errors["base"] = "connection_upgrade"
+            except IPPConnectionError, IPPResponseError:
+                _LOGGER.debug("IPP Connection/Response Error", exc_info=True)
+                errors["base"] = "cannot_connect"
+            except IPPVersionNotSupportedError:
+                errors["base"] = "ipp_version_error"
+            except IPPError:
+                _LOGGER.debug("IPP Error", exc_info=True)
+                errors["base"] = "ipp_error"
+            else:
+                if not self._is_same_printer(reconfigure_entry, info):
+                    return self.async_abort(reason="different_device")
+                return self.async_update_reload_and_abort(
+                    reconfigure_entry,
+                    data_updates={**user_input, CONF_UUID: info[CONF_UUID]},
+                )
+
+        return self.async_show_form(
+            step_id="reconfigure",
+            data_schema=self.add_suggested_values_to_schema(
+                DATA_SCHEMA, user_input or reconfigure_entry.data
+            ),
+            errors=errors,
+        )
+
+    def _is_same_printer(self, entry: IPPConfigEntry, info: dict[str, Any]) -> bool:
+        """Return whether the printer info belongs to the config entry."""
+        if entry.unique_id == (info[CONF_UUID] or info[CONF_SERIAL]):
+            return True
+        # A UUID advertised over zeroconf is not always in the IPP response,
+        # so fall back to the serial number recorded on the device.
+        return bool(info[CONF_SERIAL]) and any(
+            device.serial_number == info[CONF_SERIAL]
+            for device in dr.async_entries_for_config_entry(
+                dr.async_get(self.hass), entry.entry_id
+            )
+        )
+
+    def _show_setup_form(self, errors: dict | None = None) -> ConfigFlowResult:
         """Show the setup form to the user."""
         return self.async_show_form(
             step_id="user",
-            data_schema=vol.Schema(
-                {
-                    vol.Required(CONF_HOST): str,
-                    vol.Required(CONF_PORT, default=631): int,
-                    vol.Required(CONF_BASE_PATH, default="/ipp/print"): str,
-                    vol.Required(CONF_SSL, default=False): bool,
-                    vol.Required(CONF_VERIFY_SSL, default=False): bool,
-                }
-            ),
+            data_schema=DATA_SCHEMA,
             errors=errors or {},
         )

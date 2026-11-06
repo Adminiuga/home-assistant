@@ -1,37 +1,37 @@
 """Update entities for Netgear devices."""
-from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, override
 
 from homeassistant.components.update import (
     UpdateDeviceClass,
     UpdateEntity,
     UpdateEntityFeature,
 )
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .const import DOMAIN, KEY_COORDINATOR_FIRMWARE, KEY_ROUTER
-from .router import NetgearRouter, NetgearRouterCoordinatorEntity
+from .coordinator import NetgearConfigEntry, NetgearFirmwareCoordinator
+from .entity import NetgearRouterCoordinatorEntity
 
 LOGGER = logging.getLogger(__name__)
 
 
 async def async_setup_entry(
-    hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
+    hass: HomeAssistant,
+    entry: NetgearConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up update entities for Netgear component."""
-    router = hass.data[DOMAIN][entry.entry_id][KEY_ROUTER]
-    coordinator = hass.data[DOMAIN][entry.entry_id][KEY_COORDINATOR_FIRMWARE]
-    entities = [NetgearUpdateEntity(coordinator, router)]
+    coordinator = entry.runtime_data.coordinator_firmware
+    entities = [NetgearUpdateEntity(coordinator)]
 
     async_add_entities(entities)
 
 
-class NetgearUpdateEntity(NetgearRouterCoordinatorEntity, UpdateEntity):
+class NetgearUpdateEntity(
+    NetgearRouterCoordinatorEntity[NetgearFirmwareCoordinator], UpdateEntity
+):
     """Update entity for a Netgear device."""
 
     _attr_device_class = UpdateDeviceClass.FIRMWARE
@@ -39,15 +39,15 @@ class NetgearUpdateEntity(NetgearRouterCoordinatorEntity, UpdateEntity):
 
     def __init__(
         self,
-        coordinator: DataUpdateCoordinator,
-        router: NetgearRouter,
+        coordinator: NetgearFirmwareCoordinator,
     ) -> None:
         """Initialize a Netgear device."""
-        super().__init__(coordinator, router)
-        self._name = f"{router.device_name} Update"
-        self._unique_id = f"{router.serial_number}-update"
+        super().__init__(coordinator)
+        # Legacy format, kept as migrating existing unique IDs is not worth the risk
+        self._attr_unique_id = f"{coordinator.router.serial_number}-update"  # pylint: disable=home-assistant-entity-unique-id-redundant-platform
 
     @property
+    @override
     def installed_version(self) -> str | None:
         """Version currently in use."""
         if self.coordinator.data is not None:
@@ -55,6 +55,7 @@ class NetgearUpdateEntity(NetgearRouterCoordinatorEntity, UpdateEntity):
         return None
 
     @property
+    @override
     def latest_version(self) -> str | None:
         """Latest version available for install."""
         if self.coordinator.data is not None:
@@ -66,12 +67,14 @@ class NetgearUpdateEntity(NetgearRouterCoordinatorEntity, UpdateEntity):
         return self.installed_version
 
     @property
+    @override
     def release_summary(self) -> str | None:
         """Release summary."""
         if self.coordinator.data is not None:
             return self.coordinator.data.get("ReleaseNote")
         return None
 
+    @override
     async def async_install(
         self, version: str | None, backup: bool, **kwargs: Any
     ) -> None:
@@ -79,5 +82,6 @@ class NetgearUpdateEntity(NetgearRouterCoordinatorEntity, UpdateEntity):
         await self._router.async_update_new_firmware()
 
     @callback
+    @override
     def async_update_device(self) -> None:
         """Update the Netgear device."""

@@ -1,10 +1,12 @@
 """Test the HVV Departures config flow."""
-import json
-from unittest.mock import patch
 
-from pygti.exceptions import CannotConnect, InvalidAuth
+from unittest.mock import MagicMock, patch
 
-from homeassistant import data_entry_flow
+from aiohttp import ClientConnectorError
+from pygti.exceptions import GTIUnauthorizedError
+from pygti.models import CNResponse, DLResponse, StationInformationResponse
+from pytest_homeassistant.common import MockConfigEntry, load_json_object_fixture
+
 from homeassistant.components.hvv_departures.const import (
     CONF_FILTER,
     CONF_REAL_TIME,
@@ -13,42 +15,54 @@ from homeassistant.components.hvv_departures.const import (
 )
 from homeassistant.config_entries import SOURCE_USER
 from homeassistant.const import CONF_HOST, CONF_OFFSET, CONF_PASSWORD, CONF_USERNAME
+from homeassistant.core import HomeAssistant
+from homeassistant.data_entry_flow import FlowResultType
 
-from tests.common import MockConfigEntry, load_fixture
-
-FIXTURE_INIT = json.loads(load_fixture("hvv_departures/init.json"))
-FIXTURE_CHECK_NAME = json.loads(load_fixture("hvv_departures/check_name.json"))
-FIXTURE_STATION_INFORMATION = json.loads(
-    load_fixture("hvv_departures/station_information.json")
+FIXTURE_INIT = load_json_object_fixture("hvv_departures/init.json")
+FIXTURE_CHECK_NAME = load_json_object_fixture("hvv_departures/check_name.json")
+FIXTURE_STATION_INFORMATION = load_json_object_fixture(
+    "hvv_departures/station_information.json"
 )
-FIXTURE_CONFIG_ENTRY = json.loads(load_fixture("hvv_departures/config_entry.json"))
-FIXTURE_OPTIONS = json.loads(load_fixture("hvv_departures/options.json"))
-FIXTURE_DEPARTURE_LIST = json.loads(load_fixture("hvv_departures/departure_list.json"))
+FIXTURE_CONFIG_ENTRY = load_json_object_fixture("hvv_departures/config_entry.json")
+FIXTURE_OPTIONS = load_json_object_fixture("hvv_departures/options.json")
+FIXTURE_DEPARTURE_LIST = load_json_object_fixture("hvv_departures/departure_list.json")
 
 
-async def test_user_flow(hass):
+async def test_user_flow(hass: HomeAssistant) -> None:
     """Test that config flow works."""
 
-    with patch(
-        "homeassistant.components.hvv_departures.hub.GTI.init",
-        return_value=FIXTURE_INIT,
-    ), patch(
-        "homeassistant.components.hvv_departures.hub.GTI.checkName",
-        return_value=FIXTURE_CHECK_NAME,
-    ), patch(
-        "homeassistant.components.hvv_departures.hub.GTI.stationInformation",
-        return_value=FIXTURE_STATION_INFORMATION,
-    ), patch(
-        "homeassistant.components.hvv_departures.async_setup_entry",
-        return_value=True,
+    with (
+        patch(
+            "homeassistant.components.hvv_departures.hub.GTI.init",
+            return_value=FIXTURE_INIT,
+        ),
+        patch(
+            "homeassistant.components.hvv_departures.hub.GTI.checkName",
+            return_value=CNResponse.model_validate(FIXTURE_CHECK_NAME),
+        ),
+        patch(
+            "homeassistant.components.hvv_departures.hub.GTI.getStationInformation",
+            return_value=StationInformationResponse.model_validate(
+                FIXTURE_STATION_INFORMATION
+            ),
+        ),
+        patch(
+            "homeassistant.components.hvv_departures.async_setup_entry",
+            return_value=None,
+        ),
     ):
-
         # step: user
 
         result_user = await hass.config_entries.flow.async_init(
-            DOMAIN,
-            context={"source": SOURCE_USER},
-            data={
+            DOMAIN, context={"source": SOURCE_USER}
+        )
+
+        assert result_user["type"] is FlowResultType.FORM
+        assert result_user["step_id"] == "user"
+
+        result_user = await hass.config_entries.flow.async_configure(
+            result_user["flow_id"],
+            user_input={
                 CONF_HOST: "api-test.geofox.de",
                 CONF_USERNAME: "test-username",
                 CONF_PASSWORD: "test-password",
@@ -68,10 +82,10 @@ async def test_user_flow(hass):
         # step: station_select
         result_station_select = await hass.config_entries.flow.async_configure(
             result_user["flow_id"],
-            {CONF_STATION: "Wartenau"},
+            {CONF_STATION: "Master:10901"},
         )
 
-        assert result_station_select["type"] == "create_entry"
+        assert result_station_select["type"] is FlowResultType.CREATE_ENTRY
         assert result_station_select["title"] == "Wartenau"
         assert result_station_select["data"] == {
             CONF_HOST: "api-test.geofox.de",
@@ -83,33 +97,114 @@ async def test_user_flow(hass):
                 "combinedName": "Wartenau",
                 "id": "Master:10901",
                 "type": "STATION",
-                "coordinate": {"x": 10.035515, "y": 53.56478},
+                "coordinate": {"x": 10.035515, "y": 53.56478, "type": "EPSG_4326"},
                 "serviceTypes": ["bus", "u"],
                 "hasStationInformation": True,
             },
         }
 
 
-async def test_user_flow_no_results(hass):
+async def test_user_flow_stations_with_same_name(hass: HomeAssistant) -> None:
+    """Test that stations with the same name in different cities can be selected."""
+
+    with (
+        patch(
+            "homeassistant.components.hvv_departures.hub.GTI.init",
+            return_value=FIXTURE_INIT,
+        ),
+        patch(
+            "homeassistant.components.hvv_departures.hub.GTI.checkName",
+            return_value=CNResponse.model_validate(
+                {
+                    "returnCode": "OK",
+                    "results": [
+                        {
+                            "name": "Rathaus",
+                            "city": "Hamburg",
+                            "id": "Master:1",
+                            "type": "STATION",
+                        },
+                        {
+                            "name": "Rathaus",
+                            "city": "Barsbüttel",
+                            "id": "Master:2",
+                            "type": "STATION",
+                        },
+                    ],
+                }
+            ),
+        ),
+        patch(
+            "homeassistant.components.hvv_departures.async_setup_entry",
+            return_value=None,
+        ),
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN, context={"source": SOURCE_USER}
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            user_input={
+                CONF_HOST: "api-test.geofox.de",
+                CONF_USERNAME: "test-username",
+                CONF_PASSWORD: "test-password",
+            },
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {CONF_STATION: "Rathaus"},
+        )
+
+        assert result["step_id"] == "station_select"
+        assert result["data_schema"].schema[CONF_STATION].container == {
+            "Master:1": "Rathaus (Hamburg)",
+            "Master:2": "Rathaus (Barsbüttel)",
+        }
+
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {CONF_STATION: "Master:1"},
+        )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["title"] == "Rathaus"
+    assert result["data"][CONF_STATION] == {
+        "name": "Rathaus",
+        "city": "Hamburg",
+        "id": "Master:1",
+        "type": "STATION",
+    }
+
+
+async def test_user_flow_no_results(hass: HomeAssistant) -> None:
     """Test that config flow works when there are no results."""
 
-    with patch(
-        "homeassistant.components.hvv_departures.hub.GTI.init",
-        return_value=FIXTURE_INIT,
-    ), patch(
-        "homeassistant.components.hvv_departures.hub.GTI.checkName",
-        return_value={"returnCode": "OK", "results": []},
-    ), patch(
-        "homeassistant.components.hvv_departures.async_setup_entry",
-        return_value=True,
+    with (
+        patch(
+            "homeassistant.components.hvv_departures.hub.GTI.init",
+            return_value=FIXTURE_INIT,
+        ),
+        patch(
+            "homeassistant.components.hvv_departures.hub.GTI.checkName",
+            return_value=CNResponse.model_validate({"returnCode": "OK", "results": []}),
+        ),
+        patch(
+            "homeassistant.components.hvv_departures.async_setup_entry",
+            return_value=None,
+        ),
     ):
-
         # step: user
 
         result_user = await hass.config_entries.flow.async_init(
-            DOMAIN,
-            context={"source": SOURCE_USER},
-            data={
+            DOMAIN, context={"source": SOURCE_USER}
+        )
+
+        assert result_user["type"] is FlowResultType.FORM
+        assert result_user["step_id"] == "user"
+
+        result_user = await hass.config_entries.flow.async_configure(
+            result_user["flow_id"],
+            user_input={
                 CONF_HOST: "api-test.geofox.de",
                 CONF_USERNAME: "test-username",
                 CONF_PASSWORD: "test-password",
@@ -125,76 +220,186 @@ async def test_user_flow_no_results(hass):
         )
 
         assert result_station["step_id"] == "station"
-        assert result_station["errors"]["base"] == "no_results"
+        assert result_station["errors"] == {"base": "no_results"}
+
+        with patch(
+            "homeassistant.components.hvv_departures.hub.GTI.checkName",
+            return_value=CNResponse.model_validate(FIXTURE_CHECK_NAME),
+        ):
+            result_station = await hass.config_entries.flow.async_configure(
+                result_user["flow_id"],
+                {CONF_STATION: "Wartenau"},
+            )
+
+        assert result_station["step_id"] == "station_select"
+
+        result_station_select = await hass.config_entries.flow.async_configure(
+            result_user["flow_id"],
+            {CONF_STATION: "Master:10901"},
+        )
+
+        assert result_station_select["type"] is FlowResultType.CREATE_ENTRY
 
 
-async def test_user_flow_invalid_auth(hass):
+async def test_user_flow_invalid_auth(hass: HomeAssistant) -> None:
     """Test that config flow handles invalid auth."""
 
     with patch(
         "homeassistant.components.hvv_departures.hub.GTI.init",
-        side_effect=InvalidAuth(
-            "ERROR_TEXT",
-            "Bei der Verarbeitung der Anfrage ist ein technisches Problem aufgetreten.",
-            "Authentication failed!",
-        ),
+        side_effect=GTIUnauthorizedError(),
     ):
-
         # step: user
         result_user = await hass.config_entries.flow.async_init(
-            DOMAIN,
-            context={"source": SOURCE_USER},
-            data={
+            DOMAIN, context={"source": SOURCE_USER}
+        )
+
+        assert result_user["type"] is FlowResultType.FORM
+        assert result_user["step_id"] == "user"
+
+        result_user = await hass.config_entries.flow.async_configure(
+            result_user["flow_id"],
+            user_input={
                 CONF_HOST: "api-test.geofox.de",
                 CONF_USERNAME: "test-username",
                 CONF_PASSWORD: "test-password",
             },
         )
 
-        assert result_user["type"] == "form"
+        assert result_user["type"] is FlowResultType.FORM
         assert result_user["errors"] == {"base": "invalid_auth"}
 
+    with (
+        patch(
+            "homeassistant.components.hvv_departures.hub.GTI.init",
+            return_value=FIXTURE_INIT,
+        ),
+        patch(
+            "homeassistant.components.hvv_departures.hub.GTI.checkName",
+            return_value=CNResponse.model_validate(FIXTURE_CHECK_NAME),
+        ),
+        patch(
+            "homeassistant.components.hvv_departures.async_setup_entry",
+            return_value=None,
+        ),
+    ):
+        result_user = await hass.config_entries.flow.async_configure(
+            result_user["flow_id"],
+            user_input={
+                CONF_HOST: "api-test.geofox.de",
+                CONF_USERNAME: "test-username",
+                CONF_PASSWORD: "test-password",
+            },
+        )
 
-async def test_user_flow_cannot_connect(hass):
+        assert result_user["step_id"] == "station"
+
+        result_station = await hass.config_entries.flow.async_configure(
+            result_user["flow_id"],
+            {CONF_STATION: "Wartenau"},
+        )
+
+        assert result_station["step_id"] == "station_select"
+
+        result_station_select = await hass.config_entries.flow.async_configure(
+            result_user["flow_id"],
+            {CONF_STATION: "Master:10901"},
+        )
+
+    assert result_station_select["type"] is FlowResultType.CREATE_ENTRY
+
+
+async def test_user_flow_cannot_connect(hass: HomeAssistant) -> None:
     """Test that config flow handles connection errors."""
 
     with patch(
         "homeassistant.components.hvv_departures.hub.GTI.init",
-        side_effect=CannotConnect(),
+        side_effect=ClientConnectorError(MagicMock(), MagicMock()),
     ):
-
         # step: user
         result_user = await hass.config_entries.flow.async_init(
-            DOMAIN,
-            context={"source": SOURCE_USER},
-            data={
+            DOMAIN, context={"source": SOURCE_USER}
+        )
+
+        assert result_user["type"] is FlowResultType.FORM
+        assert result_user["step_id"] == "user"
+
+        result_user = await hass.config_entries.flow.async_configure(
+            result_user["flow_id"],
+            user_input={
                 CONF_HOST: "api-test.geofox.de",
                 CONF_USERNAME: "test-username",
                 CONF_PASSWORD: "test-password",
             },
         )
 
-        assert result_user["type"] == "form"
+        assert result_user["type"] is FlowResultType.FORM
         assert result_user["errors"] == {"base": "cannot_connect"}
 
+    with (
+        patch(
+            "homeassistant.components.hvv_departures.hub.GTI.init",
+            return_value=FIXTURE_INIT,
+        ),
+        patch(
+            "homeassistant.components.hvv_departures.hub.GTI.checkName",
+            return_value=CNResponse.model_validate(FIXTURE_CHECK_NAME),
+        ),
+        patch(
+            "homeassistant.components.hvv_departures.async_setup_entry",
+            return_value=None,
+        ),
+    ):
+        result_user = await hass.config_entries.flow.async_configure(
+            result_user["flow_id"],
+            user_input={
+                CONF_HOST: "api-test.geofox.de",
+                CONF_USERNAME: "test-username",
+                CONF_PASSWORD: "test-password",
+            },
+        )
 
-async def test_user_flow_station(hass):
+        assert result_user["step_id"] == "station"
+
+        result_station = await hass.config_entries.flow.async_configure(
+            result_user["flow_id"],
+            {CONF_STATION: "Wartenau"},
+        )
+
+        assert result_station["step_id"] == "station_select"
+
+        result_station_select = await hass.config_entries.flow.async_configure(
+            result_user["flow_id"],
+            {CONF_STATION: "Master:10901"},
+        )
+
+    assert result_station_select["type"] is FlowResultType.CREATE_ENTRY
+
+
+async def test_user_flow_station(hass: HomeAssistant) -> None:
     """Test that config flow handles empty data on step station."""
 
-    with patch(
-        "homeassistant.components.hvv_departures.hub.GTI.init",
-        return_value=True,
-    ), patch(
-        "homeassistant.components.hvv_departures.hub.GTI.checkName",
-        return_value={"returnCode": "OK", "results": []},
+    with (
+        patch(
+            "homeassistant.components.hvv_departures.hub.GTI.init",
+            return_value=True,
+        ),
+        patch(
+            "homeassistant.components.hvv_departures.hub.GTI.checkName",
+            return_value=CNResponse.model_validate({"returnCode": "OK", "results": []}),
+        ),
     ):
-
         # step: user
 
         result_user = await hass.config_entries.flow.async_init(
-            DOMAIN,
-            context={"source": SOURCE_USER},
-            data={
+            DOMAIN, context={"source": SOURCE_USER}
+        )
+
+        assert result_user["type"] is FlowResultType.FORM
+        assert result_user["step_id"] == "user"
+
+        result_user = await hass.config_entries.flow.async_configure(
+            result_user["flow_id"],
+            user_input={
                 CONF_HOST: "api-test.geofox.de",
                 CONF_USERNAME: "test-username",
                 CONF_PASSWORD: "test-password",
@@ -208,24 +413,33 @@ async def test_user_flow_station(hass):
             result_user["flow_id"],
             None,
         )
-        assert result_station["type"] == "form"
+        assert result_station["type"] is FlowResultType.FORM
         assert result_station["step_id"] == "station"
 
 
-async def test_user_flow_station_select(hass):
+async def test_user_flow_station_select(hass: HomeAssistant) -> None:
     """Test that config flow handles empty data on step station_select."""
 
-    with patch(
-        "homeassistant.components.hvv_departures.hub.GTI.init",
-        return_value=True,
-    ), patch(
-        "homeassistant.components.hvv_departures.hub.GTI.checkName",
-        return_value=FIXTURE_CHECK_NAME,
+    with (
+        patch(
+            "homeassistant.components.hvv_departures.hub.GTI.init",
+            return_value=True,
+        ),
+        patch(
+            "homeassistant.components.hvv_departures.hub.GTI.checkName",
+            return_value=CNResponse.model_validate(FIXTURE_CHECK_NAME),
+        ),
     ):
         result_user = await hass.config_entries.flow.async_init(
-            DOMAIN,
-            context={"source": SOURCE_USER},
-            data={
+            DOMAIN, context={"source": SOURCE_USER}
+        )
+
+        assert result_user["type"] is FlowResultType.FORM
+        assert result_user["step_id"] == "user"
+
+        result_user = await hass.config_entries.flow.async_configure(
+            result_user["flow_id"],
+            user_input={
                 CONF_HOST: "api-test.geofox.de",
                 CONF_USERNAME: "test-username",
                 CONF_PASSWORD: "test-password",
@@ -243,11 +457,11 @@ async def test_user_flow_station_select(hass):
             None,
         )
 
-        assert result_station_select["type"] == "form"
+        assert result_station_select["type"] is FlowResultType.FORM
         assert result_station_select["step_id"] == "station_select"
 
 
-async def test_options_flow(hass):
+async def test_options_flow(hass: HomeAssistant) -> None:
     """Test that options flow works."""
 
     config_entry = MockConfigEntry(
@@ -261,19 +475,23 @@ async def test_options_flow(hass):
     )
     config_entry.add_to_hass(hass)
 
-    with patch("homeassistant.components.hvv_departures.PLATFORMS", new=[]), patch(
-        "homeassistant.components.hvv_departures.hub.GTI.init",
-        return_value=True,
-    ), patch(
-        "homeassistant.components.hvv_departures.hub.GTI.departureList",
-        return_value=FIXTURE_DEPARTURE_LIST,
+    with (
+        patch("homeassistant.components.hvv_departures.PLATFORMS", new=[]),
+        patch(
+            "homeassistant.components.hvv_departures.hub.GTI.init",
+            return_value=True,
+        ),
+        patch(
+            "homeassistant.components.hvv_departures.hub.GTI.departureList",
+            return_value=DLResponse.model_validate(FIXTURE_DEPARTURE_LIST),
+        ),
     ):
         assert await hass.config_entries.async_setup(config_entry.entry_id)
         await hass.async_block_till_done()
 
         result = await hass.config_entries.options.async_init(config_entry.entry_id)
 
-        assert result["type"] == data_entry_flow.FlowResultType.FORM
+        assert result["type"] is FlowResultType.FORM
         assert result["step_id"] == "init"
 
         result = await hass.config_entries.options.async_configure(
@@ -281,13 +499,18 @@ async def test_options_flow(hass):
             user_input={CONF_FILTER: ["0"], CONF_OFFSET: 15, CONF_REAL_TIME: False},
         )
 
-        assert result["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
+        assert result["type"] is FlowResultType.CREATE_ENTRY
         assert config_entry.options == {
             CONF_FILTER: [
                 {
                     "serviceID": "HHA-U:U1_HHA-U",
                     "stationIDs": ["Master:10902"],
-                    "label": "Fuhlsbüttel Nord / Ochsenzoll / Norderstedt Mitte / Kellinghusenstraße / Ohlsdorf / Garstedt",
+                    "label": (
+                        "Fuhlsbüttel Nord / Ochsenzoll /"
+                        " Norderstedt Mitte /"
+                        " Kellinghusenstraße /"
+                        " Ohlsdorf / Garstedt"
+                    ),
                     "serviceName": "U1",
                 }
             ],
@@ -296,7 +519,7 @@ async def test_options_flow(hass):
         }
 
 
-async def test_options_flow_invalid_auth(hass):
+async def test_options_flow_invalid_auth(hass: HomeAssistant) -> None:
     """Test that options flow works."""
 
     config_entry = MockConfigEntry(
@@ -310,32 +533,43 @@ async def test_options_flow_invalid_auth(hass):
     )
     config_entry.add_to_hass(hass)
 
-    with patch("homeassistant.components.hvv_departures.PLATFORMS", new=[]), patch(
-        "homeassistant.components.hvv_departures.hub.GTI.init", return_value=True
-    ), patch(
-        "homeassistant.components.hvv_departures.hub.GTI.departureList",
-        return_value=FIXTURE_DEPARTURE_LIST,
+    with (
+        patch("homeassistant.components.hvv_departures.PLATFORMS", new=[]),
+        patch(
+            "homeassistant.components.hvv_departures.hub.GTI.init", return_value=True
+        ),
+        patch(
+            "homeassistant.components.hvv_departures.hub.GTI.departureList",
+            return_value=DLResponse.model_validate(FIXTURE_DEPARTURE_LIST),
+        ),
     ):
         assert await hass.config_entries.async_setup(config_entry.entry_id)
         await hass.async_block_till_done()
 
     with patch(
         "homeassistant.components.hvv_departures.hub.GTI.departureList",
-        side_effect=InvalidAuth(
-            "ERROR_TEXT",
-            "Bei der Verarbeitung der Anfrage ist ein technisches Problem aufgetreten.",
-            "Authentication failed!",
-        ),
+        side_effect=GTIUnauthorizedError(),
     ):
         result = await hass.config_entries.options.async_init(config_entry.entry_id)
 
-        assert result["type"] == data_entry_flow.FlowResultType.FORM
+        assert result["type"] is FlowResultType.FORM
         assert result["step_id"] == "init"
 
         assert result["errors"] == {"base": "invalid_auth"}
 
+    with patch(
+        "homeassistant.components.hvv_departures.hub.GTI.departureList",
+        return_value=DLResponse.model_validate(FIXTURE_DEPARTURE_LIST),
+    ):
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"],
+            user_input={CONF_OFFSET: 15, CONF_REAL_TIME: False},
+        )
 
-async def test_options_flow_cannot_connect(hass):
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+
+
+async def test_options_flow_cannot_connect(hass: HomeAssistant) -> None:
     """Test that options flow works."""
 
     config_entry = MockConfigEntry(
@@ -349,22 +583,37 @@ async def test_options_flow_cannot_connect(hass):
     )
     config_entry.add_to_hass(hass)
 
-    with patch("homeassistant.components.hvv_departures.PLATFORMS", new=[]), patch(
-        "homeassistant.components.hvv_departures.hub.GTI.init", return_value=True
-    ), patch(
-        "homeassistant.components.hvv_departures.hub.GTI.departureList",
-        return_value=FIXTURE_DEPARTURE_LIST,
+    with (
+        patch("homeassistant.components.hvv_departures.PLATFORMS", new=[]),
+        patch(
+            "homeassistant.components.hvv_departures.hub.GTI.init", return_value=True
+        ),
+        patch(
+            "homeassistant.components.hvv_departures.hub.GTI.departureList",
+            return_value=DLResponse.model_validate(FIXTURE_DEPARTURE_LIST),
+        ),
     ):
         assert await hass.config_entries.async_setup(config_entry.entry_id)
         await hass.async_block_till_done()
 
     with patch(
         "homeassistant.components.hvv_departures.hub.GTI.departureList",
-        side_effect=CannotConnect(),
+        side_effect=ClientConnectorError(MagicMock(), MagicMock()),
     ):
         result = await hass.config_entries.options.async_init(config_entry.entry_id)
 
-        assert result["type"] == data_entry_flow.FlowResultType.FORM
+        assert result["type"] is FlowResultType.FORM
         assert result["step_id"] == "init"
 
         assert result["errors"] == {"base": "cannot_connect"}
+
+    with patch(
+        "homeassistant.components.hvv_departures.hub.GTI.departureList",
+        return_value=DLResponse.model_validate(FIXTURE_DEPARTURE_LIST),
+    ):
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"],
+            user_input={CONF_OFFSET: 15, CONF_REAL_TIME: False},
+        )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY

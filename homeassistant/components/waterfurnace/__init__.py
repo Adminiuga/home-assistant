@@ -1,161 +1,135 @@
-"""Support for Waterfurnaces."""
-from datetime import timedelta
-import logging
-import threading
-import time
+"""Support for WaterFurnace geothermal systems."""
 
-import voluptuous as vol
+import asyncio
+import logging
+
 from waterfurnace.waterfurnace import WaterFurnace, WFCredentialError, WFException
 
-from homeassistant.components import persistent_notification
-from homeassistant.const import (
-    CONF_PASSWORD,
-    CONF_USERNAME,
-    EVENT_HOMEASSISTANT_STOP,
-    Platform,
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import CONF_PASSWORD, CONF_USERNAME, Platform
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import (
+    ConfigEntryAuthFailed,
+    ConfigEntryError,
+    ConfigEntryNotReady,
 )
-from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers import config_validation as cv, discovery
-from homeassistant.helpers.dispatcher import dispatcher_send
-from homeassistant.helpers.typing import ConfigType
+from homeassistant.helpers.start import async_at_started
+
+from .const import DOMAIN
+from .coordinator import (
+    WaterFurnaceCoordinator,
+    WaterFurnaceDeviceData,
+    WaterFurnaceEnergyCoordinator,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
-DOMAIN = "waterfurnace"
-UPDATE_TOPIC = f"{DOMAIN}_update"
-SCAN_INTERVAL = timedelta(seconds=10)
-ERROR_INTERVAL = timedelta(seconds=300)
-MAX_FAILS = 10
-NOTIFICATION_ID = "waterfurnace_website_notification"
-NOTIFICATION_TITLE = "WaterFurnace website status"
+PLATFORMS = [Platform.CLIMATE, Platform.SENSOR]
 
 
-CONFIG_SCHEMA = vol.Schema(
-    {
-        DOMAIN: vol.Schema(
-            {
-                vol.Required(CONF_PASSWORD): cv.string,
-                vol.Required(CONF_USERNAME): cv.string,
-            }
+type WaterFurnaceConfigEntry = ConfigEntry[dict[str, WaterFurnaceDeviceData]]
+
+
+async def _async_setup_coordinator(
+    hass: HomeAssistant,
+    username: str,
+    password: str,
+    device_index: int,
+    entry: WaterFurnaceConfigEntry,
+) -> tuple[str, WaterFurnaceDeviceData]:
+    """Set up a coordinator for a device."""
+
+    device_client = WaterFurnace(username, password, device=device_index)
+    await hass.async_add_executor_job(device_client.login)
+    coordinator = WaterFurnaceCoordinator(hass, device_client, entry)
+    await coordinator.async_config_entry_first_refresh()
+
+    if device_client.gwid is None:
+        raise ConfigEntryNotReady(
+            f"Invalid GWID for device at index {device_index}: {device_client.gwid}"
         )
-    },
-    extra=vol.ALLOW_EXTRA,
-)
+
+    energy_coordinator = WaterFurnaceEnergyCoordinator(
+        hass, device_client, entry, device_client.gwid
+    )
+
+    # Defer the first energy refresh until HA has fully started so the
+    # potentially large initial backfill doesn't compete with startup I/O.
+    async def _async_start_energy(hass: HomeAssistant) -> None:
+        await energy_coordinator.async_refresh()
+
+    entry.async_on_unload(async_at_started(hass, _async_start_energy))
+
+    return device_client.gwid, WaterFurnaceDeviceData(
+        realtime=coordinator, energy=energy_coordinator
+    )
 
 
-def setup(hass: HomeAssistant, base_config: ConfigType) -> bool:
-    """Set up waterfurnace platform."""
+async def async_setup_entry(
+    hass: HomeAssistant, entry: WaterFurnaceConfigEntry
+) -> None:
+    """Set up WaterFurnace from a config entry."""
+    username = entry.data[CONF_USERNAME]
+    password = entry.data[CONF_PASSWORD]
 
-    config = base_config[DOMAIN]
+    client = WaterFurnace(username, password)
 
-    username = config[CONF_USERNAME]
-    password = config[CONF_PASSWORD]
-
-    wfconn = WaterFurnace(username, password)
-    # NOTE(sdague): login will throw an exception if this doesn't
-    # work, which will abort the setup.
     try:
-        wfconn.login()
-    except WFCredentialError:
-        _LOGGER.error("Invalid credentials for waterfurnace login")
-        return False
+        await hass.async_add_executor_job(client.login)
+    except WFCredentialError as err:
+        raise ConfigEntryAuthFailed(
+            "Authentication failed. Please update your credentials."
+        ) from err
 
-    hass.data[DOMAIN] = WaterFurnaceData(hass, wfconn)
-    hass.data[DOMAIN].start()
+    device_count = len(client.devices) if client.devices else 0
 
-    discovery.load_platform(hass, Platform.SENSOR, DOMAIN, {}, config)
-    return True
+    results = await asyncio.gather(
+        *[
+            _async_setup_coordinator(hass, username, password, index, entry)
+            for index in range(device_count)
+        ]
+    )
+    entry.runtime_data = dict(results)
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
 
-class WaterFurnaceData(threading.Thread):
-    """WaterFurnace Data collector.
+async def async_unload_entry(
+    hass: HomeAssistant, entry: WaterFurnaceConfigEntry
+) -> None:
+    """Unload a WaterFurnace config entry."""
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)
 
-    This is implemented as a dedicated thread polling a websocket in a
-    tight loop. The websocket will shut itself from the server side if
-    a packet is not sent at least every 30 seconds. The reading is
-    cheap, the login is less cheap, so keeping this open and polling
-    on a very regular cadence is actually the least io intensive thing
-    to do.
-    """
 
-    def __init__(self, hass, client):
-        """Initialize the data object."""
-        super().__init__()
-        self.hass = hass
-        self.client = client
-        self.unit = self.client.gwid
-        self.data = None
-        self._shutdown = False
-        self._fails = 0
+async def async_migrate_entry(
+    hass: HomeAssistant, entry: WaterFurnaceConfigEntry
+) -> None:
+    """Migrate old entry."""
 
-    def _reconnect(self):
-        """Reconnect on a failure."""
+    if entry.version == 1 and entry.minor_version < 2:
+        # Migrate from gwid-based unique_id to account_id-based unique_id
+        client = WaterFurnace(entry.data[CONF_USERNAME], entry.data[CONF_PASSWORD])
+        try:
+            await hass.async_add_executor_job(client.login)
+        except WFCredentialError as err:
+            raise ConfigEntryError(
+                translation_domain=DOMAIN,
+                translation_key="invalid_auth",
+                translation_placeholders={"username": entry.data[CONF_USERNAME]},
+            ) from err
+        except WFException as err:
+            raise ConfigEntryError(
+                translation_domain=DOMAIN,
+                translation_key="login_failed",
+                translation_placeholders={"username": entry.data[CONF_USERNAME]},
+            ) from err
 
-        self._fails += 1
-        if self._fails > MAX_FAILS:
-            _LOGGER.error("Failed to refresh login credentials. Thread stopped")
-            persistent_notification.create(
-                self.hass,
-                "Error:<br/>Connection to waterfurnace website failed "
-                "the maximum number of times. Thread has stopped",
-                title=NOTIFICATION_TITLE,
-                notification_id=NOTIFICATION_ID,
+        if client.account_id is None:
+            raise ConfigEntryError(
+                translation_domain=DOMAIN,
+                translation_key="invalid_account_id",
             )
 
-            self._shutdown = True
-            return
-
-        # sleep first before the reconnect attempt
-        _LOGGER.debug("Sleeping for fail # %s", self._fails)
-        time.sleep(self._fails * ERROR_INTERVAL.total_seconds())
-
-        try:
-            self.client.login()
-            self.data = self.client.read()
-        except WFException:
-            _LOGGER.exception("Failed to reconnect attempt %s", self._fails)
-        else:
-            _LOGGER.debug("Reconnected to furnace")
-            self._fails = 0
-
-    def run(self):
-        """Thread run loop."""
-
-        @callback
-        def register():
-            """Connect to hass for shutdown."""
-
-            def shutdown(event):
-                """Shutdown the thread."""
-                _LOGGER.debug("Signaled to shutdown")
-                self._shutdown = True
-                self.join()
-
-            self.hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, shutdown)
-
-        self.hass.add_job(register)
-
-        # This does a tight loop in sending read calls to the
-        # websocket. That's a blocking call, which returns pretty
-        # quickly (1 second). It's important that we do this
-        # frequently though, because if we don't call the websocket at
-        # least every 30 seconds the server side closes the
-        # connection.
-        while True:
-            if self._shutdown:
-                _LOGGER.debug("Graceful shutdown")
-                return
-
-            try:
-                self.data = self.client.read()
-
-            except WFException:
-                # WFExceptions are things the WF library understands
-                # that pretty much can all be solved by logging in and
-                # back out again.
-                _LOGGER.exception("Failed to read data, attempting to recover")
-                self._reconnect()
-
-            else:
-                dispatcher_send(self.hass, UPDATE_TOPIC)
-                time.sleep(SCAN_INTERVAL.total_seconds())
+        hass.config_entries.async_update_entry(
+            entry, unique_id=str(client.account_id), minor_version=2
+        )
+        _LOGGER.info("Migrated config entry unique_id to account_id")

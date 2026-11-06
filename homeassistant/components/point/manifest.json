@@ -1,12 +1,14 @@
 {
   "domain": "point",
   "name": "Minut Point",
-  "config_flow": true,
-  "documentation": "https://www.home-assistant.io/integrations/point",
-  "requirements": ["pypoint==2.3.0"],
-  "dependencies": ["webhook", "http"],
+  "categories": ["security_safety.alarm_systems", "sensors"],
   "codeowners": ["@fredrike"],
-  "quality_scale": "gold",
+  "config_flow": true,
+  "connectivity": ["cloud"],
+  "dependencies": ["application_credentials", "http", "webhook"],
+  "documentation": "https://www.home-assistant.io/integrations/point",
+  "integration_type": "hub",
   "iot_class": "cloud_polling",
-  "loggers": ["pypoint"]
+  "loggers": ["pypoint"],
+  "requirements": ["pypoint==3.0.0"]
 }

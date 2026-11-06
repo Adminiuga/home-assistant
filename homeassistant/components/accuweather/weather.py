@@ -1,194 +1,248 @@
 """Support for the AccuWeather service."""
-from __future__ import annotations
 
-from statistics import mean
-from typing import Any, cast
+from typing import cast, override
 
 from homeassistant.components.weather import (
+    ATTR_FORECAST_CLOUD_COVERAGE,
     ATTR_FORECAST_CONDITION,
+    ATTR_FORECAST_HUMIDITY,
+    ATTR_FORECAST_NATIVE_APPARENT_TEMP,
     ATTR_FORECAST_NATIVE_PRECIPITATION,
     ATTR_FORECAST_NATIVE_TEMP,
     ATTR_FORECAST_NATIVE_TEMP_LOW,
+    ATTR_FORECAST_NATIVE_WIND_GUST_SPEED,
     ATTR_FORECAST_NATIVE_WIND_SPEED,
     ATTR_FORECAST_PRECIPITATION_PROBABILITY,
     ATTR_FORECAST_TIME,
+    ATTR_FORECAST_UV_INDEX,
     ATTR_FORECAST_WIND_BEARING,
+    CoordinatorWeatherEntity,
     Forecast,
-    WeatherEntity,
+    WeatherEntityFeature,
 )
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
-    LENGTH_INCHES,
-    LENGTH_KILOMETERS,
-    LENGTH_MILES,
-    LENGTH_MILLIMETERS,
-    PRESSURE_HPA,
-    PRESSURE_INHG,
-    SPEED_KILOMETERS_PER_HOUR,
-    SPEED_MILES_PER_HOUR,
-    TEMP_CELSIUS,
-    TEMP_FAHRENHEIT,
+    UnitOfLength,
+    UnitOfPrecipitationDepth,
+    UnitOfPressure,
+    UnitOfSpeed,
+    UnitOfTemperature,
 )
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.util.dt import utc_from_timestamp
-from homeassistant.util.unit_system import METRIC_SYSTEM
 
-from . import AccuWeatherDataUpdateCoordinator
-from .const import (
-    API_IMPERIAL,
-    API_METRIC,
-    ATTR_FORECAST,
-    ATTRIBUTION,
-    CONDITION_CLASSES,
-    DOMAIN,
+from .const import API_METRIC, ATTR_DIRECTION, ATTR_SPEED, ATTR_VALUE, CONDITION_MAP
+from .coordinator import (
+    AccuWeatherConfigEntry,
+    AccuWeatherDailyForecastDataUpdateCoordinator,
+    AccuWeatherData,
+    AccuWeatherHourlyForecastDataUpdateCoordinator,
+    AccuWeatherObservationDataUpdateCoordinator,
 )
+from .entity import AccuWeatherEntity
 
 PARALLEL_UPDATES = 1
 
 
 async def async_setup_entry(
-    hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
+    hass: HomeAssistant,
+    entry: AccuWeatherConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Add a AccuWeather weather entity from a config_entry."""
-
-    coordinator: AccuWeatherDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
-
-    async_add_entities([AccuWeatherEntity(coordinator)])
+    async_add_entities([AccuWeatherWeather(entry.runtime_data)])
 
 
-class AccuWeatherEntity(
-    CoordinatorEntity[AccuWeatherDataUpdateCoordinator], WeatherEntity
+class AccuWeatherWeather(
+    CoordinatorWeatherEntity[
+        AccuWeatherObservationDataUpdateCoordinator,
+        AccuWeatherDailyForecastDataUpdateCoordinator,
+        AccuWeatherHourlyForecastDataUpdateCoordinator,
+    ],
+    AccuWeatherEntity[AccuWeatherObservationDataUpdateCoordinator],
 ):
     """Define an AccuWeather entity."""
 
-    _attr_has_entity_name = True
+    _attr_name = None
 
-    def __init__(self, coordinator: AccuWeatherDataUpdateCoordinator) -> None:
+    def __init__(self, accuweather_data: AccuWeatherData) -> None:
         """Initialize."""
-        super().__init__(coordinator)
-        # Coordinator data is used also for sensors which don't have units automatically
-        # converted, hence the weather entity's native units follow the configured unit
-        # system
-        if coordinator.hass.config.units is METRIC_SYSTEM:
-            self._attr_native_precipitation_unit = LENGTH_MILLIMETERS
-            self._attr_native_pressure_unit = PRESSURE_HPA
-            self._attr_native_temperature_unit = TEMP_CELSIUS
-            self._attr_native_visibility_unit = LENGTH_KILOMETERS
-            self._attr_native_wind_speed_unit = SPEED_KILOMETERS_PER_HOUR
-            self._unit_system = API_METRIC
-        else:
-            self._unit_system = API_IMPERIAL
-            self._attr_native_precipitation_unit = LENGTH_INCHES
-            self._attr_native_pressure_unit = PRESSURE_INHG
-            self._attr_native_temperature_unit = TEMP_FAHRENHEIT
-            self._attr_native_visibility_unit = LENGTH_MILES
-            self._attr_native_wind_speed_unit = SPEED_MILES_PER_HOUR
-        self._attr_unique_id = coordinator.location_key
-        self._attr_attribution = ATTRIBUTION
-        self._attr_device_info = coordinator.device_info
+        super().__init__(
+            observation_coordinator=accuweather_data.coordinator_observation,
+            daily_coordinator=accuweather_data.coordinator_daily_forecast,
+            hourly_coordinator=accuweather_data.coordinator_hourly_forecast,
+        )
+
+        self._attr_native_precipitation_unit = UnitOfPrecipitationDepth.MILLIMETERS
+        self._attr_native_pressure_unit = UnitOfPressure.HPA
+        self._attr_native_temperature_unit = UnitOfTemperature.CELSIUS
+        self._attr_native_visibility_unit = UnitOfLength.KILOMETERS
+        self._attr_native_wind_speed_unit = UnitOfSpeed.KILOMETERS_PER_HOUR
+        self._attr_unique_id = accuweather_data.coordinator_observation.location_key
+        self._attr_supported_features = (
+            WeatherEntityFeature.FORECAST_DAILY | WeatherEntityFeature.FORECAST_HOURLY
+        )
+
+        self.observation_coordinator = accuweather_data.coordinator_observation
+        self.daily_coordinator = accuweather_data.coordinator_daily_forecast
+        self.hourly_coordinator = accuweather_data.coordinator_hourly_forecast
 
     @property
+    @override
     def condition(self) -> str | None:
         """Return the current condition."""
-        try:
-            return [
-                k
-                for k, v in CONDITION_CLASSES.items()
-                if self.coordinator.data["WeatherIcon"] in v
-            ][0]
-        except IndexError:
-            return None
+        return CONDITION_MAP.get(self.observation_coordinator.data["WeatherIcon"])
 
     @property
+    @override
+    def cloud_coverage(self) -> float:
+        """Return the Cloud coverage in %."""
+        return cast(float, self.observation_coordinator.data["CloudCover"])
+
+    @property
+    @override
+    def native_apparent_temperature(self) -> float:
+        """Return the apparent temperature."""
+        return cast(
+            float,
+            self.observation_coordinator.data["ApparentTemperature"][API_METRIC][
+                ATTR_VALUE
+            ],
+        )
+
+    @property
+    @override
     def native_temperature(self) -> float:
         """Return the temperature."""
         return cast(
-            float, self.coordinator.data["Temperature"][self._unit_system]["Value"]
+            float,
+            self.observation_coordinator.data["Temperature"][API_METRIC][ATTR_VALUE],
         )
 
     @property
+    @override
     def native_pressure(self) -> float:
         """Return the pressure."""
         return cast(
-            float, self.coordinator.data["Pressure"][self._unit_system]["Value"]
+            float, self.observation_coordinator.data["Pressure"][API_METRIC][ATTR_VALUE]
         )
 
     @property
-    def humidity(self) -> int:
-        """Return the humidity."""
-        return cast(int, self.coordinator.data["RelativeHumidity"])
+    @override
+    def native_dew_point(self) -> float:
+        """Return the dew point."""
+        return cast(
+            float, self.observation_coordinator.data["DewPoint"][API_METRIC][ATTR_VALUE]
+        )
 
     @property
+    @override
+    def humidity(self) -> int:
+        """Return the humidity."""
+        return cast(int, self.observation_coordinator.data["RelativeHumidity"])
+
+    @property
+    @override
+    def native_wind_gust_speed(self) -> float:
+        """Return the wind gust speed."""
+        return cast(
+            float,
+            self.observation_coordinator.data["WindGust"][ATTR_SPEED][API_METRIC][
+                ATTR_VALUE
+            ],
+        )
+
+    @property
+    @override
     def native_wind_speed(self) -> float:
         """Return the wind speed."""
         return cast(
-            float, self.coordinator.data["Wind"]["Speed"][self._unit_system]["Value"]
+            float,
+            self.observation_coordinator.data["Wind"][ATTR_SPEED][API_METRIC][
+                ATTR_VALUE
+            ],
         )
 
     @property
+    @override
     def wind_bearing(self) -> int:
         """Return the wind bearing."""
-        return cast(int, self.coordinator.data["Wind"]["Direction"]["Degrees"])
+        return cast(
+            int, self.observation_coordinator.data["Wind"][ATTR_DIRECTION]["Degrees"]
+        )
 
     @property
+    @override
     def native_visibility(self) -> float:
         """Return the visibility."""
         return cast(
-            float, self.coordinator.data["Visibility"][self._unit_system]["Value"]
+            float,
+            self.observation_coordinator.data["Visibility"][API_METRIC][ATTR_VALUE],
         )
 
     @property
-    def ozone(self) -> int | None:
-        """Return the ozone level."""
-        # We only have ozone data for certain locations and only in the forecast data.
-        if self.coordinator.forecast and self.coordinator.data[ATTR_FORECAST][0].get(
-            "Ozone"
-        ):
-            return cast(int, self.coordinator.data[ATTR_FORECAST][0]["Ozone"]["Value"])
-        return None
+    @override
+    def uv_index(self) -> float:
+        """Return the UV index."""
+        return cast(float, self.observation_coordinator.data["UVIndex"])
 
-    @property
-    def forecast(self) -> list[Forecast] | None:
-        """Return the forecast array."""
-        if not self.coordinator.forecast:
-            return None
-        # remap keys from library to keys understood by the weather component
+    @callback
+    @override
+    def _async_forecast_daily(self) -> list[Forecast] | None:
+        """Return the daily forecast in native units."""
         return [
             {
                 ATTR_FORECAST_TIME: utc_from_timestamp(item["EpochDate"]).isoformat(),
-                ATTR_FORECAST_NATIVE_TEMP: item["TemperatureMax"]["Value"],
-                ATTR_FORECAST_NATIVE_TEMP_LOW: item["TemperatureMin"]["Value"],
-                ATTR_FORECAST_NATIVE_PRECIPITATION: self._calc_precipitation(item),
-                ATTR_FORECAST_PRECIPITATION_PROBABILITY: round(
-                    mean(
-                        [
-                            item["PrecipitationProbabilityDay"],
-                            item["PrecipitationProbabilityNight"],
-                        ]
-                    )
-                ),
-                ATTR_FORECAST_NATIVE_WIND_SPEED: item["WindDay"]["Speed"]["Value"],
-                ATTR_FORECAST_WIND_BEARING: item["WindDay"]["Direction"]["Degrees"],
-                ATTR_FORECAST_CONDITION: [
-                    k for k, v in CONDITION_CLASSES.items() if item["IconDay"] in v
-                ][0],
+                ATTR_FORECAST_CLOUD_COVERAGE: item["CloudCoverDay"],
+                ATTR_FORECAST_HUMIDITY: item["RelativeHumidityDay"].get("Average"),
+                ATTR_FORECAST_NATIVE_TEMP: item["TemperatureMax"][ATTR_VALUE],
+                ATTR_FORECAST_NATIVE_TEMP_LOW: item["TemperatureMin"][ATTR_VALUE],
+                ATTR_FORECAST_NATIVE_APPARENT_TEMP: item["RealFeelTemperatureMax"][
+                    ATTR_VALUE
+                ],
+                ATTR_FORECAST_NATIVE_PRECIPITATION: item["TotalLiquidDay"][ATTR_VALUE],
+                ATTR_FORECAST_PRECIPITATION_PROBABILITY: item[
+                    "PrecipitationProbabilityDay"
+                ],
+                ATTR_FORECAST_NATIVE_WIND_SPEED: item["WindDay"][ATTR_SPEED][
+                    ATTR_VALUE
+                ],
+                ATTR_FORECAST_NATIVE_WIND_GUST_SPEED: item["WindGustDay"][ATTR_SPEED][
+                    ATTR_VALUE
+                ],
+                ATTR_FORECAST_UV_INDEX: item["UVIndex"][ATTR_VALUE],
+                ATTR_FORECAST_WIND_BEARING: item["WindDay"][ATTR_DIRECTION]["Degrees"],
+                ATTR_FORECAST_CONDITION: CONDITION_MAP.get(item["IconDay"]),
             }
-            for item in self.coordinator.data[ATTR_FORECAST]
+            for item in self.daily_coordinator.data
         ]
 
-    @staticmethod
-    def _calc_precipitation(day: dict[str, Any]) -> float:
-        """Return sum of the precipitation."""
-        precip_sum = 0
-        precip_types = ["Rain", "Snow", "Ice"]
-        for precip in precip_types:
-            precip_sum = sum(
-                [
-                    precip_sum,
-                    day[f"{precip}Day"]["Value"],
-                    day[f"{precip}Night"]["Value"],
-                ]
-            )
-        return round(precip_sum, 1)
+    @callback
+    @override
+    def _async_forecast_hourly(self) -> list[Forecast] | None:
+        """Return the hourly forecast in native units."""
+        return [
+            {
+                ATTR_FORECAST_TIME: utc_from_timestamp(
+                    item["EpochDateTime"]
+                ).isoformat(),
+                ATTR_FORECAST_CLOUD_COVERAGE: item["CloudCover"],
+                ATTR_FORECAST_HUMIDITY: item["RelativeHumidity"],
+                ATTR_FORECAST_NATIVE_TEMP: item["Temperature"][ATTR_VALUE],
+                ATTR_FORECAST_NATIVE_APPARENT_TEMP: item["RealFeelTemperature"][
+                    ATTR_VALUE
+                ],
+                ATTR_FORECAST_NATIVE_PRECIPITATION: item["TotalLiquid"][ATTR_VALUE],
+                ATTR_FORECAST_PRECIPITATION_PROBABILITY: item[
+                    "PrecipitationProbability"
+                ],
+                ATTR_FORECAST_NATIVE_WIND_SPEED: item["Wind"][ATTR_SPEED][ATTR_VALUE],
+                ATTR_FORECAST_NATIVE_WIND_GUST_SPEED: item["WindGust"][ATTR_SPEED][
+                    ATTR_VALUE
+                ],
+                ATTR_FORECAST_UV_INDEX: item["UVIndex"],
+                ATTR_FORECAST_WIND_BEARING: item["Wind"][ATTR_DIRECTION]["Degrees"],
+                ATTR_FORECAST_CONDITION: CONDITION_MAP.get(item["WeatherIcon"]),
+            }
+            for item in self.hourly_coordinator.data
+        ]

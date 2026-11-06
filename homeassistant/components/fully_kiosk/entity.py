@@ -1,12 +1,34 @@
 """Base entity for the Fully Kiosk Browser integration."""
-from __future__ import annotations
 
-from homeassistant.helpers.device_registry import CONNECTION_NETWORK_MAC
-from homeassistant.helpers.entity import DeviceInfo, Entity
+import json
+from typing import TYPE_CHECKING
+
+from yarl import URL
+
+from homeassistant.core import CALLBACK_TYPE, callback
+from homeassistant.helpers.device_registry import CONNECTION_NETWORK_MAC, DeviceInfo
+from homeassistant.helpers.entity import Entity
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from .coordinator import FullyKioskDataUpdateCoordinator
+
+if TYPE_CHECKING:
+    from homeassistant.components.mqtt import ReceiveMessage
+
+
+def valid_global_mac_address(mac: str | None) -> bool:
+    """Check if a MAC address is valid, non-locally administered address."""
+    if not isinstance(mac, str):
+        return False
+    try:
+        first_octet = int(mac.split(":")[0], 16)
+        # If the second least-significant bit is set, it's a
+        # locally administered address, should not be used as
+        # an ID
+        return not bool(first_octet & 0x2)
+    except ValueError:
+        return False
 
 
 class FullyKioskEntity(CoordinatorEntity[FullyKioskDataUpdateCoordinator], Entity):
@@ -17,12 +39,58 @@ class FullyKioskEntity(CoordinatorEntity[FullyKioskDataUpdateCoordinator], Entit
     def __init__(self, coordinator: FullyKioskDataUpdateCoordinator) -> None:
         """Initialize the Fully Kiosk Browser entity."""
         super().__init__(coordinator=coordinator)
-        self._attr_device_info = DeviceInfo(
+
+        url = URL.build(
+            scheme="https" if coordinator.use_ssl else "http",
+            host=coordinator.data["ip4"],
+            port=2323,
+        )
+
+        device_info = DeviceInfo(
             identifiers={(DOMAIN, coordinator.data["deviceID"])},
             name=coordinator.data["deviceName"],
             manufacturer=coordinator.data["deviceManufacturer"],
             model=coordinator.data["deviceModel"],
             sw_version=coordinator.data["appVersionName"],
-            configuration_url=f"http://{coordinator.data['ip4']}:2323",
-            connections={(CONNECTION_NETWORK_MAC, coordinator.data["Mac"])},
+            configuration_url=str(url),
         )
+        if "Mac" in coordinator.data and valid_global_mac_address(
+            coordinator.data["Mac"]
+        ):
+            device_info.connections = {
+                (CONNECTION_NETWORK_MAC, coordinator.data["Mac"])
+            }
+        self._attr_device_info = device_info
+
+    async def mqtt_subscribe(
+        self, event: str | None, event_callback: CALLBACK_TYPE
+    ) -> CALLBACK_TYPE | None:
+        """Subscribe to MQTT for a given event."""
+        data = self.coordinator.data
+        # MQTT is only imported once it is set up, as it is heavy to load
+        if (
+            event is None
+            or "mqtt" not in self.hass.config.components
+            or not data["settings"]["mqttEnabled"]
+        ):
+            return None
+
+        from homeassistant.components import mqtt  # noqa: PLC0415
+
+        if not mqtt.mqtt_config_entry_enabled(self.hass):
+            return None
+
+        @callback
+        def message_callback(message: ReceiveMessage) -> None:
+            payload = json.loads(message.payload)
+            if "event" in payload and payload["event"] == event:
+                event_callback(**payload)
+
+        topic_template = data["settings"]["mqttEventTopic"]
+        topic = (
+            topic_template.replace("$appId", "fully")
+            .replace("$event", event)
+            .replace("$deviceId", data["deviceID"])
+        )
+
+        return await mqtt.async_subscribe(self.hass, topic, message_callback)

@@ -1,43 +1,78 @@
 """Fixtures for Waze Travel Time tests."""
+
+from collections.abc import Generator
 from unittest.mock import patch
 
-from WazeRouteCalculator import WRCError
 import pytest
+from pytest_homeassistant.common import MockConfigEntry
+from pywaze.route_calculator import CalcRoutesResponse, WRCError
+
+from homeassistant.components.waze_travel_time.config_flow import WazeConfigFlow
+from homeassistant.components.waze_travel_time.const import DOMAIN
+from homeassistant.core import HomeAssistant
 
 
-@pytest.fixture(name="mock_wrc", autouse=True)
-def mock_wrc_fixture():
-    """Mock out WazeRouteCalculator."""
+@pytest.fixture(autouse=True)
+def no_api_call_delay() -> Generator[None]:
+    """Skip the delay between Waze API calls."""
     with patch(
-        "homeassistant.components.waze_travel_time.sensor.WazeRouteCalculator"
-    ) as mock_wrc:
-        yield mock_wrc
+        "homeassistant.components.waze_travel_time.coordinator.SECONDS_BETWEEN_API_CALLS",
+        0,
+    ):
+        yield
+
+
+@pytest.fixture(name="mock_config")
+async def mock_config_fixture(hass: HomeAssistant, data, options):
+    """Mock a Waze Travel Time config entry."""
+    config_entry = MockConfigEntry(
+        domain=DOMAIN,
+        data=data,
+        options=options,
+        entry_id="test",
+        version=WazeConfigFlow.VERSION,
+        minor_version=WazeConfigFlow.MINOR_VERSION,
+    )
+    config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
 
 
 @pytest.fixture(name="mock_update")
-def mock_update_fixture(mock_wrc):
+def mock_update_fixture():
     """Mock an update to the sensor."""
-    obj = mock_wrc.return_value
-    obj.calc_all_routes_info.return_value = {"My route": (150, 300)}
+    with patch(
+        "pywaze.route_calculator.WazeRouteCalculator.calc_routes",
+        return_value=[
+            CalcRoutesResponse(
+                distance=300,
+                duration=150,
+                name="E1337 - Teststreet",
+                street_names=["E1337", "IncludeThis", "Teststreet"],
+            ),
+            CalcRoutesResponse(
+                distance=500,
+                duration=600,
+                name="E0815 - Otherstreet",
+                street_names=["E0815", "ExcludeThis", "Otherstreet"],
+            ),
+        ],
+    ) as mock_wrc:
+        yield mock_wrc
 
 
 @pytest.fixture(name="validate_config_entry")
-def validate_config_entry_fixture():
+def validate_config_entry_fixture(mock_update):
     """Return valid config entry."""
-    with patch(
-        "homeassistant.components.waze_travel_time.helpers.WazeRouteCalculator"
-    ) as mock_wrc:
-        obj = mock_wrc.return_value
-        obj.calc_all_routes_info.return_value = None
-        yield mock_wrc
+    mock_update.return_value = []
+    return mock_update
 
 
 @pytest.fixture(name="invalidate_config_entry")
 def invalidate_config_entry_fixture(validate_config_entry):
     """Return invalid config entry."""
-    obj = validate_config_entry.return_value
-    obj.calc_all_routes_info.return_value = {}
-    obj.calc_all_routes_info.side_effect = WRCError("test")
+    validate_config_entry.side_effect = WRCError("test")
+    return validate_config_entry
 
 
 @pytest.fixture(name="bypass_platform_setup")
@@ -45,7 +80,7 @@ def bypass_platform_setup_fixture():
     """Bypass platform setup."""
     with patch(
         "homeassistant.components.waze_travel_time.sensor.async_setup_entry",
-        return_value=True,
+        return_value=None,
     ):
         yield
 
@@ -55,6 +90,6 @@ def bypass_setup_fixture():
     """Bypass entry setup."""
     with patch(
         "homeassistant.components.waze_travel_time.async_setup_entry",
-        return_value=True,
+        return_value=None,
     ):
         yield

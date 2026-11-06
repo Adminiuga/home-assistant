@@ -1,16 +1,17 @@
 """Config flow to configure Xiaomi Aqara."""
+
 import logging
 from socket import gaierror
+from typing import Any, override
 
-import voluptuous as vol
+import probatio
 from xiaomi_gateway import MULTICAST_PORT, XiaomiGateway, XiaomiGatewayDiscovery
 
-from homeassistant import config_entries
-from homeassistant.components import zeroconf
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_HOST, CONF_MAC, CONF_NAME, CONF_PORT, CONF_PROTOCOL
 from homeassistant.core import callback
-from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers.device_registry import format_mac
+from homeassistant.helpers.service_info.zeroconf import ZeroconfServiceInfo
 
 from .const import (
     CONF_INTERFACE,
@@ -28,34 +29,44 @@ DEFAULT_GATEWAY_NAME = "Xiaomi Aqara Gateway"
 DEFAULT_INTERFACE = "any"
 
 
-GATEWAY_CONFIG = vol.Schema(
-    {vol.Optional(CONF_INTERFACE, default=DEFAULT_INTERFACE): str}
+GATEWAY_CONFIG = probatio.Schema(
+    {probatio.Optional(CONF_INTERFACE, default=DEFAULT_INTERFACE): str}
 )
 CONFIG_HOST = {
-    vol.Optional(CONF_HOST): str,
-    vol.Optional(CONF_MAC): str,
+    probatio.Optional(CONF_HOST): str,
+    probatio.Optional(CONF_MAC): str,
 }
 GATEWAY_CONFIG_HOST = GATEWAY_CONFIG.extend(CONFIG_HOST)
-GATEWAY_SETTINGS = vol.Schema(
+GATEWAY_SETTINGS = probatio.Schema(
     {
-        vol.Optional(CONF_KEY): vol.All(str, vol.Length(min=16, max=16)),
-        vol.Optional(CONF_NAME, default=DEFAULT_GATEWAY_NAME): str,
+        probatio.Optional(probatio.Secret(CONF_KEY)): probatio.All(
+            str, probatio.Length(min=16, max=16)
+        ),
+        # Name field is no longer allowed in config flow schemas
+        # pylint: disable-next=home-assistant-config-flow-name-field
+        probatio.Optional(CONF_NAME, default=DEFAULT_GATEWAY_NAME): str,
     }
 )
 
+ERROR_STEP_PLACEHOLDERS = {
+    "tutorial_url": "https://www.domoticz.com/wiki/Xiaomi_Gateway_(Aqara)#Adding_the_Xiaomi_Gateway_to_Domoticz",
+    "invalid_host_url": "https://www.home-assistant.io/integrations/xiaomi_aqara/#connection-problem",
+}
 
-class XiaomiAqaraFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
+
+class XiaomiAqaraFlowHandler(ConfigFlow, domain=DOMAIN):
     """Handle a Xiaomi Aqara config flow."""
 
     VERSION = 1
 
-    def __init__(self):
+    selected_gateway: XiaomiGateway
+    gateways: dict[str, XiaomiGateway]
+
+    def __init__(self) -> None:
         """Initialize."""
-        self.host = None
+        self.host: str | None = None
         self.interface = DEFAULT_INTERFACE
-        self.sid = None
-        self.gateways = None
-        self.selected_gateway = None
+        self.sid: str | None = None
 
     @callback
     def async_show_form_step_user(self, errors):
@@ -64,11 +75,19 @@ class XiaomiAqaraFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         if (self.host is None and self.sid is None) or errors:
             schema = GATEWAY_CONFIG_HOST
 
-        return self.async_show_form(step_id="user", data_schema=schema, errors=errors)
+        return self.async_show_form(
+            step_id="user",
+            data_schema=schema,
+            errors=errors,
+            description_placeholders=ERROR_STEP_PLACEHOLDERS,
+        )
 
-    async def async_step_user(self, user_input=None):
+    @override
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle a flow initialized by the user."""
-        errors = {}
+        errors: dict[str, str] = {}
         if user_input is None:
             return self.async_show_form_step_user(errors)
 
@@ -105,7 +124,7 @@ class XiaomiAqaraFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
 
             return await self.async_step_settings()
 
-        # Discover Xiaomi Aqara Gateways in the netwerk to get required SIDs.
+        # Discover Xiaomi Aqara Gateways in the network to get required SIDs.
         xiaomi = XiaomiGatewayDiscovery(self.interface)
         try:
             await self.hass.async_add_executor_job(xiaomi.discover_gateways)
@@ -125,30 +144,36 @@ class XiaomiAqaraFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         errors["base"] = "discovery_error"
         return self.async_show_form_step_user(errors)
 
-    async def async_step_select(self, user_input=None):
+    async def async_step_select(
+        self, user_input: dict[str, str] | None = None
+    ) -> ConfigFlowResult:
         """Handle multiple aqara gateways found."""
-        errors = {}
+        errors: dict[str, str] = {}
         if user_input is not None:
             ip_adress = user_input["select_ip"]
             self.selected_gateway = self.gateways[ip_adress]
             self.sid = self.selected_gateway.sid
             return await self.async_step_settings()
 
-        select_schema = vol.Schema(
+        select_schema = probatio.Schema(
             {
-                vol.Required("select_ip"): vol.In(
+                probatio.Required("select_ip"): probatio.In(
                     [gateway.ip_adress for gateway in self.gateways.values()]
                 )
             }
         )
 
         return self.async_show_form(
-            step_id="select", data_schema=select_schema, errors=errors
+            step_id="select",
+            data_schema=select_schema,
+            errors=errors,
+            description_placeholders=ERROR_STEP_PLACEHOLDERS,
         )
 
+    @override
     async def async_step_zeroconf(
-        self, discovery_info: zeroconf.ZeroconfServiceInfo
-    ) -> FlowResult:
+        self, discovery_info: ZeroconfServiceInfo
+    ) -> ConfigFlowResult:
         """Handle zeroconf discovery."""
         name = discovery_info.name
         self.host = discovery_info.host
@@ -158,11 +183,12 @@ class XiaomiAqaraFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             return self.async_abort(reason="not_xiaomi_aqara")
 
         # Check if the discovered device is an xiaomi aqara gateway.
-        if not (
-            name.startswith(ZEROCONF_GATEWAY) or name.startswith(ZEROCONF_ACPARTNER)
-        ):
+        if not (name.startswith((ZEROCONF_GATEWAY, ZEROCONF_ACPARTNER))):
             _LOGGER.debug(
-                "Xiaomi device '%s' discovered with host %s, not identified as xiaomi aqara gateway",
+                (
+                    "Xiaomi device '%s' discovered with host %s, not identified as"
+                    " xiaomi aqara gateway"
+                ),
                 name,
                 self.host,
             )
@@ -184,7 +210,9 @@ class XiaomiAqaraFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
 
         return await self.async_step_user()
 
-    async def async_step_settings(self, user_input=None):
+    async def async_step_settings(
+        self, user_input: dict[str, str] | None = None
+    ) -> ConfigFlowResult:
         """Specify settings and connect aqara gateway."""
         errors = {}
         if user_input is not None:
@@ -203,7 +231,7 @@ class XiaomiAqaraFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
                 valid_key = True
 
             if valid_key:
-                # format_mac, for a gateway the sid equels the mac address
+                # format_mac, for a gateway the sid equals the mac address
                 mac_address = format_mac(self.sid)
 
                 # set unique_id
@@ -227,5 +255,8 @@ class XiaomiAqaraFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             errors[CONF_KEY] = "invalid_key"
 
         return self.async_show_form(
-            step_id="settings", data_schema=GATEWAY_SETTINGS, errors=errors
+            step_id="settings",
+            data_schema=GATEWAY_SETTINGS,
+            errors=errors,
+            description_placeholders=ERROR_STEP_PLACEHOLDERS,
         )

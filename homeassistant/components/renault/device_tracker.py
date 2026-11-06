@@ -1,32 +1,50 @@
 """Support for Renault device trackers."""
-from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import override
 
 from renault_api.kamereon.models import KamereonVehicleLocationData
 
-from homeassistant.components.device_tracker import SourceType, TrackerEntity
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.components.device_tracker import (
+    TrackerEntity,
+    TrackerEntityDescription,
+)
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .const import DOMAIN
-from .renault_entities import RenaultDataEntity, RenaultDataEntityDescription
-from .renault_hub import RenaultHub
+from . import RenaultConfigEntry
+from .entity import RenaultDataEntity, RenaultDataEntityDescription
+from .renault_vehicle import RenaultVehicleProxy
+
+# Coordinator is used to centralize the data updates
+PARALLEL_UPDATES = 0
+
+
+@dataclass(frozen=True, kw_only=True)
+class RenaultTrackerEntityDescription(
+    TrackerEntityDescription, RenaultDataEntityDescription
+):
+    """Class describing Renault tracker entities."""
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    config_entry: RenaultConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up the Renault entities from config entry."""
-    proxy: RenaultHub = hass.data[DOMAIN][config_entry.entry_id]
-    entities: list[RenaultDeviceTracker] = [
-        RenaultDeviceTracker(vehicle, description)
-        for vehicle in proxy.vehicles.values()
-        for description in DEVICE_TRACKER_TYPES
-        if description.coordinator in vehicle.coordinators
-    ]
-    async_add_entities(entities)
+
+    @callback
+    def _async_add_vehicle(vehicle: RenaultVehicleProxy) -> None:
+        async_add_entities(
+            RenaultDeviceTracker(vehicle, description)
+            for description in DEVICE_TRACKER_TYPES
+            if description.coordinator in vehicle.coordinators
+        )
+
+    config_entry.async_on_unload(
+        config_entry.runtime_data.async_add_vehicle_listener(_async_add_vehicle)
+    )
 
 
 class RenaultDeviceTracker(
@@ -34,27 +52,25 @@ class RenaultDeviceTracker(
 ):
     """Mixin for device tracker specific attributes."""
 
+    entity_description: RenaultTrackerEntityDescription
+
     @property
+    @override
     def latitude(self) -> float | None:
         """Return latitude value of the device."""
-        return self.coordinator.data.gpsLatitude if self.coordinator.data else None
+        return self.coordinator.data.gpsLatitude
 
     @property
+    @override
     def longitude(self) -> float | None:
         """Return longitude value of the device."""
-        return self.coordinator.data.gpsLongitude if self.coordinator.data else None
-
-    @property
-    def source_type(self) -> SourceType:
-        """Return the source type of the device."""
-        return SourceType.GPS
+        return self.coordinator.data.gpsLongitude
 
 
-DEVICE_TRACKER_TYPES: tuple[RenaultDataEntityDescription, ...] = (
-    RenaultDataEntityDescription(
+DEVICE_TRACKER_TYPES: tuple[RenaultTrackerEntityDescription, ...] = (
+    RenaultTrackerEntityDescription(
         key="location",
         coordinator="location",
-        icon="mdi:car",
-        name="Location",
+        translation_key="location",
     ),
 )

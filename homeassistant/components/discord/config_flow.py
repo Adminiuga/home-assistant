@@ -1,46 +1,69 @@
 """Config flow for Discord integration."""
-from __future__ import annotations
 
 from collections.abc import Mapping
 import logging
-from typing import Any
+from typing import Any, override
 
 from aiohttp.client_exceptions import ClientConnectorError
 import nextcord
-import voluptuous as vol
+from nextcord.abc import Messageable
+import probatio
 
-from homeassistant import config_entries
+from homeassistant.config_entries import (
+    ConfigFlow,
+    ConfigFlowResult,
+    ConfigSubentryFlow,
+    SubentryFlowResult,
+)
 from homeassistant.const import CONF_API_TOKEN, CONF_NAME
-from homeassistant.data_entry_flow import FlowResult
+from homeassistant.core import callback
+from homeassistant.helpers.selector import TextSelector
 
-from .const import DOMAIN, URL_PLACEHOLDER
+from . import DiscordConfigEntry
+from .const import CONF_TARGET_ID, DOMAIN, SUBENTRY_TYPE_TARGET, URL_PLACEHOLDER
 
 _LOGGER = logging.getLogger(__name__)
 
-CONFIG_SCHEMA = vol.Schema({vol.Required(CONF_API_TOKEN): str})
+CONFIG_SCHEMA = probatio.Schema(
+    {probatio.Required(probatio.Secret(CONF_API_TOKEN)): str}
+)
+
+# Discord IDs are unsigned 64-bit snowflakes that exceed JavaScript's safe
+# integer range, so they are kept as strings and only cast to int at the
+# nextcord API boundary.
+TARGET_SCHEMA = probatio.Schema({probatio.Required(CONF_TARGET_ID): TextSelector()})
 
 
-class DiscordFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
+class DiscordFlowHandler(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Discord."""
 
-    async def async_step_reauth(self, entry_data: Mapping[str, Any]) -> FlowResult:
+    @classmethod
+    @callback
+    @override
+    def async_get_supported_subentry_types(
+        cls, config_entry: DiscordConfigEntry
+    ) -> dict[str, type[ConfigSubentryFlow]]:
+        """Return subentries supported by this integration."""
+        return {SUBENTRY_TYPE_TARGET: TargetSubentryFlowHandler}
+
+    async def async_step_reauth(
+        self, entry_data: Mapping[str, Any]
+    ) -> ConfigFlowResult:
         """Handle a reauthorization flow request."""
         return await self.async_step_reauth_confirm()
 
     async def async_step_reauth_confirm(
         self, user_input: dict[str, str] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Confirm reauth dialog."""
         errors = {}
 
         if user_input:
             error, info = await _async_try_connect(user_input[CONF_API_TOKEN])
             if info and (entry := await self.async_set_unique_id(str(info.id))):
-                self.hass.config_entries.async_update_entry(
+                return self.async_update_reload_and_abort(
                     entry, data=entry.data | user_input
                 )
-                await self.hass.config_entries.async_reload(entry.entry_id)
-                return self.async_abort(reason="reauth_successful")
             if error:
                 errors["base"] = error
 
@@ -52,9 +75,10 @@ class DiscordFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             errors=errors,
         )
 
+    @override
     async def async_step_user(
         self, user_input: dict[str, str] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle a flow initiated by the user."""
         errors = {}
 
@@ -79,6 +103,44 @@ class DiscordFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
 
+class TargetSubentryFlowHandler(ConfigSubentryFlow):
+    """Handle a subentry flow for adding a Discord notification target."""
+
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> SubentryFlowResult:
+        """Add a target (channel, user or DM) to send notifications to."""
+        entry = self._get_entry()
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            target_id = user_input[CONF_TARGET_ID]
+            # isdecimal (not isdigit) rejects superscripts like "²" that int() can't parse.
+            if not target_id.isdecimal():
+                errors["base"] = "invalid_target"
+            elif any(
+                subentry.unique_id == target_id
+                for subentry in entry.subentries.values()
+            ):
+                return self.async_abort(reason="already_configured")
+            else:
+                error, name = await _async_try_target(
+                    entry.data[CONF_API_TOKEN], int(target_id)
+                )
+                if error is not None:
+                    errors["base"] = error
+                else:
+                    return self.async_create_entry(
+                        title=name,
+                        data={CONF_TARGET_ID: target_id},
+                        unique_id=target_id,
+                    )
+
+        return self.async_show_form(
+            step_id="user", data_schema=TARGET_SCHEMA, errors=errors
+        )
+
+
 async def _async_try_connect(token: str) -> tuple[str | None, nextcord.AppInfo | None]:
     """Try connecting to Discord."""
     discord_bot = nextcord.Client()
@@ -87,10 +149,38 @@ async def _async_try_connect(token: str) -> tuple[str | None, nextcord.AppInfo |
         info = await discord_bot.application_info()
     except nextcord.LoginFailure:
         return "invalid_auth", None
-    except (ClientConnectorError, nextcord.HTTPException, nextcord.NotFound):
+    except ClientConnectorError, nextcord.HTTPException, nextcord.NotFound:
         return "cannot_connect", None
-    except Exception as ex:  # pylint: disable=broad-except
-        _LOGGER.exception("Unexpected exception: %s", ex)
+    except Exception:
+        _LOGGER.exception("Unexpected exception")
         return "unknown", None
     await discord_bot.close()
     return None, info
+
+
+async def _async_try_target(token: str, target: int) -> tuple[str | None, str]:
+    """Try resolving a Discord target, returning an error or its name."""
+    discord_bot = nextcord.Client()
+    try:
+        await discord_bot.login(token)
+        try:
+            channel = await discord_bot.fetch_channel(target)
+        except nextcord.NotFound:
+            # Not a channel; a user ID resolves to a direct message target.
+            return None, (await discord_bot.fetch_user(target)).name
+        if not isinstance(channel, Messageable):
+            return "unsupported_target", ""
+        # DM channels have no name and group channel names are optional.
+        name = getattr(channel, "name", None)
+    except nextcord.LoginFailure:
+        return "invalid_auth", ""
+    except nextcord.NotFound:
+        return "target_not_found", ""
+    except ClientConnectorError, nextcord.HTTPException:
+        return "cannot_connect", ""
+    except Exception:
+        _LOGGER.exception("Unexpected exception")
+        return "unknown", ""
+    finally:
+        await discord_bot.close()
+    return None, name or str(target)

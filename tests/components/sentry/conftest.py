@@ -1,13 +1,11 @@
 """Configuration for Sentry tests."""
-from __future__ import annotations
 
 from typing import Any
 
 import pytest
+from pytest_homeassistant.common import MockConfigEntry
 
-from homeassistant.components.sentry import DOMAIN
-
-from tests.common import MockConfigEntry
+from homeassistant.components.sentry.const import DOMAIN
 
 
 @pytest.fixture(name="config_entry")

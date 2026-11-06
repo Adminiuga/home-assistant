@@ -1,19 +1,17 @@
 """Support for Xiaomi Yeelight WiFi color bulb."""
-from __future__ import annotations
 
-import asyncio
 import logging
+from typing import Any
 
 from yeelight import BulbException
-from yeelight.aio import KEY_CONNECTED
+from yeelight.aio import KEY_CONNECTED, AsyncBulb
 
 from homeassistant.const import CONF_ID, CONF_NAME
-from homeassistant.core import callback
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.event import async_call_later
 
 from .const import (
-    ACTIVE_COLOR_FLOWING,
     ACTIVE_MODE_NIGHTLIGHT,
     DATA_UPDATED,
     STATE_CHANGE_TIME,
@@ -31,13 +29,13 @@ def async_format_model(model: str) -> str:
 
 
 @callback
-def async_format_id(id_: str) -> str:
+def async_format_id(id_: str | None) -> str:
     """Generate a more human readable id."""
     return hex(int(id_, 16)) if id_ else "None"
 
 
 @callback
-def async_format_model_id(model: str, id_: str) -> str:
+def async_format_model_id(model: str, id_: str | None) -> str:
     """Generate a more human readable name."""
     return f"{async_format_model(model)} {async_format_id(id_)}"
 
@@ -63,17 +61,19 @@ def update_needs_bg_power_workaround(data):
 class YeelightDevice:
     """Represents single Yeelight device."""
 
-    def __init__(self, hass, host, config, bulb):
+    def __init__(
+        self, hass: HomeAssistant, host: str, config: dict[str, Any], bulb: AsyncBulb
+    ) -> None:
         """Initialize device."""
         self._hass = hass
         self._config = config
         self._host = host
         self._bulb_device = bulb
-        self.capabilities = {}
-        self._device_type = None
+        self.capabilities: dict[str, Any] = {}
+        self._device_type: str | None = None
         self._available = True
         self._initialized = False
-        self._name = None
+        self._name: str | None = None
 
     @property
     def bulb(self):
@@ -116,9 +116,13 @@ class YeelightDevice:
         return self.capabilities.get("fw_ver")
 
     @property
+    def unique_id(self) -> str | None:
+        """Return the unique ID of the device."""
+        return self.capabilities.get("id")
+
+    @property
     def is_nightlight_supported(self) -> bool:
-        """
-        Return true / false if nightlight is supported.
+        """Return true / false if nightlight is supported.
 
         Uses brightness as it appears to be supported in both ceiling and other lights.
         """
@@ -138,17 +142,8 @@ class YeelightDevice:
         return False
 
     @property
-    def is_color_flow_enabled(self) -> bool:
-        """Return true / false if color flow is currently running."""
-        return self._color_flow and int(self._color_flow) == ACTIVE_COLOR_FLOWING
-
-    @property
     def _active_mode(self):
         return self.bulb.last_properties.get("active_mode")
-
-    @property
-    def _color_flow(self):
-        return self.bulb.last_properties.get("flowing")
 
     @property
     def _nightlight_brightness(self):
@@ -169,19 +164,19 @@ class YeelightDevice:
             self._available = True
             if not self._initialized:
                 self._initialized = True
-        except OSError as ex:
-            if self._available:  # just inform once
-                _LOGGER.error(
-                    "Unable to update device %s, %s: %s", self._host, self.name, ex
-                )
-            self._available = False
-        except asyncio.TimeoutError as ex:
+        except TimeoutError as ex:
             _LOGGER.debug(
                 "timed out while trying to update device %s, %s: %s",
                 self._host,
                 self.name,
                 ex,
             )
+        except OSError as ex:
+            if self._available:  # just inform once
+                _LOGGER.error(
+                    "Unable to update device %s, %s: %s", self._host, self.name, ex
+                )
+            self._available = False
         except BulbException as ex:
             _LOGGER.debug(
                 "Unable to update device %s, %s: %s", self._host, self.name, ex

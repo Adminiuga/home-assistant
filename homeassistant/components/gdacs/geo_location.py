@@ -1,25 +1,23 @@
 """Geolocation support for GDACS Feed."""
-from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import datetime
 import logging
-from typing import Any
+from typing import Any, override
 
-from aio_georss_gdacs import GdacsFeedManager
 from aio_georss_gdacs.feed_entry import GdacsFeedEntry
 
 from homeassistant.components.geo_location import GeolocationEvent
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import LENGTH_KILOMETERS, LENGTH_MILES
+from homeassistant.const import UnitOfLength
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.util.unit_conversion import DistanceConverter
 from homeassistant.util.unit_system import US_CUSTOMARY_SYSTEM
 
-from . import GdacsFeedEntityManager
-from .const import DEFAULT_ICON, DOMAIN, FEED
+from . import GdacsConfigEntry, GdacsFeedEntityManager
+from .const import DEFAULT_ICON
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -51,14 +49,16 @@ SOURCE = "gdacs"
 
 
 async def async_setup_entry(
-    hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
+    hass: HomeAssistant,
+    entry: GdacsConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up the GDACS Feed platform."""
-    manager: GdacsFeedEntityManager = hass.data[DOMAIN][FEED][entry.entry_id]
+    manager = entry.runtime_data
 
     @callback
     def async_add_geolocation(
-        feed_manager: GdacsFeedManager, integration_id: str, external_id: str
+        feed_manager: GdacsFeedEntityManager, integration_id: str, external_id: str
     ) -> None:
         """Add geolocation entity from feed."""
         new_entity = GdacsEvent(feed_manager, integration_id, external_id)
@@ -77,38 +77,42 @@ async def async_setup_entry(
 
 
 class GdacsEvent(GeolocationEvent):
-    """This represents an external event with GDACS feed data."""
+    """Represents an external event with GDACS feed data."""
 
     _attr_should_poll = False
     _attr_source = SOURCE
 
     def __init__(
-        self, feed_manager: GdacsFeedManager, integration_id: str, external_id: str
+        self,
+        feed_manager: GdacsFeedEntityManager,
+        integration_id: str,
+        external_id: str,
     ) -> None:
         """Initialize entity with data from feed entry."""
         self._feed_manager = feed_manager
         self._external_id = external_id
         self._attr_unique_id = f"{integration_id}_{external_id}"
-        self._attr_unit_of_measurement = LENGTH_KILOMETERS
-        self._alert_level = None
-        self._country = None
-        self._description = None
-        self._duration_in_week = None
-        self._event_type_short = None
-        self._event_type = None
-        self._from_date = None
-        self._to_date = None
-        self._population = None
-        self._severity = None
-        self._vulnerability = None
-        self._version = None
+        self._attr_unit_of_measurement = UnitOfLength.KILOMETERS
+        self._alert_level: str | None = None
+        self._country: str | None = None
+        self._description: str | None = None
+        self._duration_in_week: int | None = None
+        self._event_type_short: str | None = None
+        self._event_type: str | None = None
+        self._from_date: datetime | None = None
+        self._to_date: datetime | None = None
+        self._population: str | None = None
+        self._severity: str | None = None
+        self._vulnerability: str | float | None = None
+        self._version: int | None = None
         self._remove_signal_delete: Callable[[], None]
         self._remove_signal_update: Callable[[], None]
 
+    @override
     async def async_added_to_hass(self) -> None:
         """Call when entity is added to hass."""
         if self.hass.config.units is US_CUSTOMARY_SYSTEM:
-            self._attr_unit_of_measurement = LENGTH_MILES
+            self._attr_unit_of_measurement = UnitOfLength.MILES
         self._remove_signal_delete = async_dispatcher_connect(
             self.hass, f"gdacs_delete_{self._external_id}", self._delete_callback
         )
@@ -116,6 +120,7 @@ class GdacsEvent(GeolocationEvent):
             self.hass, f"gdacs_update_{self._external_id}", self._update_callback
         )
 
+    @override
     async def async_will_remove_from_hass(self) -> None:
         """Call when entity will be removed from hass."""
         self._remove_signal_delete()
@@ -151,7 +156,7 @@ class GdacsEvent(GeolocationEvent):
         # Convert distance if not metric system.
         if self.hass.config.units is US_CUSTOMARY_SYSTEM:
             self._attr_distance = DistanceConverter.convert(
-                feed_entry.distance_to_home, LENGTH_KILOMETERS, LENGTH_MILES
+                feed_entry.distance_to_home, UnitOfLength.KILOMETERS, UnitOfLength.MILES
             )
         else:
             self._attr_distance = feed_entry.distance_to_home
@@ -175,6 +180,7 @@ class GdacsEvent(GeolocationEvent):
         self._version = feed_entry.version
 
     @property
+    @override
     def icon(self) -> str:
         """Return the icon to use in the frontend, if any."""
         if self._event_type_short and self._event_type_short in ICONS:
@@ -182,22 +188,23 @@ class GdacsEvent(GeolocationEvent):
         return DEFAULT_ICON
 
     @property
+    @override
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return the device state attributes."""
-        attributes = {}
-        for key, value in (
-            (ATTR_EXTERNAL_ID, self._external_id),
-            (ATTR_DESCRIPTION, self._description),
-            (ATTR_EVENT_TYPE, self._event_type),
-            (ATTR_ALERT_LEVEL, self._alert_level),
-            (ATTR_COUNTRY, self._country),
-            (ATTR_DURATION_IN_WEEK, self._duration_in_week),
-            (ATTR_FROM_DATE, self._from_date),
-            (ATTR_TO_DATE, self._to_date),
-            (ATTR_POPULATION, self._population),
-            (ATTR_SEVERITY, self._severity),
-            (ATTR_VULNERABILITY, self._vulnerability),
-        ):
-            if value or isinstance(value, bool):
-                attributes[key] = value
-        return attributes
+        return {
+            key: value
+            for key, value in (
+                (ATTR_EXTERNAL_ID, self._external_id),
+                (ATTR_DESCRIPTION, self._description),
+                (ATTR_EVENT_TYPE, self._event_type),
+                (ATTR_ALERT_LEVEL, self._alert_level),
+                (ATTR_COUNTRY, self._country),
+                (ATTR_DURATION_IN_WEEK, self._duration_in_week),
+                (ATTR_FROM_DATE, self._from_date),
+                (ATTR_TO_DATE, self._to_date),
+                (ATTR_POPULATION, self._population),
+                (ATTR_SEVERITY, self._severity),
+                (ATTR_VULNERABILITY, self._vulnerability),
+            )
+            if value or isinstance(value, bool)
+        }

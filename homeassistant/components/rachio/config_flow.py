@@ -1,18 +1,22 @@
 """Config flow for Rachio integration."""
-from __future__ import annotations
 
+from collections.abc import Mapping
 from http import HTTPStatus
 import logging
+from typing import Any, override
 
+import probatio
 from rachiopy import Rachio
 from requests.exceptions import ConnectTimeout
-import voluptuous as vol
 
-from homeassistant import config_entries, core, exceptions
-from homeassistant.components import zeroconf
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult, OptionsFlow
 from homeassistant.const import CONF_API_KEY
-from homeassistant.core import callback
-from homeassistant.data_entry_flow import FlowResult
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.service_info.zeroconf import (
+    ATTR_PROPERTIES_ID,
+    ZeroconfServiceInfo,
+)
 
 from .const import (
     CONF_MANUAL_RUN_MINS,
@@ -22,13 +26,17 @@ from .const import (
     KEY_STATUS,
     KEY_USERNAME,
 )
+from .device import RachioConfigEntry
 
 _LOGGER = logging.getLogger(__name__)
 
-DATA_SCHEMA = vol.Schema({vol.Required(CONF_API_KEY): str}, extra=vol.ALLOW_EXTRA)
+DATA_SCHEMA = probatio.Schema(
+    {probatio.Required(probatio.Secret(CONF_API_KEY)): str}, extra=probatio.ALLOW_EXTRA
+)
+REAUTH_SCHEMA = probatio.Schema({probatio.Required(probatio.Secret(CONF_API_KEY)): str})
 
 
-async def validate_input(hass: core.HomeAssistant, data):
+async def validate_input(hass: HomeAssistant, data):
     """Validate the user input allows us to connect.
 
     Data has the keys from DATA_SCHEMA with values provided by the user.
@@ -56,12 +64,15 @@ async def validate_input(hass: core.HomeAssistant, data):
     return {"title": username}
 
 
-class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
+class RachioConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Rachio."""
 
     VERSION = 1
 
-    async def async_step_user(self, user_input=None):
+    @override
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle the initial step."""
         errors = {}
         if user_input is not None:
@@ -69,54 +80,103 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             self._abort_if_unique_id_configured()
             try:
                 info = await validate_input(self.hass, user_input)
-                return self.async_create_entry(title=info["title"], data=user_input)
             except CannotConnect:
                 errors["base"] = "cannot_connect"
             except InvalidAuth:
                 errors["base"] = "invalid_auth"
-            except Exception:  # pylint: disable=broad-except
+            except Exception:
                 _LOGGER.exception("Unexpected exception")
                 errors["base"] = "unknown"
+            else:
+                return self.async_create_entry(title=info["title"], data=user_input)
 
         return self.async_show_form(
-            step_id="user", data_schema=DATA_SCHEMA, errors=errors
+            step_id="user",
+            data_schema=DATA_SCHEMA,
+            errors=errors,
+            description_placeholders={
+                "api_key_url": "https://app.rach.io/",
+            },
         )
 
+    async def async_step_reauth(
+        self, entry_data: Mapping[str, Any]
+    ) -> ConfigFlowResult:
+        """Handle reauthentication."""
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Confirm reauthentication with a new API key."""
+        errors = {}
+        if user_input is not None:
+            try:
+                await validate_input(self.hass, user_input)
+            except CannotConnect:
+                errors["base"] = "cannot_connect"
+            except InvalidAuth:
+                errors["base"] = "invalid_auth"
+            except Exception:
+                _LOGGER.exception("Unexpected exception")
+                errors["base"] = "unknown"
+            else:
+                reauth_entry = self._get_reauth_entry()
+                existing_entry = (
+                    self.hass.config_entries.async_entry_for_domain_unique_id(
+                        DOMAIN, user_input[CONF_API_KEY]
+                    )
+                )
+                if existing_entry and existing_entry.entry_id != reauth_entry.entry_id:
+                    return self.async_abort(reason="already_configured")
+                return self.async_update_reload_and_abort(
+                    reauth_entry,
+                    unique_id=user_input[CONF_API_KEY],
+                    data_updates=user_input,
+                )
+
+        return self.async_show_form(
+            step_id="reauth_confirm",
+            data_schema=REAUTH_SCHEMA,
+            errors=errors,
+            description_placeholders={
+                "api_key_url": "https://app.rach.io/",
+            },
+        )
+
+    @override
     async def async_step_homekit(
-        self, discovery_info: zeroconf.ZeroconfServiceInfo
-    ) -> FlowResult:
+        self, discovery_info: ZeroconfServiceInfo
+    ) -> ConfigFlowResult:
         """Handle HomeKit discovery."""
         self._async_abort_entries_match()
-        await self.async_set_unique_id(
-            discovery_info.properties[zeroconf.ATTR_PROPERTIES_ID]
-        )
+        await self.async_set_unique_id(discovery_info.properties[ATTR_PROPERTIES_ID])
         self._abort_if_unique_id_configured()
         return await self.async_step_user()
 
     @staticmethod
     @callback
+    @override
     def async_get_options_flow(
-        config_entry: config_entries.ConfigEntry,
+        config_entry: RachioConfigEntry,
     ) -> OptionsFlowHandler:
         """Get the options flow for this handler."""
-        return OptionsFlowHandler(config_entry)
+        return OptionsFlowHandler()
 
 
-class OptionsFlowHandler(config_entries.OptionsFlow):
+class OptionsFlowHandler(OptionsFlow):
     """Handle a option flow for Rachio."""
 
-    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
-        """Initialize options flow."""
-        self.config_entry = config_entry
-
-    async def async_step_init(self, user_input=None):
+    async def async_step_init(
+        self, user_input: dict[str, int] | None = None
+    ) -> ConfigFlowResult:
         """Handle options flow."""
         if user_input is not None:
             return self.async_create_entry(title="", data=user_input)
 
-        data_schema = vol.Schema(
+        data_schema = probatio.Schema(
             {
-                vol.Optional(
+                probatio.Optional(
                     CONF_MANUAL_RUN_MINS,
                     default=self.config_entry.options.get(
                         CONF_MANUAL_RUN_MINS, DEFAULT_MANUAL_RUN_MINS
@@ -127,9 +187,9 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
         return self.async_show_form(step_id="init", data_schema=data_schema)
 
 
-class CannotConnect(exceptions.HomeAssistantError):
+class CannotConnect(HomeAssistantError):
     """Error to indicate we cannot connect."""
 
 
-class InvalidAuth(exceptions.HomeAssistantError):
+class InvalidAuth(HomeAssistantError):
     """Error to indicate there is invalid auth."""

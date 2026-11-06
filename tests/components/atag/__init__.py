@@ -1,11 +1,12 @@
 """Tests for the Atag integration."""
 
-from homeassistant.components.atag import DOMAIN, AtagException
+from pyatag import AtagException
+from pytest_homeassistant.common import MockConfigEntry
+from pytest_homeassistant.test_util.aiohttp import AiohttpClientMocker
+
+from homeassistant.components.atag import DOMAIN
 from homeassistant.const import CONF_HOST, CONF_PORT
 from homeassistant.core import HomeAssistant
-
-from tests.common import MockConfigEntry
-from tests.test_util.aiohttp import AiohttpClientMocker
 
 USER_INPUT = {
     CONF_HOST: "127.0.0.1",
@@ -92,10 +93,11 @@ async def init_integration(
     hass: HomeAssistant,
     aioclient_mock: AiohttpClientMocker,
     skip_setup: bool = False,
+    unique_id: str = UID,
 ) -> MockConfigEntry:
     """Set up the Atag integration in Home Assistant."""
     mock_connection(aioclient_mock)
-    entry = MockConfigEntry(domain=DOMAIN, data=USER_INPUT)
+    entry = MockConfigEntry(domain=DOMAIN, data=USER_INPUT, unique_id=unique_id)
     entry.add_to_hass(hass)
 
     if not skip_setup:

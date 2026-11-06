@@ -1,0 +1,20 @@
+{
+  "domain": "imeon_inverter",
+  "name": "Imeon Inverter",
+  "categories": ["energy.solar_batteries"],
+  "codeowners": ["@Imeon-Energy"],
+  "config_flow": true,
+  "connectivity": ["network"],
+  "documentation": "https://www.home-assistant.io/integrations/imeon_inverter",
+  "integration_type": "device",
+  "iot_class": "local_polling",
+  "quality_scale": "bronze",
+  "requirements": ["imeon_inverter_api==0.4.0"],
+  "ssdp": [
+    {
+      "deviceType": "urn:schemas-upnp-org:device:Basic:1",
+      "manufacturer": "IMEON",
+      "st": "upnp:rootdevice"
+    }
+  ]
+}

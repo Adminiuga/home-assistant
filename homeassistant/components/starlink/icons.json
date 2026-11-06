@@ -1,0 +1,38 @@
+{
+  "entity": {
+    "sensor": {
+      "azimuth": {
+        "default": "mdi:compass"
+      },
+      "downlink_throughput": {
+        "default": "mdi:download"
+      },
+      "download": {
+        "default": "mdi:download"
+      },
+      "elevation": {
+        "default": "mdi:compass"
+      },
+      "last_boot_time": {
+        "default": "mdi:clock"
+      },
+      "ping": {
+        "default": "mdi:speedometer"
+      },
+      "uplink_throughput": {
+        "default": "mdi:upload"
+      },
+      "upload": {
+        "default": "mdi:upload"
+      }
+    },
+    "switch": {
+      "starlink_positioning_exclusive": {
+        "default": "mdi:crosshairs-gps",
+        "state": {
+          "on": "mdi:crosshairs-off"
+        }
+      }
+    }
+  }
+}

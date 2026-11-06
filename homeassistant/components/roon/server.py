@@ -1,4 +1,5 @@
 """Code to handle the api connection to a Roon server."""
+
 import asyncio
 import logging
 
@@ -66,7 +67,9 @@ class RoonServer:
         )
 
         # Initialize Roon background polling
-        asyncio.create_task(self.async_do_loop())
+        self.config_entry.async_create_background_task(
+            self.hass, self.async_do_loop(), "roon.server-do-loop"
+        )
 
         return True
 
@@ -89,6 +92,12 @@ class RoonServer:
         self._roon_name_by_id[entity_id] = roon_name
         self._id_by_roon_name[roon_name] = entity_id
 
+    def remove_player_id(self, entity_id):
+        """Unregister a roon player."""
+        roon_name = self._roon_name_by_id.pop(entity_id, None)
+        if self._id_by_roon_name.get(roon_name) == entity_id:
+            del self._id_by_roon_name[roon_name]
+
     def roon_name(self, entity_id):
         """Get the name of the roon player from entity_id."""
         return self._roon_name_by_id.get(entity_id)
@@ -103,7 +112,7 @@ class RoonServer:
         self._exit = True
 
     def roonapi_state_callback(self, event, changed_zones):
-        """Callbacks from the roon api websockets."""
+        """Callbacks from the roon api websocket with state change."""
         self.hass.add_job(self.async_update_changed_players(changed_zones))
 
     async def async_do_loop(self):
@@ -167,6 +176,7 @@ class RoonServer:
         new_dict["zone_name"] = zone["display_name"]
         new_dict["display_name"] = output["display_name"]
         new_dict["last_changed"] = utcnow()
-        # we don't use the zone_id or output_id for now as unique id as I've seen cases were it changes for some reason
+        # we don't use the zone_id or output_id for now as
+        # unique id as I've seen cases where it changes
         new_dict["dev_id"] = f"roon_{self.roon_id}_{output['display_name']}"
         return new_dict

@@ -1,13 +1,20 @@
 """Test generic (IP camera) diagnostics."""
+
 import pytest
+from pytest_homeassistant.common import MockConfigEntry
+from pytest_homeassistant.components.diagnostics import get_diagnostics_for_config_entry
+from pytest_homeassistant.typing import ClientSessionGenerator
 
 from homeassistant.components.diagnostics import REDACTED
 from homeassistant.components.generic.diagnostics import redact_url
+from homeassistant.core import HomeAssistant
 
-from tests.components.diagnostics import get_diagnostics_for_config_entry
 
-
-async def test_entry_diagnostics(hass, hass_client, setup_entry):
+async def test_entry_diagnostics(
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    setup_entry: MockConfigEntry,
+) -> None:
     """Test config entry diagnostics."""
 
     assert await get_diagnostics_for_config_entry(hass, hass_client, setup_entry) == {
@@ -18,11 +25,13 @@ async def test_entry_diagnostics(hass, hass_client, setup_entry):
             "stream_source": "http://****:****@example.com/****",
             "username": REDACTED,
             "password": REDACTED,
-            "limit_refetch_to_url_change": False,
-            "authentication": "basic",
-            "framerate": 2.0,
-            "verify_ssl": True,
             "content_type": "image/jpeg",
+            "advanced": {
+                "limit_refetch_to_url_change": False,
+                "authentication": "basic",
+                "framerate": 2.0,
+                "verify_ssl": True,
+            },
         },
     }
 
@@ -52,7 +61,7 @@ async def test_entry_diagnostics(hass, hass_client, setup_entry):
         ),
     ],
 )
-def test_redact_url(url_in, url_out_expected):
+def test_redact_url(url_in, url_out_expected) -> None:
     """Test url redaction."""
     url_out = redact_url(url_in)
     assert url_out == url_out_expected

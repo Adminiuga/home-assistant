@@ -1,24 +1,34 @@
 """Config flow for Kostal Plenticore Solar Inverter integration."""
-import asyncio
+
+from collections.abc import Mapping
 import logging
+from typing import Any, override
 
 from aiohttp.client_exceptions import ClientError
-from kostal.plenticore import PlenticoreApiClient, PlenticoreAuthenticationException
-import voluptuous as vol
+import probatio
+from pykoplenti import ApiClient, AuthenticationException
 
-from homeassistant import config_entries
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_BASE, CONF_HOST, CONF_PASSWORD
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from .const import DOMAIN
+from .const import CONF_SERVICE_CODE, DOMAIN
+from .helper import get_hostname_id
 
 _LOGGER = logging.getLogger(__name__)
 
-DATA_SCHEMA = vol.Schema(
+DATA_SCHEMA = probatio.Schema(
     {
-        vol.Required(CONF_HOST): str,
-        vol.Required(CONF_PASSWORD): str,
+        probatio.Required(CONF_HOST): str,
+        probatio.Required(probatio.Secret(CONF_PASSWORD)): str,
+        probatio.Optional(CONF_SERVICE_CODE): str,
+    }
+)
+REAUTH_SCHEMA = probatio.Schema(
+    {
+        probatio.Required(probatio.Secret(CONF_PASSWORD)): str,
+        probatio.Optional(CONF_SERVICE_CODE): str,
     }
 )
 
@@ -30,40 +40,109 @@ async def test_connection(hass: HomeAssistant, data) -> str:
     """
 
     session = async_get_clientsession(hass)
-    async with PlenticoreApiClient(session, data["host"]) as client:
-        await client.login(data["password"])
-        values = await client.get_setting_values("scb:network", "Hostname")
+    async with ApiClient(session, data[CONF_HOST]) as client:
+        await client.login(
+            data[CONF_PASSWORD], service_code=data.get(CONF_SERVICE_CODE)
+        )
+        hostname_id = await get_hostname_id(client)
+        values = await client.get_setting_values("scb:network", hostname_id)
 
-    return values["scb:network"]["Hostname"]
+    return values["scb:network"][hostname_id]
 
 
-class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
+class KostalPlenticoreConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Kostal Plenticore Solar Inverter."""
 
     VERSION = 1
 
-    async def async_step_user(self, user_input=None):
+    @override
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle the initial step."""
         errors = {}
-        hostname = None
 
         if user_input is not None:
             self._async_abort_entries_match({CONF_HOST: user_input[CONF_HOST]})
 
             try:
                 hostname = await test_connection(self.hass, user_input)
-            except PlenticoreAuthenticationException as ex:
+            except AuthenticationException as ex:
                 errors[CONF_PASSWORD] = "invalid_auth"
                 _LOGGER.error("Error response: %s", ex)
-            except (ClientError, asyncio.TimeoutError):
+            except ClientError, TimeoutError:
                 errors[CONF_HOST] = "cannot_connect"
-            except Exception:  # pylint: disable=broad-except
+            except Exception:
                 _LOGGER.exception("Unexpected exception")
                 errors[CONF_BASE] = "unknown"
-
-            if not errors:
+            else:
                 return self.async_create_entry(title=hostname, data=user_input)
 
         return self.async_show_form(
             step_id="user", data_schema=DATA_SCHEMA, errors=errors
+        )
+
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Add reconfigure step to allow to reconfigure a config entry."""
+        errors = {}
+
+        if user_input is not None:
+            self._async_abort_entries_match({CONF_HOST: user_input[CONF_HOST]})
+            try:
+                hostname = await test_connection(self.hass, user_input)
+            except AuthenticationException as ex:
+                errors[CONF_PASSWORD] = "invalid_auth"
+                _LOGGER.error("Error response: %s", ex)
+            except ClientError, TimeoutError:
+                errors[CONF_HOST] = "cannot_connect"
+            except Exception:
+                _LOGGER.exception("Unexpected exception")
+                errors[CONF_BASE] = "unknown"
+            else:
+                return self.async_update_reload_and_abort(
+                    entry=self._get_reconfigure_entry(), title=hostname, data=user_input
+                )
+
+        return self.async_show_form(
+            step_id="reconfigure", data_schema=DATA_SCHEMA, errors=errors
+        )
+
+    async def async_step_reauth(
+        self, entry_data: Mapping[str, Any]
+    ) -> ConfigFlowResult:
+        """Handle reauthentication."""
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Confirm reauthentication with a new password."""
+        errors = {}
+        reauth_entry = self._get_reauth_entry()
+
+        if user_input is not None:
+            data = {CONF_HOST: reauth_entry.data[CONF_HOST], **user_input}
+            try:
+                await test_connection(self.hass, data)
+            except AuthenticationException as ex:
+                errors[CONF_PASSWORD] = "invalid_auth"
+                _LOGGER.error("Error response: %s", ex)
+            except ClientError, TimeoutError:
+                errors[CONF_BASE] = "cannot_connect"
+            except Exception:
+                _LOGGER.exception("Unexpected exception")
+                errors[CONF_BASE] = "unknown"
+            else:
+                return self.async_update_reload_and_abort(reauth_entry, data=data)
+
+        return self.async_show_form(
+            step_id="reauth_confirm",
+            data_schema=self.add_suggested_values_to_schema(
+                REAUTH_SCHEMA,
+                {CONF_SERVICE_CODE: reauth_entry.data.get(CONF_SERVICE_CODE)},
+            ),
+            description_placeholders={"host": reauth_entry.data[CONF_HOST]},
+            errors=errors,
         )

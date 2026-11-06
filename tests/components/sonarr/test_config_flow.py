@@ -1,23 +1,25 @@
 """Test the Sonarr config flow."""
+
 from unittest.mock import MagicMock, patch
 
 from aiopyarr import ArrAuthenticationException, ArrException
+import pytest
+from pytest_homeassistant.common import MockConfigEntry
 
 from homeassistant.components.sonarr.const import (
+    CONF_MORE_OPTIONS,
     CONF_UPCOMING_DAYS,
     CONF_WANTED_MAX_ITEMS,
     DEFAULT_UPCOMING_DAYS,
     DEFAULT_WANTED_MAX_ITEMS,
     DOMAIN,
 )
-from homeassistant.config_entries import SOURCE_REAUTH, SOURCE_USER
+from homeassistant.config_entries import SOURCE_USER
 from homeassistant.const import CONF_API_KEY, CONF_SOURCE, CONF_URL, CONF_VERIFY_SSL
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
 
 from . import MOCK_REAUTH_INPUT, MOCK_USER_INPUT
-
-from tests.common import MockConfigEntry
 
 
 async def test_show_user_form(hass: HomeAssistant) -> None:
@@ -28,9 +30,10 @@ async def test_show_user_form(hass: HomeAssistant) -> None:
     )
 
     assert result["step_id"] == "user"
-    assert result["type"] == FlowResultType.FORM
+    assert result["type"] is FlowResultType.FORM
 
 
+@pytest.mark.usefixtures("mock_setup_entry")
 async def test_cannot_connect(
     hass: HomeAssistant, mock_sonarr_config_flow: MagicMock
 ) -> None:
@@ -44,11 +47,67 @@ async def test_cannot_connect(
         data=user_input,
     )
 
-    assert result["type"] == FlowResultType.FORM
+    assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "user"
     assert result["errors"] == {"base": "cannot_connect"}
 
+    mock_sonarr_config_flow.async_get_system_status.side_effect = None
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input=MOCK_USER_INPUT.copy()
+    )
 
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+
+
+@pytest.mark.parametrize(
+    ("input_url", "expected_url", "expected_title"),
+    [
+        pytest.param(
+            "https://192.168.1.189",
+            "https://192.168.1.189:443/",
+            "192.168.1.189",
+            id="ip_without_port",
+        ),
+        pytest.param(
+            "https://sonarr-anime.example.com/",
+            "https://sonarr-anime.example.com:443/",
+            "sonarr-anime.example.com",
+            id="hyphenated_hostname",
+        ),
+    ],
+)
+@pytest.mark.usefixtures("mock_setup_entry")
+async def test_url_rewrite(
+    hass: HomeAssistant,
+    mock_sonarr_config_flow: MagicMock,
+    input_url: str,
+    expected_url: str,
+    expected_title: str,
+) -> None:
+    """Test auth flow url rewrite."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={CONF_SOURCE: SOURCE_USER},
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "user"
+
+    user_input = MOCK_USER_INPUT.copy()
+    user_input[CONF_URL] = input_url
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input=user_input,
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["title"] == expected_title
+
+    assert result["data"]
+    assert result["data"][CONF_URL] == expected_url
+
+
+@pytest.mark.usefixtures("mock_setup_entry")
 async def test_invalid_auth(
     hass: HomeAssistant, mock_sonarr_config_flow: MagicMock
 ) -> None:
@@ -64,9 +123,16 @@ async def test_invalid_auth(
         data=user_input,
     )
 
-    assert result["type"] == FlowResultType.FORM
+    assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "user"
     assert result["errors"] == {"base": "invalid_auth"}
+
+    mock_sonarr_config_flow.async_get_system_status.side_effect = None
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input=MOCK_USER_INPUT.copy()
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
 
 
 async def test_unknown_error(
@@ -82,37 +148,29 @@ async def test_unknown_error(
         data=user_input,
     )
 
-    assert result["type"] == FlowResultType.ABORT
+    assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "unknown"
 
 
+@pytest.mark.usefixtures("mock_setup_entry")
 async def test_full_reauth_flow_implementation(
     hass: HomeAssistant,
     mock_sonarr_config_flow: MagicMock,
-    mock_setup_entry: None,
     init_integration: MockConfigEntry,
 ) -> None:
     """Test the manual reauth flow from start to finish."""
     entry = init_integration
 
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN,
-        context={
-            CONF_SOURCE: SOURCE_REAUTH,
-            "entry_id": entry.entry_id,
-            "unique_id": entry.unique_id,
-        },
-        data=entry.data,
-    )
+    result = await entry.start_reauth_flow(hass)
 
-    assert result["type"] == FlowResultType.FORM
+    assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "reauth_confirm"
 
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"], user_input={}
     )
 
-    assert result["type"] == FlowResultType.FORM
+    assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "user"
 
     user_input = MOCK_REAUTH_INPUT.copy()
@@ -121,16 +179,15 @@ async def test_full_reauth_flow_implementation(
     )
     await hass.async_block_till_done()
 
-    assert result["type"] == FlowResultType.ABORT
+    assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "reauth_successful"
 
     assert entry.data[CONF_API_KEY] == "test-api-key-reauth"
 
 
+@pytest.mark.usefixtures("mock_setup_entry")
 async def test_full_user_flow_implementation(
-    hass: HomeAssistant,
-    mock_sonarr_config_flow: MagicMock,
-    mock_setup_entry: None,
+    hass: HomeAssistant, mock_sonarr_config_flow: MagicMock
 ) -> None:
     """Test the full manual user flow from start to finish."""
     result = await hass.config_entries.flow.async_init(
@@ -138,7 +195,7 @@ async def test_full_user_flow_implementation(
         context={CONF_SOURCE: SOURCE_USER},
     )
 
-    assert result["type"] == FlowResultType.FORM
+    assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "user"
 
     user_input = MOCK_USER_INPUT.copy()
@@ -148,50 +205,46 @@ async def test_full_user_flow_implementation(
         user_input=user_input,
     )
 
-    assert result["type"] == FlowResultType.CREATE_ENTRY
+    assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["title"] == "192.168.1.189"
 
     assert result["data"]
-    assert result["data"][CONF_URL] == "http://192.168.1.189:8989"
+    assert result["data"][CONF_URL] == "http://192.168.1.189:8989/"
 
 
-async def test_full_user_flow_advanced_options(
-    hass: HomeAssistant,
-    mock_sonarr_config_flow: MagicMock,
-    mock_setup_entry: None,
+@pytest.mark.usefixtures("mock_setup_entry")
+async def test_full_user_flow_with_verify_ssl(
+    hass: HomeAssistant, mock_sonarr_config_flow: MagicMock
 ) -> None:
-    """Test the full manual user flow with advanced options."""
+    """Test the full manual user flow with verify SSL option."""
     result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={CONF_SOURCE: SOURCE_USER, "show_advanced_options": True}
+        DOMAIN, context={CONF_SOURCE: SOURCE_USER}
     )
 
-    assert result["type"] == FlowResultType.FORM
+    assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "user"
-
-    user_input = {
-        **MOCK_USER_INPUT,
-        CONF_VERIFY_SSL: True,
-    }
 
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"],
-        user_input=user_input,
+        user_input={
+            **MOCK_USER_INPUT,
+            CONF_MORE_OPTIONS: {CONF_VERIFY_SSL: True},
+        },
     )
 
-    assert result["type"] == FlowResultType.CREATE_ENTRY
+    assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["title"] == "192.168.1.189"
 
     assert result["data"]
-    assert result["data"][CONF_URL] == "http://192.168.1.189:8989"
+    assert result["data"][CONF_URL] == "http://192.168.1.189:8989/"
     assert result["data"][CONF_VERIFY_SSL]
 
 
 @patch("homeassistant.components.sonarr.PLATFORMS", [])
+@pytest.mark.usefixtures("mock_setup_entry")
 async def test_options_flow(
-    hass: HomeAssistant,
-    mock_setup_entry: None,
-    init_integration: MockConfigEntry,
-):
+    hass: HomeAssistant, init_integration: MockConfigEntry
+) -> None:
     """Test updating options."""
     entry = init_integration
 
@@ -200,7 +253,7 @@ async def test_options_flow(
 
     result = await hass.config_entries.options.async_init(entry.entry_id)
 
-    assert result["type"] == FlowResultType.FORM
+    assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "init"
 
     result = await hass.config_entries.options.async_configure(
@@ -209,6 +262,105 @@ async def test_options_flow(
     )
     await hass.async_block_till_done()
 
-    assert result["type"] == FlowResultType.CREATE_ENTRY
+    assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["data"][CONF_UPCOMING_DAYS] == 2
     assert result["data"][CONF_WANTED_MAX_ITEMS] == 100
+
+
+@pytest.mark.usefixtures("mock_setup_entry", "mock_sonarr_config_flow")
+async def test_reconfigure_flow(
+    hass: HomeAssistant, init_integration: MockConfigEntry
+) -> None:
+    """Test the reconfigure flow."""
+    result = await init_integration.start_reconfigure_flow(hass)
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "reconfigure"
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={
+            CONF_URL: "https://sonarr.example.com",
+            CONF_API_KEY: "new-api-key",
+            CONF_MORE_OPTIONS: {CONF_VERIFY_SSL: True},
+        },
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    assert init_integration.data[CONF_URL] == "https://sonarr.example.com:443/"
+    assert init_integration.data[CONF_API_KEY] == "new-api-key"
+    assert init_integration.data[CONF_VERIFY_SSL] is True
+
+
+@pytest.mark.parametrize(
+    ("side_effect", "error"),
+    [
+        pytest.param(ArrAuthenticationException, "invalid_auth", id="invalid_auth"),
+        pytest.param(ArrException, "cannot_connect", id="cannot_connect"),
+        pytest.param(Exception, "unknown", id="unknown"),
+    ],
+)
+@pytest.mark.usefixtures("mock_setup_entry")
+async def test_reconfigure_flow_errors(
+    hass: HomeAssistant,
+    mock_sonarr_config_flow: MagicMock,
+    init_integration: MockConfigEntry,
+    side_effect: type[Exception],
+    error: str,
+) -> None:
+    """Test the reconfigure flow recovers from errors."""
+    mock_sonarr_config_flow.async_get_system_status.side_effect = side_effect
+
+    result = await init_integration.start_reconfigure_flow(hass)
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input=MOCK_USER_INPUT.copy()
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "reconfigure"
+    assert result["errors"] == {"base": error}
+
+    mock_sonarr_config_flow.async_get_system_status.side_effect = None
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input=MOCK_USER_INPUT.copy()
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+
+
+@pytest.mark.parametrize(
+    "stored_url",
+    [
+        pytest.param("http://192.168.1.190:8989/", id="normalized"),
+        pytest.param("http://192.168.1.190:8989", id="migrated"),
+    ],
+)
+@pytest.mark.usefixtures("mock_setup_entry", "mock_sonarr_config_flow")
+async def test_reconfigure_flow_already_configured(
+    hass: HomeAssistant, init_integration: MockConfigEntry, stored_url: str
+) -> None:
+    """Test the reconfigure flow aborts when the URL is used by another entry."""
+    MockConfigEntry(
+        domain=DOMAIN,
+        version=2,
+        data={
+            CONF_URL: stored_url,
+            CONF_API_KEY: "other-api-key",
+            CONF_VERIFY_SSL: False,
+        },
+    ).add_to_hass(hass)
+
+    result = await init_integration.start_reconfigure_flow(hass)
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={
+            CONF_URL: "http://192.168.1.190:8989",
+            CONF_API_KEY: "MOCK_API_KEY",
+            CONF_MORE_OPTIONS: {},
+        },
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "already_configured"

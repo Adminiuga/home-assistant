@@ -1,18 +1,20 @@
 """Config flow to configure the Meteoclimatic integration."""
+
 import logging
+from typing import Any, override
 
 from meteoclimatic import MeteoclimaticClient
 from meteoclimatic.exceptions import MeteoclimaticError, StationNotFound
-import voluptuous as vol
+import probatio
 
-from homeassistant import config_entries
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 
 from .const import CONF_STATION_CODE, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
 
-class MeteoclimaticFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
+class MeteoclimaticFlowHandler(ConfigFlow, domain=DOMAIN):
     """Handle a Meteoclimatic config flow."""
 
     VERSION = 1
@@ -24,9 +26,9 @@ class MeteoclimaticFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="user",
-            data_schema=vol.Schema(
+            data_schema=probatio.Schema(
                 {
-                    vol.Required(
+                    probatio.Required(
                         CONF_STATION_CODE, default=user_input.get(CONF_STATION_CODE, "")
                     ): str
                 }
@@ -34,9 +36,12 @@ class MeteoclimaticFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             errors=errors or {},
         )
 
-    async def async_step_user(self, user_input=None):
+    @override
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle a flow initiated by the user."""
-        errors = {}
+        errors: dict[str, str] = {}
 
         if user_input is None:
             return self._show_setup_form(user_input, errors)

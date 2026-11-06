@@ -1,39 +1,42 @@
 """Trigger entity."""
-from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 import logging
-from typing import Any
+from typing import Any, override
 
-from homeassistant.const import (
-    ATTR_ENTITY_PICTURE,
-    ATTR_FRIENDLY_NAME,
-    ATTR_ICON,
-    CONF_DEVICE_CLASS,
-    CONF_ICON,
-    CONF_NAME,
-    CONF_UNIQUE_ID,
-)
-from homeassistant.core import HomeAssistant, State, callback
+import probatio
+
+from homeassistant.const import CONF_CONDITIONS, CONF_VARIABLES
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import TemplateError
-from homeassistant.helpers import template
+from homeassistant.helpers import condition
+from homeassistant.helpers.script_variables import ScriptVariables
+from homeassistant.helpers.template import (
+    _SENTINEL,
+    render_complex as template_render_complex,
+)
+from homeassistant.helpers.trigger_template_entity import (
+    TriggerBaseEntity,
+    log_triggered_template_error,
+)
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from . import TriggerUpdateCoordinator
-from .const import CONF_ATTRIBUTES, CONF_AVAILABILITY, CONF_PICTURE
+from .const import CONF_ATTRIBUTES
+from .coordinator import TriggerUpdateCoordinator
+from .entity import AbstractTemplateEntity
+from .validators import check_conditions, log_validation_error, validate_attributes
 
-CONF_TO_ATTRIBUTE = {
-    CONF_ICON: ATTR_ICON,
-    CONF_NAME: ATTR_FRIENDLY_NAME,
-    CONF_PICTURE: ATTR_ENTITY_PICTURE,
-}
+_LOGGER = logging.getLogger(__name__)
 
 
-class TriggerEntity(CoordinatorEntity[TriggerUpdateCoordinator]):
+class TriggerEntity(  # pylint: disable=home-assistant-enforce-class-module
+    TriggerBaseEntity,
+    CoordinatorEntity[TriggerUpdateCoordinator],
+    AbstractTemplateEntity,
+):
     """Template entity based on trigger data."""
 
-    domain: str
-    extra_template_keys: tuple | None = None
-    extra_template_keys_complex: tuple | None = None
+    skip_rendered_result: tuple[str, ...] | None = None
 
     def __init__(
         self,
@@ -42,150 +45,351 @@ class TriggerEntity(CoordinatorEntity[TriggerUpdateCoordinator]):
         config: dict,
     ) -> None:
         """Initialize the entity."""
-        super().__init__(coordinator)
+        CoordinatorEntity.__init__(self, coordinator)
+        TriggerBaseEntity.__init__(self, hass, config)
+        AbstractTemplateEntity.__init__(self, hass, config)
 
-        entity_unique_id = config.get(CONF_UNIQUE_ID)
+        self._entity_variables: ScriptVariables | None = config.get(CONF_VARIABLES)
+        self._rendered_entity_variables: Mapping[str, Any] | None = None
+        self._state_render_error = False
+        self._cond_func: condition.ConditionsChecker | None = None
 
-        self._unique_id: str | None
-        if entity_unique_id and coordinator.unique_id:
-            self._unique_id = f"{coordinator.unique_id}-{entity_unique_id}"
-        else:
-            self._unique_id = entity_unique_id
+        self._skip_rendered_result: list[str] = []
+        if self.skip_rendered_result is not None:
+            self._skip_rendered_result.extend(self.skip_rendered_result)
 
-        self._config = config
-
-        self._static_rendered = {}
-        self._to_render_simple = []
-        self._to_render_complex: list[str] = []
-
-        for itm in (
-            CONF_AVAILABILITY,
-            CONF_ICON,
-            CONF_NAME,
-            CONF_PICTURE,
-        ):
-            if itm not in config:
-                continue
-
-            if config[itm].is_static:
-                self._static_rendered[itm] = config[itm].template
-            else:
-                self._to_render_simple.append(itm)
-
-        if self.extra_template_keys is not None:
-            self._to_render_simple.extend(self.extra_template_keys)
-
-        if self.extra_template_keys_complex is not None:
-            self._to_render_complex.extend(self.extra_template_keys_complex)
-
-        # We make a copy so our initial render is 'unknown' and not 'unavailable'
-        self._rendered = dict(self._static_rendered)
-        self._parse_result = {CONF_AVAILABILITY}
-
-    @property
-    def name(self):
-        """Name of the entity."""
-        return self._rendered.get(CONF_NAME)
-
-    @property
-    def unique_id(self):
-        """Return unique ID of the entity."""
-        return self._unique_id
-
-    @property
-    def device_class(self):
-        """Return device class of the entity."""
-        return self._config.get(CONF_DEVICE_CLASS)
-
-    @property
-    def icon(self) -> str | None:
-        """Return icon."""
-        return self._rendered.get(CONF_ICON)
-
-    @property
-    def entity_picture(self) -> str | None:
-        """Return entity picture."""
-        return self._rendered.get(CONF_PICTURE)
-
-    @property
-    def available(self):
-        """Return availability of the entity."""
-        return (
-            self._rendered is not self._static_rendered
-            and
-            # Check against False so `None` is ok
-            self._rendered.get(CONF_AVAILABILITY) is not False
-        )
-
-    @property
-    def extra_state_attributes(self) -> dict[str, Any] | None:
-        """Return extra attributes."""
-        return self._rendered.get(CONF_ATTRIBUTES)
-
+    @override
     async def async_added_to_hass(self) -> None:
         """Handle being added to Home Assistant."""
-        template.attach(self.hass, self._config)
+
+        # Setup condition before calling async_added_to_hass to ensure
+        # the condition is available before a trigger can occur
+        if condition_config := self._config.get(CONF_CONDITIONS):
+            self._cond_func = await condition.async_conditions_from_config(
+                self.hass,
+                condition_config,
+                _LOGGER,
+                f"template {self.domain} entity",
+            )
+
         await super().async_added_to_hass()
+
         if self.coordinator.data is not None:
+            # The trigger already produced data; rendering it must win over
+            # restored state, so skip restore entirely to avoid clobbering the
+            # freshly rendered attributes.
             self._process_data()
+        else:
+            await self.async_restore_last_state()
 
-    def restore_attributes(self, last_state: State) -> None:
-        """Restore attributes."""
-        for conf_key, attr in CONF_TO_ATTRIBUTE.items():
-            if conf_key not in self._config or attr not in last_state.attributes:
+    @override
+    async def async_will_remove_from_hass(self) -> None:
+        """Clean up conditions when removing from Home Assistant."""
+        await super().async_will_remove_from_hass()
+        if self._cond_func:
+            self._cond_func.async_unload()
+
+    @override
+    def _set_unique_id(self, unique_id: str | None) -> None:
+        """Set unique id."""
+        if unique_id and self.coordinator.unique_id:
+            self._unique_id = f"{self.coordinator.unique_id}-{unique_id}"
+        else:
+            self._unique_id = unique_id
+
+    @override
+    def setup_state_template(
+        self,
+        attribute: str,
+        validator: Callable[[Any], Any] | None = None,
+        on_update: Callable[[Any], None] | None = None,
+    ) -> None:
+        """Set up a template that manages the main state of the entity.
+
+        Requires _state_option to be set on the inheriting
+        class. _state_option represents the configuration
+        option that derives the state. E.g. Template weather
+        entities main state option is 'condition', where
+        switch is 'state'.
+        """
+        if self._state_option is None:
+            raise NotImplementedError(
+                f"{self.__class__.__name__} does not implement"
+                " '_state_option' for 'setup_state_template'."
+            )
+
+        if self.add_template(
+            self._state_option,
+            attribute,
+            validator,
+            on_update,
+            none_on_template_error=False,
+        ):
+            self._to_render_simple.append(self._state_option)
+            self._parse_result.add(self._state_option)
+
+    @override
+    def setup_template(
+        self,
+        option: str,
+        attribute: str,
+        validator: Callable[[Any], Any] | None = None,
+        on_update: Callable[[Any], None] | None = None,
+        render_complex: bool = False,
+        none_on_template_error: bool = True,
+    ) -> None:
+        """Set up a template that manages any property or attribute of the entity.
+
+        Parameters
+        ----------
+        option
+            The configuration key provided by ConfigFlow or the yaml option
+        attribute
+            The name of the attribute to link to. This attribute must exist
+            unless a custom on_update method is supplied.
+        validator:
+            Optional function that validates the rendered result.
+        on_update:
+            Called to store the template result rather than storing it
+            the supplied attribute. Passed the result of the validator.
+        render_complex (default=False):
+            This signals trigger based template entities to render the template
+            as a complex result. State based template entities always render
+            complex results.
+        none_on_template_error (default=True)
+            If set to false, template errors will be supplied in the result to
+            on_update.
+        """
+        if self.add_template(
+            option, attribute, validator, on_update, none_on_template_error
+        ):
+            if render_complex:
+                self._to_render_complex.append(option)
+            else:
+                self._to_render_simple.append(option)
+            self._parse_result.add(option)
+
+    @property
+    @override
+    def referenced_blueprint(self) -> str | None:
+        """Return referenced blueprint or None."""
+        return self.coordinator.referenced_blueprint
+
+    @property
+    @override
+    def available(self) -> bool:
+        """Return availability of the entity."""
+        if self._state_render_error:
+            return False
+
+        return super().available
+
+    @property
+    @override
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Return the state attributes."""
+        # Override TriggerBaseEntity's extra_state_attributes property to restore Entity's extra state attributes behavior.
+        return self._attr_extra_state_attributes
+
+    @override
+    def restore_attribute(self, conf_attr: str, attr: str, restored_value: Any) -> None:
+        """Restore an attribute from the last value."""
+        self._rendered[conf_attr] = restored_value
+
+    @callback
+    @override
+    def _render_script_variables(self) -> dict:
+        """Render configured variables."""
+        return {
+            **self.coordinator.trigger_variables,
+            **(self._rendered_entity_variables or {}),
+        }
+
+    @override
+    def _render_single_template(
+        self,
+        key: str,
+        variables: dict[str, Any],
+        strict: bool = False,
+    ) -> Any:
+        """Render a single template."""
+        try:
+            if key in self._to_render_complex:
+                return template_render_complex(self._config[key], variables)
+
+            return self._config[key].async_render(
+                variables, parse_result=key in self._parse_result, strict=strict
+            )
+        except TemplateError as err:
+            log_triggered_template_error(self.entity_id, err, key=key)
+            # Filter out state templates because they have unique behavior
+            # with none_on_template_error.
+            if (
+                key != self._state_option
+                and key in self._templates
+                and not self._templates[key].none_on_template_error
+            ):
+                return err
+
+        return _SENTINEL
+
+    @override
+    def _render_templates(self, variables: dict[str, Any]) -> None:
+        """Render templates."""
+        self._state_render_error = False
+        rendered = dict(self._static_rendered)
+
+        # If state fails to render, the entity should go unavailable. Render the
+        # state as a simple template because the result
+        # should always be a string or None.
+        if (
+            state_option := self._state_option
+        ) is not None and state_option in self._to_render_simple:
+            if (
+                result := self._render_single_template(state_option, variables)
+            ) is _SENTINEL:
+                self._rendered = self._static_rendered
+                self._state_render_error = True
+                return
+
+            rendered[state_option] = result
+
+        self._render_single_templates(
+            rendered, variables, [state_option] if state_option else []
+        )
+
+        # Handle attributes as a dictionary.
+        if self._attribute_templates:
+            attributes = {}
+            for attribute, template in self._attribute_templates.items():
+                try:
+                    value = template_render_complex(template, variables)
+                    attributes[attribute] = value
+                    variables.update({attribute: value})
+                except TemplateError as err:
+                    log_triggered_template_error(
+                        self.entity_id, err, attribute=attribute
+                    )
+            self._attr_extra_state_attributes = attributes
+
+        # Handle attributes as a template.
+        elif attributes_template := self._attributes_template:
+            validated = {}
+            try:
+                result = template_render_complex(attributes_template, variables)
+                validated = probatio.All(
+                    dict,
+                    validate_attributes(
+                        self.entity_id,
+                        self._blocked_attributes,
+                    ),
+                )(result)
+
+            except TemplateError as err:
+                log_triggered_template_error(
+                    self.entity_id, err, attribute=CONF_ATTRIBUTES
+                )
+            except probatio.Invalid as err:
+                log_validation_error(
+                    result, attributes_template, CONF_ATTRIBUTES, self.entity_id, err
+                )
+            self._attr_extra_state_attributes = validated
+
+        self._rendered = rendered
+
+    def _handle_rendered_results(self) -> bool:
+        """Get a rendered result and return the value."""
+        # Handle any templates.
+        write_state = False
+        if self._state_render_error:
+            # The state errored and the entity is unavailable,
+            # do not process any values.
+            return True
+
+        for option, entity_template in self._templates.items():
+            if option in self._skip_rendered_result:
                 continue
-            self._rendered[conf_key] = last_state.attributes[attr]
 
-        if CONF_ATTRIBUTES in self._config:
-            extra_state_attributes = {}
-            for attr in self._config[CONF_ATTRIBUTES]:
-                if attr not in last_state.attributes:
-                    continue
-                extra_state_attributes[attr] = last_state.attributes[attr]
-            self._rendered[CONF_ATTRIBUTES] = extra_state_attributes
+            # Capture templates that did not render a result due to an exception and
+            # ensure the state object updates. _SENTINEL is used to differentiate
+            # templates that render None.
+            if (rendered := self._rendered.get(option, _SENTINEL)) is _SENTINEL:
+                write_state = True
+                continue
+
+            try:
+                value = (
+                    entity_template.validator(rendered)
+                    if entity_template.validator
+                    else rendered
+                )
+            except probatio.Invalid as err:
+                log_validation_error(
+                    rendered,
+                    entity_template.template,
+                    entity_template.attribute,
+                    self.entity_id,
+                    err,
+                )
+                value = None
+
+            if entity_template.on_update:
+                entity_template.on_update(value)
+            else:
+                setattr(self, entity_template.attribute, value)
+            write_state = True
+
+        return write_state
 
     @callback
     def _process_data(self) -> None:
         """Process new data."""
 
-        this = None
-        if state := self.hass.states.get(self.entity_id):
-            this = state.as_dict()
-        run_variables = self.coordinator.data["run_variables"]
-        variables = {"this": this, **(run_variables or {})}
-
-        try:
-            rendered = dict(self._static_rendered)
-
-            for key in self._to_render_simple:
-                rendered[key] = self._config[key].async_render(
-                    variables,
-                    parse_result=key in self._parse_result,
-                )
-
-            for key in self._to_render_complex:
-                rendered[key] = template.render_complex(
-                    self._config[key],
-                    variables,
-                )
-
-            if CONF_ATTRIBUTES in self._config:
-                rendered[CONF_ATTRIBUTES] = template.render_complex(
-                    self._config[CONF_ATTRIBUTES],
-                    variables,
-                )
-
-            self._rendered = rendered
-        except TemplateError as err:
-            logging.getLogger(f"{__package__}.{self.entity_id.split('.')[0]}").error(
-                "Error rendering %s template for %s: %s", key, self.entity_id, err
+        coordinator_variables = self.coordinator.data["run_variables"]
+        if self._entity_variables:
+            entity_variables = self._entity_variables.async_simple_render(
+                coordinator_variables
             )
-            self._rendered = self._static_rendered
+            self._rendered_entity_variables = {
+                **coordinator_variables,
+                **entity_variables,
+            }
+        else:
+            self._rendered_entity_variables = coordinator_variables
+        variables = self._template_variables(self._rendered_entity_variables)
 
-        self.async_set_context(self.coordinator.data["context"])
+        if not check_conditions(self._cond_func, variables):
+            return
+
+        if (context := self.coordinator.data["context"]) is None:
+            # A trigger without a context must not inherit the previous one
+            self._context = None
+            self._context_set = None
+        else:
+            self.async_set_context(context)
+        if self._render_availability_template(variables):
+            self._render_templates(variables)
+
+            write_state = self._handle_rendered_results()
+
+            if len(self._rendered) > 0:
+                # In some cases, the entity may be state optimistic or
+                # attribute optimistic, in these scenarios the state needs
+                # to update.
+                write_state = True
+
+            if write_state:
+                self.async_write_ha_state()
+        else:
+            self.async_write_ha_state()
 
     @callback
+    @override
     def _handle_coordinator_update(self) -> None:
-        """Handle updated data from the coordinator."""
+        """Handle updated data from the coordinator.
+
+        While transitioning platforms to the new framework, this
+        function is necessary for backward compatibility with existing
+        trigger based platforms.
+        """
         self._process_data()
-        self.async_write_ha_state()

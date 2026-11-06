@@ -1,0 +1,115 @@
+"""Support for RFXtrx sensors."""
+
+import logging
+from typing import override
+
+from RFXtrx import ControlEvent, RFXtrxDevice, RFXtrxEvent, SensorEvent
+
+from homeassistant.components.event import EventEntity
+from homeassistant.config_entries import ConfigSubentry
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.entity import Entity
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.util import slugify
+
+from . import (
+    DeviceTuple,
+    RfxtrxConfigEntry,
+    async_setup_platform_entry,
+    get_device_tuple_from_device,
+)
+from .const import DEVICE_PACKET_TYPE_LIGHTING4
+from .entity import RfxtrxEntity
+
+_LOGGER = logging.getLogger(__name__)
+
+
+async def async_setup_entry(
+    hass: HomeAssistant,
+    config_entry: RfxtrxConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up config entry."""
+
+    def _supported(event: RFXtrxEvent) -> bool:
+        return (
+            isinstance(event, (ControlEvent, SensorEvent))
+            and event.device.packettype != DEVICE_PACKET_TYPE_LIGHTING4
+        )
+
+    def _constructor(
+        event: RFXtrxEvent,
+        auto: RFXtrxEvent | None,
+        subentry: ConfigSubentry,
+    ) -> list[Entity]:
+        device_id = get_device_tuple_from_device(event.device)
+        entities: list[Entity] = []
+
+        if hasattr(event.device, "COMMANDS"):
+            entities.append(
+                RfxtrxEventEntity(
+                    event.device,
+                    device_id,
+                    subentry.subentry_id,
+                    "COMMANDS",
+                    "Command",
+                    "command",
+                )
+            )
+
+        if hasattr(event.device, "STATUS"):
+            entities.append(
+                RfxtrxEventEntity(
+                    event.device,
+                    device_id,
+                    subentry.subentry_id,
+                    "STATUS",
+                    "Sensor Status",
+                    "status",
+                )
+            )
+
+        return entities
+
+    await async_setup_platform_entry(
+        hass, config_entry, async_add_entities, _supported, _constructor
+    )
+
+
+class RfxtrxEventEntity(RfxtrxEntity, EventEntity):
+    """Representation of a RFXtrx event."""
+
+    def __init__(
+        self,
+        device: RFXtrxDevice,
+        device_id: DeviceTuple,
+        subentry_id: str,
+        device_attribute: str,
+        value_attribute: str,
+        translation_key: str,
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__(device, device_id, subentry_id)
+        commands: dict[int, str] = getattr(device, device_attribute)
+        self._attr_name = None
+        self._attr_unique_id = f"{subentry_id}_{translation_key}"
+        self._attr_event_types = [slugify(command) for command in commands.values()]
+        self._attr_translation_key = translation_key
+        self._value_attribute = value_attribute
+
+    @callback
+    @override
+    def _handle_event(self, event: RFXtrxEvent, device_id: DeviceTuple) -> None:
+        """Check if event applies to me and update."""
+        if not self._event_applies(event, device_id):
+            return
+
+        assert isinstance(event, (ControlEvent, SensorEvent))
+
+        event_type = slugify(event.values[self._value_attribute])
+        if event_type not in self._attr_event_types:
+            _LOGGER.warning("Event type %s is not known", event_type)
+            return
+
+        self._trigger_event(event_type, event.values)
+        self.async_write_ha_state()

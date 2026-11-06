@@ -1,55 +1,49 @@
 """Support for Fibaro locks."""
-from __future__ import annotations
 
-from typing import Any
+from typing import Any, override
 
-from fiblary3.client.v4.models import DeviceModel, SceneModel
-
-from homeassistant.components.lock import ENTITY_ID_FORMAT, LockEntity
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.components.lock import LockEntity
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from . import FIBARO_DEVICES, FibaroDevice
-from .const import DOMAIN
+from . import FibaroConfigEntry
+from .entity import FibaroEntity
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    entry: FibaroConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up the Fibaro locks."""
+    controller = entry.runtime_data
     async_add_entities(
         [
-            FibaroLock(device)
-            for device in hass.data[DOMAIN][entry.entry_id][FIBARO_DEVICES][
-                Platform.LOCK
-            ]
+            FibaroLock(device, controller)
+            for device in controller.fibaro_devices[Platform.LOCK]
         ],
         True,
     )
 
 
-class FibaroLock(FibaroDevice, LockEntity):
+class FibaroLock(FibaroEntity, LockEntity):
     """Representation of a Fibaro Lock."""
 
-    def __init__(self, fibaro_device: DeviceModel | SceneModel) -> None:
-        """Initialize the Fibaro device."""
-        super().__init__(fibaro_device)
-        self.entity_id = ENTITY_ID_FORMAT.format(self.ha_id)
-
+    @override
     def lock(self, **kwargs: Any) -> None:
         """Lock the device."""
         self.action("secure")
         self._attr_is_locked = True
 
+    @override
     def unlock(self, **kwargs: Any) -> None:
         """Unlock the device."""
-        self.action("unsecure")
+        self.action("unsecure")  # codespell:ignore unsecure
         self._attr_is_locked = False
 
+    @override
     def update(self) -> None:
         """Update device state."""
+        super().update()
         self._attr_is_locked = self.current_binary_state

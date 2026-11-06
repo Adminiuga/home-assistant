@@ -1,0 +1,29 @@
+{
+  "entity": {
+    "sensor": {
+      "communication_quality": {
+        "default": "mdi:wifi"
+      },
+      "purity": {
+        "default": "mdi:molecule-co2"
+      },
+      "valvetappet": {
+        "default": "mdi:gauge"
+      }
+    },
+    "switch": {
+      "bypass": {
+        "default": "mdi:shield-off-outline"
+      },
+      "bypass_infinite": {
+        "default": "mdi:timer-off-outline"
+      },
+      "child_lock": {
+        "default": "mdi:lock"
+      },
+      "routing": {
+        "default": "mdi:wifi"
+      }
+    }
+  }
+}

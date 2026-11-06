@@ -1,14 +1,15 @@
 """Support for recording details."""
-from __future__ import annotations
 
 import logging
 from typing import Any
 
-import voluptuous as vol
+import probatio
+from sqlalchemy import URL, make_url
+from sqlalchemy.exc import ArgumentError
 
 from homeassistant.const import CONF_EXCLUDE, EVENT_STATE_CHANGED
-from homeassistant.core import HomeAssistant
-import homeassistant.helpers.config_validation as cv
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.entityfilter import (
     INCLUDE_EXCLUDE_BASE_FILTER_SCHEMA,
     INCLUDE_EXCLUDE_FILTER_SCHEMA_INNER,
@@ -17,31 +18,39 @@ from homeassistant.helpers.entityfilter import (
 from homeassistant.helpers.integration_platform import (
     async_process_integration_platforms,
 )
+from homeassistant.helpers.recorder import DATA_INSTANCE, get_instance
 from homeassistant.helpers.typing import ConfigType
-from homeassistant.loader import bind_hass
+from homeassistant.util.event_type import EventType
 
-from . import statistics, websocket_api
+# Pre-import backup to avoid it being imported
+# later when the import executor is busy and delaying
+# startup
+from . import (
+    backup,  # noqa: F401
+    entity_options,
+    entity_registry,
+    websocket_api,
+)
 from .const import (
     CONF_DB_INTEGRITY_CHECK,
-    DATA_INSTANCE,
     DOMAIN,
-    EXCLUDE_ATTRIBUTES,
-    SQLITE_URL_PREFIX,
+    INTEGRATION_PLATFORM_METHODS,
+    SupportedDialect,
 )
 from .core import Recorder
-from .services import async_register_services
+from .entity_options import is_entity_recorded
+from .services import async_setup_services
 from .tasks import AddRecorderPlatformTask
-from .util import get_instance
+from .util import get_engine_db_url, is_file_sqlite_url
 
 _LOGGER = logging.getLogger(__name__)
 
 
-DEFAULT_URL = "sqlite:///{hass_config_path}"
 DEFAULT_DB_FILE = "home-assistant_v2.db"
 DEFAULT_DB_INTEGRITY_CHECK = True
 DEFAULT_DB_MAX_RETRIES = 10
 DEFAULT_DB_RETRY_WAIT = 3
-DEFAULT_COMMIT_INTERVAL = 1
+DEFAULT_COMMIT_INTERVAL = 5
 
 CONF_AUTO_PURGE = "auto_purge"
 CONF_AUTO_REPACK = "auto_repack"
@@ -55,97 +64,115 @@ CONF_COMMIT_INTERVAL = "commit_interval"
 
 
 EXCLUDE_SCHEMA = INCLUDE_EXCLUDE_FILTER_SCHEMA_INNER.extend(
-    {vol.Optional(CONF_EVENT_TYPES): vol.All(cv.ensure_list, [cv.string])}
+    {
+        probatio.Optional(CONF_EVENT_TYPES): probatio.All(
+            probatio.EnsureList(), [cv.string]
+        )
+    }
 )
 
 FILTER_SCHEMA = INCLUDE_EXCLUDE_BASE_FILTER_SCHEMA.extend(
-    {vol.Optional(CONF_EXCLUDE, default=EXCLUDE_SCHEMA({})): EXCLUDE_SCHEMA}
+    {probatio.Optional(CONF_EXCLUDE, default=EXCLUDE_SCHEMA({})): EXCLUDE_SCHEMA}
 )
 
 
 ALLOW_IN_MEMORY_DB = False
 
+__all__ = [
+    "CONF_DB_URL",
+    "DEFAULT_DB_FILE",
+    "DOMAIN",
+    "Recorder",
+    "SupportedDialect",
+    "get_engine_db_url",
+    "get_instance",
+    "is_entity_recorded",
+]
+
 
 def validate_db_url(db_url: str) -> Any:
     """Validate database URL."""
+    # An empty URL falls back to the default database in async_setup
+    if not db_url:
+        return db_url
+    try:
+        url = make_url(db_url)
+    except (ArgumentError, ValueError) as err:
+        raise probatio.Invalid("Invalid database URL") from err
+    # SQLAlchemy only rejects these when creating the engine, after the
+    # recorder may already have moved away the file named in the URL
+    if (
+        url.get_backend_name() == "sqlite"
+        and url.get_driver_name() == "pysqlite"
+        and (url.username or url.password or url.host or url.port)
+    ):
+        raise probatio.Invalid("Invalid database URL")
     # Don't allow on-memory sqlite databases
     if (
-        db_url == SQLITE_URL_PREFIX
-        or (db_url.startswith(SQLITE_URL_PREFIX) and ":memory:" in db_url)
-    ) and not ALLOW_IN_MEMORY_DB:
-        raise vol.Invalid("In-memory SQLite database is not supported")
+        url.get_backend_name() == "sqlite"
+        and not is_file_sqlite_url(url)
+        and not ALLOW_IN_MEMORY_DB
+    ):
+        raise probatio.Invalid("In-memory SQLite database is not supported")
 
     return db_url
 
 
-CONFIG_SCHEMA = vol.Schema(
+CONFIG_SCHEMA = probatio.Schema(
     {
-        vol.Optional(DOMAIN, default=dict): vol.All(
+        probatio.Optional(DOMAIN, default=dict): probatio.All(
             cv.deprecated(CONF_PURGE_INTERVAL),
             cv.deprecated(CONF_DB_INTEGRITY_CHECK),
             FILTER_SCHEMA.extend(
                 {
-                    vol.Optional(CONF_AUTO_PURGE, default=True): cv.boolean,
-                    vol.Optional(CONF_AUTO_REPACK, default=True): cv.boolean,
-                    vol.Optional(CONF_PURGE_KEEP_DAYS, default=10): vol.All(
-                        vol.Coerce(int), vol.Range(min=1)
+                    probatio.Optional(CONF_AUTO_PURGE, default=True): cv.boolean,
+                    probatio.Optional(CONF_AUTO_REPACK, default=True): cv.boolean,
+                    probatio.Optional(CONF_PURGE_KEEP_DAYS, default=10): probatio.All(
+                        probatio.Coerce(int), probatio.Range(min=1)
                     ),
-                    vol.Optional(CONF_PURGE_INTERVAL, default=1): cv.positive_int,
-                    vol.Optional(CONF_DB_URL): vol.All(cv.string, validate_db_url),
-                    vol.Optional(
+                    probatio.Optional(CONF_PURGE_INTERVAL, default=1): cv.positive_int,
+                    probatio.Optional(CONF_DB_URL): probatio.All(
+                        cv.string, validate_db_url
+                    ),
+                    probatio.Optional(
                         CONF_COMMIT_INTERVAL, default=DEFAULT_COMMIT_INTERVAL
                     ): cv.positive_int,
-                    vol.Optional(
+                    probatio.Optional(
                         CONF_DB_MAX_RETRIES, default=DEFAULT_DB_MAX_RETRIES
                     ): cv.positive_int,
-                    vol.Optional(
+                    probatio.Optional(
                         CONF_DB_RETRY_WAIT, default=DEFAULT_DB_RETRY_WAIT
                     ): cv.positive_int,
-                    vol.Optional(
+                    probatio.Optional(
                         CONF_DB_INTEGRITY_CHECK, default=DEFAULT_DB_INTEGRITY_CHECK
                     ): cv.boolean,
                 }
             ),
         )
     },
-    extra=vol.ALLOW_EXTRA,
+    extra=probatio.ALLOW_EXTRA,
 )
-
-
-@bind_hass
-def is_entity_recorded(hass: HomeAssistant, entity_id: str) -> bool:
-    """Check if an entity is being recorded.
-
-    Async friendly.
-    """
-    if DATA_INSTANCE not in hass.data:
-        return False
-    instance = get_instance(hass)
-    return instance.entity_filter(entity_id)
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the recorder."""
-    exclude_attributes_by_domain: dict[str, set[str]] = {}
-    hass.data[EXCLUDE_ATTRIBUTES] = exclude_attributes_by_domain
     conf = config[DOMAIN]
-    entity_filter = convert_include_exclude_filter(conf)
+    _filter = convert_include_exclude_filter(conf)
+    entity_filter = None if _filter.empty_filter else _filter.get_filter()
     auto_purge = conf[CONF_AUTO_PURGE]
     auto_repack = conf[CONF_AUTO_REPACK]
     keep_days = conf[CONF_PURGE_KEEP_DAYS]
     commit_interval = conf[CONF_COMMIT_INTERVAL]
     db_max_retries = conf[CONF_DB_MAX_RETRIES]
     db_retry_wait = conf[CONF_DB_RETRY_WAIT]
-    db_url = conf.get(CONF_DB_URL) or DEFAULT_URL.format(
-        hass_config_path=hass.config.path(DEFAULT_DB_FILE)
-    )
+    db_url = conf.get(CONF_DB_URL) or get_default_url(hass)
     exclude = conf[CONF_EXCLUDE]
-    exclude_t = exclude.get(CONF_EVENT_TYPES, [])
-    if EVENT_STATE_CHANGED in exclude_t:
-        _LOGGER.warning(
-            "State change events are excluded, recorder will not record state changes."
-            "This will become an error in Home Assistant Core 2022.2"
-        )
+    exclude_event_types: set[EventType[Any] | str] = set(
+        exclude.get(CONF_EVENT_TYPES, [])
+    )
+    if EVENT_STATE_CHANGED in exclude_event_types:
+        _LOGGER.error("State change events cannot be excluded, use a filter instead")
+        exclude_event_types.remove(EVENT_STATE_CHANGED)
     instance = hass.data[DATA_INSTANCE] = Recorder(
         hass=hass,
         auto_purge=auto_purge,
@@ -156,23 +183,42 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         db_max_retries=db_max_retries,
         db_retry_wait=db_retry_wait,
         entity_filter=entity_filter,
-        exclude_t=exclude_t,
-        exclude_attributes_by_domain=exclude_attributes_by_domain,
+        exclude_event_types=exclude_event_types,
     )
+    get_instance.cache_clear()
+    entity_registry.async_setup(hass)
+    entity_options.async_setup(hass)
     instance.async_initialize()
     instance.async_register()
     instance.start()
-    async_register_services(hass, instance)
-    statistics.async_setup(hass)
+    async_setup_services(hass)
     websocket_api.async_setup(hass)
-    await async_process_integration_platforms(hass, DOMAIN, _process_recorder_platform)
+
+    await _async_setup_integration_platform(hass, instance)
 
     return await instance.async_db_ready
 
 
-async def _process_recorder_platform(
-    hass: HomeAssistant, domain: str, platform: Any
+async def _async_setup_integration_platform(
+    hass: HomeAssistant, instance: Recorder
 ) -> None:
-    """Process a recorder platform."""
-    instance = get_instance(hass)
-    instance.queue_task(AddRecorderPlatformTask(domain, platform))
+    """Set up a recorder integration platform."""
+
+    @callback
+    def _process_recorder_platform(
+        hass: HomeAssistant, domain: str, platform: Any
+    ) -> None:
+        """Process a recorder platform."""
+        # If the platform has a compile_statistics method, we need to
+        # add it to the recorder queue to be processed.
+        if any(hasattr(platform, _attr) for _attr in INTEGRATION_PLATFORM_METHODS):
+            instance.queue_task(AddRecorderPlatformTask(domain, platform))
+
+    await async_process_integration_platforms(hass, DOMAIN, _process_recorder_platform)
+
+
+def get_default_url(hass: HomeAssistant) -> str:
+    """Return the default URL."""
+    return URL.create(
+        "sqlite", database=hass.config.path(DEFAULT_DB_FILE)
+    ).render_as_string()

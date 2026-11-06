@@ -1,8 +1,11 @@
 {
   "domain": "ziggo_mediabox_xl",
   "name": "Ziggo Mediabox XL",
-  "documentation": "https://www.home-assistant.io/integrations/ziggo_mediabox_xl",
-  "requirements": ["ziggo-mediabox-xl==1.1.0"],
+  "categories": ["media_entertainment.tv_streaming"],
   "codeowners": [],
-  "iot_class": "local_polling"
+  "connectivity": ["network"],
+  "documentation": "https://www.home-assistant.io/integrations/ziggo_mediabox_xl",
+  "iot_class": "local_polling",
+  "quality_scale": "legacy",
+  "requirements": ["ziggo-mediabox-xl==1.1.0"]
 }

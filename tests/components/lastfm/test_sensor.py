@@ -1,92 +1,96 @@
 """Tests for the lastfm sensor."""
+
+from datetime import timedelta
 from unittest.mock import patch
 
-from pylast import Track
+from freezegun.api import FrozenDateTimeFactory
+from pylast import LastFMNetwork, WSError
 import pytest
+from pytest_homeassistant.common import MockConfigEntry, async_fire_time_changed
+from syrupy.assertion import SnapshotAssertion
 
-from homeassistant.components import sensor
-from homeassistant.components.lastfm.sensor import STATE_NOT_SCROBBLING
-from homeassistant.setup import async_setup_component
+from homeassistant.components.lastfm.const import ATTR_LAST_PLAYED, STATE_NOT_SCROBBLING
+from homeassistant.core import HomeAssistant
 
-
-class MockNetwork:
-    """Mock _Network object for pylast."""
-
-    def __init__(self, username: str):
-        """Initialize the mock."""
-        self.username = username
+from . import API_KEY, MockUser
+from .conftest import ComponentSetup
 
 
-class MockUser:
-    """Mock User object for pylast."""
+@pytest.mark.parametrize(
+    ("fixture"),
+    [
+        ("not_found_user"),
+        ("first_time_user"),
+        ("default_user"),
+        ("hidden_user"),
+        ("recent_tracks_error_user"),
+    ],
+)
+async def test_sensors(
+    hass: HomeAssistant,
+    setup_integration: ComponentSetup,
+    config_entry: MockConfigEntry,
+    snapshot: SnapshotAssertion,
+    fixture: str,
+    request: pytest.FixtureRequest,
+) -> None:
+    """Test sensors."""
+    user = request.getfixturevalue(fixture)
+    await setup_integration(config_entry, user)
 
-    def __init__(self, now_playing_result):
-        """Initialize the mock."""
-        self._now_playing_result = now_playing_result
-
-    def get_playcount(self):
-        """Get mock play count."""
-        return 1
-
-    def get_image(self):
-        """Get mock image."""
-        pass
-
-    def get_recent_tracks(self, limit):
-        """Get mock recent tracks."""
-        return []
-
-    def get_top_tracks(self, limit):
-        """Get mock top tracks."""
-        return []
-
-    def get_now_playing(self):
-        """Get mock now playing."""
-        return self._now_playing_result
-
-
-@pytest.fixture(name="lastfm_network")
-def lastfm_network_fixture():
-    """Create fixture for LastFMNetwork."""
-    with patch("pylast.LastFMNetwork") as lastfm_network:
-        yield lastfm_network
-
-
-async def test_update_not_playing(hass, lastfm_network):
-    """Test update when no playing song."""
-
-    lastfm_network.return_value.get_user.return_value = MockUser(None)
-
-    assert await async_setup_component(
-        hass,
-        sensor.DOMAIN,
-        {"sensor": {"platform": "lastfm", "api_key": "secret-key", "users": ["test"]}},
-    )
-    await hass.async_block_till_done()
-
-    entity_id = "sensor.test"
+    entity_id = "sensor.lastfm_testaccount1"
 
     state = hass.states.get(entity_id)
 
+    assert state == snapshot
+
+
+async def test_sensor_hidden_listening_information(
+    hass: HomeAssistant,
+    setup_integration: ComponentSetup,
+    config_entry: MockConfigEntry,
+    hidden_user: MockUser,
+    caplog: pytest.LogCaptureFixture,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Test sensor stays available when the user hides recent listening info."""
+    await setup_integration(config_entry, hidden_user)
+
+    state = hass.states.get("sensor.lastfm_testaccount1")
     assert state.state == STATE_NOT_SCROBBLING
+    assert state.attributes[ATTR_LAST_PLAYED] is None
+    warnings = caplog.text.count("has hidden their recent listening information")
+    assert warnings > 0
 
+    with patch("pylast.User", return_value=hidden_user) as mock_user:
+        freezer.tick(timedelta(seconds=30))
+        async_fire_time_changed(hass)
+        await hass.async_block_till_done(wait_background_tasks=True)
 
-async def test_update_playing(hass, lastfm_network):
-    """Test update when song playing."""
-
-    lastfm_network.return_value.get_user.return_value = MockUser(
-        Track("artist", "title", MockNetwork("test"))
+    mock_user.assert_called()
+    assert config_entry.runtime_data.last_update_success
+    assert (
+        caplog.text.count("has hidden their recent listening information") == warnings
     )
 
-    assert await async_setup_component(
-        hass,
-        sensor.DOMAIN,
-        {"sensor": {"platform": "lastfm", "api_key": "secret-key", "users": ["test"]}},
-    )
-    await hass.async_block_till_done()
 
-    entity_id = "sensor.test"
+@pytest.mark.parametrize(
+    "error_kwarg",
+    [
+        pytest.param("thrown_error", id="user_info"),
+        pytest.param("recent_tracks_error", id="recent_tracks"),
+    ],
+)
+async def test_update_error_does_not_log_api_key(
+    hass: HomeAssistant,
+    setup_integration: ComponentSetup,
+    config_entry: MockConfigEntry,
+    caplog: pytest.LogCaptureFixture,
+    error_kwarg: str,
+) -> None:
+    """Test the API key in the pylast network repr is not logged."""
+    error = WSError(LastFMNetwork(api_key=API_KEY), "8", "Operation failed")
+    await setup_integration(config_entry, MockUser(**{error_kwarg: error}))
 
-    state = hass.states.get(entity_id)
-
-    assert state.state == "artist - title"
+    assert "LastFM update for testaccount1 failed: Operation failed" in caplog.text
+    assert API_KEY not in caplog.text

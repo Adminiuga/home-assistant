@@ -1,8 +1,11 @@
 {
   "domain": "ombi",
   "name": "Ombi",
-  "documentation": "https://www.home-assistant.io/integrations/ombi/",
+  "categories": ["media_entertainment.tv_streaming"],
   "codeowners": ["@larssont"],
-  "requirements": ["pyombi==0.1.10"],
-  "iot_class": "local_polling"
+  "connectivity": ["network"],
+  "documentation": "https://www.home-assistant.io/integrations/ombi",
+  "iot_class": "local_polling",
+  "quality_scale": "legacy",
+  "requirements": ["pyombi==0.1.10"]
 }

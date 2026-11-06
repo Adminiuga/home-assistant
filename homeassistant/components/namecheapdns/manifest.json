@@ -1,8 +1,13 @@
 {
   "domain": "namecheapdns",
-  "name": "Namecheap FreeDNS",
+  "name": "Namecheap DynamicDNS",
+  "categories": ["computers_network.routers_network"],
+  "codeowners": ["@tr4nt0r"],
+  "config_flow": true,
+  "connectivity": ["cloud"],
   "documentation": "https://www.home-assistant.io/integrations/namecheapdns",
-  "requirements": ["defusedxml==0.7.1"],
-  "codeowners": [],
-  "iot_class": "cloud_push"
+  "integration_type": "service",
+  "iot_class": "cloud_push",
+  "quality_scale": "platinum",
+  "requirements": []
 }

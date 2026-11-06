@@ -1,9 +1,13 @@
 {
   "domain": "pjlink",
   "name": "PJLink",
-  "documentation": "https://www.home-assistant.io/integrations/pjlink",
-  "requirements": ["pypjlink2==1.2.1"],
+  "categories": ["media_entertainment.tv_streaming"],
   "codeowners": [],
+  "config_flow": true,
+  "connectivity": ["network"],
+  "documentation": "https://www.home-assistant.io/integrations/pjlink",
+  "integration_type": "device",
   "iot_class": "local_polling",
-  "loggers": ["pypjlink"]
+  "loggers": ["pypjlink"],
+  "requirements": ["pypjlink2==1.2.1"]
 }

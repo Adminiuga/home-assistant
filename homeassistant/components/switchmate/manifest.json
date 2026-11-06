@@ -1,9 +1,12 @@
 {
   "domain": "switchmate",
   "name": "Switchmate SimplySmart Home",
-  "documentation": "https://www.home-assistant.io/integrations/switchmate",
-  "requirements": ["pySwitchmate==0.5.1"],
+  "categories": ["plugs_switches"],
   "codeowners": ["@danielhiversen", "@qiz-li"],
+  "connectivity": ["bluetooth"],
+  "documentation": "https://www.home-assistant.io/integrations/switchmate",
   "iot_class": "local_polling",
-  "loggers": ["switchmate"]
+  "loggers": ["switchmate"],
+  "quality_scale": "legacy",
+  "requirements": ["PySwitchmate==0.5.1"]
 }

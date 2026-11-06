@@ -1,1 +1,40 @@
-"""The gpsd component."""
+"""The GPSD integration."""
+
+from gps3.agps3threaded import AGPS3mechanism
+
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import CONF_HOST, CONF_PORT, Platform
+from homeassistant.core import HomeAssistant
+
+PLATFORMS: list[Platform] = [Platform.SENSOR]
+
+type GPSDConfigEntry = ConfigEntry[AGPS3mechanism]
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: GPSDConfigEntry) -> None:
+    """Set up GPSD from a config entry."""
+    agps_thread = AGPS3mechanism()
+    entry.runtime_data = agps_thread
+
+    def setup_agps() -> None:
+        host = entry.data.get(CONF_HOST)
+        port = entry.data.get(CONF_PORT)
+        agps_thread.stream_data(host, port)
+        agps_thread.run_thread()
+
+    await hass.async_add_executor_job(setup_agps)
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: GPSDConfigEntry) -> None:
+    """Unload a config entry."""
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)
+    agps_thread = entry.runtime_data
+    await hass.async_add_executor_job(
+        lambda: agps_thread.stream_data(
+            host=entry.data.get(CONF_HOST),
+            port=entry.data.get(CONF_PORT),
+            enable=False,
+        )
+    )

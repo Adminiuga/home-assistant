@@ -1,16 +1,19 @@
 {
   "domain": "nexia",
   "name": "Nexia/American Standard/Trane",
-  "requirements": ["nexia==2.0.6"],
+  "categories": ["climate.thermostats_heating"],
   "codeowners": ["@bdraco"],
-  "documentation": "https://www.home-assistant.io/integrations/nexia",
   "config_flow": true,
+  "connectivity": ["cloud"],
   "dhcp": [
     {
       "hostname": "xl857-*",
       "macaddress": "000231*"
     }
   ],
+  "documentation": "https://www.home-assistant.io/integrations/nexia",
+  "integration_type": "hub",
   "iot_class": "cloud_polling",
-  "loggers": ["nexia"]
+  "loggers": ["nexia"],
+  "requirements": ["nexia==2.13.0"]
 }

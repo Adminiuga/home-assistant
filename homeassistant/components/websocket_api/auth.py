@@ -1,17 +1,19 @@
 """Handle the auth of a connection."""
-from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from typing import TYPE_CHECKING, Any, Final
 
 from aiohttp.web import Request
-import voluptuous as vol
-from voluptuous.humanize import humanize_error
+import probatio
+from probatio.humanize import humanize_error
 
-from homeassistant.auth.models import RefreshToken, User
+from homeassistant.components.http.auth_util import async_user_not_allowed_do_auth
 from homeassistant.components.http.ban import process_success_login, process_wrong_login
+from homeassistant.components.http.const import KEY_HASS_USER
 from homeassistant.const import __version__
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant
+from homeassistant.helpers.json import json_bytes
+from homeassistant.util.json import JsonValueType
 
 from .connection import ActiveConnection
 from .error import Disconnect
@@ -25,28 +27,23 @@ TYPE_AUTH_INVALID: Final = "auth_invalid"
 TYPE_AUTH_OK: Final = "auth_ok"
 TYPE_AUTH_REQUIRED: Final = "auth_required"
 
-AUTH_MESSAGE_SCHEMA: Final = vol.Schema(
+AUTH_MESSAGE_SCHEMA: Final = probatio.Schema(
     {
-        vol.Required("type"): TYPE_AUTH,
-        vol.Exclusive("api_password", "auth"): str,
-        vol.Exclusive("access_token", "auth"): str,
+        probatio.Required("type"): TYPE_AUTH,
+        probatio.Exclusive("api_password", "auth"): str,
+        probatio.Exclusive("access_token", "auth"): str,
     }
 )
 
-
-def auth_ok_message() -> dict[str, str]:
-    """Return an auth_ok message."""
-    return {"type": TYPE_AUTH_OK, "ha_version": __version__}
-
-
-def auth_required_message() -> dict[str, str]:
-    """Return an auth_required message."""
-    return {"type": TYPE_AUTH_REQUIRED, "ha_version": __version__}
+AUTH_OK_MESSAGE = json_bytes({"type": TYPE_AUTH_OK, "ha_version": __version__})
+AUTH_REQUIRED_MESSAGE = json_bytes(
+    {"type": TYPE_AUTH_REQUIRED, "ha_version": __version__}
+)
 
 
-def auth_invalid_message(message: str) -> dict[str, str]:
+def auth_invalid_message(message: str) -> bytes:
     """Return an auth_invalid message."""
-    return {"type": TYPE_AUTH_INVALID, "message": message}
+    return json_bytes({"type": TYPE_AUTH_INVALID, "message": message})
 
 
 class AuthPhase:
@@ -56,55 +53,81 @@ class AuthPhase:
         self,
         logger: WebSocketAdapter,
         hass: HomeAssistant,
-        send_message: Callable[[str | dict[str, Any] | Callable[[], str]], None],
+        send_message: Callable[[bytes | str | dict[str, Any]], None],
         cancel_ws: CALLBACK_TYPE,
         request: Request,
+        send_bytes_text: Callable[[bytes], Coroutine[Any, Any, None]],
     ) -> None:
-        """Initialize the authentiated connection."""
+        """Initialize the authenticated connection."""
         self._hass = hass
+        # send_message will send a message to the client via the queue.
         self._send_message = send_message
         self._cancel_ws = cancel_ws
         self._logger = logger
         self._request = request
+        # send_bytes_text will directly send a message to the client.
+        self._send_bytes_text = send_bytes_text
 
-    async def async_handle(self, msg: dict[str, str]) -> ActiveConnection:
+    async def async_handle_supervisor_unix_socket(self) -> ActiveConnection:
+        """Handle a pre-authenticated Unix socket connection."""
+        conn = ActiveConnection(
+            self._logger,
+            self._hass,
+            self._send_message,
+            self._request[KEY_HASS_USER],
+            refresh_token=None,
+            remote=self._request.remote,
+        )
+        await self._send_bytes_text(AUTH_OK_MESSAGE)
+        self._logger.debug("Auth OK (unix socket)")
+        return conn
+
+    async def async_handle(self, msg: JsonValueType) -> ActiveConnection:
         """Handle authentication."""
         try:
-            msg = AUTH_MESSAGE_SCHEMA(msg)
-        except vol.Invalid as err:
+            valid_msg = AUTH_MESSAGE_SCHEMA(msg)
+        except probatio.Invalid as err:
             error_msg = (
                 f"Auth message incorrectly formatted: {humanize_error(msg, err)}"
             )
             self._logger.warning(error_msg)
-            self._send_message(auth_invalid_message(error_msg))
+            await self._send_bytes_text(auth_invalid_message(error_msg))
             raise Disconnect from err
 
-        if "access_token" in msg:
-            self._logger.debug("Received access_token")
-            refresh_token = await self._hass.auth.async_validate_access_token(
-                msg["access_token"]
+        if (access_token := valid_msg.get("access_token")) and (
+            refresh_token := self._hass.auth.async_validate_access_token(access_token)
+        ):
+            if user_access_error := async_user_not_allowed_do_auth(
+                self._hass, refresh_token.user, self._request
+            ):
+                await self._send_bytes_text(auth_invalid_message(user_access_error))
+                await process_wrong_login(self._request)
+                raise Disconnect
+
+            self._hass.auth.async_log_access_token_usage(
+                refresh_token, self._request.remote
             )
-            if refresh_token is not None:
-                conn = await self._async_finish_auth(refresh_token.user, refresh_token)
-                conn.subscriptions[
-                    "auth"
-                ] = self._hass.auth.async_register_revoke_token_callback(
-                    refresh_token.id, self._cancel_ws
+            conn = ActiveConnection(
+                self._logger,
+                self._hass,
+                self._send_message,
+                refresh_token.user,
+                refresh_token,
+                remote=self._request.remote,
+                cancel_ws=self._cancel_ws,
+            )
+            conn.subscriptions["auth"] = (
+                self._hass.auth.async_register_revoke_token_callback(
+                    refresh_token.id, conn.async_auth_revoked
                 )
+            )
+            await self._send_bytes_text(AUTH_OK_MESSAGE)
+            self._logger.debug("Auth OK")
+            process_success_login(self._request)
+            return conn
 
-                return conn
-
-        self._send_message(auth_invalid_message("Invalid access token or password"))
+        await self._send_bytes_text(
+            auth_invalid_message("Invalid access token or password")
+        )
         await process_wrong_login(self._request)
         raise Disconnect
-
-    async def _async_finish_auth(
-        self, user: User, refresh_token: RefreshToken
-    ) -> ActiveConnection:
-        """Create an active connection."""
-        self._logger.debug("Auth OK")
-        await process_success_login(self._request)
-        self._send_message(auth_ok_message())
-        return ActiveConnection(
-            self._logger, self._hass, self._send_message, user, refresh_token
-        )

@@ -1,52 +1,39 @@
 """Support for Flo Water Monitor sensors."""
-from __future__ import annotations
+
+from typing import override
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
     SensorEntity,
     SensorStateClass,
 )
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     PERCENTAGE,
-    PRESSURE_PSI,
-    TEMP_FAHRENHEIT,
-    VOLUME_GALLONS,
+    UnitOfPressure,
+    UnitOfTemperature,
+    UnitOfVolume,
+    UnitOfVolumeFlowRate,
 )
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .const import DOMAIN as FLO_DOMAIN
-from .device import FloDeviceDataUpdateCoordinator
+from .coordinator import FloConfigEntry
 from .entity import FloEntity
-
-WATER_ICON = "mdi:water"
-GAUGE_ICON = "mdi:gauge"
-NAME_DAILY_USAGE = "Today's water usage"
-NAME_CURRENT_SYSTEM_MODE = "Current system mode"
-NAME_FLOW_RATE = "Water flow rate"
-NAME_WATER_TEMPERATURE = "Water temperature"
-NAME_AIR_TEMPERATURE = "Temperature"
-NAME_WATER_PRESSURE = "Water pressure"
-NAME_HUMIDITY = "Humidity"
-NAME_BATTERY = "Battery"
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    config_entry: FloConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up the Flo sensors from config entry."""
-    devices: list[FloDeviceDataUpdateCoordinator] = hass.data[FLO_DOMAIN][
-        config_entry.entry_id
-    ]["devices"]
+    devices = config_entry.runtime_data.devices
     entities = []
     for device in devices:
         if device.device_type == "puck_oem":
             entities.extend(
                 [
-                    FloTemperatureSensor(NAME_AIR_TEMPERATURE, device),
+                    FloTemperatureSensor(device, False),
                     FloHumiditySensor(device),
                     FloBatterySensor(device),
                 ]
@@ -57,7 +44,7 @@ async def async_setup_entry(
                     FloDailyUsageSensor(device),
                     FloSystemModeSensor(device),
                     FloCurrentFlowRateSensor(device),
-                    FloTemperatureSensor(NAME_WATER_TEMPERATURE, device),
+                    FloTemperatureSensor(device, True),
                     FloPressureSensor(device),
                 ]
             )
@@ -67,18 +54,17 @@ async def async_setup_entry(
 class FloDailyUsageSensor(FloEntity, SensorEntity):
     """Monitors the daily water usage."""
 
-    _attr_device_class = SensorDeviceClass.VOLUME
-    _attr_icon = WATER_ICON
-    _attr_native_unit_of_measurement = VOLUME_GALLONS
+    _attr_native_unit_of_measurement = UnitOfVolume.GALLONS
     _attr_state_class: SensorStateClass = SensorStateClass.TOTAL_INCREASING
     _attr_device_class = SensorDeviceClass.WATER
+    _attr_translation_key = "daily_consumption"
 
     def __init__(self, device):
         """Initialize the daily water usage sensor."""
-        super().__init__("daily_consumption", NAME_DAILY_USAGE, device)
-        self._state: float = None
+        super().__init__("daily_consumption", device)
 
     @property
+    @override
     def native_value(self) -> float | None:
         """Return the current daily usage."""
         if self._device.consumption_today is None:
@@ -89,12 +75,14 @@ class FloDailyUsageSensor(FloEntity, SensorEntity):
 class FloSystemModeSensor(FloEntity, SensorEntity):
     """Monitors the current Flo system mode."""
 
+    _attr_translation_key = "current_system_mode"
+
     def __init__(self, device):
         """Initialize the system mode sensor."""
-        super().__init__("current_system_mode", NAME_CURRENT_SYSTEM_MODE, device)
-        self._state: str = None
+        super().__init__("current_system_mode", device)
 
     @property
+    @override
     def native_value(self) -> str | None:
         """Return the current system mode."""
         if not self._device.current_system_mode:
@@ -105,16 +93,17 @@ class FloSystemModeSensor(FloEntity, SensorEntity):
 class FloCurrentFlowRateSensor(FloEntity, SensorEntity):
     """Monitors the current water flow rate."""
 
-    _attr_icon = GAUGE_ICON
-    _attr_native_unit_of_measurement = "gpm"
+    _attr_native_unit_of_measurement = UnitOfVolumeFlowRate.GALLONS_PER_MINUTE
     _attr_state_class: SensorStateClass = SensorStateClass.MEASUREMENT
+    _attr_device_class = SensorDeviceClass.VOLUME_FLOW_RATE
+    _attr_translation_key = "current_flow_rate"
 
     def __init__(self, device):
         """Initialize the flow rate sensor."""
-        super().__init__("current_flow_rate", NAME_FLOW_RATE, device)
-        self._state: float = None
+        super().__init__("current_flow_rate", device)
 
     @property
+    @override
     def native_value(self) -> float | None:
         """Return the current flow rate."""
         if self._device.current_flow_rate is None:
@@ -126,15 +115,17 @@ class FloTemperatureSensor(FloEntity, SensorEntity):
     """Monitors the temperature."""
 
     _attr_device_class = SensorDeviceClass.TEMPERATURE
-    _attr_native_unit_of_measurement = TEMP_FAHRENHEIT
+    _attr_native_unit_of_measurement = UnitOfTemperature.FAHRENHEIT
     _attr_state_class: SensorStateClass = SensorStateClass.MEASUREMENT
 
-    def __init__(self, name, device):
+    def __init__(self, device, is_water):
         """Initialize the temperature sensor."""
-        super().__init__("temperature", name, device)
-        self._state: float = None
+        super().__init__("temperature", device)
+        if is_water:
+            self._attr_translation_key = "water_temperature"
 
     @property
+    @override
     def native_value(self) -> float | None:
         """Return the current temperature."""
         if self._device.temperature is None:
@@ -151,10 +142,10 @@ class FloHumiditySensor(FloEntity, SensorEntity):
 
     def __init__(self, device):
         """Initialize the humidity sensor."""
-        super().__init__("humidity", NAME_HUMIDITY, device)
-        self._state: float = None
+        super().__init__("humidity", device)
 
     @property
+    @override
     def native_value(self) -> float | None:
         """Return the current humidity."""
         if self._device.humidity is None:
@@ -166,15 +157,16 @@ class FloPressureSensor(FloEntity, SensorEntity):
     """Monitors the water pressure."""
 
     _attr_device_class = SensorDeviceClass.PRESSURE
-    _attr_native_unit_of_measurement = PRESSURE_PSI
+    _attr_native_unit_of_measurement = UnitOfPressure.PSI
     _attr_state_class: SensorStateClass = SensorStateClass.MEASUREMENT
+    _attr_translation_key = "water_pressure"
 
     def __init__(self, device):
         """Initialize the pressure sensor."""
-        super().__init__("water_pressure", NAME_WATER_PRESSURE, device)
-        self._state: float = None
+        super().__init__("water_pressure", device)
 
     @property
+    @override
     def native_value(self) -> float | None:
         """Return the current water pressure."""
         if self._device.current_psi is None:
@@ -191,10 +183,10 @@ class FloBatterySensor(FloEntity, SensorEntity):
 
     def __init__(self, device):
         """Initialize the battery sensor."""
-        super().__init__("battery", NAME_BATTERY, device)
-        self._state: float = None
+        super().__init__("battery", device)
 
     @property
+    @override
     def native_value(self) -> float | None:
         """Return the current battery level."""
         return self._device.battery_level

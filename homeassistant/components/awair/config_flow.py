@@ -1,21 +1,20 @@
 """Config flow for Awair."""
-from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, Self, cast, override
 
 from aiohttp.client_exceptions import ClientError
+import probatio
 from python_awair import Awair, AwairLocal, AwairLocalDevice
 from python_awair.exceptions import AuthError, AwairError
 from python_awair.user import AwairUser
-import voluptuous as vol
 
-from homeassistant.components import onboarding, zeroconf
-from homeassistant.config_entries import SOURCE_ZEROCONF, ConfigFlow
+from homeassistant.components import onboarding
+from homeassistant.config_entries import SOURCE_ZEROCONF, ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_ACCESS_TOKEN, CONF_DEVICE, CONF_HOST
 from homeassistant.core import callback
-from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.service_info.zeroconf import ZeroconfServiceInfo
 
 from .const import DOMAIN, LOGGER
 
@@ -26,26 +25,28 @@ class AwairFlowHandler(ConfigFlow, domain=DOMAIN):
     VERSION = 1
 
     _device: AwairLocalDevice
+    host: str
 
+    @override
     async def async_step_zeroconf(
-        self, discovery_info: zeroconf.ZeroconfServiceInfo
-    ) -> FlowResult:
+        self, discovery_info: ZeroconfServiceInfo
+    ) -> ConfigFlowResult:
         """Handle zeroconf discovery."""
 
-        host = discovery_info.host
-        LOGGER.debug("Discovered device: %s", host)
+        self.host = discovery_info.host
+        LOGGER.debug("Discovered device: %s", self.host)
 
-        self._device, _ = await self._check_local_connection(host)
+        self._device, _ = await self._check_local_connection(self.host)
 
         if self._device is not None:
             await self.async_set_unique_id(self._device.mac_address)
             self._abort_if_unique_id_configured(
                 updates={CONF_HOST: self._device.device_addr},
+                reload_on_update=False,
                 error="already_configured_device",
             )
             self.context.update(
                 {
-                    "host": host,
                     "title_placeholders": {
                         "model": self._device.model,
                         "device_id": self._device.device_id,
@@ -58,7 +59,7 @@ class AwairFlowHandler(ConfigFlow, domain=DOMAIN):
 
     async def async_step_discovery_confirm(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Confirm discovery."""
         if user_input is not None or not onboarding.async_is_onboarded(self.hass):
             title = f"{self._device.model} ({self._device.device_id})"
@@ -67,7 +68,6 @@ class AwairFlowHandler(ConfigFlow, domain=DOMAIN):
                 data={CONF_HOST: self._device.device_addr},
             )
 
-        self._set_confirm_only()
         placeholders = {
             "model": self._device.model,
             "device_id": self._device.device_id,
@@ -77,14 +77,15 @@ class AwairFlowHandler(ConfigFlow, domain=DOMAIN):
             description_placeholders=placeholders,
         )
 
+    @override
     async def async_step_user(
         self, user_input: dict[str, str] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle a flow initialized by the user."""
 
         return self.async_show_menu(step_id="user", menu_options=["local", "cloud"])
 
-    async def async_step_cloud(self, user_input: Mapping[str, Any]) -> FlowResult:
+    async def async_step_cloud(self, user_input: Mapping[str, Any]) -> ConfigFlowResult:
         """Handle collecting and verifying Awair Cloud API credentials."""
 
         errors = {}
@@ -108,7 +109,9 @@ class AwairFlowHandler(ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="cloud",
-            data_schema=vol.Schema({vol.Optional(CONF_ACCESS_TOKEN): str}),
+            data_schema=probatio.Schema(
+                {probatio.Optional(probatio.Secret(CONF_ACCESS_TOKEN)): str}
+            ),
             description_placeholders={
                 "url": "https://developer.getawair.com/onboard/login"
             },
@@ -119,17 +122,21 @@ class AwairFlowHandler(ConfigFlow, domain=DOMAIN):
     def _get_discovered_entries(self) -> dict[str, str]:
         """Get discovered entries."""
         entries: dict[str, str] = {}
-        for flow in self._async_in_progress():
-            if flow["context"]["source"] == SOURCE_ZEROCONF:
-                info = flow["context"]["title_placeholders"]
-                entries[
-                    flow["context"]["host"]
-                ] = f"{info['model']} ({info['device_id']})"
+
+        flows = cast(
+            set[Self],
+            self.hass.config_entries.flow._handler_progress_index.get(DOMAIN) or set(),  # noqa: SLF001
+        )
+        for flow in flows:
+            if flow.source != SOURCE_ZEROCONF:
+                continue
+            info = flow.context["title_placeholders"]
+            entries[flow.host] = f"{info['model']} ({info['device_id']})"
         return entries
 
     async def async_step_local(
         self, user_input: Mapping[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Show how to enable local API."""
         if user_input is not None:
             return await self.async_step_local_pick()
@@ -143,7 +150,7 @@ class AwairFlowHandler(ConfigFlow, domain=DOMAIN):
 
     async def async_step_local_pick(
         self, user_input: Mapping[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle collecting and verifying Awair Local API hosts."""
 
         errors = {}
@@ -176,11 +183,13 @@ class AwairFlowHandler(ConfigFlow, domain=DOMAIN):
         discovered = self._get_discovered_entries()
 
         if not discovered or (user_input and user_input.get(CONF_DEVICE) == "manual"):
-            data_schema = vol.Schema({vol.Required(CONF_HOST): str})
+            data_schema = probatio.Schema({probatio.Required(CONF_HOST): str})
 
         elif discovered:
             discovered["manual"] = "Manual"
-            data_schema = vol.Schema({vol.Required(CONF_DEVICE): vol.In(discovered)})
+            data_schema = probatio.Schema(
+                {probatio.Required(CONF_DEVICE): probatio.In(discovered)}
+            )
 
         return self.async_show_form(
             step_id="local_pick",
@@ -188,13 +197,15 @@ class AwairFlowHandler(ConfigFlow, domain=DOMAIN):
             errors=errors,
         )
 
-    async def async_step_reauth(self, entry_data: Mapping[str, Any]) -> FlowResult:
+    async def async_step_reauth(
+        self, entry_data: Mapping[str, Any]
+    ) -> ConfigFlowResult:
         """Handle re-auth if token invalid."""
         return await self.async_step_reauth_confirm()
 
     async def async_step_reauth_confirm(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Confirm reauth dialog."""
         errors = {}
 
@@ -203,10 +214,9 @@ class AwairFlowHandler(ConfigFlow, domain=DOMAIN):
             _, error = await self._check_cloud_connection(access_token)
 
             if error is None:
-                entry = await self.async_set_unique_id(self.unique_id)
-                assert entry
-                self.hass.config_entries.async_update_entry(entry, data=user_input)
-                return self.async_abort(reason="reauth_successful")
+                return self.async_update_reload_and_abort(
+                    self._get_reauth_entry(), data_updates=user_input
+                )
 
             if error != "invalid_access_token":
                 return self.async_abort(reason=error)
@@ -215,7 +225,9 @@ class AwairFlowHandler(ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="reauth_confirm",
-            data_schema=vol.Schema({vol.Required(CONF_ACCESS_TOKEN): str}),
+            data_schema=probatio.Schema(
+                {probatio.Required(probatio.Secret(CONF_ACCESS_TOKEN)): str}
+            ),
             errors=errors,
         )
 
@@ -248,13 +260,12 @@ class AwairFlowHandler(ConfigFlow, domain=DOMAIN):
         try:
             user = await awair.user()
             devices = await user.devices()
-            if not devices:
-                return (None, "no_devices_found")
-
-            return (user, None)
-
         except AuthError:
             return (None, "invalid_access_token")
         except AwairError as err:
             LOGGER.error("Unexpected API error: %s", err)
             return (None, "unknown")
+
+        if not devices:
+            return (None, "no_devices_found")
+        return (user, None)

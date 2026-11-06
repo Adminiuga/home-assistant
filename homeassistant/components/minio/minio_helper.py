@@ -1,13 +1,13 @@
 """Minio helper methods."""
-from __future__ import annotations
 
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable
 import json
 import logging
 from queue import Queue
 import re
 import threading
 import time
+from typing import Self, override
 from urllib.parse import unquote
 
 from minio import Minio
@@ -34,7 +34,9 @@ def create_minio_client(
     endpoint: str, access_key: str, secret_key: str, secure: bool
 ) -> Minio:
     """Create Minio client."""
-    return Minio(endpoint, access_key, secret_key, secure)
+    return Minio(
+        endpoint=endpoint, access_key=access_key, secret_key=secret_key, secure=secure
+    )
 
 
 def get_minio_notification_response(
@@ -42,8 +44,7 @@ def get_minio_notification_response(
 ):
     """Start listening to minio events. Copied from minio-py."""
     query = {"prefix": prefix, "suffix": suffix, "events": events}
-    # pylint: disable=protected-access
-    return minio_client._url_open(
+    return minio_client._url_open(  # noqa: SLF001
         "GET", bucket_name=bucket_name, query=query, preload_content=False
     )
 
@@ -51,14 +52,15 @@ def get_minio_notification_response(
 class MinioEventStreamIterator(Iterable):
     """Iterator wrapper over notification http response stream."""
 
-    def __iter__(self) -> Iterator:
-        """Return self."""
-        return self
-
     def __init__(self, response):
         """Init."""
         self._response = response
         self._stream = response.stream()
+
+    @override
+    def __iter__(self) -> Self:
+        """Return self."""
+        return self
 
     def __next__(self):
         """Get next not empty line."""
@@ -111,9 +113,10 @@ class MinioEventThread(threading.Thread):
         """Stop and join the thread."""
         self.stop()
 
+    @override
     def run(self):
         """Create MinioClient and run the loop."""
-        _LOGGER.info("Running MinioEventThread")
+        _LOGGER.debug("Running MinioEventThread")
 
         self._should_stop = False
 
@@ -122,7 +125,7 @@ class MinioEventThread(threading.Thread):
         )
 
         while not self._should_stop:
-            _LOGGER.info("Connecting to minio event stream")
+            _LOGGER.debug("Connecting to minio event stream")
             response = None
             try:
                 response = get_minio_notification_response(
@@ -157,8 +160,7 @@ class MinioEventThread(threading.Thread):
                     presigned_url = minio_client.presigned_get_object(bucket, key)
                 # Fail gracefully. If for whatever reason this stops working,
                 # it shouldn't prevent it from firing events.
-                # pylint: disable=broad-except
-                except Exception as error:
+                except Exception as error:  # noqa: BLE001
                     _LOGGER.error("Failed to generate presigned url: %s", error)
 
                 queue_entry = {
@@ -185,8 +187,7 @@ class MinioEventThread(threading.Thread):
 
 
 def iterate_objects(event):
-    """
-    Iterate over file records of notification event.
+    """Iterate over file records of notification event.
 
     Most of the time it should still be only one record.
     """

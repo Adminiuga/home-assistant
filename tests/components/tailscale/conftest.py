@@ -1,22 +1,40 @@
 """Fixtures for Tailscale integration tests."""
-from __future__ import annotations
 
 from collections.abc import Generator
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from pytest_homeassistant.common import MockConfigEntry, load_fixture
 from tailscale.models import Devices
 
-from homeassistant.components.tailscale.const import CONF_TAILNET, DOMAIN
+from homeassistant.components.tailscale.const import (
+    CONF_OAUTH_CLIENT_ID,
+    CONF_OAUTH_CLIENT_SECRET,
+    CONF_TAILNET,
+    DOMAIN,
+)
 from homeassistant.const import CONF_API_KEY
 from homeassistant.core import HomeAssistant
-
-from tests.common import MockConfigEntry, load_fixture
 
 
 @pytest.fixture
 def mock_config_entry() -> MockConfigEntry:
-    """Return the default mocked config entry."""
+    """Return the default mocked config entry, using OAuth client credentials."""
+    return MockConfigEntry(
+        title="homeassistant.github",
+        domain=DOMAIN,
+        data={
+            CONF_TAILNET: "homeassistant.github",
+            CONF_OAUTH_CLIENT_ID: "tskey-client-MOCK",
+            CONF_OAUTH_CLIENT_SECRET: "mock-oauth-client-secret",
+        },
+        unique_id="homeassistant.github",
+    )
+
+
+@pytest.fixture
+def mock_config_entry_api_key() -> MockConfigEntry:
+    """Return a legacy mocked config entry still using an API access token."""
     return MockConfigEntry(
         title="homeassistant.github",
         domain=DOMAIN,
@@ -26,35 +44,35 @@ def mock_config_entry() -> MockConfigEntry:
 
 
 @pytest.fixture
-def mock_setup_entry() -> Generator[AsyncMock, None, None]:
+def mock_setup_entry() -> Generator[AsyncMock]:
     """Mock setting up a config entry."""
     with patch(
-        "homeassistant.components.tailscale.async_setup_entry", return_value=True
+        "homeassistant.components.tailscale.async_setup_entry", return_value=None
     ) as mock_setup:
         yield mock_setup
 
 
 @pytest.fixture
-def mock_tailscale_config_flow() -> Generator[None, MagicMock, None]:
+def mock_tailscale_config_flow() -> Generator[MagicMock]:
     """Return a mocked Tailscale client."""
     with patch(
         "homeassistant.components.tailscale.config_flow.Tailscale", autospec=True
     ) as tailscale_mock:
         tailscale = tailscale_mock.return_value
-        tailscale.devices.return_value = Devices.parse_raw(
+        tailscale.devices.return_value = Devices.from_json(
             load_fixture("tailscale/devices.json")
         ).devices
         yield tailscale
 
 
 @pytest.fixture
-def mock_tailscale(request: pytest.FixtureRequest) -> Generator[None, MagicMock, None]:
+def mock_tailscale(request: pytest.FixtureRequest) -> Generator[MagicMock]:
     """Return a mocked Tailscale client."""
     fixture: str = "tailscale/devices.json"
     if hasattr(request, "param") and request.param:
         fixture = request.param
 
-    devices = Devices.parse_raw(load_fixture(fixture)).devices
+    devices = Devices.from_json(load_fixture(fixture)).devices
     with patch(
         "homeassistant.components.tailscale.coordinator.Tailscale", autospec=True
     ) as tailscale_mock:

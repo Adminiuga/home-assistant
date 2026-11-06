@@ -1,22 +1,42 @@
 """The tests for the logbook component."""
-# pylint: disable=protected-access,invalid-name
+
 import asyncio
-import collections
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from http import HTTPStatus
-import json
-from typing import Callable
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
+from freezegun import freeze_time
+import probatio
 import pytest
-import voluptuous as vol
+from pytest_homeassistant.common import (
+    MockConfigEntry,
+    async_capture_events,
+    mock_platform,
+)
+from pytest_homeassistant.components.recorder.common import (
+    async_recorder_block_till_done,
+    async_wait_recording_done,
+)
+from pytest_homeassistant.typing import ClientSessionGenerator, WebSocketGenerator
 
+from homeassistant import core as ha
 from homeassistant.components import logbook, recorder
+
+# pylint: disable-next=home-assistant-component-root-import
 from homeassistant.components.alexa.smart_home import EVENT_ALEXA_SMART_HOME
 from homeassistant.components.automation import EVENT_AUTOMATION_TRIGGERED
-from homeassistant.components.logbook.models import LazyEventPartialState
+from homeassistant.components.logbook import DOMAIN
+from homeassistant.components.logbook.const import ATTR_MESSAGE
+from homeassistant.components.logbook.models import EventAsRow, LazyEventPartialState
 from homeassistant.components.logbook.processor import EventProcessor
-from homeassistant.components.logbook.queries.common import PSUEDO_EVENT_STATE_CHANGED
+from homeassistant.components.logbook.queries.common import PSEUDO_EVENT_STATE_CHANGED
+from homeassistant.components.logbook.services import (
+    LogbookService,
+    LogbookServiceArgument,
+)
+from homeassistant.components.recorder import Recorder
+from homeassistant.components.recorder.models import ulid_to_bytes_or_none
 from homeassistant.components.script import EVENT_SCRIPT_STARTED
 from homeassistant.components.sensor import SensorStateClass
 from homeassistant.const import (
@@ -37,60 +57,60 @@ from homeassistant.const import (
     EVENT_LOGBOOK_ENTRY,
     STATE_OFF,
     STATE_ON,
+    STATE_UNKNOWN,
+    CommonServiceArgument,
 )
-import homeassistant.core as ha
-from homeassistant.core import Event, HomeAssistant
-from homeassistant.helpers import device_registry, entity_registry as er
+from homeassistant.core import Context, Event, HomeAssistant
+from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.helpers.entityfilter import CONF_ENTITY_GLOBS
-from homeassistant.helpers.json import JSONEncoder
 from homeassistant.setup import async_setup_component
-import homeassistant.util.dt as dt_util
+from homeassistant.util import dt as dt_util
 
-from .common import MockRow, mock_humanify
-
-from tests.common import MockConfigEntry, async_capture_events, mock_platform
-from tests.components.recorder.common import (
-    async_recorder_block_till_done,
-    async_wait_recording_done,
+from .common import (
+    MockRow,
+    assert_thermostat_context_chain_events,
+    mock_humanify,
+    setup_thermostat_context_test_entities,
+    simulate_thermostat_context_chain,
 )
 
 EMPTY_CONFIG = logbook.CONFIG_SCHEMA({logbook.DOMAIN: {}})
 
 
 @pytest.fixture
-async def hass_(recorder_mock, hass):
+async def hass_(recorder_mock: Recorder, hass: HomeAssistant) -> HomeAssistant:
     """Set up things to be run when tests are started."""
     assert await async_setup_component(hass, logbook.DOMAIN, EMPTY_CONFIG)
     return hass
 
 
-@pytest.fixture()
-def set_utc(hass):
+@pytest.fixture
+async def set_utc(hass: HomeAssistant) -> None:
     """Set timezone to UTC."""
-    hass.config.set_time_zone("UTC")
+    await hass.config.async_set_time_zone("UTC")
 
 
-async def test_service_call_create_logbook_entry(hass_):
+async def test_service_call_create_logbook_entry(hass_: HomeAssistant) -> None:
     """Test if service call create log book entry."""
-    calls = async_capture_events(hass_, logbook.EVENT_LOGBOOK_ENTRY)
+    calls = async_capture_events(hass_, EVENT_LOGBOOK_ENTRY)
 
     await hass_.services.async_call(
         logbook.DOMAIN,
-        "log",
+        LogbookService.LOG,
         {
-            logbook.ATTR_NAME: "Alarm",
-            logbook.ATTR_MESSAGE: "is triggered",
-            logbook.ATTR_DOMAIN: "switch",
-            logbook.ATTR_ENTITY_ID: "switch.test_switch",
+            LogbookServiceArgument.NAME: "Alarm",
+            LogbookServiceArgument.MESSAGE: "is triggered",
+            LogbookServiceArgument.DOMAIN: "switch",
+            CommonServiceArgument.ENTITY_ID: "switch.test_switch",
         },
         True,
     )
     await hass_.services.async_call(
         logbook.DOMAIN,
-        "log",
+        LogbookService.LOG,
         {
-            logbook.ATTR_NAME: "This entry",
-            logbook.ATTR_MESSAGE: "has no domain or entity_id",
+            LogbookServiceArgument.NAME: "This entry",
+            LogbookServiceArgument.MESSAGE: "has no domain or entity_id",
         },
         True,
     )
@@ -111,29 +131,32 @@ async def test_service_call_create_logbook_entry(hass_):
     assert len(calls) == 2
     first_call = calls[-2]
 
-    assert first_call.data.get(logbook.ATTR_NAME) == "Alarm"
-    assert first_call.data.get(logbook.ATTR_MESSAGE) == "is triggered"
-    assert first_call.data.get(logbook.ATTR_DOMAIN) == "switch"
-    assert first_call.data.get(logbook.ATTR_ENTITY_ID) == "switch.test_switch"
+    assert first_call.data.get(ATTR_NAME) == "Alarm"
+    assert first_call.data.get(ATTR_MESSAGE) == "is triggered"
+    assert first_call.data.get(ATTR_DOMAIN) == "switch"
+    assert first_call.data.get(ATTR_ENTITY_ID) == "switch.test_switch"
 
     last_call = calls[-1]
 
-    assert last_call.data.get(logbook.ATTR_NAME) == "This entry"
-    assert last_call.data.get(logbook.ATTR_MESSAGE) == "has no domain or entity_id"
-    assert last_call.data.get(logbook.ATTR_DOMAIN) == "logbook"
+    assert last_call.data.get(ATTR_NAME) == "This entry"
+    assert last_call.data.get(ATTR_MESSAGE) == "has no domain or entity_id"
+    assert last_call.data.get(ATTR_DOMAIN) == "logbook"
 
 
-async def test_service_call_create_logbook_entry_invalid_entity_id(recorder_mock, hass):
+@pytest.mark.usefixtures("recorder_mock")
+async def test_service_call_create_logbook_entry_invalid_entity_id(
+    hass: HomeAssistant,
+) -> None:
     """Test if service call create log book entry with an invalid entity id."""
-    await async_setup_component(hass, "logbook", {})
+    await async_setup_component(hass, DOMAIN, {})
     await hass.async_block_till_done()
     hass.bus.async_fire(
-        logbook.EVENT_LOGBOOK_ENTRY,
+        EVENT_LOGBOOK_ENTRY,
         {
-            logbook.ATTR_NAME: "Alarm",
-            logbook.ATTR_MESSAGE: "is triggered",
-            logbook.ATTR_DOMAIN: "switch",
-            logbook.ATTR_ENTITY_ID: 1234,
+            ATTR_NAME: "Alarm",
+            ATTR_MESSAGE: "is triggered",
+            ATTR_DOMAIN: "switch",
+            ATTR_ENTITY_ID: 1234,
         },
     )
     await async_wait_recording_done(hass)
@@ -145,18 +168,20 @@ async def test_service_call_create_logbook_entry_invalid_entity_id(recorder_mock
         )
     )
     assert len(events) == 1
-    assert events[0][logbook.ATTR_DOMAIN] == "switch"
-    assert events[0][logbook.ATTR_NAME] == "Alarm"
-    assert events[0][logbook.ATTR_ENTITY_ID] == 1234
-    assert events[0][logbook.ATTR_MESSAGE] == "is triggered"
+    assert events[0][ATTR_DOMAIN] == "switch"
+    assert events[0][ATTR_NAME] == "Alarm"
+    assert events[0][ATTR_ENTITY_ID] == 1234
+    assert events[0][ATTR_MESSAGE] == "is triggered"
 
 
-async def test_service_call_create_log_book_entry_no_message(hass_):
+async def test_service_call_create_log_book_entry_no_message(
+    hass_: HomeAssistant,
+) -> None:
     """Test if service call create log book entry without message."""
-    calls = async_capture_events(hass_, logbook.EVENT_LOGBOOK_ENTRY)
+    calls = async_capture_events(hass_, EVENT_LOGBOOK_ENTRY)
 
-    with pytest.raises(vol.Invalid):
-        await hass_.services.async_call(logbook.DOMAIN, "log", {}, True)
+    with pytest.raises(probatio.Invalid):
+        await hass_.services.async_call(logbook.DOMAIN, LogbookService.LOG, {}, True)
 
     # Logbook entry service call results in firing an event.
     # Our service call will unblock when the event listeners have been
@@ -166,10 +191,12 @@ async def test_service_call_create_log_book_entry_no_message(hass_):
     assert len(calls) == 0
 
 
-async def test_filter_sensor(hass_: ha.HomeAssistant, hass_client):
+async def test_filter_sensor(
+    hass_: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    hass_client: ClientSessionGenerator,
+) -> None:
     """Test numeric sensors are filtered."""
-
-    registry = er.async_get(hass_)
 
     # Unregistered sensor without a unit of measurement - should be in logbook
     entity_id1 = "sensor.bla"
@@ -178,7 +205,7 @@ async def test_filter_sensor(hass_: ha.HomeAssistant, hass_client):
     entity_id2 = "sensor.blu"
     attributes_2 = {ATTR_UNIT_OF_MEASUREMENT: "cats"}
     # Registered sensor with state class - should be excluded from logbook
-    entity_id3 = registry.async_get_or_create(
+    entity_id3 = entity_registry.async_get_or_create(
         "sensor",
         "test",
         "unique_3",
@@ -187,7 +214,7 @@ async def test_filter_sensor(hass_: ha.HomeAssistant, hass_client):
     ).entity_id
     attributes_3 = None
     # Registered sensor without state class or unit - should be in logbook
-    entity_id4 = registry.async_get_or_create(
+    entity_id4 = entity_registry.async_get_or_create(
         "sensor", "test", "unique_4", suggested_object_id="ble"
     ).entity_id
     attributes_4 = None
@@ -213,7 +240,7 @@ async def test_filter_sensor(hass_: ha.HomeAssistant, hass_client):
     _assert_entry(entries[2], name="ble", entity_id=entity_id4, state="10")
 
 
-async def test_home_assistant_start_stop_not_grouped(hass_):
+async def test_home_assistant_start_stop_not_grouped(hass_: HomeAssistant) -> None:
     """Test if HA start and stop events are no longer grouped."""
     await async_setup_component(hass_, "homeassistant", {})
     await hass_.async_block_till_done()
@@ -230,7 +257,7 @@ async def test_home_assistant_start_stop_not_grouped(hass_):
     assert_entry(entries[1], name="Home Assistant", message="started", domain=ha.DOMAIN)
 
 
-async def test_home_assistant_start(hass_):
+async def test_home_assistant_start(hass_: HomeAssistant) -> None:
     """Test if HA start is not filtered or converted into a restart."""
     await async_setup_component(hass_, "homeassistant", {})
     await hass_.async_block_till_done()
@@ -250,7 +277,7 @@ async def test_home_assistant_start(hass_):
     assert_entry(entries[1], pointA, "bla", entity_id=entity_id)
 
 
-def test_process_custom_logbook_entries(hass_):
+def test_process_custom_logbook_entries(hass_: HomeAssistant) -> None:
     """Test if custom log book entries get added as an entry."""
     name = "Nice name"
     message = "has a custom entry"
@@ -260,11 +287,11 @@ def test_process_custom_logbook_entries(hass_):
         hass_,
         (
             MockRow(
-                logbook.EVENT_LOGBOOK_ENTRY,
+                EVENT_LOGBOOK_ENTRY,
                 {
-                    logbook.ATTR_NAME: name,
-                    logbook.ATTR_MESSAGE: message,
-                    logbook.ATTR_ENTITY_ID: entity_id,
+                    ATTR_NAME: name,
+                    ATTR_MESSAGE: message,
+                    ATTR_ENTITY_ID: entity_id,
                 },
             ),
         ),
@@ -287,14 +314,25 @@ def create_state_changed_event(
     state,
     attributes=None,
     last_changed=None,
+    last_reported=None,
     last_updated=None,
 ):
     """Create state changed event."""
     old_state = ha.State(
-        entity_id, "old", attributes, last_changed, last_updated
+        entity_id,
+        "old",
+        attributes,
+        last_changed=last_changed,
+        last_reported=last_reported,
+        last_updated=last_updated,
     ).as_dict()
     new_state = ha.State(
-        entity_id, state, attributes, last_changed, last_updated
+        entity_id,
+        state,
+        attributes,
+        last_changed=last_changed,
+        last_reported=last_reported,
+        last_updated=last_updated,
     ).as_dict()
 
     return create_state_changed_event_from_old_new(
@@ -306,73 +344,55 @@ def create_state_changed_event_from_old_new(
     entity_id, event_time_fired, old_state, new_state
 ):
     """Create a state changed event from a old and new state."""
-    attributes = {}
-    if new_state is not None:
-        attributes = new_state.get("attributes")
-    attributes_json = json.dumps(attributes, cls=JSONEncoder)
-    row = collections.namedtuple(
-        "Row",
-        [
-            "event_type"
-            "event_data"
-            "time_fired"
-            "context_id"
-            "context_user_id"
-            "context_parent_id"
-            "state"
-            "entity_id"
-            "domain"
-            "attributes"
-            "state_id",
-            "old_state_id",
-            "shared_attrs",
-            "shared_data",
-            "context_only",
-        ],
+    row = EventAsRow(
+        row_id=1,
+        event_type=PSEUDO_EVENT_STATE_CHANGED,
+        event_data="{}",
+        time_fired_ts=event_time_fired.timestamp(),
+        context_id_bin=None,
+        context_user_id_bin=None,
+        context_parent_id_bin=None,
+        state=new_state and new_state.get("state"),
+        entity_id=entity_id,
+        icon=None,
+        attributes=None,
+        context_only=False,
+        data=None,
+        context=None,
     )
-
-    row.event_type = PSUEDO_EVENT_STATE_CHANGED
-    row.event_data = "{}"
-    row.shared_data = "{}"
-    row.attributes = attributes_json
-    row.shared_attrs = attributes_json
-    row.time_fired = event_time_fired
-    row.state = new_state and new_state.get("state")
-    row.entity_id = entity_id
-    row.domain = entity_id and ha.split_entity_id(entity_id)[0]
-    row.context_only = False
-    row.context_id = None
-    row.friendly_name = None
-    row.icon = None
-    row.old_format_icon = None
-    row.context_user_id = None
-    row.context_parent_id = None
-    row.old_state_id = old_state and 1
-    row.state_id = new_state and 1
     return LazyEventPartialState(row, {})
 
 
-async def test_logbook_view(recorder_mock, hass, hass_client):
+@pytest.mark.usefixtures("recorder_mock")
+async def test_logbook_view(
+    hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
     """Test the logbook view."""
-    await async_setup_component(hass, "logbook", {})
+    await async_setup_component(hass, DOMAIN, {})
     await async_recorder_block_till_done(hass)
     client = await hass_client()
     response = await client.get(f"/api/logbook/{dt_util.utcnow().isoformat()}")
     assert response.status == HTTPStatus.OK
 
 
-async def test_logbook_view_invalid_start_date_time(recorder_mock, hass, hass_client):
+@pytest.mark.usefixtures("recorder_mock")
+async def test_logbook_view_invalid_start_date_time(
+    hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
     """Test the logbook view with an invalid date time."""
-    await async_setup_component(hass, "logbook", {})
+    await async_setup_component(hass, DOMAIN, {})
     await async_recorder_block_till_done(hass)
     client = await hass_client()
     response = await client.get("/api/logbook/INVALID")
     assert response.status == HTTPStatus.BAD_REQUEST
 
 
-async def test_logbook_view_invalid_end_date_time(recorder_mock, hass, hass_client):
+@pytest.mark.usefixtures("recorder_mock")
+async def test_logbook_view_invalid_end_date_time(
+    hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
     """Test the logbook view."""
-    await async_setup_component(hass, "logbook", {})
+    await async_setup_component(hass, DOMAIN, {})
     await async_recorder_block_till_done(hass)
     client = await hass_client()
     response = await client.get(
@@ -381,9 +401,13 @@ async def test_logbook_view_invalid_end_date_time(recorder_mock, hass, hass_clie
     assert response.status == HTTPStatus.BAD_REQUEST
 
 
-async def test_logbook_view_period_entity(recorder_mock, hass, hass_client, set_utc):
+@pytest.mark.usefixtures("recorder_mock", "set_utc")
+async def test_logbook_view_period_entity(
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+) -> None:
     """Test the logbook view with period and entity."""
-    await async_setup_component(hass, "logbook", {})
+    await async_setup_component(hass, DOMAIN, {})
     await async_recorder_block_till_done(hass)
 
     entity_id_test = "switch.test"
@@ -398,7 +422,7 @@ async def test_logbook_view_period_entity(recorder_mock, hass, hass_client, set_
 
     # Today time 00:00:00
     start = dt_util.utcnow().date()
-    start_date = datetime(start.year, start.month, start.day)
+    start_date = datetime(start.year, start.month, start.day, tzinfo=dt_util.UTC)
 
     # Test today entries without filters
     response = await client.get(f"/api/logbook/{start_date.isoformat()}")
@@ -436,7 +460,7 @@ async def test_logbook_view_period_entity(recorder_mock, hass, hass_client, set_
 
     # Tomorrow time 00:00:00
     start = (dt_util.utcnow() + timedelta(days=1)).date()
-    start_date = datetime(start.year, start.month, start.day)
+    start_date = datetime(start.year, start.month, start.day, tzinfo=dt_util.UTC)
 
     # Test tomorrow entries without filters
     response = await client.get(f"/api/logbook/{start_date.isoformat()}")
@@ -462,7 +486,10 @@ async def test_logbook_view_period_entity(recorder_mock, hass, hass_client, set_
     assert response_json[0]["entity_id"] == entity_id_test
 
 
-async def test_logbook_describe_event(recorder_mock, hass, hass_client):
+@pytest.mark.usefixtures("recorder_mock")
+async def test_logbook_describe_event(
+    hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
     """Test teaching logbook about a new event."""
 
     def _describe(event):
@@ -474,29 +501,31 @@ async def test_logbook_describe_event(recorder_mock, hass, hass_client):
         hass,
         "fake_integration.logbook",
         Mock(
-            async_describe_events=lambda hass, async_describe_event: async_describe_event(
-                "test_domain", "some_event", _describe
-            )
+            async_describe_events=(
+                lambda hass, async_describe_event: async_describe_event(
+                    "test_domain",
+                    "some_event",
+                    _describe,
+                )
+            ),
         ),
     )
 
-    assert await async_setup_component(hass, "logbook", {})
-    with patch(
-        "homeassistant.util.dt.utcnow",
-        return_value=dt_util.utcnow() - timedelta(seconds=5),
-    ):
+    assert await async_setup_component(hass, DOMAIN, {})
+    with freeze_time(dt_util.utcnow() - timedelta(seconds=5)):
         hass.bus.async_fire("some_event")
         await async_wait_recording_done(hass)
 
     client = await hass_client()
     # Today time 00:00:00
     start = dt_util.utcnow().date()
-    start_date = datetime(start.year, start.month, start.day)
+    start_date = datetime(start.year, start.month, start.day, tzinfo=dt_util.UTC)
 
     # Test today entries with filter by end_time
-    end_time = start + timedelta(hours=24)
+    end_time = start_date + timedelta(hours=24)
     response = await client.get(
-        f"/api/logbook/{start_date.isoformat()}?end_time={end_time}"
+        f"/api/logbook/{start_date.isoformat()}",
+        params={"end_time": end_time.isoformat()},
     )
     results = await response.json()
     assert len(results) == 1
@@ -506,14 +535,17 @@ async def test_logbook_describe_event(recorder_mock, hass, hass_client):
     assert event["domain"] == "test_domain"
 
 
-async def test_exclude_described_event(recorder_mock, hass, hass_client):
+@pytest.mark.usefixtures("recorder_mock")
+async def test_exclude_described_event(
+    hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
     """Test exclusions of events that are described by another integration."""
     name = "My Automation Rule"
     entity_id = "automation.excluded_rule"
     entity_id2 = "automation.included_rule"
     entity_id3 = "sensor.excluded_domain"
 
-    def _describe(event):
+    def _describe(event: Event) -> dict[str, str]:
         """Describe an event."""
         return {
             "name": "Test Name",
@@ -521,7 +553,12 @@ async def test_exclude_described_event(recorder_mock, hass, hass_client):
             "entity_id": event.data[ATTR_ENTITY_ID],
         }
 
-    def async_describe_events(hass, async_describe_event):
+    def async_describe_events(
+        hass: HomeAssistant,
+        async_describe_event: Callable[
+            [str, str, Callable[[Event], dict[str, str]]], None
+        ],
+    ) -> None:
         """Mock to describe events."""
         async_describe_event("automation", "some_automation_event", _describe)
         async_describe_event("sensor", "some_event", _describe)
@@ -543,32 +580,28 @@ async def test_exclude_described_event(recorder_mock, hass, hass_client):
         },
     )
 
-    with patch(
-        "homeassistant.util.dt.utcnow",
-        return_value=dt_util.utcnow() - timedelta(seconds=5),
-    ):
+    with freeze_time(dt_util.utcnow() - timedelta(seconds=5)):
         hass.bus.async_fire(
             "some_automation_event",
-            {logbook.ATTR_NAME: name, logbook.ATTR_ENTITY_ID: entity_id},
+            {ATTR_NAME: name, ATTR_ENTITY_ID: entity_id},
         )
         hass.bus.async_fire(
             "some_automation_event",
-            {logbook.ATTR_NAME: name, logbook.ATTR_ENTITY_ID: entity_id2},
+            {ATTR_NAME: name, ATTR_ENTITY_ID: entity_id2},
         )
-        hass.bus.async_fire(
-            "some_event", {logbook.ATTR_NAME: name, logbook.ATTR_ENTITY_ID: entity_id3}
-        )
+        hass.bus.async_fire("some_event", {ATTR_NAME: name, ATTR_ENTITY_ID: entity_id3})
         await async_wait_recording_done(hass)
 
     client = await hass_client()
     # Today time 00:00:00
     start = dt_util.utcnow().date()
-    start_date = datetime(start.year, start.month, start.day)
+    start_date = datetime(start.year, start.month, start.day, tzinfo=dt_util.UTC)
 
     # Test today entries with filter by end_time
-    end_time = start + timedelta(hours=24)
+    end_time = start_date + timedelta(hours=24)
     response = await client.get(
-        f"/api/logbook/{start_date.isoformat()}?end_time={end_time}"
+        f"/api/logbook/{start_date.isoformat()}",
+        params={"end_time": end_time.isoformat()},
     )
     results = await response.json()
     assert len(results) == 1
@@ -577,9 +610,12 @@ async def test_exclude_described_event(recorder_mock, hass, hass_client):
     assert event["entity_id"] == "automation.included_rule"
 
 
-async def test_logbook_view_end_time_entity(recorder_mock, hass, hass_client):
+@pytest.mark.usefixtures("recorder_mock")
+async def test_logbook_view_end_time_entity(
+    hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
     """Test the logbook view with end_time and entity."""
-    await async_setup_component(hass, "logbook", {})
+    await async_setup_component(hass, DOMAIN, {})
     await async_recorder_block_till_done(hass)
 
     entity_id_test = "switch.test"
@@ -594,12 +630,13 @@ async def test_logbook_view_end_time_entity(recorder_mock, hass, hass_client):
 
     # Today time 00:00:00
     start = dt_util.utcnow().date()
-    start_date = datetime(start.year, start.month, start.day)
+    start_date = datetime(start.year, start.month, start.day, tzinfo=dt_util.UTC)
 
     # Test today entries with filter by end_time
-    end_time = start + timedelta(hours=24)
+    end_time = start_date + timedelta(hours=24)
     response = await client.get(
-        f"/api/logbook/{start_date.isoformat()}?end_time={end_time}"
+        f"/api/logbook/{start_date.isoformat()}",
+        params={"end_time": end_time.isoformat()},
     )
     assert response.status == HTTPStatus.OK
     response_json = await response.json()
@@ -610,7 +647,8 @@ async def test_logbook_view_end_time_entity(recorder_mock, hass, hass_client):
     # Test entries for 3 days with filter by entity_id
     end_time = start + timedelta(hours=72)
     response = await client.get(
-        f"/api/logbook/{start_date.isoformat()}?end_time={end_time}&entity=switch.test"
+        f"/api/logbook/{start_date.isoformat()}",
+        params={"end_time": end_time.isoformat(), "entity": "switch.test"},
     )
     assert response.status == HTTPStatus.OK
     response_json = await response.json()
@@ -619,25 +657,29 @@ async def test_logbook_view_end_time_entity(recorder_mock, hass, hass_client):
 
     # Tomorrow time 00:00:00
     start = dt_util.utcnow()
-    start_date = datetime(start.year, start.month, start.day)
+    start_date = datetime(start.year, start.month, start.day, tzinfo=dt_util.UTC)
 
     # Test entries from today to 3 days with filter by entity_id
     end_time = start_date + timedelta(hours=72)
     response = await client.get(
-        f"/api/logbook/{start_date.isoformat()}?end_time={end_time}&entity=switch.test"
+        f"/api/logbook/{start_date.isoformat()}",
+        params={"end_time": end_time.isoformat(), "entity": "switch.test"},
     )
-    assert response.status == HTTPStatus.OK
     response_json = await response.json()
+    assert response.status == HTTPStatus.OK
     assert len(response_json) == 1
     assert response_json[0]["entity_id"] == entity_id_test
 
 
-async def test_logbook_entity_filter_with_automations(recorder_mock, hass, hass_client):
+@pytest.mark.usefixtures("recorder_mock")
+async def test_logbook_entity_filter_with_automations(
+    hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
     """Test the logbook view with end_time and entity with automations and scripts."""
     await asyncio.gather(
         *[
-            async_setup_component(hass, comp, {})
-            for comp in ("homeassistant", "logbook", "automation", "script")
+            async_setup_component(hass, domain, {})
+            for domain in ("homeassistant", "logbook", "automation", "script")
         ]
     )
 
@@ -666,12 +708,13 @@ async def test_logbook_entity_filter_with_automations(recorder_mock, hass, hass_
 
     # Today time 00:00:00
     start = dt_util.utcnow().date()
-    start_date = datetime(start.year, start.month, start.day)
+    start_date = datetime(start.year, start.month, start.day, tzinfo=dt_util.UTC)
 
     # Test today entries with filter by end_time
-    end_time = start + timedelta(hours=24)
+    end_time = start_date + timedelta(hours=24)
     response = await client.get(
-        f"/api/logbook/{start_date.isoformat()}?end_time={end_time}"
+        f"/api/logbook/{start_date.isoformat()}",
+        params={"end_time": end_time.isoformat()},
     )
     assert response.status == HTTPStatus.OK
     json_dict = await response.json()
@@ -685,7 +728,11 @@ async def test_logbook_entity_filter_with_automations(recorder_mock, hass, hass_
     # Test entries for 3 days with filter by entity_id
     end_time = start + timedelta(hours=72)
     response = await client.get(
-        f"/api/logbook/{start_date.isoformat()}?end_time={end_time}&entity=alarm_control_panel.area_001"
+        f"/api/logbook/{start_date.isoformat()}",
+        params={
+            "end_time": end_time.isoformat(),
+            "entity": "alarm_control_panel.area_001",
+        },
     )
     assert response.status == HTTPStatus.OK
     json_dict = await response.json()
@@ -694,12 +741,16 @@ async def test_logbook_entity_filter_with_automations(recorder_mock, hass, hass_
 
     # Tomorrow time 00:00:00
     start = dt_util.utcnow()
-    start_date = datetime(start.year, start.month, start.day)
+    start_date = datetime(start.year, start.month, start.day, tzinfo=dt_util.UTC)
 
     # Test entries from today to 3 days with filter by entity_id
     end_time = start_date + timedelta(hours=72)
     response = await client.get(
-        f"/api/logbook/{start_date.isoformat()}?end_time={end_time}&entity=alarm_control_panel.area_002"
+        f"/api/logbook/{start_date.isoformat()}",
+        params={
+            "end_time": end_time.isoformat(),
+            "entity": "alarm_control_panel.area_002",
+        },
     )
     assert response.status == HTTPStatus.OK
     json_dict = await response.json()
@@ -707,11 +758,12 @@ async def test_logbook_entity_filter_with_automations(recorder_mock, hass, hass_
     assert json_dict[0]["entity_id"] == entity_id_second
 
 
+@pytest.mark.usefixtures("recorder_mock")
 async def test_logbook_entity_no_longer_in_state_machine(
-    recorder_mock, hass, hass_client
-):
-    """Test the logbook view with an entity that hass been removed from the state machine."""
-    await async_setup_component(hass, "logbook", {})
+    hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
+    """Test logbook view with entity removed from state machine."""
+    await async_setup_component(hass, DOMAIN, {})
     await async_setup_component(hass, "automation", {})
     await async_setup_component(hass, "script", {})
 
@@ -733,23 +785,26 @@ async def test_logbook_entity_no_longer_in_state_machine(
 
     # Today time 00:00:00
     start = dt_util.utcnow().date()
-    start_date = datetime(start.year, start.month, start.day)
+    start_date = datetime(start.year, start.month, start.day, tzinfo=dt_util.UTC)
 
     # Test today entries with filter by end_time
-    end_time = start + timedelta(hours=24)
+    end_time = start_date + timedelta(hours=24)
     response = await client.get(
-        f"/api/logbook/{start_date.isoformat()}?end_time={end_time}"
+        f"/api/logbook/{start_date.isoformat()}",
+        params={"end_time": end_time.isoformat()},
     )
     assert response.status == HTTPStatus.OK
     json_dict = await response.json()
     assert json_dict[0]["name"] == "area 001"
 
 
+@pytest.mark.usefixtures("recorder_mock", "set_utc")
 async def test_filter_continuous_sensor_values(
-    recorder_mock, hass, hass_client, set_utc
-):
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+) -> None:
     """Test remove continuous sensor events from logbook."""
-    await async_setup_component(hass, "logbook", {})
+    await async_setup_component(hass, DOMAIN, {})
     await async_recorder_block_till_done(hass)
 
     entity_id_test = "switch.test"
@@ -774,7 +829,7 @@ async def test_filter_continuous_sensor_values(
 
     # Today time 00:00:00
     start = dt_util.utcnow().date()
-    start_date = datetime(start.year, start.month, start.day)
+    start_date = datetime(start.year, start.month, start.day, tzinfo=dt_util.UTC)
 
     # Test today entries without filters
     response = await client.get(f"/api/logbook/{start_date.isoformat()}")
@@ -786,12 +841,16 @@ async def test_filter_continuous_sensor_values(
     assert response_json[1]["entity_id"] == entity_id_third
 
 
-async def test_exclude_new_entities(recorder_mock, hass, hass_client, set_utc):
+@pytest.mark.usefixtures("recorder_mock", "set_utc")
+async def test_exclude_new_entities(
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+) -> None:
     """Test if events are excluded on first update."""
     await asyncio.gather(
         *[
-            async_setup_component(hass, comp, {})
-            for comp in ("homeassistant", "logbook")
+            async_setup_component(hass, domain, {})
+            for domain in ("homeassistant", "logbook")
         ]
     )
     await async_recorder_block_till_done(hass)
@@ -810,7 +869,7 @@ async def test_exclude_new_entities(recorder_mock, hass, hass_client, set_utc):
 
     # Today time 00:00:00
     start = dt_util.utcnow().date()
-    start_date = datetime(start.year, start.month, start.day)
+    start_date = datetime(start.year, start.month, start.day, tzinfo=dt_util.UTC)
 
     # Test today entries without filters
     response = await client.get(f"/api/logbook/{start_date.isoformat()}")
@@ -823,12 +882,16 @@ async def test_exclude_new_entities(recorder_mock, hass, hass_client, set_utc):
     assert response_json[1]["message"] == "started"
 
 
-async def test_exclude_removed_entities(recorder_mock, hass, hass_client, set_utc):
+@pytest.mark.usefixtures("recorder_mock", "set_utc")
+async def test_exclude_removed_entities(
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+) -> None:
     """Test if events are excluded on last update."""
     await asyncio.gather(
         *[
-            async_setup_component(hass, comp, {})
-            for comp in ("homeassistant", "logbook")
+            async_setup_component(hass, domain, {})
+            for domain in ("homeassistant", "logbook")
         ]
     )
     await async_recorder_block_till_done(hass)
@@ -853,7 +916,7 @@ async def test_exclude_removed_entities(recorder_mock, hass, hass_client, set_ut
 
     # Today time 00:00:00
     start = dt_util.utcnow().date()
-    start_date = datetime(start.year, start.month, start.day)
+    start_date = datetime(start.year, start.month, start.day, tzinfo=dt_util.UTC)
 
     # Test today entries without filters
     response = await client.get(f"/api/logbook/{start_date.isoformat()}")
@@ -867,12 +930,16 @@ async def test_exclude_removed_entities(recorder_mock, hass, hass_client, set_ut
     assert response_json[2]["entity_id"] == entity_id2
 
 
-async def test_exclude_attribute_changes(recorder_mock, hass, hass_client, set_utc):
+@pytest.mark.usefixtures("recorder_mock", "set_utc")
+async def test_exclude_attribute_changes(
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+) -> None:
     """Test if events of attribute changes are filtered."""
     await asyncio.gather(
         *[
-            async_setup_component(hass, comp, {})
-            for comp in ("homeassistant", "logbook")
+            async_setup_component(hass, domain, {})
+            for domain in ("homeassistant", "logbook")
         ]
     )
     await async_recorder_block_till_done(hass)
@@ -894,7 +961,7 @@ async def test_exclude_attribute_changes(recorder_mock, hass, hass_client, set_u
 
     # Today time 00:00:00
     start = dt_util.utcnow().date()
-    start_date = datetime(start.year, start.month, start.day)
+    start_date = datetime(start.year, start.month, start.day, tzinfo=dt_util.UTC)
 
     # Test today entries without filters
     response = await client.get(f"/api/logbook/{start_date.isoformat()}")
@@ -907,19 +974,22 @@ async def test_exclude_attribute_changes(recorder_mock, hass, hass_client, set_u
     assert response_json[2]["entity_id"] == "light.kitchen"
 
 
-async def test_logbook_entity_context_id(recorder_mock, hass, hass_client):
+@pytest.mark.usefixtures("recorder_mock")
+async def test_logbook_entity_context_id(
+    hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
     """Test the logbook view with end_time and entity with automations and scripts."""
     await asyncio.gather(
         *[
-            async_setup_component(hass, comp, {})
-            for comp in ("homeassistant", "logbook", "automation", "script")
+            async_setup_component(hass, domain, {})
+            for domain in ("homeassistant", "logbook", "automation", "script")
         ]
     )
 
     await async_recorder_block_till_done(hass)
 
     context = ha.Context(
-        id="ac5bd62de45711eaaeb351041eec8dd9",
+        id="01GTDGKBCH00GW0X476W5TVAAA",
         user_id="b400facee45711eaa9308bfd3d19e474",
     )
 
@@ -980,7 +1050,7 @@ async def test_logbook_entity_context_id(recorder_mock, hass, hass_client):
 
     # A service call
     light_turn_off_service_context = ha.Context(
-        id="9c5bd62de45711eaaeb351041eec8dd9",
+        id="01GTDGKBCH00GW0X476W5TVBFC",
         user_id="9400facee45711eaa9308bfd3d19e474",
     )
     hass.states.async_set("light.switch", STATE_ON)
@@ -1006,12 +1076,13 @@ async def test_logbook_entity_context_id(recorder_mock, hass, hass_client):
 
     # Today time 00:00:00
     start = dt_util.utcnow().date()
-    start_date = datetime(start.year, start.month, start.day)
+    start_date = datetime(start.year, start.month, start.day, tzinfo=dt_util.UTC)
 
     # Test today entries with filter by end_time
-    end_time = start + timedelta(hours=24)
+    end_time = start_date + timedelta(hours=24)
     response = await client.get(
-        f"/api/logbook/{start_date.isoformat()}?end_time={end_time}"
+        f"/api/logbook/{start_date.isoformat()}",
+        params={"end_time": end_time.isoformat()},
     )
     assert response.status == HTTPStatus.OK
     json_dict = await response.json()
@@ -1057,14 +1128,15 @@ async def test_logbook_entity_context_id(recorder_mock, hass, hass_client):
     assert json_dict[7]["context_user_id"] == "9400facee45711eaa9308bfd3d19e474"
 
 
+@pytest.mark.usefixtures("recorder_mock")
 async def test_logbook_context_id_automation_script_started_manually(
-    recorder_mock, hass, hass_client
-):
-    """Test the logbook populates context_ids for scripts and automations started manually."""
+    hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
+    """Test logbook context_ids for manually started scripts/automations."""
     await asyncio.gather(
         *[
-            async_setup_component(hass, comp, {})
-            for comp in ("homeassistant", "logbook", "automation", "script")
+            async_setup_component(hass, domain, {})
+            for domain in ("homeassistant", "logbook", "automation", "script")
         ]
     )
 
@@ -1073,7 +1145,7 @@ async def test_logbook_context_id_automation_script_started_manually(
     # An Automation
     automation_entity_id_test = "automation.alarm"
     automation_context = ha.Context(
-        id="fc5bd62de45711eaaeb351041eec8dd9",
+        id="01GTDGKBCH00GW0X476W5TVCCC",
         user_id="f400facee45711eaa9308bfd3d19e474",
     )
     hass.bus.async_fire(
@@ -1082,7 +1154,7 @@ async def test_logbook_context_id_automation_script_started_manually(
         context=automation_context,
     )
     script_context = ha.Context(
-        id="ac5bd62de45711eaaeb351041eec8dd9",
+        id="01GTDGKBCH00GW0X476W5TVAAA",
         user_id="b400facee45711eaa9308bfd3d19e474",
     )
     hass.bus.async_fire(
@@ -1094,7 +1166,7 @@ async def test_logbook_context_id_automation_script_started_manually(
     hass.bus.async_fire(EVENT_HOMEASSISTANT_START)
 
     script_2_context = ha.Context(
-        id="1234",
+        id="01GTDGKBCH00GW0X476W5TVEEE",
         user_id="b400facee45711eaa9308bfd3d19e474",
     )
     hass.bus.async_fire(
@@ -1112,12 +1184,13 @@ async def test_logbook_context_id_automation_script_started_manually(
 
     # Today time 00:00:00
     start = dt_util.utcnow().date()
-    start_date = datetime(start.year, start.month, start.day)
+    start_date = datetime(start.year, start.month, start.day, tzinfo=dt_util.UTC)
 
     # Test today entries with filter by end_time
-    end_time = start + timedelta(hours=24)
+    end_time = start_date + timedelta(hours=24)
     response = await client.get(
-        f"/api/logbook/{start_date.isoformat()}?end_time={end_time}"
+        f"/api/logbook/{start_date.isoformat()}",
+        params={"end_time": end_time.isoformat()},
     )
     assert response.status == HTTPStatus.OK
     json_dict = await response.json()
@@ -1125,12 +1198,12 @@ async def test_logbook_context_id_automation_script_started_manually(
     assert json_dict[0]["entity_id"] == "automation.alarm"
     assert "context_entity_id" not in json_dict[0]
     assert json_dict[0]["context_user_id"] == "f400facee45711eaa9308bfd3d19e474"
-    assert json_dict[0]["context_id"] == "fc5bd62de45711eaaeb351041eec8dd9"
+    assert json_dict[0]["context_id"] == "01GTDGKBCH00GW0X476W5TVCCC"
 
     assert json_dict[1]["entity_id"] == "script.mock_script"
     assert "context_entity_id" not in json_dict[1]
     assert json_dict[1]["context_user_id"] == "b400facee45711eaa9308bfd3d19e474"
-    assert json_dict[1]["context_id"] == "ac5bd62de45711eaaeb351041eec8dd9"
+    assert json_dict[1]["context_id"] == "01GTDGKBCH00GW0X476W5TVAAA"
 
     assert json_dict[2]["domain"] == "homeassistant"
 
@@ -1138,7 +1211,7 @@ async def test_logbook_context_id_automation_script_started_manually(
     assert json_dict[3]["name"] == "Mock script"
     assert "context_entity_id" not in json_dict[1]
     assert json_dict[3]["context_user_id"] == "b400facee45711eaa9308bfd3d19e474"
-    assert json_dict[3]["context_id"] == "1234"
+    assert json_dict[3]["context_id"] == "01GTDGKBCH00GW0X476W5TVEEE"
 
     assert json_dict[4]["entity_id"] == "switch.new"
     assert json_dict[4]["state"] == "off"
@@ -1148,19 +1221,22 @@ async def test_logbook_context_id_automation_script_started_manually(
     assert json_dict[4]["context_domain"] == "script"
 
 
-async def test_logbook_entity_context_parent_id(recorder_mock, hass, hass_client):
+@pytest.mark.usefixtures("recorder_mock")
+async def test_logbook_entity_context_parent_id(
+    hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
     """Test the logbook view links events via context parent_id."""
     await asyncio.gather(
         *[
-            async_setup_component(hass, comp, {})
-            for comp in ("homeassistant", "logbook", "automation", "script")
+            async_setup_component(hass, domain, {})
+            for domain in ("homeassistant", "logbook", "automation", "script")
         ]
     )
 
     await async_recorder_block_till_done(hass)
 
     context = ha.Context(
-        id="ac5bd62de45711eaaeb351041eec8dd9",
+        id="01GTDGKBCH00GW0X476W5TVAAA",
         user_id="b400facee45711eaa9308bfd3d19e474",
     )
 
@@ -1173,8 +1249,8 @@ async def test_logbook_entity_context_parent_id(recorder_mock, hass, hass_client
     )
 
     child_context = ha.Context(
-        id="2798bfedf8234b5e9f4009c91f48f30c",
-        parent_id="ac5bd62de45711eaaeb351041eec8dd9",
+        id="01GTDGKBCH00GW0X476W5TVDDD",
+        parent_id="01GTDGKBCH00GW0X476W5TVAAA",
         user_id="b400facee45711eaa9308bfd3d19e474",
     )
     hass.bus.async_fire(
@@ -1225,8 +1301,8 @@ async def test_logbook_entity_context_parent_id(recorder_mock, hass, hass_client
 
     # A state change via service call with the script as the parent
     light_turn_off_service_context = ha.Context(
-        id="9c5bd62de45711eaaeb351041eec8dd9",
-        parent_id="2798bfedf8234b5e9f4009c91f48f30c",
+        id="01GTDGKBCH00GW0X476W5TVBFC",
+        parent_id="01GTDGKBCH00GW0X476W5TVDDD",
         user_id="9400facee45711eaa9308bfd3d19e474",
     )
     hass.states.async_set("light.switch", STATE_ON)
@@ -1250,8 +1326,8 @@ async def test_logbook_entity_context_parent_id(recorder_mock, hass, hass_client
 
     # An event with a parent event, but the parent event isn't available
     missing_parent_context = ha.Context(
-        id="fc40b9a0d1f246f98c34b33c76228ee6",
-        parent_id="c8ce515fe58e442f8664246c65ed964f",
+        id="01GTDGKBCH00GW0X476W5TEDDD",
+        parent_id="01GTDGKBCH00GW0X276W5TEDDD",
         user_id="485cacf93ef84d25a99ced3126b921d2",
     )
     logbook.async_log_entry(
@@ -1268,12 +1344,13 @@ async def test_logbook_entity_context_parent_id(recorder_mock, hass, hass_client
 
     # Today time 00:00:00
     start = dt_util.utcnow().date()
-    start_date = datetime(start.year, start.month, start.day)
+    start_date = datetime(start.year, start.month, start.day, tzinfo=dt_util.UTC)
 
     # Test today entries with filter by end_time
-    end_time = start + timedelta(hours=24)
+    end_time = start_date + timedelta(hours=24)
     response = await client.get(
-        f"/api/logbook/{start_date.isoformat()}?end_time={end_time}"
+        f"/api/logbook/{start_date.isoformat()}",
+        params={"end_time": end_time.isoformat()},
     )
     assert response.status == HTTPStatus.OK
     json_dict = await response.json()
@@ -1327,33 +1404,34 @@ async def test_logbook_entity_context_parent_id(recorder_mock, hass, hass_client
     assert json_dict[8]["context_user_id"] == "485cacf93ef84d25a99ced3126b921d2"
 
 
-async def test_logbook_context_from_template(recorder_mock, hass, hass_client):
+@pytest.mark.usefixtures("recorder_mock")
+async def test_logbook_context_from_template(
+    hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
     """Test the logbook view with end_time and entity with automations and scripts."""
     await asyncio.gather(
         *[
-            async_setup_component(hass, comp, {})
-            for comp in ("homeassistant", "logbook")
+            async_setup_component(hass, domain, {})
+            for domain in ("homeassistant", "logbook")
         ]
     )
 
     assert await async_setup_component(
         hass,
-        "switch",
+        "template",
         {
-            "switch": {
-                "platform": "template",
-                "switches": {
-                    "test_template_switch": {
-                        "value_template": "{{ states.switch.test_state.state }}",
-                        "turn_on": {
-                            "service": "switch.turn_on",
-                            "entity_id": "switch.test_state",
-                        },
-                        "turn_off": {
-                            "service": "switch.turn_off",
-                            "entity_id": "switch.test_state",
-                        },
-                    }
+            "template": {
+                "switch": {
+                    "default_entity_id": "switch.test_template_switch",
+                    "state": "{{ states.switch.test_state.state }}",
+                    "turn_on": {
+                        "service": "switch.turn_on",
+                        "entity_id": "switch.test_state",
+                    },
+                    "turn_off": {
+                        "service": "switch.turn_off",
+                        "entity_id": "switch.test_state",
+                    },
                 },
             }
         },
@@ -1372,7 +1450,7 @@ async def test_logbook_context_from_template(recorder_mock, hass, hass_client):
     await hass.async_block_till_done()
 
     switch_turn_off_context = ha.Context(
-        id="9c5bd62de45711eaaeb351041eec8dd9",
+        id="01GTDGKBCH00GW0X476W5TVBFC",
         user_id="9400facee45711eaa9308bfd3d19e474",
     )
     hass.states.async_set(
@@ -1384,12 +1462,13 @@ async def test_logbook_context_from_template(recorder_mock, hass, hass_client):
 
     # Today time 00:00:00
     start = dt_util.utcnow().date()
-    start_date = datetime(start.year, start.month, start.day)
+    start_date = datetime(start.year, start.month, start.day, tzinfo=dt_util.UTC)
 
     # Test today entries with filter by end_time
-    end_time = start + timedelta(hours=24)
+    end_time = start_date + timedelta(hours=24)
     response = await client.get(
-        f"/api/logbook/{start_date.isoformat()}?end_time={end_time}"
+        f"/api/logbook/{start_date.isoformat()}",
+        params={"end_time": end_time.isoformat()},
     )
     assert response.status == HTTPStatus.OK
     json_dict = await response.json()
@@ -1414,27 +1493,28 @@ async def test_logbook_context_from_template(recorder_mock, hass, hass_client):
     assert json_dict[5]["context_user_id"] == "9400facee45711eaa9308bfd3d19e474"
 
 
-async def test_logbook_(recorder_mock, hass, hass_client):
+@pytest.mark.usefixtures("recorder_mock")
+async def test_logbook_(
+    hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
     """Test the logbook view with a single entity and ."""
-    await async_setup_component(hass, "logbook", {})
+    await async_setup_component(hass, DOMAIN, {})
     assert await async_setup_component(
         hass,
-        "switch",
+        "template",
         {
-            "switch": {
-                "platform": "template",
-                "switches": {
-                    "test_template_switch": {
-                        "value_template": "{{ states.switch.test_state.state }}",
-                        "turn_on": {
-                            "service": "switch.turn_on",
-                            "entity_id": "switch.test_state",
-                        },
-                        "turn_off": {
-                            "service": "switch.turn_off",
-                            "entity_id": "switch.test_state",
-                        },
-                    }
+            "template": {
+                "switch": {
+                    "default_entity_id": "switch.test_template_switch",
+                    "state": "{{ states.switch.test_state.state }}",
+                    "turn_on": {
+                        "service": "switch.turn_on",
+                        "entity_id": "switch.test_state",
+                    },
+                    "turn_off": {
+                        "service": "switch.turn_off",
+                        "entity_id": "switch.test_state",
+                    },
                 },
             }
         },
@@ -1453,7 +1533,7 @@ async def test_logbook_(recorder_mock, hass, hass_client):
     await hass.async_block_till_done()
 
     switch_turn_off_context = ha.Context(
-        id="9c5bd62de45711eaaeb351041eec8dd9",
+        id="01GTDGKBCH00GW0X476W5TVBFC",
         user_id="9400facee45711eaa9308bfd3d19e474",
     )
     hass.states.async_set(
@@ -1465,7 +1545,7 @@ async def test_logbook_(recorder_mock, hass, hass_client):
 
     # Today time 00:00:00
     start = dt_util.utcnow().date()
-    start_date = datetime(start.year, start.month, start.day)
+    start_date = datetime(start.year, start.month, start.day, tzinfo=dt_util.UTC)
 
     # Test today entries with filter by end_time
     end_time = start + timedelta(hours=24)
@@ -1483,9 +1563,12 @@ async def test_logbook_(recorder_mock, hass, hass_client):
     assert json_dict[1]["context_user_id"] == "9400facee45711eaa9308bfd3d19e474"
 
 
-async def test_logbook_many_entities_multiple_calls(recorder_mock, hass, hass_client):
+@pytest.mark.usefixtures("recorder_mock")
+async def test_logbook_many_entities_multiple_calls(
+    hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
     """Test the logbook view with a many entities called multiple times."""
-    await async_setup_component(hass, "logbook", {})
+    await async_setup_component(hass, DOMAIN, {})
     await async_setup_component(hass, "automation", {})
 
     await async_recorder_block_till_done(hass)
@@ -1506,7 +1589,7 @@ async def test_logbook_many_entities_multiple_calls(recorder_mock, hass, hass_cl
 
     # Today time 00:00:00
     start = dt_util.utcnow().date()
-    start_date = datetime(start.year, start.month, start.day)
+    start_date = datetime(start.year, start.month, start.day, tzinfo=dt_util.UTC)
     end_time = start + timedelta(hours=24)
 
     for automation_id in range(5):
@@ -1553,9 +1636,12 @@ async def test_logbook_many_entities_multiple_calls(recorder_mock, hass, hass_cl
     assert len(json_dict) == 0
 
 
-async def test_custom_log_entry_discoverable_via_(recorder_mock, hass, hass_client):
+@pytest.mark.usefixtures("recorder_mock")
+async def test_custom_log_entry_discoverable_via_(
+    hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
     """Test if a custom log entry is later discoverable via ."""
-    await async_setup_component(hass, "logbook", {})
+    await async_setup_component(hass, DOMAIN, {})
     await async_recorder_block_till_done(hass)
 
     logbook.async_log_entry(
@@ -1571,7 +1657,7 @@ async def test_custom_log_entry_discoverable_via_(recorder_mock, hass, hass_clie
 
     # Today time 00:00:00
     start = dt_util.utcnow().date()
-    start_date = datetime(start.year, start.month, start.day)
+    start_date = datetime(start.year, start.month, start.day, tzinfo=dt_util.UTC)
 
     # Test today entries with filter by end_time
     end_time = start + timedelta(hours=24)
@@ -1588,27 +1674,28 @@ async def test_custom_log_entry_discoverable_via_(recorder_mock, hass, hass_clie
     assert json_dict[0]["entity_id"] == "switch.test_switch"
 
 
-async def test_logbook_multiple_entities(recorder_mock, hass, hass_client):
+@pytest.mark.usefixtures("recorder_mock")
+async def test_logbook_multiple_entities(
+    hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
     """Test the logbook view with a multiple entities."""
-    await async_setup_component(hass, "logbook", {})
+    await async_setup_component(hass, DOMAIN, {})
     assert await async_setup_component(
         hass,
-        "switch",
+        "template",
         {
-            "switch": {
-                "platform": "template",
-                "switches": {
-                    "test_template_switch": {
-                        "value_template": "{{ states.switch.test_state.state }}",
-                        "turn_on": {
-                            "service": "switch.turn_on",
-                            "entity_id": "switch.test_state",
-                        },
-                        "turn_off": {
-                            "service": "switch.turn_off",
-                            "entity_id": "switch.test_state",
-                        },
-                    }
+            "template": {
+                "switch": {
+                    "default_entity_id": "switch.test_template_switch",
+                    "state": "{{ states.switch.test_state.state }}",
+                    "turn_on": {
+                        "service": "switch.turn_on",
+                        "entity_id": "switch.test_state",
+                    },
+                    "turn_off": {
+                        "service": "switch.turn_off",
+                        "entity_id": "switch.test_state",
+                    },
                 },
             }
         },
@@ -1633,7 +1720,7 @@ async def test_logbook_multiple_entities(recorder_mock, hass, hass_client):
     await hass.async_block_till_done()
 
     switch_turn_off_context = ha.Context(
-        id="9c5bd62de45711eaaeb351041eec8dd9",
+        id="01GTDGKBCH00GW0X476W5TVBFC",
         user_id="9400facee45711eaa9308bfd3d19e474",
     )
     hass.states.async_set(
@@ -1649,7 +1736,7 @@ async def test_logbook_multiple_entities(recorder_mock, hass, hass_client):
 
     # Today time 00:00:00
     start = dt_util.utcnow().date()
-    start_date = datetime(start.year, start.month, start.day)
+    start_date = datetime(start.year, start.month, start.day, tzinfo=dt_util.UTC)
 
     # Test today entries with filter by end_time
     end_time = start + timedelta(hours=24)
@@ -1712,15 +1799,18 @@ async def test_logbook_multiple_entities(recorder_mock, hass, hass_client):
     assert json_dict[3]["context_user_id"] == "9400facee45711eaa9308bfd3d19e474"
 
 
-async def test_logbook_invalid_entity(recorder_mock, hass, hass_client):
+@pytest.mark.usefixtures("recorder_mock")
+async def test_logbook_invalid_entity(
+    hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
     """Test the logbook view with requesting an invalid entity."""
-    await async_setup_component(hass, "logbook", {})
+    await async_setup_component(hass, DOMAIN, {})
     await hass.async_block_till_done()
     client = await hass_client()
 
     # Today time 00:00:00
     start = dt_util.utcnow().date()
-    start_date = datetime(start.year, start.month, start.day)
+    start_date = datetime(start.year, start.month, start.day, tzinfo=dt_util.UTC)
 
     # Test today entries with filter by end_time
     end_time = start + timedelta(hours=24)
@@ -1730,12 +1820,15 @@ async def test_logbook_invalid_entity(recorder_mock, hass, hass_client):
     assert response.status == HTTPStatus.INTERNAL_SERVER_ERROR
 
 
-async def test_icon_and_state(recorder_mock, hass, hass_client):
+@pytest.mark.usefixtures("recorder_mock")
+async def test_icon_and_state(
+    hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
     """Test to ensure state and custom icons are returned."""
     await asyncio.gather(
         *[
-            async_setup_component(hass, comp, {})
-            for comp in ("homeassistant", "logbook")
+            async_setup_component(hass, domain, {})
+            for domain in ("homeassistant", "logbook")
         ]
     )
 
@@ -1773,31 +1866,74 @@ async def test_icon_and_state(recorder_mock, hass, hass_client):
     assert response_json[2]["state"] == STATE_OFF
 
 
-async def test_fire_logbook_entries(recorder_mock, hass, hass_client):
+@pytest.mark.usefixtures("recorder_mock")
+async def test_state_attributes_in_logbook(
+    hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
+    """Test state attributes are exposed in the logbook like the history.
+
+    The recorded subset is surfaced, so attributes the recorder excludes
+    (such as supported_features) must not appear.
+    """
+    await asyncio.gather(
+        *[
+            async_setup_component(hass, domain, {})
+            for domain in ("homeassistant", "logbook")
+        ]
+    )
+    await async_recorder_block_till_done(hass)
+
+    hass.bus.async_fire(EVENT_HOMEASSISTANT_START)
+
+    hass.states.async_set("event.doorbell", STATE_UNKNOWN, {"event_type": None})
+    hass.states.async_set(
+        "event.doorbell",
+        "2024-01-01T00:00:00.000+00:00",
+        {"event_type": "ring", "supported_features": 1},
+    )
+    hass.states.async_set(
+        "event.doorbell", "2024-01-01T00:01:00.000+00:00", {"event_type": "motion"}
+    )
+
+    await async_wait_recording_done(hass)
+
+    client = await hass_client()
+    response_json = await _async_fetch_logbook(client)
+
+    entries = [e for e in response_json if e.get("entity_id") == "event.doorbell"]
+    assert len(entries) == 2
+    assert entries[0]["attributes"] == {"event_type": "ring"}
+    assert entries[1]["attributes"] == {"event_type": "motion"}
+
+
+@pytest.mark.usefixtures("recorder_mock")
+async def test_fire_logbook_entries(
+    hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
     """Test many logbook entry calls."""
-    await async_setup_component(hass, "logbook", {})
+    await async_setup_component(hass, DOMAIN, {})
     await async_recorder_block_till_done(hass)
 
     for _ in range(10):
         hass.bus.async_fire(
-            logbook.EVENT_LOGBOOK_ENTRY,
+            EVENT_LOGBOOK_ENTRY,
             {
-                logbook.ATTR_NAME: "Alarm",
-                logbook.ATTR_MESSAGE: "is triggered",
-                logbook.ATTR_DOMAIN: "switch",
-                logbook.ATTR_ENTITY_ID: "sensor.xyz",
+                ATTR_NAME: "Alarm",
+                ATTR_MESSAGE: "is triggered",
+                ATTR_DOMAIN: "switch",
+                ATTR_ENTITY_ID: "sensor.xyz",
             },
         )
         hass.bus.async_fire(
-            logbook.EVENT_LOGBOOK_ENTRY,
+            EVENT_LOGBOOK_ENTRY,
             {},
         )
     hass.bus.async_fire(
-        logbook.EVENT_LOGBOOK_ENTRY,
+        EVENT_LOGBOOK_ENTRY,
         {
-            logbook.ATTR_NAME: "Alarm",
-            logbook.ATTR_MESSAGE: "is triggered",
-            logbook.ATTR_DOMAIN: "switch",
+            ATTR_NAME: "Alarm",
+            ATTR_MESSAGE: "is triggered",
+            ATTR_DOMAIN: "switch",
         },
     )
     await async_wait_recording_done(hass)
@@ -1809,7 +1945,10 @@ async def test_fire_logbook_entries(recorder_mock, hass, hass_client):
     assert len(response_json) == 11
 
 
-async def test_exclude_events_domain(recorder_mock, hass, hass_client):
+@pytest.mark.usefixtures("recorder_mock")
+async def test_exclude_events_domain(
+    hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
     """Test if events are filtered if domain is excluded in config."""
     entity_id = "switch.bla"
     entity_id2 = "sensor.blu"
@@ -1821,7 +1960,7 @@ async def test_exclude_events_domain(recorder_mock, hass, hass_client):
             logbook.DOMAIN: {CONF_EXCLUDE: {CONF_DOMAINS: ["switch", "alexa"]}},
         }
     )
-    await async_setup_component(hass, "logbook", config)
+    await async_setup_component(hass, DOMAIN, config)
     await async_recorder_block_till_done(hass)
 
     hass.bus.async_fire(EVENT_HOMEASSISTANT_START)
@@ -1843,7 +1982,10 @@ async def test_exclude_events_domain(recorder_mock, hass, hass_client):
     _assert_entry(entries[1], name="blu", entity_id=entity_id2)
 
 
-async def test_exclude_events_domain_glob(recorder_mock, hass, hass_client):
+@pytest.mark.usefixtures("recorder_mock")
+async def test_exclude_events_domain_glob(
+    hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
     """Test if events are filtered if domain or glob is excluded in config."""
     entity_id = "switch.bla"
     entity_id2 = "sensor.blu"
@@ -1862,7 +2004,7 @@ async def test_exclude_events_domain_glob(recorder_mock, hass, hass_client):
     )
     await asyncio.gather(
         async_setup_component(hass, "homeassistant", {}),
-        async_setup_component(hass, "logbook", config),
+        async_setup_component(hass, DOMAIN, config),
     )
     await async_recorder_block_till_done(hass)
 
@@ -1886,7 +2028,10 @@ async def test_exclude_events_domain_glob(recorder_mock, hass, hass_client):
     _assert_entry(entries[1], name="blu", entity_id=entity_id2)
 
 
-async def test_include_events_entity(recorder_mock, hass, hass_client):
+@pytest.mark.usefixtures("recorder_mock")
+async def test_include_events_entity(
+    hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
     """Test if events are filtered if entity is included in config."""
     entity_id = "sensor.bla"
     entity_id2 = "sensor.blu"
@@ -1904,7 +2049,7 @@ async def test_include_events_entity(recorder_mock, hass, hass_client):
     )
     await asyncio.gather(
         async_setup_component(hass, "homeassistant", {}),
-        async_setup_component(hass, "logbook", config),
+        async_setup_component(hass, DOMAIN, config),
     )
     await async_recorder_block_till_done(hass)
 
@@ -1926,7 +2071,10 @@ async def test_include_events_entity(recorder_mock, hass, hass_client):
     _assert_entry(entries[1], name="blu", entity_id=entity_id2)
 
 
-async def test_exclude_events_entity(recorder_mock, hass, hass_client):
+@pytest.mark.usefixtures("recorder_mock")
+async def test_exclude_events_entity(
+    hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
     """Test if events are filtered if entity is excluded in config."""
     entity_id = "sensor.bla"
     entity_id2 = "sensor.blu"
@@ -1939,7 +2087,7 @@ async def test_exclude_events_entity(recorder_mock, hass, hass_client):
     )
     await asyncio.gather(
         async_setup_component(hass, "homeassistant", {}),
-        async_setup_component(hass, "logbook", config),
+        async_setup_component(hass, DOMAIN, config),
     )
     await async_recorder_block_till_done(hass)
 
@@ -1960,7 +2108,10 @@ async def test_exclude_events_entity(recorder_mock, hass, hass_client):
     _assert_entry(entries[1], name="blu", entity_id=entity_id2)
 
 
-async def test_include_events_domain(recorder_mock, hass, hass_client):
+@pytest.mark.usefixtures("recorder_mock")
+async def test_include_events_domain(
+    hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
     """Test if events are filtered if domain is included in config."""
     assert await async_setup_component(hass, "alexa", {})
     entity_id = "switch.bla"
@@ -1975,7 +2126,7 @@ async def test_include_events_domain(recorder_mock, hass, hass_client):
     )
     await asyncio.gather(
         async_setup_component(hass, "homeassistant", {}),
-        async_setup_component(hass, "logbook", config),
+        async_setup_component(hass, DOMAIN, config),
     )
     await async_recorder_block_till_done(hass)
 
@@ -2002,7 +2153,10 @@ async def test_include_events_domain(recorder_mock, hass, hass_client):
     _assert_entry(entries[2], name="blu", entity_id=entity_id2)
 
 
-async def test_include_events_domain_glob(recorder_mock, hass, hass_client):
+@pytest.mark.usefixtures("recorder_mock")
+async def test_include_events_domain_glob(
+    hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
     """Test if events are filtered if domain or glob is included in config."""
     assert await async_setup_component(hass, "alexa", {})
     entity_id = "switch.bla"
@@ -2021,16 +2175,16 @@ async def test_include_events_domain_glob(recorder_mock, hass, hass_client):
     )
     await asyncio.gather(
         async_setup_component(hass, "homeassistant", {}),
-        async_setup_component(hass, "logbook", config),
+        async_setup_component(hass, DOMAIN, config),
     )
     await async_recorder_block_till_done(hass)
 
     hass.bus.async_fire(
-        logbook.EVENT_LOGBOOK_ENTRY,
+        EVENT_LOGBOOK_ENTRY,
         {
-            logbook.ATTR_NAME: "Alarm",
-            logbook.ATTR_MESSAGE: "is triggered",
-            logbook.ATTR_ENTITY_ID: "switch.any",
+            ATTR_NAME: "Alarm",
+            ATTR_MESSAGE: "is triggered",
+            ATTR_ENTITY_ID: "switch.any",
         },
     )
     hass.bus.async_fire(EVENT_HOMEASSISTANT_START)
@@ -2059,7 +2213,10 @@ async def test_include_events_domain_glob(recorder_mock, hass, hass_client):
     _assert_entry(entries[3], name="included", entity_id=entity_id3)
 
 
-async def test_include_exclude_events_no_globs(recorder_mock, hass, hass_client):
+@pytest.mark.usefixtures("recorder_mock")
+async def test_include_exclude_events_no_globs(
+    hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
     """Test if events are filtered if include and exclude is configured."""
     entity_id = "switch.bla"
     entity_id2 = "sensor.blu"
@@ -2083,7 +2240,7 @@ async def test_include_exclude_events_no_globs(recorder_mock, hass, hass_client)
     )
     await asyncio.gather(
         async_setup_component(hass, "homeassistant", {}),
-        async_setup_component(hass, "logbook", config),
+        async_setup_component(hass, DOMAIN, config),
     )
     await async_recorder_block_till_done(hass)
 
@@ -2115,9 +2272,10 @@ async def test_include_exclude_events_no_globs(recorder_mock, hass, hass_client)
     _assert_entry(entries[5], name="keep", entity_id=entity_id4, state="10")
 
 
+@pytest.mark.usefixtures("recorder_mock")
 async def test_include_exclude_events_with_glob_filters(
-    recorder_mock, hass, hass_client
-):
+    hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
     """Test if events are filtered if include and exclude is configured."""
     entity_id = "switch.bla"
     entity_id2 = "sensor.blu"
@@ -2144,7 +2302,7 @@ async def test_include_exclude_events_with_glob_filters(
     )
     await asyncio.gather(
         async_setup_component(hass, "homeassistant", {}),
-        async_setup_component(hass, "logbook", config),
+        async_setup_component(hass, DOMAIN, config),
     )
     await async_recorder_block_till_done(hass)
 
@@ -2181,7 +2339,10 @@ async def test_include_exclude_events_with_glob_filters(
     _assert_entry(entries[6], name="included", entity_id=entity_id5, state="30")
 
 
-async def test_empty_config(recorder_mock, hass, hass_client):
+@pytest.mark.usefixtures("recorder_mock")
+async def test_empty_config(
+    hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
     """Test we can handle an empty entity filter."""
     entity_id = "sensor.blu"
 
@@ -2193,7 +2354,7 @@ async def test_empty_config(recorder_mock, hass, hass_client):
     )
     await asyncio.gather(
         async_setup_component(hass, "homeassistant", {}),
-        async_setup_component(hass, "logbook", config),
+        async_setup_component(hass, DOMAIN, config),
     )
     await async_recorder_block_till_done(hass)
 
@@ -2213,9 +2374,12 @@ async def test_empty_config(recorder_mock, hass, hass_client):
     _assert_entry(entries[1], name="blu", entity_id=entity_id)
 
 
-async def test_context_filter(recorder_mock, hass, hass_client):
+@pytest.mark.usefixtures("recorder_mock")
+async def test_context_filter(
+    hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
     """Test we can filter by context."""
-    assert await async_setup_component(hass, "logbook", {})
+    assert await async_setup_component(hass, DOMAIN, {})
     await async_recorder_block_till_done(hass)
 
     entity_id = "switch.blu"
@@ -2250,11 +2414,14 @@ async def _async_fetch_logbook(client, params=None):
         params = {}
 
     # Today time 00:00:00
-    start = dt_util.utcnow().date()
-    start_date = datetime(start.year, start.month, start.day) - timedelta(hours=24)
+    now = dt_util.utcnow()
+    start = datetime(now.year, now.month, now.day, tzinfo=dt_util.UTC)
+    start_date = datetime(
+        start.year, start.month, start.day, tzinfo=dt_util.UTC
+    ) - timedelta(hours=24)
 
     if "end_time" not in params:
-        params["end_time"] = str(start + timedelta(hours=48))
+        params["end_time"] = (start + timedelta(hours=48)).isoformat()
 
     # Test today entries without filters
     response = await client.get(f"/api/logbook/{start_date.isoformat()}", params=params)
@@ -2285,13 +2452,16 @@ def _assert_entry(
         assert state == entry["state"]
 
 
-async def test_get_events(recorder_mock, hass, hass_ws_client):
+@pytest.mark.usefixtures("recorder_mock")
+async def test_get_events(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator
+) -> None:
     """Test logbook get_events."""
     now = dt_util.utcnow()
     await asyncio.gather(
         *[
-            async_setup_component(hass, comp, {})
-            for comp in ("homeassistant", "logbook")
+            async_setup_component(hass, domain, {})
+            for domain in ("homeassistant", "logbook")
         ]
     )
     await async_recorder_block_till_done(hass)
@@ -2309,7 +2479,7 @@ async def test_get_events(recorder_mock, hass, hass_ws_client):
     hass.states.async_set("light.kitchen", STATE_ON, {"brightness": 400})
     await hass.async_block_till_done()
     context = ha.Context(
-        id="ac5bd62de45711eaaeb351041eec8dd9",
+        id="01GTDGKBCH00GW0X476W5TVAAA",
         user_id="b400facee45711eaa9308bfd3d19e474",
     )
 
@@ -2389,7 +2559,7 @@ async def test_get_events(recorder_mock, hass, hass_ws_client):
             "id": 5,
             "type": "logbook/get_events",
             "start_time": now.isoformat(),
-            "context_id": "ac5bd62de45711eaaeb351041eec8dd9",
+            "context_id": "01GTDGKBCH00GW0X476W5TVAAA",
         }
     )
     response = await client.receive_json()
@@ -2403,9 +2573,12 @@ async def test_get_events(recorder_mock, hass, hass_ws_client):
     assert isinstance(results[0]["when"], float)
 
 
-async def test_get_events_future_start_time(recorder_mock, hass, hass_ws_client):
+@pytest.mark.usefixtures("recorder_mock")
+async def test_get_events_future_start_time(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator
+) -> None:
     """Test get_events with a future start time."""
-    await async_setup_component(hass, "logbook", {})
+    await async_setup_component(hass, DOMAIN, {})
     await async_recorder_block_till_done(hass)
     future = dt_util.utcnow() + timedelta(hours=10)
 
@@ -2426,9 +2599,12 @@ async def test_get_events_future_start_time(recorder_mock, hass, hass_ws_client)
     assert len(results) == 0
 
 
-async def test_get_events_bad_start_time(recorder_mock, hass, hass_ws_client):
+@pytest.mark.usefixtures("recorder_mock")
+async def test_get_events_bad_start_time(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator
+) -> None:
     """Test get_events bad start time."""
-    await async_setup_component(hass, "logbook", {})
+    await async_setup_component(hass, DOMAIN, {})
     await async_recorder_block_till_done(hass)
 
     client = await hass_ws_client()
@@ -2444,10 +2620,13 @@ async def test_get_events_bad_start_time(recorder_mock, hass, hass_ws_client):
     assert response["error"]["code"] == "invalid_start_time"
 
 
-async def test_get_events_bad_end_time(recorder_mock, hass, hass_ws_client):
+@pytest.mark.usefixtures("recorder_mock")
+async def test_get_events_bad_end_time(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator
+) -> None:
     """Test get_events bad end time."""
     now = dt_util.utcnow()
-    await async_setup_component(hass, "logbook", {})
+    await async_setup_component(hass, DOMAIN, {})
     await async_recorder_block_till_done(hass)
 
     client = await hass_ws_client()
@@ -2464,9 +2643,12 @@ async def test_get_events_bad_end_time(recorder_mock, hass, hass_ws_client):
     assert response["error"]["code"] == "invalid_end_time"
 
 
-async def test_get_events_invalid_filters(recorder_mock, hass, hass_ws_client):
+@pytest.mark.usefixtures("recorder_mock")
+async def test_get_events_invalid_filters(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator
+) -> None:
     """Test get_events invalid filters."""
-    await async_setup_component(hass, "logbook", {})
+    await async_setup_component(hass, DOMAIN, {})
     await async_recorder_block_till_done(hass)
 
     client = await hass_ws_client()
@@ -2492,22 +2674,26 @@ async def test_get_events_invalid_filters(recorder_mock, hass, hass_ws_client):
     assert response["error"]["code"] == "invalid_format"
 
 
-async def test_get_events_with_device_ids(recorder_mock, hass, hass_ws_client):
+@pytest.mark.usefixtures("recorder_mock")
+async def test_get_events_with_device_ids(
+    hass: HomeAssistant,
+    hass_ws_client: WebSocketGenerator,
+    device_registry: dr.DeviceRegistry,
+) -> None:
     """Test logbook get_events for device ids."""
     now = dt_util.utcnow()
     await asyncio.gather(
         *[
-            async_setup_component(hass, comp, {})
-            for comp in ("homeassistant", "logbook")
+            async_setup_component(hass, domain, {})
+            for domain in ("homeassistant", "logbook")
         ]
     )
 
     entry = MockConfigEntry(domain="test", data={"first": True}, options=None)
     entry.add_to_hass(hass)
-    dev_reg = device_registry.async_get(hass)
-    device = dev_reg.async_get_or_create(
+    device = device_registry.async_get_or_create(
         config_entry_id=entry.entry_id,
-        connections={(device_registry.CONNECTION_NETWORK_MAC, "12:34:56:AB:CD:EF")},
+        connections={(dr.CONNECTION_NETWORK_MAC, "12:34:56:AB:CD:EF")},
         identifiers={("bridgeid", "0123")},
         sw_version="sw-version",
         name="device name",
@@ -2521,7 +2707,7 @@ async def test_get_events_with_device_ids(recorder_mock, hass, hass_ws_client):
 
         @ha.callback
         def async_describe_events(
-            hass: HomeAssistant,
+            hass: HomeAssistant,  # noqa: N805
             async_describe_event: Callable[
                 [str, str, Callable[[Event], dict[str, str]]], None
             ],
@@ -2538,7 +2724,7 @@ async def test_get_events_with_device_ids(recorder_mock, hass, hass_ws_client):
 
             async_describe_event("test", "mock_event", async_describe_test_event)
 
-    await logbook._process_logbook_platform(hass, "test", MockLogbookPlatform)
+    logbook._process_logbook_platform(hass, "test", MockLogbookPlatform)
 
     hass.bus.async_fire(EVENT_HOMEASSISTANT_START)
     hass.bus.async_fire("mock_event", {"device_id": device.id})
@@ -2554,7 +2740,7 @@ async def test_get_events_with_device_ids(recorder_mock, hass, hass_ws_client):
     hass.states.async_set("light.kitchen", STATE_ON, {"brightness": 400})
     await hass.async_block_till_done()
     context = ha.Context(
-        id="ac5bd62de45711eaaeb351041eec8dd9",
+        id="01GTDGKBCH00GW0X476W5TVAAA",
         user_id="b400facee45711eaa9308bfd3d19e474",
     )
 
@@ -2629,19 +2815,22 @@ async def test_get_events_with_device_ids(recorder_mock, hass, hass_ws_client):
     assert isinstance(results[3]["when"], float)
 
 
-async def test_logbook_select_entities_context_id(recorder_mock, hass, hass_client):
+@pytest.mark.usefixtures("recorder_mock")
+async def test_logbook_select_entities_context_id(
+    hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
     """Test the logbook view with end_time and entity with automations and scripts."""
     await asyncio.gather(
         *[
-            async_setup_component(hass, comp, {})
-            for comp in ("homeassistant", "logbook", "automation", "script")
+            async_setup_component(hass, domain, {})
+            for domain in ("homeassistant", "logbook", "automation", "script")
         ]
     )
 
     await async_recorder_block_till_done(hass)
 
     context = ha.Context(
-        id="ac5bd62de45711eaaeb351041eec8dd9",
+        id="01GTDGKBCH00GW0X476W5TVAAA",
         user_id="b400facee45711eaa9308bfd3d19e474",
     )
 
@@ -2700,7 +2889,7 @@ async def test_logbook_select_entities_context_id(recorder_mock, hass, hass_clie
 
     # A service call
     light_turn_off_service_context = ha.Context(
-        id="9c5bd62de45711eaaeb351041eec8dd9",
+        id="01GTDGKBCH00GW0X476W5TVBFC",
         user_id="9400facee45711eaa9308bfd3d19e474",
     )
     hass.states.async_set("light.switch", STATE_ON)
@@ -2726,7 +2915,7 @@ async def test_logbook_select_entities_context_id(recorder_mock, hass, hass_clie
 
     # Today time 00:00:00
     start = dt_util.utcnow().date()
-    start_date = datetime(start.year, start.month, start.day)
+    start_date = datetime(start.year, start.month, start.day, tzinfo=dt_util.UTC)
 
     # Test today entries with filter by end_time
     end_time = start + timedelta(hours=24)
@@ -2762,13 +2951,16 @@ async def test_logbook_select_entities_context_id(recorder_mock, hass, hass_clie
     assert json_dict[3]["context_user_id"] == "9400facee45711eaa9308bfd3d19e474"
 
 
-async def test_get_events_with_context_state(recorder_mock, hass, hass_ws_client):
+@pytest.mark.usefixtures("recorder_mock")
+async def test_get_events_with_context_state(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator
+) -> None:
     """Test logbook get_events with a context state."""
     now = dt_util.utcnow()
     await asyncio.gather(
         *[
-            async_setup_component(hass, comp, {})
-            for comp in ("homeassistant", "logbook")
+            async_setup_component(hass, domain, {})
+            for domain in ("homeassistant", "logbook")
         ]
     )
     await async_recorder_block_till_done(hass)
@@ -2779,7 +2971,7 @@ async def test_get_events_with_context_state(recorder_mock, hass, hass_ws_client
     hass.states.async_set("light.kitchen2", STATE_OFF)
 
     context = ha.Context(
-        id="ac5bd62de45711eaaeb351041eec8dd9",
+        id="01GTDGKBCH00GW0X476W5TVAAA",
         user_id="b400facee45711eaa9308bfd3d19e474",
     )
     hass.states.async_set("binary_sensor.is_light", STATE_OFF, context=context)
@@ -2825,7 +3017,8 @@ async def test_get_events_with_context_state(recorder_mock, hass, hass_ws_client
     assert "context_event_type" not in results[3]
 
 
-async def test_logbook_with_empty_config(recorder_mock, hass):
+@pytest.mark.usefixtures("recorder_mock")
+async def test_logbook_with_empty_config(hass: HomeAssistant) -> None:
     """Test we handle a empty configuration."""
     assert await async_setup_component(
         hass,
@@ -2838,7 +3031,8 @@ async def test_logbook_with_empty_config(recorder_mock, hass):
     await hass.async_block_till_done()
 
 
-async def test_logbook_with_non_iterable_entity_filter(recorder_mock, hass):
+@pytest.mark.usefixtures("recorder_mock")
+async def test_logbook_with_non_iterable_entity_filter(hass: HomeAssistant) -> None:
     """Test we handle a non-iterable entity filter."""
     assert await async_setup_component(
         hass,
@@ -2859,3 +3053,346 @@ async def test_logbook_with_non_iterable_entity_filter(recorder_mock, hass):
         },
     )
     await hass.async_block_till_done()
+
+
+@pytest.mark.usefixtures("recorder_mock")
+async def test_logbook_user_id_from_parent_context(
+    hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
+    """Test user attribution is inherited through the full context chain.
+
+    Simulates the generic_thermostat pattern:
+    1. User calls set_hvac_mode → parent context (has user_id)
+       - Climate state changes off → heat (parent context)
+    2. Thermostat calls homeassistant.turn_on → child context (no user_id)
+       - SERVICE_CALL event fired (child context)
+    3. Switch state changes off → on (child context)
+
+    All entries should have user_id attributed, either directly (step 1)
+    or inherited from the parent context (steps 2-3).
+    """
+    await asyncio.gather(
+        *[
+            async_setup_component(hass, domain, {})
+            for domain in ("homeassistant", "logbook")
+        ]
+    )
+
+    await async_recorder_block_till_done(hass)
+
+    setup_thermostat_context_test_entities(hass)
+    await hass.async_block_till_done()
+
+    parent_context, _ = simulate_thermostat_context_chain(hass)
+    await hass.async_block_till_done()
+
+    await async_wait_recording_done(hass)
+
+    client = await hass_client()
+
+    start = dt_util.utcnow().date()
+    start_date = datetime(start.year, start.month, start.day, tzinfo=dt_util.UTC)
+    end_time = start_date + timedelta(hours=24)
+
+    response = await client.get(
+        f"/api/logbook/{start_date.isoformat()}",
+        params={"end_time": end_time.isoformat()},
+    )
+    assert response.status == HTTPStatus.OK
+    json_dict = await response.json()
+
+    assert_thermostat_context_chain_events(json_dict, parent_context)
+
+
+@pytest.mark.usefixtures("recorder_mock")
+async def test_logbook_user_id_from_parent_context_state_changes_only(
+    hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
+    """Test user attribution is inherited when only state changes are present.
+
+    Same chain as the full test but without the EVENT_CALL_SERVICE event.
+    This exercises the code path where context_lookup resolves the child
+    context to the state change row itself, and augment walks up to the
+    parent state change.
+    """
+    await asyncio.gather(
+        *[
+            async_setup_component(hass, domain, {})
+            for domain in ("homeassistant", "logbook")
+        ]
+    )
+
+    await async_recorder_block_till_done(hass)
+
+    # Set initial states so that subsequent changes are real state transitions
+    hass.states.async_set(
+        "climate.living_room",
+        "off",
+        {ATTR_FRIENDLY_NAME: "Living Room Thermostat"},
+    )
+    hass.states.async_set("switch.heater", STATE_OFF)
+    await hass.async_block_till_done()
+
+    # Parent context with user_id
+    parent_context = ha.Context(
+        id="01GTDGKBCH00GW0X476W5TVAAA",
+        user_id="b400facee45711eaa9308bfd3d19e474",
+    )
+
+    # Climate state change with the parent context
+    hass.states.async_set(
+        "climate.living_room",
+        "heat",
+        {ATTR_FRIENDLY_NAME: "Living Room Thermostat"},
+        context=parent_context,
+    )
+    await hass.async_block_till_done()
+
+    # Child context WITHOUT user_id, no service call event
+    child_context = ha.Context(
+        id="01GTDGKBCH00GW0X476W5TVDDD",
+        parent_id="01GTDGKBCH00GW0X476W5TVAAA",
+    )
+
+    # Switch state change with the child context
+    hass.states.async_set(
+        "switch.heater",
+        STATE_ON,
+        {ATTR_FRIENDLY_NAME: "Heater"},
+        context=child_context,
+    )
+    await hass.async_block_till_done()
+
+    # Climate updates again in response to switch state change
+    hass.states.async_set(
+        "climate.living_room",
+        "heat",
+        {ATTR_FRIENDLY_NAME: "Living Room Thermostat"},
+        context=child_context,
+    )
+    await hass.async_block_till_done()
+
+    await async_wait_recording_done(hass)
+
+    client = await hass_client()
+
+    start = dt_util.utcnow().date()
+    start_date = datetime(start.year, start.month, start.day, tzinfo=dt_util.UTC)
+    end_time = start_date + timedelta(hours=24)
+
+    response = await client.get(
+        f"/api/logbook/{start_date.isoformat()}",
+        params={"end_time": end_time.isoformat()},
+    )
+    assert response.status == HTTPStatus.OK
+    json_dict = await response.json()
+
+    # Switch state change should be attributed to the climate entity
+    # and inherit user_id from the parent context
+    heater_entries = [
+        entry for entry in json_dict if entry.get("entity_id") == "switch.heater"
+    ]
+    assert len(heater_entries) == 1
+
+    heater_entry = heater_entries[0]
+    assert heater_entry["context_entity_id"] == "climate.living_room"
+    assert heater_entry["context_entity_id_name"] == "Living Room Thermostat"
+    assert heater_entry["context_state"] == "heat"
+    assert heater_entry["context_user_id"] == "b400facee45711eaa9308bfd3d19e474"
+
+
+async def test_context_user_ids_lru_eviction(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+) -> None:
+    """Test that the parent context user-id cache is bounded by LRU eviction.
+
+    The cache must keep memory bounded under sustained load. New entries
+    arriving after the cap evict the least recently used entries. An
+    early parent context whose entry has been evicted should no longer
+    contribute its user_id to a later child state change.
+    """
+    user_id = "b400facee45711eaa9308bfd3d19e474"
+    early_parent_context = ha.Context(
+        id="01GTDGKBCH00GW0X476W5TVAAA",
+        user_id=user_id,
+    )
+    child_context = ha.Context(
+        id="01GTDGKBCH00GW0X476W5TVDDD",
+        parent_id=early_parent_context.id,
+    )
+
+    logbook_run = logbook.processor.LogbookRun(
+        context_lookup={None: None},
+        external_events={},
+        event_cache=logbook.processor.EventCache({}),
+        entity_name_cache=logbook.processor.EntityNameCache(hass),
+        include_entity_name=True,
+        timestamp=False,
+        memoize_new_contexts=False,
+        for_live_stream=True,
+    )
+    context_augmenter = logbook.processor.ContextAugmenter(logbook_run)
+
+    processor = logbook.processor.EventProcessor.__new__(
+        logbook.processor.EventProcessor
+    )
+    processor.hass = hass
+    processor.ent_reg = entity_registry
+    processor.logbook_run = logbook_run
+    processor.context_augmenter = context_augmenter
+
+    hass.states.async_set("switch.heater", STATE_OFF)
+    await hass.async_block_till_done()
+
+    # Seed: the early parent SERVICE_CALL event populates the cache.
+    parent_row = MockRow(
+        EVENT_CALL_SERVICE,
+        {
+            ATTR_DOMAIN: "climate",
+            ATTR_SERVICE: "set_hvac_mode",
+            "service_data": {ATTR_ENTITY_ID: "climate.living_room"},
+        },
+        context=early_parent_context,
+    )
+    parent_row.context_only = True
+    parent_row.icon = None
+    processor.humanify([parent_row])
+    assert (
+        ulid_to_bytes_or_none(early_parent_context.id) in logbook_run.context_user_ids
+    )
+
+    # Flood the cache with MAX+1 unrelated parent contexts so the early
+    # parent is evicted from the front of the LRU.
+    filler_rows = []
+    for index in range(logbook.processor.MAX_CONTEXT_USER_IDS_CACHE + 1):
+        filler_context = ha.Context(
+            user_id=f"ffffffff{index:024x}"[:32],
+        )
+        filler_row = MockRow(
+            EVENT_CALL_SERVICE,
+            {
+                ATTR_DOMAIN: "test",
+                ATTR_SERVICE: "noop",
+                "service_data": {},
+            },
+            context=filler_context,
+        )
+        filler_row.context_only = True
+        filler_row.icon = None
+        filler_rows.append(filler_row)
+    processor.humanify(filler_rows)
+
+    assert (
+        len(logbook_run.context_user_ids)
+        == logbook.processor.MAX_CONTEXT_USER_IDS_CACHE
+    )
+    assert (
+        ulid_to_bytes_or_none(early_parent_context.id)
+        not in logbook_run.context_user_ids
+    )
+
+    # The child state change can no longer inherit the early parent's user_id
+    # because that entry was evicted.
+    child_row = MockRow(
+        PSEUDO_EVENT_STATE_CHANGED,
+        context=child_context,
+    )
+    child_row.state = STATE_ON
+    child_row.entity_id = "switch.heater"
+    child_row.icon = None
+    results = processor.humanify([child_row])
+
+    heater_entries = [e for e in results if e.get("entity_id") == "switch.heater"]
+    assert len(heater_entries) == 1
+    assert "context_user_id" not in heater_entries[0]
+
+
+async def test_parent_user_attribution_does_not_use_origin_event_fallback(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+) -> None:
+    """Test that parent context lookup doesn't fall back to origin_event.
+
+    ContextAugmenter.get_context() has a fallback: when a context_id isn't in
+    context_lookup, it returns async_event_to_row(row.context.origin_event).
+    This fallback uses the *child row's* origin event, not the parent's,
+    so it can attribute the wrong user_id to a child context.
+
+    In practice this scenario is unlikely — child contexts don't carry a
+    user_id, so the origin_event fallback would return None for user_id
+    anyway. We guard against it nevertheless to ensure the lookup is
+    semantically correct: the parent context should only be resolved via
+    context_lookup, never via an unrelated fallback path.
+
+    Scenario:
+    - A user_id is set directly on child_context (not realistic, but
+      exercises the fallback path).
+    - Creating an Event with that context sets context.origin_event,
+      which carries the user_id.
+    - A state change for switch.heater uses that same child_context.
+    - The parent context is NOT in context_lookup (simulating live stream).
+    - The parent user_id should NOT be resolved via the origin_event fallback.
+    """
+    wrong_user_id = "aaaaaaaaaaa711eaa9308bfd3d19e474"
+    parent_context = Context(id="01GTDGKBCH00GW0X476W5TVAAA")
+
+    # Child context whose origin_event will carry wrong_user_id
+    child_context = Context(
+        id="01GTDGKBCH00GW0X476W5TVDDD",
+        parent_id=parent_context.id,
+        user_id=wrong_user_id,
+    )
+    # Creating an Event sets context.origin_event = self, which carries
+    # wrong_user_id via child_context.user_id.
+    Event(EVENT_CALL_SERVICE, {}, context=child_context)
+    assert child_context.origin_event is not None
+
+    hass.states.async_set("switch.heater", STATE_OFF)
+    await hass.async_block_till_done()
+
+    logbook_run = logbook.processor.LogbookRun(
+        context_lookup={None: None},
+        external_events={},
+        event_cache=logbook.processor.EventCache({}),
+        entity_name_cache=logbook.processor.EntityNameCache(hass),
+        include_entity_name=True,
+        timestamp=False,
+        memoize_new_contexts=False,
+    )
+    context_augmenter = logbook.processor.ContextAugmenter(logbook_run)
+    processor = logbook.processor.EventProcessor.__new__(
+        logbook.processor.EventProcessor
+    )
+    processor.hass = hass
+    processor.ent_reg = entity_registry
+    processor.logbook_run = logbook_run
+    processor.context_augmenter = context_augmenter
+
+    # Build a child state-change EventAsRow with the child_context.
+    # The row itself has no user_id (context_user_id_bin=None) but
+    # the child_context.origin_event carries wrong_user_id.
+    child_row = EventAsRow(
+        row_id=1,
+        event_type=PSEUDO_EVENT_STATE_CHANGED,
+        event_data=None,
+        time_fired_ts=dt_util.utcnow().timestamp(),
+        context_id_bin=ulid_to_bytes_or_none(child_context.id),
+        context_user_id_bin=None,
+        context_parent_id_bin=ulid_to_bytes_or_none(child_context.parent_id),
+        state=STATE_ON,
+        entity_id="switch.heater",
+        icon=None,
+        attributes=None,
+        context_only=False,
+        data={},
+        context=child_context,
+    )
+
+    results = processor.humanify([child_row])
+
+    heater_entries = [e for e in results if e.get("entity_id") == "switch.heater"]
+    assert len(heater_entries) == 1
+    # The parent context is unknown — no user should be attributed.
+    # If get_context's origin_event fallback is used, wrong_user_id leaks in.
+    assert "context_user_id" not in heater_entries[0]

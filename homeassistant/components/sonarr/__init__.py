@@ -1,12 +1,10 @@
 """The Sonarr component."""
-from __future__ import annotations
 
-from typing import Any
+from dataclasses import fields
 
 from aiopyarr.models.host_configuration import PyArrHostConfiguration
 from aiopyarr.sonarr_client import SonarrClient
 
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     CONF_API_KEY,
     CONF_HOST,
@@ -17,7 +15,9 @@ from homeassistant.const import (
     Platform,
 )
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.typing import ConfigType
 
 from .const import (
     CONF_BASE_PATH,
@@ -34,15 +34,25 @@ from .coordinator import (
     DiskSpaceDataUpdateCoordinator,
     QueueDataUpdateCoordinator,
     SeriesDataUpdateCoordinator,
-    SonarrDataUpdateCoordinator,
+    SonarrConfigEntry,
+    SonarrData,
     StatusDataUpdateCoordinator,
     WantedDataUpdateCoordinator,
 )
+from .services import async_setup_services
 
-PLATFORMS = [Platform.SENSOR]
+PLATFORMS = [Platform.CALENDAR, Platform.SENSOR]
+
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Set up the Sonarr integration."""
+    async_setup_services(hass)
+    return True
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: SonarrConfigEntry) -> None:
     """Set up Sonarr from a config entry."""
     if not entry.options:
         options = {
@@ -64,30 +74,30 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         host_configuration=host_configuration,
         session=async_get_clientsession(hass),
     )
-    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
-    coordinators: dict[str, SonarrDataUpdateCoordinator[Any]] = {
-        "upcoming": CalendarDataUpdateCoordinator(hass, host_configuration, sonarr),
-        "commands": CommandsDataUpdateCoordinator(hass, host_configuration, sonarr),
-        "diskspace": DiskSpaceDataUpdateCoordinator(hass, host_configuration, sonarr),
-        "queue": QueueDataUpdateCoordinator(hass, host_configuration, sonarr),
-        "series": SeriesDataUpdateCoordinator(hass, host_configuration, sonarr),
-        "status": StatusDataUpdateCoordinator(hass, host_configuration, sonarr),
-        "wanted": WantedDataUpdateCoordinator(hass, host_configuration, sonarr),
-    }
+    data = SonarrData(
+        upcoming=CalendarDataUpdateCoordinator(hass, entry, host_configuration, sonarr),
+        commands=CommandsDataUpdateCoordinator(hass, entry, host_configuration, sonarr),
+        diskspace=DiskSpaceDataUpdateCoordinator(
+            hass, entry, host_configuration, sonarr
+        ),
+        queue=QueueDataUpdateCoordinator(hass, entry, host_configuration, sonarr),
+        series=SeriesDataUpdateCoordinator(hass, entry, host_configuration, sonarr),
+        status=StatusDataUpdateCoordinator(hass, entry, host_configuration, sonarr),
+        wanted=WantedDataUpdateCoordinator(hass, entry, host_configuration, sonarr),
+    )
     # Temporary, until we add diagnostic entities
     _version = None
-    for coordinator in coordinators.values():
+    for field in fields(data):
+        coordinator = getattr(data, field.name)
         await coordinator.async_config_entry_first_refresh()
         if isinstance(coordinator, StatusDataUpdateCoordinator):
             _version = coordinator.data.version
         coordinator.system_version = _version
-    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinators
+    entry.runtime_data = data
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    return True
 
-
-async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_migrate_entry(hass: HomeAssistant, entry: SonarrConfigEntry) -> None:
     """Migrate old entry."""
     LOGGER.debug("Migrating from version %s", entry.version)
 
@@ -104,24 +114,11 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             **entry.data,
             CONF_URL: f"{new_proto}://{new_host_port}{new_path}",
         }
-        hass.config_entries.async_update_entry(entry, data=data)
-        entry.version = 2
+        hass.config_entries.async_update_entry(entry, data=data, version=2)
 
-    LOGGER.info("Migration to version %s successful", entry.version)
-
-    return True
+    LOGGER.debug("Migration to version %s successful", entry.version)
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_unload_entry(hass: HomeAssistant, entry: SonarrConfigEntry) -> None:
     """Unload a config entry."""
-    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-
-    if unload_ok:
-        hass.data[DOMAIN].pop(entry.entry_id)
-
-    return unload_ok
-
-
-async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Handle options update."""
-    await hass.config_entries.async_reload(entry.entry_id)
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)

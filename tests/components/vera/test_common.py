@@ -1,18 +1,18 @@
 """Tests for common vera code."""
+
 from datetime import timedelta
 from unittest.mock import MagicMock
+
+from pytest_homeassistant.common import async_fire_time_changed
 
 from homeassistant.components.vera import SubscriptionRegistry
 from homeassistant.core import HomeAssistant
 from homeassistant.util.dt import utcnow
 
-from tests.common import async_fire_time_changed
-
 
 async def test_subscription_registry(hass: HomeAssistant) -> None:
     """Test subscription registry polling."""
     subscription_registry = SubscriptionRegistry(hass)
-    # pylint: disable=protected-access
     subscription_registry.poll_server_once = poll_server_once_mock = MagicMock()
 
     poll_server_once_mock.return_value = True

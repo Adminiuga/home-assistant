@@ -1,30 +1,48 @@
 """Config flow to configure the Tailscale integration."""
-from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, override
 
+import probatio
 from tailscale import Tailscale, TailscaleAuthenticationError, TailscaleError
-import voluptuous as vol
 
-from homeassistant.config_entries import ConfigEntry, ConfigFlow
-from homeassistant.const import CONF_API_KEY
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.core import HomeAssistant
-from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from .const import CONF_TAILNET, DOMAIN
+from .const import CONF_OAUTH_CLIENT_ID, CONF_OAUTH_CLIENT_SECRET, CONF_TAILNET, DOMAIN
+
+OAUTH_URL = "https://login.tailscale.com/admin/settings/oauth"
+
+OAUTH_SCHEMA = {
+    probatio.Required(CONF_OAUTH_CLIENT_ID): str,
+    probatio.Required(probatio.Secret(CONF_OAUTH_CLIENT_SECRET)): str,
+}
+
+STEP_USER_SCHEMA = probatio.Schema(
+    {probatio.Required(CONF_TAILNET): str, **OAUTH_SCHEMA}
+)
+
+STEP_REAUTH_SCHEMA = probatio.Schema(OAUTH_SCHEMA)
 
 
-async def validate_input(hass: HomeAssistant, *, tailnet: str, api_key: str) -> None:
-    """Try using the give tailnet & api key against the Tailscale API."""
+async def validate_input(
+    hass: HomeAssistant, *, tailnet: str, user_input: Mapping[str, Any]
+) -> None:
+    """Try using the given tailnet & OAuth credentials against the Tailscale API."""
     session = async_get_clientsession(hass)
     tailscale = Tailscale(
         session=session,
-        api_key=api_key,
         tailnet=tailnet,
+        oauth_client_id=user_input[CONF_OAUTH_CLIENT_ID],
+        oauth_client_secret=user_input[CONF_OAUTH_CLIENT_SECRET],
     )
-    await tailscale.devices()
+    try:
+        await tailscale.devices()
+    finally:
+        # Requesting an access token schedules a task that expires it; closing
+        # cancels it. The session is owned by Home Assistant and left open.
+        await tailscale.close()
 
 
 class TailscaleFlowHandler(ConfigFlow, domain=DOMAIN):
@@ -32,95 +50,74 @@ class TailscaleFlowHandler(ConfigFlow, domain=DOMAIN):
 
     VERSION = 1
 
-    reauth_entry: ConfigEntry | None = None
-
+    @override
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle a flow initialized by the user."""
         errors = {}
+
+        if user_input is not None:
+            await self.async_set_unique_id(user_input[CONF_TAILNET])
+            self._abort_if_unique_id_configured()
+            try:
+                await validate_input(
+                    self.hass,
+                    tailnet=user_input[CONF_TAILNET],
+                    user_input=user_input,
+                )
+            except TailscaleAuthenticationError:
+                errors["base"] = "invalid_auth"
+            except TailscaleError:
+                errors["base"] = "cannot_connect"
+            else:
+                return self.async_create_entry(
+                    title=user_input[CONF_TAILNET],
+                    data=user_input,
+                )
+
+        return self.async_show_form(
+            step_id="user",
+            data_schema=STEP_USER_SCHEMA,
+            description_placeholders={"oauth_url": OAUTH_URL},
+            errors=errors,
+        )
+
+    async def async_step_reauth(
+        self, entry_data: Mapping[str, Any]
+    ) -> ConfigFlowResult:
+        """Handle initiation of re-authentication with Tailscale."""
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Re-authenticate with an OAuth client, migrating an API token entry."""
+        errors = {}
+        reauth_entry = self._get_reauth_entry()
 
         if user_input is not None:
             try:
                 await validate_input(
                     self.hass,
-                    tailnet=user_input[CONF_TAILNET],
-                    api_key=user_input[CONF_API_KEY],
+                    tailnet=reauth_entry.data[CONF_TAILNET],
+                    user_input=user_input,
                 )
             except TailscaleAuthenticationError:
                 errors["base"] = "invalid_auth"
             except TailscaleError:
                 errors["base"] = "cannot_connect"
             else:
-                await self.async_set_unique_id(user_input[CONF_TAILNET])
-                self._abort_if_unique_id_configured()
-                return self.async_create_entry(
-                    title=user_input[CONF_TAILNET],
-                    data={
-                        CONF_TAILNET: user_input[CONF_TAILNET],
-                        CONF_API_KEY: user_input[CONF_API_KEY],
-                    },
+                # Replace, rather than update, so a migrated entry's API access
+                # token is not left behind in storage.
+                return self.async_update_reload_and_abort(
+                    reauth_entry,
+                    data={CONF_TAILNET: reauth_entry.data[CONF_TAILNET], **user_input},
                 )
-        else:
-            user_input = {}
-
-        return self.async_show_form(
-            step_id="user",
-            description_placeholders={
-                "authkeys_url": "https://login.tailscale.com/admin/settings/authkeys"
-            },
-            data_schema=vol.Schema(
-                {
-                    vol.Required(
-                        CONF_TAILNET, default=user_input.get(CONF_TAILNET, "")
-                    ): str,
-                    vol.Required(
-                        CONF_API_KEY, default=user_input.get(CONF_API_KEY, "")
-                    ): str,
-                }
-            ),
-            errors=errors,
-        )
-
-    async def async_step_reauth(self, entry_data: Mapping[str, Any]) -> FlowResult:
-        """Handle initiation of re-authentication with Tailscale."""
-        self.reauth_entry = self.hass.config_entries.async_get_entry(
-            self.context["entry_id"]
-        )
-        return await self.async_step_reauth_confirm()
-
-    async def async_step_reauth_confirm(
-        self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
-        """Handle re-authentication with Tailscale."""
-        errors = {}
-
-        if user_input is not None and self.reauth_entry:
-            try:
-                await validate_input(
-                    self.hass,
-                    tailnet=self.reauth_entry.data[CONF_TAILNET],
-                    api_key=user_input[CONF_API_KEY],
-                )
-            except TailscaleAuthenticationError:
-                errors["base"] = "invalid_auth"
-            except TailscaleError:
-                errors["base"] = "cannot_connect"
-            else:
-                self.hass.config_entries.async_update_entry(
-                    self.reauth_entry,
-                    data={
-                        **self.reauth_entry.data,
-                        CONF_API_KEY: user_input[CONF_API_KEY],
-                    },
-                )
-                self.hass.async_create_task(
-                    self.hass.config_entries.async_reload(self.reauth_entry.entry_id)
-                )
-                return self.async_abort(reason="reauth_successful")
 
         return self.async_show_form(
             step_id="reauth_confirm",
-            data_schema=vol.Schema({vol.Required(CONF_API_KEY): str}),
+            data_schema=STEP_REAUTH_SCHEMA,
+            description_placeholders={"oauth_url": OAUTH_URL},
             errors=errors,
         )

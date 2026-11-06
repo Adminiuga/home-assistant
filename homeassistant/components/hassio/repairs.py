@@ -1,185 +1,281 @@
-"""Supervisor events monitor."""
-from __future__ import annotations
+"""Repairs implementation for supervisor integration."""
 
-from typing import Any
+from collections.abc import Callable, Coroutine
+from types import MethodType
+from typing import Any, override
 
-from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.dispatcher import async_dispatcher_connect
-from homeassistant.helpers.issue_registry import (
-    IssueSeverity,
-    async_create_issue,
-    async_delete_issue,
+from aiohasupervisor import SupervisorError
+from aiohasupervisor.models import ContextType
+import probatio
+
+from homeassistant.components.repairs import (
+    ConfirmRepairFlow,
+    RepairsFlow,
+    RepairsFlowResult,
 )
+from homeassistant.const import ATTR_NAME
+from homeassistant.core import HomeAssistant
 
+from . import get_addons_list
 from .const import (
-    ATTR_DATA,
-    ATTR_HEALTHY,
-    ATTR_SUPPORTED,
-    ATTR_UNHEALTHY,
-    ATTR_UNHEALTHY_REASONS,
-    ATTR_UNSUPPORTED,
-    ATTR_UNSUPPORTED_REASONS,
-    ATTR_UPDATE_KEY,
-    ATTR_WS_EVENT,
-    DOMAIN,
-    EVENT_HEALTH_CHANGED,
-    EVENT_SUPERVISOR_EVENT,
-    EVENT_SUPERVISOR_UPDATE,
-    EVENT_SUPPORTED_CHANGED,
-    UPDATE_KEY_SUPERVISOR,
+    ATTR_SLUG,
+    EXTRA_PLACEHOLDERS,
+    ISSUE_KEY_ADDON_APP_PORT_CONFLICT,
+    ISSUE_KEY_ADDON_BOOT_FAIL,
+    ISSUE_KEY_ADDON_DEPRECATED,
+    ISSUE_KEY_ADDON_DEPRECATED_ARCH,
+    ISSUE_KEY_ADDON_DETACHED_ADDON_REMOVED,
+    ISSUE_KEY_ADDON_PWNED,
+    ISSUE_KEY_LEGACY_HOMEASSISTANT_FOLDER,
+    ISSUE_KEY_SYSTEM_DOCKER_CONFIG,
+    PLACEHOLDER_KEY_ADDON,
+    PLACEHOLDER_KEY_ADDON_DOCUMENTATION,
+    PLACEHOLDER_KEY_ADDON_INFO,
+    PLACEHOLDER_KEY_COMPONENTS,
+    PLACEHOLDER_KEY_PORT,
+    PLACEHOLDER_KEY_REFERENCE,
 )
-from .handler import HassIO
+from .coordinator import get_issues_info, presentable_issue_suggestions
+from .handler import get_supervisor_client
+from .issues import Issue, Suggestion
 
-ISSUE_ID_UNHEALTHY = "unhealthy_system"
-ISSUE_ID_UNSUPPORTED = "unsupported_system"
-
-INFO_URL_UNHEALTHY = "https://www.home-assistant.io/more-info/unhealthy"
-INFO_URL_UNSUPPORTED = "https://www.home-assistant.io/more-info/unsupported"
-
-UNSUPPORTED_REASONS = {
-    "apparmor",
-    "connectivity_check",
-    "content_trust",
-    "dbus",
-    "dns_server",
-    "docker_configuration",
-    "docker_version",
-    "cgroup_version",
-    "job_conditions",
-    "lxc",
-    "network_manager",
-    "os",
-    "os_agent",
-    "restart_policy",
-    "software",
-    "source_mods",
-    "supervisor_version",
-    "systemd",
-    "systemd_journal",
-    "systemd_resolved",
-}
-# Some unsupported reasons also mark the system as unhealthy. If the unsupported reason
-# provides no additional information beyond the unhealthy one then skip that repair.
-UNSUPPORTED_SKIP_REPAIR = {"privileged"}
-UNHEALTHY_REASONS = {
-    "docker",
-    "supervisor",
-    "setup",
-    "privileged",
-    "untrusted",
+SUGGESTION_CONFIRMATION_REQUIRED = {
+    "addon_execute_remove",
+    "mount_execute_remove",
+    "mount_move_local_data",
+    "system_adopt_data_disk",
+    "system_execute_reboot",
 }
 
 
-class SupervisorRepairs:
-    """Create repairs from supervisor events."""
+class SupervisorIssueRepairFlow(RepairsFlow):
+    """Handler for an issue fixing flow."""
 
-    def __init__(self, hass: HomeAssistant, client: HassIO) -> None:
-        """Initialize supervisor repairs."""
-        self._hass = hass
-        self._client = client
-        self._unsupported_reasons: set[str] = set()
-        self._unhealthy_reasons: set[str] = set()
+    _data: dict[str, Any] | None = None
+    _issue: Issue | None = None
+    _suggestions: list[Suggestion] | None = None
 
-    @property
-    def unhealthy_reasons(self) -> set[str]:
-        """Get unhealthy reasons. Returns empty set if system is healthy."""
-        return self._unhealthy_reasons
-
-    @unhealthy_reasons.setter
-    def unhealthy_reasons(self, reasons: set[str]) -> None:
-        """Set unhealthy reasons. Create or delete repairs as necessary."""
-        for unhealthy in reasons - self.unhealthy_reasons:
-            if unhealthy in UNHEALTHY_REASONS:
-                translation_key = f"unhealthy_{unhealthy}"
-                translation_placeholders = None
-            else:
-                translation_key = "unhealthy"
-                translation_placeholders = {"reason": unhealthy}
-
-            async_create_issue(
-                self._hass,
-                DOMAIN,
-                f"{ISSUE_ID_UNHEALTHY}_{unhealthy}",
-                is_fixable=False,
-                learn_more_url=f"{INFO_URL_UNHEALTHY}/{unhealthy}",
-                severity=IssueSeverity.CRITICAL,
-                translation_key=translation_key,
-                translation_placeholders=translation_placeholders,
-            )
-
-        for fixed in self.unhealthy_reasons - reasons:
-            async_delete_issue(self._hass, DOMAIN, f"{ISSUE_ID_UNHEALTHY}_{fixed}")
-
-        self._unhealthy_reasons = reasons
+    def __init__(self, hass: HomeAssistant, issue_id: str) -> None:
+        """Initialize repair flow."""
+        self._issue_id = issue_id
+        self._supervisor_client = get_supervisor_client(hass)
+        super().__init__()
 
     @property
-    def unsupported_reasons(self) -> set[str]:
-        """Get unsupported reasons. Returns empty set if system is supported."""
-        return self._unsupported_reasons
+    def issue(self) -> Issue | None:
+        """Get associated issue."""
+        supervisor_issues = get_issues_info(self.hass)
+        if not self._issue and supervisor_issues:
+            self._issue = supervisor_issues.get_issue(self._issue_id)
 
-    @unsupported_reasons.setter
-    def unsupported_reasons(self, reasons: set[str]) -> None:
-        """Set unsupported reasons. Create or delete repairs as necessary."""
-        for unsupported in reasons - UNSUPPORTED_SKIP_REPAIR - self.unsupported_reasons:
-            if unsupported in UNSUPPORTED_REASONS:
-                translation_key = f"unsupported_{unsupported}"
-                translation_placeholders = None
-            else:
-                translation_key = "unsupported"
-                translation_placeholders = {"reason": unsupported}
+        return self._issue
 
-            async_create_issue(
-                self._hass,
-                DOMAIN,
-                f"{ISSUE_ID_UNSUPPORTED}_{unsupported}",
-                is_fixable=False,
-                learn_more_url=f"{INFO_URL_UNSUPPORTED}/{unsupported}",
-                severity=IssueSeverity.WARNING,
-                translation_key=translation_key,
-                translation_placeholders=translation_placeholders,
-            )
+    @property
+    def description_placeholders(self) -> dict[str, str] | None:
+        """Get description placeholders for steps."""
+        if not self.issue:
+            return None
 
-        for fixed in self.unsupported_reasons - (reasons - UNSUPPORTED_SKIP_REPAIR):
-            async_delete_issue(self._hass, DOMAIN, f"{ISSUE_ID_UNSUPPORTED}_{fixed}")
+        if self.issue.key in EXTRA_PLACEHOLDERS:
+            placeholders: dict[str, str] = EXTRA_PLACEHOLDERS[self.issue.key].copy()
+        else:
+            placeholders = {}
 
-        self._unsupported_reasons = reasons
+        if self.issue.reference:
+            placeholders |= {PLACEHOLDER_KEY_REFERENCE: self.issue.reference}
 
-    async def setup(self) -> None:
-        """Create supervisor events listener."""
-        await self.update()
+        return placeholders or None
 
-        async_dispatcher_connect(
-            self._hass, EVENT_SUPERVISOR_EVENT, self._supervisor_events_to_repairs
+    def _async_form_for_suggestion(self, suggestion: Suggestion) -> RepairsFlowResult:
+        """Return form for suggestion."""
+        return self.async_show_form(
+            step_id=suggestion.key,
+            data_schema=probatio.Schema({}),
+            description_placeholders=self.description_placeholders,
+            last_step=True,
         )
 
-    async def update(self) -> None:
-        """Update repairs from Supervisor resolution center."""
-        data = await self._client.get_resolution_info()
-        self.unhealthy_reasons = set(data[ATTR_UNHEALTHY])
-        self.unsupported_reasons = set(data[ATTR_UNSUPPORTED])
-
-    @callback
-    def _supervisor_events_to_repairs(self, event: dict[str, Any]) -> None:
-        """Create repairs from supervisor events."""
-        if ATTR_WS_EVENT not in event:
-            return
-
-        if (
-            event[ATTR_WS_EVENT] == EVENT_SUPERVISOR_UPDATE
-            and event.get(ATTR_UPDATE_KEY) == UPDATE_KEY_SUPERVISOR
+    async def async_step_init(self, _: None = None) -> RepairsFlowResult:
+        """Handle the first step of a fix flow."""
+        # Out of sync with supervisor: issue is resolved, or it is not
+        # fixable — no suggestions, or none this Core can present (the
+        # repair is created as not fixable then). Remove it.
+        if not self.issue or not (
+            suggestions := presentable_issue_suggestions(self.hass, self.issue)
         ):
-            self._hass.async_create_task(self.update())
+            return self.async_create_entry(data={})
 
-        elif event[ATTR_WS_EVENT] == EVENT_HEALTH_CHANGED:
-            self.unhealthy_reasons = (
-                set()
-                if event[ATTR_DATA][ATTR_HEALTHY]
-                else set(event[ATTR_DATA][ATTR_UNHEALTHY_REASONS])
+        # All suggestions have the same logic: Apply them in supervisor,
+        # optionally with a confirmation step. Generating the required handler for each
+        # allows for shared logic but screens can still be translated per step id.
+        for suggestion in self.issue.suggestions:
+            setattr(
+                self,
+                f"async_step_{suggestion.key}",
+                MethodType(self._async_step(suggestion), self),
             )
 
-        elif event[ATTR_WS_EVENT] == EVENT_SUPPORTED_CHANGED:
-            self.unsupported_reasons = (
-                set()
-                if event[ATTR_DATA][ATTR_SUPPORTED]
-                else set(event[ATTR_DATA][ATTR_UNSUPPORTED_REASONS])
+        self._suggestions = suggestions
+        if len(self._suggestions) > 1:
+            return await self.async_step_fix_menu()
+
+        # Always show a form for one suggestion to explain to user what's happening
+        return self._async_form_for_suggestion(self._suggestions[0])
+
+    async def async_step_fix_menu(self, _: None = None) -> RepairsFlowResult:
+        """Show the fix menu."""
+        assert self._suggestions
+
+        return self.async_show_menu(
+            step_id="fix_menu",
+            menu_options=[suggestion.key for suggestion in self._suggestions],
+            description_placeholders=self.description_placeholders,
+        )
+
+    async def _async_step_apply_suggestion(
+        self, suggestion: Suggestion, confirmed: bool = False
+    ) -> RepairsFlowResult:
+        """Handle applying a suggestion as a flow step.
+
+        Optionally request confirmation.
+        """
+        if not confirmed and suggestion.key in SUGGESTION_CONFIRMATION_REQUIRED:
+            return self._async_form_for_suggestion(suggestion)
+
+        try:
+            await self._supervisor_client.resolution.apply_suggestion(suggestion.uuid)
+        except SupervisorError:
+            return self.async_abort(reason="apply_suggestion_fail")
+
+        return self.async_create_entry(data={})
+
+    @staticmethod
+    def _async_step(
+        suggestion: Suggestion,
+    ) -> Callable[
+        [SupervisorIssueRepairFlow, dict[str, str] | None],
+        Coroutine[Any, Any, RepairsFlowResult],
+    ]:
+        """Generate a step handler for a suggestion."""
+
+        async def _async_step(
+            self: SupervisorIssueRepairFlow, user_input: dict[str, str] | None = None
+        ) -> RepairsFlowResult:
+            """Handle a flow step for a suggestion."""
+            return await self._async_step_apply_suggestion(
+                suggestion, confirmed=user_input is not None
             )
+
+        return _async_step
+
+
+class DockerConfigIssueRepairFlow(SupervisorIssueRepairFlow):
+    """Handler for docker config issue fixing flow."""
+
+    @property
+    @override
+    def description_placeholders(self) -> dict[str, str] | None:
+        """Get description placeholders for steps."""
+        placeholders = {PLACEHOLDER_KEY_COMPONENTS: ""}
+        supervisor_issues = get_issues_info(self.hass)
+        if supervisor_issues and self.issue:
+            addons_list = get_addons_list(self.hass) or []
+            components: list[str] = []
+            for issue in supervisor_issues.issues:
+                if issue.key == self.issue.key or issue.type != self.issue.type:
+                    continue
+
+                if issue.context == ContextType.CORE:
+                    components.insert(0, "Home Assistant")
+                elif issue.context == ContextType.ADDON:
+                    components.append(
+                        next(
+                            (
+                                addon[ATTR_NAME]
+                                for addon in addons_list
+                                if addon[ATTR_SLUG] == issue.reference
+                            ),
+                            issue.reference or "",
+                        )
+                    )
+
+            placeholders[PLACEHOLDER_KEY_COMPONENTS] = "\n- ".join(components)
+
+        return placeholders
+
+
+class AddonIssueRepairFlow(SupervisorIssueRepairFlow):
+    """Handler for addon issue fixing flows."""
+
+    @property
+    @override
+    def description_placeholders(self) -> dict[str, str] | None:
+        """Get description placeholders for steps."""
+        placeholders: dict[str, str] = super().description_placeholders or {}
+        if self.issue and self.issue.reference:
+            addons_list = get_addons_list(self.hass) or []
+            placeholders[PLACEHOLDER_KEY_ADDON] = self.issue.reference
+            for addon in addons_list:
+                if addon[ATTR_SLUG] == self.issue.reference:
+                    placeholders[PLACEHOLDER_KEY_ADDON] = addon[ATTR_NAME]
+                    break
+
+        return placeholders or None
+
+
+class DeprecatedAddonIssueRepairFlow(AddonIssueRepairFlow):
+    """Handler for deprecated addon issue fixing flows."""
+
+    @property
+    @override
+    def description_placeholders(self) -> dict[str, str] | None:
+        """Get description placeholders for steps."""
+        placeholders: dict[str, str] = super().description_placeholders or {}
+        if self.issue and self.issue.reference:
+            placeholders[PLACEHOLDER_KEY_ADDON_INFO] = (
+                f"homeassistant://config/app/{self.issue.reference}/info"
+            )
+            placeholders[PLACEHOLDER_KEY_ADDON_DOCUMENTATION] = (
+                f"homeassistant://config/app/{self.issue.reference}/documentation"
+            )
+        return placeholders or None
+
+
+class AppPortConflictRepairFlow(AddonIssueRepairFlow):
+    """Handler for app port conflict issue fixing flows."""
+
+    @property
+    @override
+    def description_placeholders(self) -> dict[str, str] | None:
+        """Get description placeholders for steps."""
+        placeholders: dict[str, str] = super().description_placeholders or {}
+        if self.issue and self.issue.reference_extra:
+            placeholders[PLACEHOLDER_KEY_PORT] = str(self.issue.reference_extra["port"])
+        return placeholders or None
+
+
+async def async_create_fix_flow(
+    hass: HomeAssistant,
+    issue_id: str,
+    data: dict[str, str | int | float | None] | None,
+) -> RepairsFlow:
+    """Create flow."""
+    if issue_id == ISSUE_KEY_LEGACY_HOMEASSISTANT_FOLDER:
+        return ConfirmRepairFlow()
+    supervisor_issues = get_issues_info(hass)
+    issue = supervisor_issues and supervisor_issues.get_issue(issue_id)
+    if issue and issue.key == ISSUE_KEY_SYSTEM_DOCKER_CONFIG:
+        return DockerConfigIssueRepairFlow(hass, issue_id)
+    if issue and issue.key == ISSUE_KEY_ADDON_DEPRECATED:
+        return DeprecatedAddonIssueRepairFlow(hass, issue_id)
+    if issue and issue.key == ISSUE_KEY_ADDON_APP_PORT_CONFLICT:
+        return AppPortConflictRepairFlow(hass, issue_id)
+    if issue and issue.key in {
+        ISSUE_KEY_ADDON_DETACHED_ADDON_REMOVED,
+        ISSUE_KEY_ADDON_BOOT_FAIL,
+        ISSUE_KEY_ADDON_PWNED,
+        ISSUE_KEY_ADDON_DEPRECATED_ARCH,
+    }:
+        return AddonIssueRepairFlow(hass, issue_id)
+
+    return SupervisorIssueRepairFlow(hass, issue_id)

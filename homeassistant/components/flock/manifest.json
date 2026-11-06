@@ -1,7 +1,10 @@
 {
   "domain": "flock",
   "name": "Flock",
-  "documentation": "https://www.home-assistant.io/integrations/flock",
+  "categories": ["messaging_notifications.chat_apps"],
   "codeowners": [],
-  "iot_class": "cloud_push"
+  "connectivity": ["cloud"],
+  "documentation": "https://www.home-assistant.io/integrations/flock",
+  "iot_class": "cloud_push",
+  "quality_scale": "legacy"
 }

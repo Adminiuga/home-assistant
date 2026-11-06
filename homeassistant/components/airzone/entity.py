@@ -1,11 +1,15 @@
 """Entity classes for the Airzone integration."""
-from __future__ import annotations
 
-from typing import Any
+import logging
+from typing import Any, override
 
 from aioairzone.const import (
+    API_SYSTEM_ID,
+    API_ZONE_ID,
+    AZD_AVAILABLE,
     AZD_FIRMWARE,
     AZD_FULL_NAME,
+    AZD_HOT_WATER,
     AZD_ID,
     AZD_MAC,
     AZD_MODEL,
@@ -17,22 +21,27 @@ from aioairzone.const import (
     AZD_WEBSERVER,
     AZD_ZONES,
 )
+from aioairzone.exceptions import AirzoneError
 
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import device_registry as dr
-from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN, MANUFACTURER
-from .coordinator import AirzoneUpdateCoordinator
+from .coordinator import AirzoneConfigEntry, AirzoneUpdateCoordinator
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class AirzoneEntity(CoordinatorEntity[AirzoneUpdateCoordinator]):
     """Define an Airzone entity."""
 
+    _attr_has_entity_name = True
+
     def get_airzone_value(self, key: str) -> Any:
         """Return Airzone entity value by key."""
-        raise NotImplementedError()
+        raise NotImplementedError
 
 
 class AirzoneSystemEntity(AirzoneEntity):
@@ -41,7 +50,7 @@ class AirzoneSystemEntity(AirzoneEntity):
     def __init__(
         self,
         coordinator: AirzoneUpdateCoordinator,
-        entry: ConfigEntry,
+        entry: AirzoneConfigEntry,
         system_data: dict[str, Any],
     ) -> None:
         """Initialize."""
@@ -53,12 +62,24 @@ class AirzoneSystemEntity(AirzoneEntity):
             identifiers={(DOMAIN, f"{entry.entry_id}_{self.system_id}")},
             manufacturer=MANUFACTURER,
             model=self.get_airzone_value(AZD_MODEL),
-            name=self.get_airzone_value(AZD_FULL_NAME),
+            name=f"System {self.system_id}",
             sw_version=self.get_airzone_value(AZD_FIRMWARE),
-            via_device=(DOMAIN, f"{entry.entry_id}_ws"),
         )
+        if AZD_WEBSERVER in self.coordinator.data:
+            self._attr_device_info.via_device_id = dr.async_get_device_id_by_identifier(
+                self.coordinator.hass,
+                (DOMAIN, f"{entry.entry_id}_ws"),
+                config_entry_id=entry.entry_id,
+            )
         self._attr_unique_id = entry.unique_id or entry.entry_id
 
+    @property
+    @override
+    def available(self) -> bool:
+        """Return system availability."""
+        return super().available and self.get_airzone_value(AZD_AVAILABLE)
+
+    @override
     def get_airzone_value(self, key: str) -> Any:
         """Return system value by key."""
         value = None
@@ -67,6 +88,67 @@ class AirzoneSystemEntity(AirzoneEntity):
                 value = system[key]
         return value
 
+    async def _async_update_sys_params(self, params: dict[str, Any]) -> None:
+        """Send system parameters to API."""
+        _params = {
+            API_SYSTEM_ID: self.system_id,
+            **params,
+        }
+        _LOGGER.debug("update_sys_params=%s", _params)
+        try:
+            await self.coordinator.airzone.set_sys_parameters(_params)
+        except AirzoneError as error:
+            raise HomeAssistantError(
+                f"Failed to set system {self.entity_id}: {error}"
+            ) from error
+
+        self.coordinator.async_set_updated_data(self.coordinator.airzone.data())
+
+
+class AirzoneHotWaterEntity(AirzoneEntity):
+    """Define an Airzone Hot Water entity."""
+
+    def __init__(
+        self,
+        coordinator: AirzoneUpdateCoordinator,
+        entry: AirzoneConfigEntry,
+    ) -> None:
+        """Initialize."""
+        super().__init__(coordinator)
+
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, f"{entry.entry_id}_dhw")},
+            manufacturer=MANUFACTURER,
+            model="DHW",
+            name=self.get_airzone_value(AZD_NAME),
+        )
+        if AZD_WEBSERVER in self.coordinator.data:
+            self._attr_device_info.via_device_id = dr.async_get_device_id_by_identifier(
+                self.coordinator.hass,
+                (DOMAIN, f"{entry.entry_id}_ws"),
+                config_entry_id=entry.entry_id,
+            )
+        self._attr_unique_id = entry.unique_id or entry.entry_id
+
+    @override
+    def get_airzone_value(self, key: str) -> Any:
+        """Return DHW value by key."""
+        return self.coordinator.data[AZD_HOT_WATER].get(key)
+
+    async def _async_update_dhw_params(self, params: dict[str, Any]) -> None:
+        """Send DHW parameters to API."""
+        _params = {
+            API_SYSTEM_ID: 0,
+            **params,
+        }
+        _LOGGER.debug("update_dhw_params=%s", _params)
+        try:
+            await self.coordinator.airzone.set_dhw_parameters(_params)
+        except AirzoneError as error:
+            raise HomeAssistantError(f"Failed to set DHW: {error}") from error
+
+        self.coordinator.async_set_updated_data(self.coordinator.airzone.data())
+
 
 class AirzoneWebServerEntity(AirzoneEntity):
     """Define an Airzone WebServer entity."""
@@ -74,7 +156,7 @@ class AirzoneWebServerEntity(AirzoneEntity):
     def __init__(
         self,
         coordinator: AirzoneUpdateCoordinator,
-        entry: ConfigEntry,
+        entry: AirzoneConfigEntry,
     ) -> None:
         """Initialize."""
         super().__init__(coordinator)
@@ -91,6 +173,7 @@ class AirzoneWebServerEntity(AirzoneEntity):
         )
         self._attr_unique_id = entry.unique_id or entry.entry_id
 
+    @override
     def get_airzone_value(self, key: str) -> Any:
         """Return system value by key."""
         return self.coordinator.data[AZD_WEBSERVER].get(key)
@@ -102,7 +185,7 @@ class AirzoneZoneEntity(AirzoneEntity):
     def __init__(
         self,
         coordinator: AirzoneUpdateCoordinator,
-        entry: ConfigEntry,
+        entry: AirzoneConfigEntry,
         system_zone_id: str,
         zone_data: dict[str, Any],
     ) -> None:
@@ -117,12 +200,23 @@ class AirzoneZoneEntity(AirzoneEntity):
             identifiers={(DOMAIN, f"{entry.entry_id}_{system_zone_id}")},
             manufacturer=MANUFACTURER,
             model=self.get_airzone_value(AZD_THERMOSTAT_MODEL),
-            name=f"Airzone [{system_zone_id}] {zone_data[AZD_NAME]}",
+            name=zone_data[AZD_NAME],
             sw_version=self.get_airzone_value(AZD_THERMOSTAT_FW),
-            via_device=(DOMAIN, f"{entry.entry_id}_{self.system_id}"),
+            via_device_id=dr.async_get_device_id_by_identifier(
+                self.coordinator.hass,
+                (DOMAIN, f"{entry.entry_id}_{self.system_id}"),
+                config_entry_id=entry.entry_id,
+            ),
         )
         self._attr_unique_id = entry.unique_id or entry.entry_id
 
+    @property
+    @override
+    def available(self) -> bool:
+        """Return zone availability."""
+        return super().available and self.get_airzone_value(AZD_AVAILABLE)
+
+    @override
     def get_airzone_value(self, key: str) -> Any:
         """Return zone value by key."""
         value = None
@@ -130,3 +224,20 @@ class AirzoneZoneEntity(AirzoneEntity):
             if key in zone:
                 value = zone[key]
         return value
+
+    async def _async_update_hvac_params(self, params: dict[str, Any]) -> None:
+        """Send HVAC parameters to API."""
+        _params = {
+            API_SYSTEM_ID: self.system_id,
+            API_ZONE_ID: self.zone_id,
+            **params,
+        }
+        _LOGGER.debug("update_hvac_params=%s", _params)
+        try:
+            await self.coordinator.airzone.set_hvac_parameters(_params)
+        except AirzoneError as error:
+            raise HomeAssistantError(
+                f"Failed to set zone {self.entity_id}: {error}"
+            ) from error
+
+        self.coordinator.async_set_updated_data(self.coordinator.airzone.data())

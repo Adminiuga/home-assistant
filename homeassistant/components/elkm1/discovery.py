@@ -1,5 +1,4 @@
 """The elkm1 integration discovery."""
-from __future__ import annotations
 
 import asyncio
 from dataclasses import asdict
@@ -13,6 +12,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import device_registry as dr, discovery_flow
 
 from .const import DISCOVER_SCAN_TIMEOUT, DOMAIN
+from .models import ElkM1ConfigEntry
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -24,7 +24,7 @@ def _short_mac(mac_address: str) -> str:
 @callback
 def async_update_entry_from_discovery(
     hass: HomeAssistant,
-    entry: config_entries.ConfigEntry,
+    entry: ElkM1ConfigEntry,
     device: ElkSystem,
 ) -> bool:
     """Update a config entry from a discovery."""
@@ -45,8 +45,10 @@ async def async_discover_devices(
         targets = [address]
     else:
         targets = [
-            str(address)
-            for address in await network.async_get_ipv4_broadcast_addresses(hass)
+            str(broadcast_address)
+            for broadcast_address in await network.async_get_ipv4_broadcast_addresses(
+                hass
+            )
         ]
 
     scanner = AIOELKDiscovery()
@@ -54,8 +56,8 @@ async def async_discover_devices(
     for idx, discovered in enumerate(
         await asyncio.gather(
             *[
-                scanner.async_scan(timeout=timeout, address=address)
-                for address in targets
+                scanner.async_scan(timeout=timeout, address=target_address)
+                for target_address in targets
             ],
             return_exceptions=True,
         )
@@ -63,6 +65,8 @@ async def async_discover_devices(
         if isinstance(discovered, Exception):
             _LOGGER.debug("Scanning %s failed with error: %s", targets[idx], discovered)
             continue
+        if isinstance(discovered, BaseException):
+            raise discovered from None
         for device in discovered:
             assert isinstance(device, ElkSystem)
             combined_discoveries[device.ip_address] = device

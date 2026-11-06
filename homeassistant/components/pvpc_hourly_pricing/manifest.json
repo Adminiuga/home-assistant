@@ -1,11 +1,13 @@
 {
   "domain": "pvpc_hourly_pricing",
   "name": "Spain electricity hourly pricing (PVPC)",
+  "categories": ["energy.energy_prices"],
+  "codeowners": ["@azogue", "@chiro79"],
   "config_flow": true,
+  "connectivity": ["cloud"],
   "documentation": "https://www.home-assistant.io/integrations/pvpc_hourly_pricing",
-  "requirements": ["aiopvpc==3.0.0"],
-  "codeowners": ["@azogue"],
-  "quality_scale": "platinum",
+  "integration_type": "service",
   "iot_class": "cloud_polling",
-  "loggers": ["aiopvpc", "holidays"]
+  "loggers": ["esios_api"],
+  "requirements": ["esios_api==4.4.0"]
 }

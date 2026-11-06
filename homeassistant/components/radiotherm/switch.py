@@ -1,15 +1,12 @@
 """Support for radiotherm switches."""
-from __future__ import annotations
 
-from typing import Any
+from typing import Any, override
 
 from homeassistant.components.switch import SwitchEntity
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .const import DOMAIN
-from .coordinator import RadioThermUpdateCoordinator
+from .coordinator import RadioThermConfigEntry, RadioThermUpdateCoordinator
 from .entity import RadioThermostatEntity
 
 PARALLEL_UPDATES = 1
@@ -17,29 +14,25 @@ PARALLEL_UPDATES = 1
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    entry: RadioThermConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up switches for a radiotherm device."""
-    coordinator: RadioThermUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities([RadioThermHoldSwitch(coordinator)])
+    async_add_entities([RadioThermHoldSwitch(entry.runtime_data)])
 
 
 class RadioThermHoldSwitch(RadioThermostatEntity, SwitchEntity):
     """Provides radiotherm hold switch support."""
 
+    _attr_translation_key = "hold"
+
     def __init__(self, coordinator: RadioThermUpdateCoordinator) -> None:
         """Initialize the hold mode switch."""
         super().__init__(coordinator)
-        self._attr_name = f"{coordinator.init_data.name} Hold"
         self._attr_unique_id = f"{coordinator.init_data.mac}_hold"
 
-    @property
-    def icon(self) -> str:
-        """Return the icon for the switch."""
-        return "mdi:timer-off" if self.is_on else "mdi:timer"
-
     @callback
+    @override
     def _process_data(self) -> None:
         """Update and validate the data from the thermostat."""
         data = self.data.tstat
@@ -56,10 +49,12 @@ class RadioThermHoldSwitch(RadioThermostatEntity, SwitchEntity):
         self.async_write_ha_state()
         await self.coordinator.async_request_refresh()
 
+    @override
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Enable permanent hold."""
         await self._async_set_hold(True)
 
+    @override
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Disable permanent hold."""
         await self._async_set_hold(False)

@@ -1,0 +1,112 @@
+"""Coordinator for the SMA integration."""
+
+from dataclasses import dataclass
+from datetime import timedelta
+import logging
+from typing import TYPE_CHECKING, override
+
+from pysma import (
+    SmaAuthenticationException,
+    SmaConnectionException,
+    SmaReadException,
+    SMAWebConnect,
+)
+from pysma.helpers import DeviceInfo
+from pysma.sensor import Sensors
+
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+
+from .const import DEFAULT_SCAN_INTERVAL, DOMAIN
+
+if TYPE_CHECKING:
+    from . import SMAConfigEntry
+
+_LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class SMACoordinatorData:
+    """Data class for SMA sensors."""
+
+    sma_device_info: DeviceInfo
+    sensors: Sensors
+
+
+class SMADataUpdateCoordinator(DataUpdateCoordinator[SMACoordinatorData]):
+    """Data Update Coordinator for SMA."""
+
+    config_entry: SMAConfigEntry
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        config_entry: SMAConfigEntry,
+        sma: SMAWebConnect,
+    ) -> None:
+        """Initialize the SMA Data Update Coordinator."""
+        super().__init__(
+            hass,
+            _LOGGER,
+            config_entry=config_entry,
+            name=DOMAIN,
+            update_interval=timedelta(seconds=DEFAULT_SCAN_INTERVAL),
+        )
+        self.sma = sma
+        self._sma_device_info = DeviceInfo()
+        self._sensors = Sensors()
+
+    @override
+    async def _async_setup(self) -> None:
+        """Setup the SMA Data Update Coordinator."""
+        try:
+            self._sma_device_info = await self.sma.device_info()
+            self._sensors = await self.sma.get_sensors()
+        except (
+            SmaReadException,
+            SmaConnectionException,
+        ) as err:
+            await self.async_close_sma_session()
+            raise ConfigEntryNotReady(
+                translation_domain=DOMAIN,
+                translation_key="cannot_connect",
+            ) from err
+        except SmaAuthenticationException as err:
+            raise ConfigEntryAuthFailed(
+                translation_domain=DOMAIN,
+                translation_key="invalid_auth",
+            ) from err
+
+    @override
+    async def _async_update_data(self) -> SMACoordinatorData:
+        """Update the used SMA sensors."""
+        try:
+            await self.sma.read(self._sensors)
+        except (
+            SmaReadException,
+            SmaConnectionException,
+        ) as err:
+            raise UpdateFailed(
+                translation_domain=DOMAIN,
+                translation_key="cannot_connect",
+            ) from err
+        except SmaAuthenticationException as err:
+            raise ConfigEntryAuthFailed(
+                translation_domain=DOMAIN,
+                translation_key="invalid_auth",
+            ) from err
+
+        return SMACoordinatorData(
+            sma_device_info=self._sma_device_info,
+            sensors=self._sensors,
+        )
+
+    async def async_close_sma_session(self) -> None:
+        """Close the SMA session."""
+        try:
+            await self.sma.close_session()
+        except SmaConnectionException as err:
+            _LOGGER.debug("Could not close the SMA session: %s", err)
+            return
+        _LOGGER.debug("SMA session closed")

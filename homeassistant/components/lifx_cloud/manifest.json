@@ -1,7 +1,10 @@
 {
   "domain": "lifx_cloud",
   "name": "LIFX Cloud",
-  "documentation": "https://www.home-assistant.io/integrations/lifx_cloud",
+  "categories": ["lighting.bulbs_lamps"],
   "codeowners": [],
-  "iot_class": "cloud_push"
+  "connectivity": ["cloud"],
+  "documentation": "https://www.home-assistant.io/integrations/lifx_cloud",
+  "iot_class": "cloud_push",
+  "quality_scale": "legacy"
 }

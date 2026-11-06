@@ -1,10 +1,13 @@
 {
   "domain": "opentherm_gw",
   "name": "OpenTherm Gateway",
-  "documentation": "https://www.home-assistant.io/integrations/opentherm_gw",
-  "requirements": ["pyotgw==2.1.1"],
+  "categories": ["climate.thermostats_heating"],
   "codeowners": ["@mvn23"],
   "config_flow": true,
+  "connectivity": ["network", "serial"],
+  "documentation": "https://www.home-assistant.io/integrations/opentherm_gw",
+  "integration_type": "device",
   "iot_class": "local_push",
-  "loggers": ["pyotgw"]
+  "loggers": ["pyotgw"],
+  "requirements": ["pyotgw==2.2.3"]
 }

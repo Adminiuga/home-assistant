@@ -1,11 +1,11 @@
 """Common code for tests."""
-from __future__ import annotations
 
 from collections.abc import Callable
 from enum import Enum
 from typing import NamedTuple
 from unittest.mock import MagicMock
 
+from pytest_homeassistant.common import MockConfigEntry
 import pyvera as pv
 
 from homeassistant import config_entries
@@ -15,11 +15,8 @@ from homeassistant.components.vera.const import (
     DOMAIN,
 )
 from homeassistant.core import HomeAssistant
-from homeassistant.setup import async_setup_component
 
-from tests.common import MockConfigEntry
-
-SetupCallback = Callable[[pv.VeraController, dict], None]
+type SetupCallback = Callable[[pv.VeraController, dict], None]
 
 
 class ControllerData(NamedTuple):
@@ -38,7 +35,6 @@ class ComponentData(NamedTuple):
 class ConfigSource(Enum):
     """Source of configuration."""
 
-    FILE = "file"
     CONFIG_FLOW = "config_flow"
     CONFIG_ENTRY = "config_entry"
 
@@ -57,8 +53,8 @@ class ControllerConfig(NamedTuple):
 
 
 def new_simple_controller_config(
-    config: dict = None,
-    options: dict = None,
+    config: dict | None = None,
+    options: dict | None = None,
     config_source=ConfigSource.CONFIG_FLOW,
     serial_number="1111",
     devices: tuple[pv.VeraDevice, ...] = (),
@@ -82,7 +78,7 @@ def new_simple_controller_config(
 class ComponentFactory:
     """Factory class."""
 
-    def __init__(self, vera_controller_class_mock):
+    def __init__(self, vera_controller_class_mock) -> None:
         """Initialize the factory."""
         self.vera_controller_class_mock = vera_controller_class_mock
 
@@ -119,7 +115,7 @@ class ComponentFactory:
         if controller_config.legacy_entity_unique_id:
             component_config[CONF_LEGACY_UNIQUE_ID] = True
 
-        controller: pv.VeraController = MagicMock(spec=pv.VeraController)
+        controller: pv.VeraController = MagicMock()
         controller.base_url = component_config.get(CONF_CONTROLLER)
         controller.register = MagicMock()
         controller.start = MagicMock()
@@ -141,22 +137,13 @@ class ComponentFactory:
 
         self.vera_controller_class_mock.return_value = controller
 
-        hass_config = {}
-
-        # Setup component through config file import.
-        if controller_config.config_source == ConfigSource.FILE:
-            hass_config[DOMAIN] = component_config
-
-        # Setup Home Assistant.
-        assert await async_setup_component(hass, DOMAIN, hass_config)
-        await hass.async_block_till_done()
-
         # Setup component through config flow.
         if controller_config.config_source == ConfigSource.CONFIG_FLOW:
-            await hass.config_entries.flow.async_init(
-                DOMAIN,
-                context={"source": config_entries.SOURCE_USER},
-                data=component_config,
+            result = await hass.config_entries.flow.async_init(
+                DOMAIN, context={"source": config_entries.SOURCE_USER}
+            )
+            await hass.config_entries.flow.async_configure(
+                result["flow_id"], component_config
             )
             await hass.async_block_till_done()
 

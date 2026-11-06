@@ -1,27 +1,147 @@
 """The sql component."""
-from __future__ import annotations
 
+import logging
+from typing import Any
+
+import probatio
+
+from homeassistant.components.recorder import CONF_DB_URL, get_instance
+from homeassistant.components.sensor import (
+    CONF_STATE_CLASS,
+    DEVICE_CLASSES_SCHEMA,
+    STATE_CLASSES_SCHEMA,
+)
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import (
+    CONF_DEVICE_CLASS,
+    CONF_ICON,
+    CONF_NAME,
+    CONF_UNIQUE_ID,
+    CONF_UNIT_OF_MEASUREMENT,
+    CONF_VALUE_TEMPLATE,
+    Platform,
+)
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import config_validation as cv, discovery
+from homeassistant.helpers.trigger_template_entity import (
+    CONF_AVAILABILITY,
+    CONF_PICTURE,
+    ValueTemplate,
+)
+from homeassistant.helpers.typing import ConfigType
 
-from .const import PLATFORMS
+from .const import (
+    CONF_ADDITIONAL_OPTIONS,
+    CONF_COLUMN_NAME,
+    CONF_QUERY,
+    DOMAIN,
+    PLATFORMS,
+)
+from .services import async_setup_services
+from .util import redact_credentials, validate_sql_select
+
+_LOGGER = logging.getLogger(__name__)
 
 
-async def async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Update listener for options."""
-    await hass.config_entries.async_reload(entry.entry_id)
+QUERY_SCHEMA = probatio.Schema(
+    {
+        probatio.Required(CONF_COLUMN_NAME): cv.string,
+        probatio.Required(CONF_NAME): cv.template,
+        probatio.Required(CONF_QUERY): probatio.All(
+            cv.template, ValueTemplate.from_template, validate_sql_select
+        ),
+        probatio.Optional(CONF_UNIT_OF_MEASUREMENT): cv.string,
+        probatio.Optional(CONF_VALUE_TEMPLATE): probatio.All(
+            cv.template, ValueTemplate.from_template
+        ),
+        probatio.Optional(CONF_UNIQUE_ID): cv.string,
+        probatio.Optional(CONF_DB_URL): cv.string,
+        probatio.Optional(CONF_DEVICE_CLASS): DEVICE_CLASSES_SCHEMA,
+        probatio.Optional(CONF_STATE_CLASS): STATE_CLASSES_SCHEMA,
+        probatio.Optional(CONF_AVAILABILITY): cv.template,
+        probatio.Optional(CONF_ICON): cv.template,
+        probatio.Optional(CONF_PICTURE): cv.template,
+    }
+)
+
+CONFIG_SCHEMA = probatio.Schema(
+    {probatio.Optional(DOMAIN): probatio.All(probatio.EnsureList(), [QUERY_SCHEMA])},
+    extra=probatio.ALLOW_EXTRA,
+)
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Set up SQL from a config entry."""
-    entry.async_on_unload(entry.add_update_listener(async_update_listener))
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Set up SQL from yaml config."""
+    async_setup_services(hass)
 
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    if (conf := config.get(DOMAIN)) is None:
+        return True
+
+    for sensor_conf in conf:
+        await discovery.async_load_platform(
+            hass, Platform.SENSOR, DOMAIN, sensor_conf, config
+        )
 
     return True
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Set up SQL from a config entry."""
+    _LOGGER.debug(
+        "Comparing %s and %s",
+        redact_credentials(entry.options.get(CONF_DB_URL)),
+        redact_credentials(get_instance(hass).db_url),
+    )
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Unload SQL config entry."""
 
-    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)
+
+
+async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Migrate old entry."""
+    _LOGGER.debug("Migrating from version %s.%s", entry.version, entry.minor_version)
+
+    if entry.version == 1:
+        old_options = {**entry.options}
+        new_data = {}
+        new_options: dict[str, Any] = {}
+
+        if (db_url := old_options.get(CONF_DB_URL)) and db_url != get_instance(
+            hass
+        ).db_url:
+            new_data[CONF_DB_URL] = db_url
+
+        new_options[CONF_COLUMN_NAME] = old_options.get(CONF_COLUMN_NAME)
+        new_options[CONF_QUERY] = old_options.get(CONF_QUERY)
+        new_options[CONF_ADDITIONAL_OPTIONS] = {}
+
+        for key in (
+            CONF_VALUE_TEMPLATE,
+            CONF_UNIT_OF_MEASUREMENT,
+            CONF_DEVICE_CLASS,
+            CONF_STATE_CLASS,
+        ):
+            if (value := old_options.get(key)) is not None:
+                new_options[CONF_ADDITIONAL_OPTIONS][key] = value
+
+        hass.config_entries.async_update_entry(
+            entry, data=new_data, options=new_options, version=2
+        )
+
+    if entry.version == 2:
+        new_options = {**entry.options}
+        # The "advanced_options" section was renamed to "additional_options"
+        if (additional := new_options.pop("advanced_options", None)) is not None:
+            new_options[CONF_ADDITIONAL_OPTIONS] = additional
+        hass.config_entries.async_update_entry(entry, options=new_options, version=3)
+
+    _LOGGER.debug(
+        "Migration to version %s.%s successful",
+        entry.version,
+        entry.minor_version,
+    )

@@ -1,0 +1,57 @@
+"""The Aprilaire integration."""
+
+from pyaprilaire.const import Attribute
+
+from homeassistant.const import CONF_HOST, CONF_PORT, EVENT_HOMEASSISTANT_STOP, Platform
+from homeassistant.core import Event, HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.helpers.device_registry import format_mac
+
+from .coordinator import AprilaireConfigEntry, AprilaireCoordinator
+
+PLATFORMS: list[Platform] = [
+    Platform.CLIMATE,
+    Platform.HUMIDIFIER,
+    Platform.SELECT,
+    Platform.SENSOR,
+]
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: AprilaireConfigEntry) -> None:
+    """Set up a config entry for Aprilaire."""
+
+    host = entry.data[CONF_HOST]
+    port = entry.data[CONF_PORT]
+
+    coordinator = AprilaireCoordinator(hass, entry, host, port)
+    await coordinator.start_listen()
+
+    async def ready_callback(ready: bool) -> None:
+        if ready:
+            mac_address = format_mac(coordinator.data[Attribute.MAC_ADDRESS])
+
+            if mac_address != entry.unique_id:
+                raise ConfigEntryAuthFailed("Invalid MAC address")
+
+            entry.runtime_data = coordinator
+            entry.async_on_unload(coordinator.stop_listen)
+
+            await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+            async def _async_close(_: Event) -> None:
+                coordinator.stop_listen()
+
+            entry.async_on_unload(
+                hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _async_close)
+            )
+        else:
+            coordinator.stop_listen()
+
+            raise ConfigEntryNotReady("Failed to wait for ready")
+
+    await coordinator.wait_for_ready(ready_callback)
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: AprilaireConfigEntry) -> None:
+    """Unload a config entry."""
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)

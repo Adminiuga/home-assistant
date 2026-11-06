@@ -1,31 +1,67 @@
 {
   "config": {
+    "abort": {
+      "already_configured": "[%key:common::config_flow::abort::already_configured_account%]",
+      "connection_error": "Could not fetch account information. Is the user registered in the Spotify Developer Dashboard?",
+      "missing_configuration": "The Spotify integration is not configured. Please follow the documentation.",
+      "reauth_account_mismatch": "The Spotify account authenticated with does not match the account that needed re-authentication.",
+      "unique_id_mismatch": "The Spotify account authenticated with does not match the account of this entry.",
+      "user_not_premium": "The Spotify API has been changed and Developer applications created with a free account can no longer access the API. To continue using the Spotify integration, you should use an Spotify Developer application created with a Spotify Premium account, or upgrade to Spotify Premium."
+    },
+    "create_entry": {
+      "default": "Successfully authenticated with Spotify."
+    },
+    "initiate_flow": {
+      "user": "[%key:common::config_flow::initiate_flow::account%]"
+    },
     "step": {
       "pick_implementation": {
+        "data": {
+          "implementation": "[%key:common::config_flow::data::implementation%]"
+        },
+        "data_description": {
+          "implementation": "[%key:common::config_flow::description::implementation%]"
+        },
         "title": "[%key:common::config_flow::title::oauth2_pick_implementation%]"
       },
       "reauth_confirm": {
-        "title": "[%key:common::config_flow::title::reauth%]",
-        "description": "The Spotify integration needs to re-authenticate with Spotify for account: {account}"
+        "description": "The Spotify integration needs to re-authenticate with Spotify for account: {account}",
+        "title": "[%key:common::config_flow::title::reauth%]"
       }
+    }
+  },
+  "exceptions": {
+    "invalid_account": {
+      "message": "Invalid Spotify account specified"
     },
-    "abort": {
-      "authorize_url_timeout": "Timeout generating authorize URL.",
-      "missing_configuration": "The Spotify integration is not configured. Please follow the documentation.",
-      "no_url_available": "[%key:common::config_flow::abort::oauth2_no_url_available%]",
-      "reauth_account_mismatch": "The Spotify account authenticated with, does not match the account needed re-authentication."
+    "invalid_url": {
+      "message": "Invalid Spotify URL specified"
     },
-    "create_entry": { "default": "Successfully authenticated with Spotify." }
+    "media_not_found": {
+      "message": "Spotify media not found: {media_content_type} / {media_content_id}"
+    },
+    "missing_scopes": {
+      "message": "The Spotify access token is missing required permissions. Please reauthenticate"
+    },
+    "token_refresh_failed": {
+      "message": "An error occurred while refreshing the Spotify access token: {error}"
+    },
+    "update_failed": {
+      "message": "An error occurred while communicating with Spotify: {error}"
+    },
+    "user_not_premium": {
+      "message": "[%key:component::spotify::issues::user_not_premium::title%]"
+    }
+  },
+  "issues": {
+    "user_not_premium": {
+      "description": "[%key:component::spotify::config::abort::user_not_premium%]",
+      "title": "Spotify integration requires a Spotify Premium account"
+    }
   },
   "system_health": {
     "info": {
       "api_endpoint_reachable": "Spotify API endpoint reachable"
-    }
-  },
-  "issues": {
-    "removed_yaml": {
-      "title": "The Spotify YAML configuration has been removed",
-      "description": "Configuring Spotify using YAML has been removed.\n\nYour existing YAML configuration is not used by Home Assistant.\n\nRemove the YAML configuration from your configuration.yaml file and restart Home Assistant to fix this issue."
     }
   }
 }

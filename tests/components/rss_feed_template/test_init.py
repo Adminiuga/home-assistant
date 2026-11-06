@@ -1,14 +1,22 @@
 """The tests for the rss_feed_api component."""
+
 from http import HTTPStatus
 
+from aiohttp.test_utils import TestClient
 from defusedxml import ElementTree
 import pytest
+from pytest_homeassistant.typing import ClientSessionGenerator
 
+from homeassistant.components.rss_feed_template import DOMAIN
+from homeassistant.core import HomeAssistant
 from homeassistant.setup import async_setup_component
 
 
 @pytest.fixture
-def mock_http_client(loop, hass, hass_client):
+async def mock_http_client(
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+) -> TestClient:
     """Set up test fixture."""
     config = {
         "rss_feed_template": {
@@ -24,17 +32,17 @@ def mock_http_client(loop, hass, hass_client):
         }
     }
 
-    loop.run_until_complete(async_setup_component(hass, "rss_feed_template", config))
-    return loop.run_until_complete(hass_client())
+    await async_setup_component(hass, DOMAIN, config)
+    return await hass_client()
 
 
-async def test_get_nonexistant_feed(mock_http_client):
+async def test_get_nonexistant_feed(mock_http_client) -> None:
     """Test if we can retrieve the correct rss feed."""
     resp = await mock_http_client.get("/api/rss_template/otherfeed")
     assert resp.status == HTTPStatus.NOT_FOUND
 
 
-async def test_get_rss_feed(mock_http_client, hass):
+async def test_get_rss_feed(mock_http_client, hass: HomeAssistant) -> None:
     """Test if we can retrieve the correct rss feed."""
     hass.states.async_set("test.test1", "a_state_1")
     hass.states.async_set("test.test2", "a_state_2")

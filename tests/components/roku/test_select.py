@@ -1,7 +1,9 @@
 """Tests for the Roku select platform."""
+
 from unittest.mock import MagicMock
 
 import pytest
+from pytest_homeassistant.common import MockConfigEntry, async_fire_time_changed
 from rokuecp import (
     Application,
     Device as RokuDevice,
@@ -17,24 +19,21 @@ from homeassistant.components.select import (
     ATTR_OPTIONS,
     DOMAIN as SELECT_DOMAIN,
 )
-from homeassistant.const import ATTR_ENTITY_ID, ATTR_ICON, SERVICE_SELECT_OPTION
+from homeassistant.const import ATTR_ENTITY_ID, SERVICE_SELECT_OPTION
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
-import homeassistant.util.dt as dt_util
-
-from tests.common import MockConfigEntry, async_fire_time_changed
+from homeassistant.util import dt as dt_util
 
 
 async def test_application_state(
     hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
     mock_config_entry: MockConfigEntry,
     mock_device: RokuDevice,
     mock_roku: MagicMock,
 ) -> None:
     """Test the creation and values of the Roku selects."""
-    entity_registry = er.async_get(hass)
-
     entity_registry.async_get_or_create(
         SELECT_DOMAIN,
         DOMAIN,
@@ -49,12 +48,11 @@ async def test_application_state(
 
     state = hass.states.get("select.my_roku_3_application")
     assert state
-    assert state.attributes.get(ATTR_ICON) == "mdi:application"
     assert state.attributes.get(ATTR_OPTIONS) == [
         "Home",
         "Amazon Video on Demand",
         "Free FrameChannel Service",
-        "MLB.TV" + "\u00AE",
+        "MLB.TV" + "\u00ae",
         "Mediafly",
         "Netflix",
         "Pandora",
@@ -113,7 +111,7 @@ async def test_application_state(
 
 
 @pytest.mark.parametrize(
-    "error, error_string",
+    ("error", "error_string"),
     [
         (RokuConnectionError, "Error communicating with Roku API"),
         (RokuConnectionTimeoutError, "Timeout communicating with Roku API"),
@@ -122,14 +120,13 @@ async def test_application_state(
 )
 async def test_application_select_error(
     hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
     mock_config_entry: MockConfigEntry,
     mock_roku: MagicMock,
     error: RokuError,
     error_string: str,
 ) -> None:
     """Test error handling of the Roku selects."""
-    entity_registry = er.async_get(hass)
-
     entity_registry.async_get_or_create(
         SELECT_DOMAIN,
         DOMAIN,
@@ -165,16 +162,14 @@ async def test_application_select_error(
 @pytest.mark.parametrize("mock_device", ["roku/rokutv-7820x.json"], indirect=True)
 async def test_channel_state(
     hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
     init_integration: MockConfigEntry,
     mock_device: RokuDevice,
     mock_roku: MagicMock,
 ) -> None:
     """Test the creation and values of the Roku selects."""
-    entity_registry = er.async_get(hass)
-
-    state = hass.states.get("select.58_onn_roku_tv_channel")
+    state = hass.states.get("select.living_room_58_onn_roku_tv_channel")
     assert state
-    assert state.attributes.get(ATTR_ICON) == "mdi:television"
     assert state.attributes.get(ATTR_OPTIONS) == [
         "99.1",
         "QVC (1.3)",
@@ -183,7 +178,7 @@ async def test_channel_state(
     ]
     assert state.state == "getTV (14.3)"
 
-    entry = entity_registry.async_get("select.58_onn_roku_tv_channel")
+    entry = entity_registry.async_get("select.living_room_58_onn_roku_tv_channel")
     assert entry
     assert entry.unique_id == "YN00H5555555_channel"
 
@@ -192,7 +187,7 @@ async def test_channel_state(
         SELECT_DOMAIN,
         SERVICE_SELECT_OPTION,
         {
-            ATTR_ENTITY_ID: "select.58_onn_roku_tv_channel",
+            ATTR_ENTITY_ID: "select.living_room_58_onn_roku_tv_channel",
             ATTR_OPTION: "WhatsOn (1.1)",
         },
         blocking=True,
@@ -205,7 +200,7 @@ async def test_channel_state(
     async_fire_time_changed(hass, dt_util.utcnow() + SCAN_INTERVAL)
     await hass.async_block_till_done()
 
-    state = hass.states.get("select.58_onn_roku_tv_channel")
+    state = hass.states.get("select.living_room_58_onn_roku_tv_channel")
     assert state
     assert state.state == "WhatsOn (1.1)"
 
@@ -214,7 +209,7 @@ async def test_channel_state(
         SELECT_DOMAIN,
         SERVICE_SELECT_OPTION,
         {
-            ATTR_ENTITY_ID: "select.58_onn_roku_tv_channel",
+            ATTR_ENTITY_ID: "select.living_room_58_onn_roku_tv_channel",
             ATTR_OPTION: "99.1",
         },
         blocking=True,
@@ -227,7 +222,7 @@ async def test_channel_state(
     async_fire_time_changed(hass, dt_util.utcnow() + SCAN_INTERVAL)
     await hass.async_block_till_done()
 
-    state = hass.states.get("select.58_onn_roku_tv_channel")
+    state = hass.states.get("select.living_room_58_onn_roku_tv_channel")
     assert state
     assert state.state == "99.1"
 
@@ -246,13 +241,13 @@ async def test_channel_select_error(
             SELECT_DOMAIN,
             SERVICE_SELECT_OPTION,
             {
-                ATTR_ENTITY_ID: "select.58_onn_roku_tv_channel",
+                ATTR_ENTITY_ID: "select.living_room_58_onn_roku_tv_channel",
                 ATTR_OPTION: "99.1",
             },
             blocking=True,
         )
 
-    state = hass.states.get("select.58_onn_roku_tv_channel")
+    state = hass.states.get("select.living_room_58_onn_roku_tv_channel")
     assert state
     assert state.state == "getTV (14.3)"
     assert mock_roku.tune.call_count == 1

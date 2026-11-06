@@ -1,17 +1,26 @@
 {
   "domain": "braviatv",
   "name": "Sony Bravia TV",
-  "documentation": "https://www.home-assistant.io/integrations/braviatv",
-  "requirements": ["pybravia==0.2.3"],
+  "categories": ["media_entertainment.tv_streaming"],
   "codeowners": ["@bieniu", "@Drafteed"],
-  "ssdp": [
+  "config_flow": true,
+  "connectivity": ["network"],
+  "dependencies": ["ssdp"],
+  "dhcp": [
     {
-      "st": "urn:schemas-sony-com:service:ScalarWebAPI:1",
-      "manufacturer": "Sony Corporation"
+      "registered_devices": true
     }
   ],
-  "config_flow": true,
+  "documentation": "https://www.home-assistant.io/integrations/braviatv",
+  "integration_type": "device",
   "iot_class": "local_polling",
   "loggers": ["pybravia"],
-  "integration_type": "device"
+  "quality_scale": "silver",
+  "requirements": ["pybravia==0.5.3"],
+  "ssdp": [
+    {
+      "manufacturer": "Sony Corporation",
+      "st": "urn:schemas-sony-com:service:ScalarWebAPI:1"
+    }
+  ]
 }

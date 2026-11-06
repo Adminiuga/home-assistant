@@ -1,9 +1,11 @@
 {
   "domain": "locative",
   "name": "Locative",
-  "config_flow": true,
-  "documentation": "https://www.home-assistant.io/integrations/locative",
-  "dependencies": ["webhook"],
+  "categories": ["presence_location.phones_companion_apps"],
   "codeowners": [],
+  "config_flow": true,
+  "connectivity": ["network"],
+  "dependencies": ["webhook"],
+  "documentation": "https://www.home-assistant.io/integrations/locative",
   "iot_class": "local_push"
 }

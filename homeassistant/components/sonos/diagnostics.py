@@ -1,14 +1,15 @@
 """Provides diagnostics for Sonos."""
-from __future__ import annotations
 
 import time
 from typing import Any
 
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.components.diagnostics import async_redact_data
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.device_registry import DeviceEntry
+from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.device_registry import AnyDeviceEntry
 
-from .const import DATA_SONOS, DOMAIN
+from .const import DOMAIN
+from .helpers import SonosConfigEntry
 from .speaker import SonosSpeaker
 
 MEDIA_DIAGNOSTIC_ATTRIBUTES = (
@@ -41,43 +42,48 @@ SPEAKER_DIAGNOSTIC_ATTRIBUTES = (
     "_last_activity",
     "_last_event_cache",
 )
+TO_REDACT = {"third_party_media_servers_x"}
 
 
 async def async_get_config_entry_diagnostics(
-    hass: HomeAssistant, config_entry: ConfigEntry
+    hass: HomeAssistant, config_entry: SonosConfigEntry
 ) -> dict[str, Any]:
     """Return diagnostics for a config entry."""
     payload: dict[str, Any] = {"current_timestamp": time.monotonic()}
 
     for section in ("discovered", "discovery_known"):
         payload[section] = {}
-        data: set[Any] | dict[str, Any] = getattr(hass.data[DATA_SONOS], section)
+        data: set[Any] | dict[str, Any] = getattr(config_entry.runtime_data, section)
         if isinstance(data, set):
             payload[section] = data
             continue
         for key, value in data.items():
             if isinstance(value, SonosSpeaker):
-                payload[section][key] = await async_generate_speaker_info(hass, value)
+                payload[section][key] = await async_generate_speaker_info(
+                    hass, config_entry, value
+                )
             else:
                 payload[section][key] = value
-    return payload
+    return async_redact_data(payload, TO_REDACT)
 
 
 async def async_get_device_diagnostics(
-    hass: HomeAssistant, config_entry: ConfigEntry, device: DeviceEntry
-) -> dict[str, Any] | None:
+    hass: HomeAssistant, config_entry: SonosConfigEntry, device: AnyDeviceEntry
+) -> dict[str, Any]:
     """Return diagnostics for a device."""
     uid = next(
         (identifier[1] for identifier in device.identifiers if identifier[0] == DOMAIN),
         None,
     )
     if uid is None:
-        return None
+        return {}
 
-    if (speaker := hass.data[DATA_SONOS].discovered.get(uid)) is None:
-        return None
+    if (speaker := config_entry.runtime_data.discovered.get(uid)) is None:
+        return {}
 
-    return await async_generate_speaker_info(hass, speaker)
+    return async_redact_data(
+        await async_generate_speaker_info(hass, config_entry, speaker), TO_REDACT
+    )
 
 
 async def async_generate_media_info(
@@ -106,13 +112,13 @@ async def async_generate_media_info(
 
 
 async def async_generate_speaker_info(
-    hass: HomeAssistant, speaker: SonosSpeaker
+    hass: HomeAssistant, config_entry: SonosConfigEntry, speaker: SonosSpeaker
 ) -> dict[str, Any]:
     """Generate the diagnostic payload for a specific speaker."""
     payload: dict[str, Any] = {}
 
     def get_contents(
-        item: int | float | str | dict[str, Any]
+        item: float | str | dict[str, Any],
     ) -> int | float | str | dict[str, Any]:
         if isinstance(item, (int, float, str)):
             return item
@@ -129,11 +135,23 @@ async def async_generate_speaker_info(
         value = getattr(speaker, attrib)
         payload[attrib] = get_contents(value)
 
-    payload["enabled_entities"] = {
-        entity_id
-        for entity_id, s in hass.data[DATA_SONOS].entity_id_mappings.items()
-        if s is speaker
-    }
+    entity_registry = er.async_get(hass)
+    payload["enabled_entities"] = sorted(
+        registry_entry.entity_id
+        for registry_entry in entity_registry.entities.get_entries_for_config_entry_id(
+            config_entry.entry_id
+        )
+        if (
+            (
+                entity_speaker
+                := config_entry.runtime_data.unique_id_speaker_mappings.get(
+                    registry_entry.unique_id
+                )
+            )
+            and speaker.uid == entity_speaker.uid
+        )
+    )
+
     payload["media"] = await async_generate_media_info(hass, speaker)
     payload["activity_stats"] = speaker.activity_stats.report()
     payload["event_stats"] = speaker.event_stats.report()

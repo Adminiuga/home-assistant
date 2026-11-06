@@ -1,24 +1,30 @@
 """Config flow for Broadlink devices."""
+
 from collections.abc import Mapping
 import errno
-from functools import partial
 import logging
 import socket
-from typing import Any
+from typing import Any, override
 
-import broadlink as blk
-from broadlink.exceptions import (
+import broadlink_async as blk
+from broadlink_async.exceptions import (
     AuthenticationError,
     BroadlinkException,
     NetworkTimeoutError,
 )
-import voluptuous as vol
+import probatio
 
-from homeassistant import config_entries
-from homeassistant.components import dhcp
-from homeassistant.const import CONF_HOST, CONF_MAC, CONF_NAME, CONF_TIMEOUT, CONF_TYPE
-from homeassistant.data_entry_flow import AbortFlow, FlowResult
+from homeassistant.config_entries import (
+    SOURCE_IMPORT,
+    SOURCE_REAUTH,
+    ConfigFlow,
+    ConfigFlowResult,
+)
+from homeassistant.const import CONF_HOST, CONF_MAC, CONF_TIMEOUT, CONF_TYPE
+from homeassistant.core import callback
+from homeassistant.data_entry_flow import AbortFlow
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.service_info.dhcp import DhcpServiceInfo
 
 from .const import DEFAULT_PORT, DEFAULT_TIMEOUT, DEVICE_TYPES, DOMAIN
 from .helpers import format_mac
@@ -26,21 +32,34 @@ from .helpers import format_mac
 _LOGGER = logging.getLogger(__name__)
 
 
-class BroadlinkFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
+class BroadlinkFlowHandler(ConfigFlow, domain=DOMAIN):
     """Handle a Broadlink config flow."""
 
     VERSION = 1
 
-    def __init__(self):
-        """Initialize the Broadlink flow."""
-        self.device = None
+    device: blk.Device
 
-    async def async_set_device(self, device, raise_on_progress=True):
+    @override
+    @callback
+    def async_remove(self) -> None:
+        """Close the device's socket when the flow ends, however it ends.
+
+        The device created for the flow is only used to probe and
+        authenticate; the config entry builds its own.
+        """
+        if (device := getattr(self, "device", None)) is not None:
+            self.hass.async_create_task(device.aclose())
+
+    async def async_set_device(
+        self, device: blk.Device, raise_on_progress: bool = True
+    ) -> None:
         """Define a device for the config flow."""
         if device.type not in DEVICE_TYPES:
             _LOGGER.error(
-                "Unsupported device: %s. If it worked before, please open "
-                "an issue at https://github.com/home-assistant/core/issues",
+                (
+                    "Unsupported device: %s. If it worked before, please open "
+                    "an issue at https://github.com/home-assistant/core/issues"
+                ),
                 hex(device.devtype),
             )
             raise AbortFlow("not_supported")
@@ -48,15 +67,22 @@ class BroadlinkFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         await self.async_set_unique_id(
             device.mac.hex(), raise_on_progress=raise_on_progress
         )
+        # A probe replaced after a failed auth() has an open endpoint.
+        previous = getattr(self, "device", None)
+        if previous is not None and previous is not device:
+            await previous.aclose()
         self.device = device
 
         self.context["title_placeholders"] = {
-            "name": device.name,
+            "name": device.name or device.model,
             "model": device.model,
             "host": device.host[0],
         }
 
-    async def async_step_dhcp(self, discovery_info: dhcp.DhcpServiceInfo) -> FlowResult:
+    @override
+    async def async_step_dhcp(
+        self, discovery_info: DhcpServiceInfo
+    ) -> ConfigFlowResult:
         """Handle dhcp discovery."""
         host = discovery_info.ip
         unique_id = discovery_info.macaddress.lower().replace(":", "")
@@ -64,7 +90,7 @@ class BroadlinkFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         self._abort_if_unique_id_configured(updates={CONF_HOST: host})
 
         try:
-            device = await self.hass.async_add_executor_job(blk.hello, host)
+            device = await blk.hello(host)
 
         except NetworkTimeoutError:
             return self.async_abort(reason="cannot_connect")
@@ -80,7 +106,10 @@ class BroadlinkFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         await self.async_set_device(device)
         return await self.async_step_auth()
 
-    async def async_step_user(self, user_input=None):
+    @override
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle a flow initiated by the user."""
         errors = {}
 
@@ -89,8 +118,7 @@ class BroadlinkFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             timeout = user_input.get(CONF_TIMEOUT, DEFAULT_TIMEOUT)
 
             try:
-                hello = partial(blk.hello, host, timeout=timeout)
-                device = await self.hass.async_add_executor_job(hello)
+                device = await blk.hello(host, timeout=timeout)
 
             except NetworkTimeoutError:
                 errors["base"] = "cannot_connect"
@@ -110,7 +138,7 @@ class BroadlinkFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             else:
                 device.timeout = timeout
 
-                if self.source != config_entries.SOURCE_REAUTH:
+                if self.source != SOURCE_REAUTH:
                     await self.async_set_device(device)
                     self._abort_if_unique_id_configured(
                         updates={CONF_HOST: device.host[0], CONF_TIMEOUT: timeout}
@@ -129,26 +157,26 @@ class BroadlinkFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
 
             _LOGGER.error("Failed to connect to the device at %s: %s", host, err_msg)
 
-            if self.source == config_entries.SOURCE_IMPORT:
+            if self.source == SOURCE_IMPORT:
                 return self.async_abort(reason=errors["base"])
 
         data_schema = {
-            vol.Required(CONF_HOST): str,
-            vol.Optional(CONF_TIMEOUT, default=DEFAULT_TIMEOUT): cv.positive_int,
+            probatio.Required(CONF_HOST): str,
+            probatio.Optional(CONF_TIMEOUT, default=DEFAULT_TIMEOUT): cv.positive_int,
         }
         return self.async_show_form(
             step_id="user",
-            data_schema=vol.Schema(data_schema),
+            data_schema=probatio.Schema(data_schema),
             errors=errors,
         )
 
-    async def async_step_auth(self):
+    async def async_step_auth(self) -> ConfigFlowResult:
         """Authenticate to the device."""
         device = self.device
-        errors = {}
+        errors: dict[str, str] = {}
 
         try:
-            await self.hass.async_add_executor_job(device.auth)
+            await device.auth()
 
         except AuthenticationError:
             errors["base"] = "invalid_auth"
@@ -173,17 +201,18 @@ class BroadlinkFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
 
         else:
             await self.async_set_unique_id(device.mac.hex())
-            if self.source == config_entries.SOURCE_IMPORT:
-                _LOGGER.warning(
-                    "%s (%s at %s) is ready to be configured. Click "
-                    "Configuration in the sidebar, click Integrations and "
-                    "click Configure on the device to complete the setup",
-                    device.name,
-                    device.model,
-                    device.host[0],
-                )
-
             if device.is_locked:
+                if self.source == SOURCE_IMPORT:
+                    _LOGGER.warning(
+                        (
+                            "%s (%s at %s) is ready to be configured. Click "
+                            "Configuration in the sidebar, click Integrations and "
+                            "click Configure on the device to complete the setup"
+                        ),
+                        device.name or device.model,
+                        device.model,
+                        device.host[0],
+                    )
                 return await self.async_step_unlock()
             return await self.async_step_finish()
 
@@ -193,7 +222,11 @@ class BroadlinkFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         )
         return self.async_show_form(step_id="auth", errors=errors)
 
-    async def async_step_reset(self, user_input=None, errors=None):
+    async def async_step_reset(
+        self,
+        user_input: dict[str, Any] | None = None,
+        errors: dict[str, str] | None = None,
+    ) -> ConfigFlowResult:
         """Guide the user to unlock the device manually.
 
         We are unable to authenticate because the device is locked.
@@ -206,7 +239,7 @@ class BroadlinkFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
                 step_id="reset",
                 errors=errors,
                 description_placeholders={
-                    "name": device.name,
+                    "name": device.name or device.model,
                     "model": device.model,
                     "host": device.host[0],
                 },
@@ -216,7 +249,9 @@ class BroadlinkFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             {CONF_HOST: device.host[0], CONF_TIMEOUT: device.timeout}
         )
 
-    async def async_step_unlock(self, user_input=None):
+    async def async_step_unlock(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Unlock the device.
 
         The authentication succeeded, but the device is locked.
@@ -230,7 +265,7 @@ class BroadlinkFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
 
         elif user_input["unlock"]:
             try:
-                await self.hass.async_add_executor_job(device.set_lock, False)
+                await device.set_lock(False)
 
             except NetworkTimeoutError as err:
                 errors["base"] = "cannot_connect"
@@ -258,56 +293,53 @@ class BroadlinkFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         else:
             return await self.async_step_finish()
 
-        data_schema = {vol.Required("unlock", default=False): bool}
+        data_schema = {probatio.Required("unlock", default=False): bool}
         return self.async_show_form(
             step_id="unlock",
             errors=errors,
-            data_schema=vol.Schema(data_schema),
+            data_schema=probatio.Schema(data_schema),
             description_placeholders={
-                "name": device.name,
+                "name": device.name or device.model,
                 "model": device.model,
                 "host": device.host[0],
             },
         )
 
-    async def async_step_finish(self, user_input=None):
-        """Choose a name for the device and create config entry."""
+    async def async_step_finish(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Create the config entry."""
         device = self.device
-        errors = {}
 
         # Abort reauthentication flow.
         self._abort_if_unique_id_configured(
             updates={CONF_HOST: device.host[0], CONF_TIMEOUT: device.timeout}
         )
 
-        if user_input is not None:
-            return self.async_create_entry(
-                title=user_input[CONF_NAME],
-                data={
-                    CONF_HOST: device.host[0],
-                    CONF_MAC: device.mac.hex(),
-                    CONF_TYPE: device.devtype,
-                    CONF_TIMEOUT: device.timeout,
-                },
-            )
-
-        data_schema = {vol.Required(CONF_NAME, default=device.name): str}
-        return self.async_show_form(
-            step_id="finish", data_schema=vol.Schema(data_schema), errors=errors
+        return self.async_create_entry(
+            title=device.name or device.model,
+            data={
+                CONF_HOST: device.host[0],
+                CONF_MAC: device.mac.hex(),
+                CONF_TYPE: device.devtype,
+                CONF_TIMEOUT: device.timeout,
+            },
         )
 
-    async def async_step_import(self, import_info):
+    async def async_step_import(self, import_data: dict[str, Any]) -> ConfigFlowResult:
         """Import a device."""
-        self._async_abort_entries_match({CONF_HOST: import_info[CONF_HOST]})
-        return await self.async_step_user(import_info)
+        self._async_abort_entries_match({CONF_HOST: import_data[CONF_HOST]})
+        return await self.async_step_user(import_data)
 
-    async def async_step_reauth(self, entry_data: Mapping[str, Any]) -> FlowResult:
+    async def async_step_reauth(
+        self, entry_data: Mapping[str, Any]
+    ) -> ConfigFlowResult:
         """Reauthenticate to the device."""
         device = blk.gendevice(
             entry_data[CONF_TYPE],
             (entry_data[CONF_HOST], DEFAULT_PORT),
             bytes.fromhex(entry_data[CONF_MAC]),
-            name=entry_data[CONF_NAME],
+            name=self._get_reauth_entry().title,
         )
         device.timeout = entry_data[CONF_TIMEOUT]
         await self.async_set_device(device)

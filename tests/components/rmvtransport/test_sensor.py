@@ -1,7 +1,9 @@
 """The tests for the rmvtransport platform."""
-import datetime
+
+import datetime as dt
 from unittest.mock import patch
 
+from homeassistant.core import HomeAssistant
 from homeassistant.setup import async_setup_component
 
 VALID_CONFIG_MINIMAL = {
@@ -39,6 +41,23 @@ VALID_CONFIG_DEST = {
                     "Frankfurt (Main) Flughafen Regionalbahnhof",
                     "Frankfurt (Main) Stadion",
                 ],
+                "lines": [12, "S8"],
+                "time_offset": 15,
+            }
+        ],
+    }
+}
+
+VALID_CONFIG_DEST_ONLY = {
+    "sensor": {
+        "platform": "rmvtransport",
+        "next_departure": [
+            {
+                "station": "3000010",
+                "destinations": [
+                    "Frankfurt (Main) Flughafen Regionalbahnhof",
+                    "Frankfurt (Main) Stadion",
+                ],
             }
         ],
     }
@@ -57,7 +76,7 @@ def get_departures_mock():
                 "number": 12,
                 "trainId": "1123456",
                 "direction": "Frankfurt (Main) Hugo-Junkers-Straße/Schleife",
-                "departure_time": datetime.datetime(2018, 8, 6, 14, 21),
+                "departure_time": dt.datetime(2018, 8, 6, 14, 21),
                 "minutes": 7,
                 "delay": 3,
                 "stops": [
@@ -79,7 +98,7 @@ def get_departures_mock():
                 "number": 21,
                 "trainId": "1234567",
                 "direction": "Frankfurt (Main) Hugo-Junkers-Straße/Schleife",
-                "departure_time": datetime.datetime(2018, 8, 6, 14, 22),
+                "departure_time": dt.datetime(2018, 8, 6, 14, 22),
                 "minutes": 8,
                 "delay": 1,
                 "stops": [
@@ -95,7 +114,7 @@ def get_departures_mock():
                 "number": 12,
                 "trainId": "1234568",
                 "direction": "Frankfurt (Main) Hugo-Junkers-Straße/Schleife",
-                "departure_time": datetime.datetime(2018, 8, 6, 14, 25),
+                "departure_time": dt.datetime(2018, 8, 6, 14, 25),
                 "minutes": 11,
                 "delay": 1,
                 "stops": ["Frankfurt (Main) Stadion"],
@@ -108,7 +127,7 @@ def get_departures_mock():
                 "number": 21,
                 "trainId": "1234569",
                 "direction": "Frankfurt (Main) Hugo-Junkers-Straße/Schleife",
-                "departure_time": datetime.datetime(2018, 8, 6, 14, 25),
+                "departure_time": dt.datetime(2018, 8, 6, 14, 25),
                 "minutes": 11,
                 "delay": 1,
                 "stops": [],
@@ -121,7 +140,7 @@ def get_departures_mock():
                 "number": 12,
                 "trainId": "1234570",
                 "direction": "Frankfurt (Main) Hugo-Junkers-Straße/Schleife",
-                "departure_time": datetime.datetime(2018, 8, 6, 14, 25),
+                "departure_time": dt.datetime(2018, 8, 6, 14, 25),
                 "minutes": 11,
                 "delay": 1,
                 "stops": [],
@@ -134,10 +153,23 @@ def get_departures_mock():
                 "number": 21,
                 "trainId": "1234571",
                 "direction": "Frankfurt (Main) Hugo-Junkers-Straße/Schleife",
-                "departure_time": datetime.datetime(2018, 8, 6, 14, 25),
+                "departure_time": dt.datetime(2018, 8, 6, 14, 25),
                 "minutes": 11,
                 "delay": 1,
                 "stops": [],
+                "info": None,
+                "info_long": None,
+                "icon": "https://products/32_pic.png",
+            },
+            {
+                "product": "Bus",
+                "number": 12,
+                "trainId": "1234568",
+                "direction": "Frankfurt (Main) Hugo-Junkers-Straße/Schleife",
+                "departure_time": dt.datetime(2018, 8, 6, 14, 30),
+                "minutes": 16,
+                "delay": 0,
+                "stops": ["Frankfurt (Main) Stadion"],
                 "info": None,
                 "info_long": None,
                 "icon": "https://products/32_pic.png",
@@ -156,7 +188,7 @@ def get_no_departures_mock():
     }
 
 
-async def test_rmvtransport_min_config(hass):
+async def test_rmvtransport_min_config(hass: HomeAssistant) -> None:
     """Test minimal rmvtransport configuration."""
     with patch(
         "RMVtransport.RMVtransport.get_departures",
@@ -167,7 +199,7 @@ async def test_rmvtransport_min_config(hass):
 
     state = hass.states.get("sensor.frankfurt_main_hauptbahnhof")
     assert state.state == "7"
-    assert state.attributes["departure_time"] == datetime.datetime(2018, 8, 6, 14, 21)
+    assert state.attributes["departure_time"] == dt.datetime(2018, 8, 6, 14, 21)
     assert (
         state.attributes["direction"] == "Frankfurt (Main) Hugo-Junkers-Straße/Schleife"
     )
@@ -177,7 +209,7 @@ async def test_rmvtransport_min_config(hass):
     assert state.attributes["friendly_name"] == "Frankfurt (Main) Hauptbahnhof"
 
 
-async def test_rmvtransport_name_config(hass):
+async def test_rmvtransport_name_config(hass: HomeAssistant) -> None:
     """Test custom name configuration."""
     with patch(
         "RMVtransport.RMVtransport.get_departures",
@@ -190,7 +222,7 @@ async def test_rmvtransport_name_config(hass):
     assert state.attributes["friendly_name"] == "My Station"
 
 
-async def test_rmvtransport_misc_config(hass):
+async def test_rmvtransport_misc_config(hass: HomeAssistant) -> None:
     """Test misc configuration."""
     with patch(
         "RMVtransport.RMVtransport.get_departures",
@@ -204,7 +236,7 @@ async def test_rmvtransport_misc_config(hass):
     assert state.attributes["line"] == 21
 
 
-async def test_rmvtransport_dest_config(hass):
+async def test_rmvtransport_dest_config(hass: HomeAssistant) -> None:
     """Test destination configuration."""
     with patch(
         "RMVtransport.RMVtransport.get_departures",
@@ -214,16 +246,36 @@ async def test_rmvtransport_dest_config(hass):
         await hass.async_block_till_done()
 
     state = hass.states.get("sensor.frankfurt_main_hauptbahnhof")
+    assert state is not None
+    assert state.state == "16"
+    assert (
+        state.attributes["direction"] == "Frankfurt (Main) Hugo-Junkers-Straße/Schleife"
+    )
+    assert state.attributes["line"] == 12
+    assert state.attributes["minutes"] == 16
+    assert state.attributes["departure_time"] == dt.datetime(2018, 8, 6, 14, 30)
+
+
+async def test_rmvtransport_dest_only_config(hass: HomeAssistant) -> None:
+    """Test destination configuration."""
+    with patch(
+        "RMVtransport.RMVtransport.get_departures",
+        return_value=get_departures_mock(),
+    ):
+        assert await async_setup_component(hass, "sensor", VALID_CONFIG_DEST_ONLY)
+        await hass.async_block_till_done()
+
+    state = hass.states.get("sensor.frankfurt_main_hauptbahnhof")
     assert state.state == "11"
     assert (
         state.attributes["direction"] == "Frankfurt (Main) Hugo-Junkers-Straße/Schleife"
     )
     assert state.attributes["line"] == 12
     assert state.attributes["minutes"] == 11
-    assert state.attributes["departure_time"] == datetime.datetime(2018, 8, 6, 14, 25)
+    assert state.attributes["departure_time"] == dt.datetime(2018, 8, 6, 14, 25)
 
 
-async def test_rmvtransport_no_departures(hass):
+async def test_rmvtransport_no_departures(hass: HomeAssistant) -> None:
     """Test for no departures."""
     with patch(
         "RMVtransport.RMVtransport.get_departures",

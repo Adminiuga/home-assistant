@@ -1,63 +1,61 @@
 """Config flow for WattTime integration."""
-from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, override
 
 from aiowatttime import Client
 from aiowatttime.errors import CoordinatesNotFoundError, InvalidCredentialsError
-import voluptuous as vol
+import probatio
 
-from homeassistant import config_entries
-from homeassistant.config_entries import ConfigEntry, OptionsFlow
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult, OptionsFlow
 from homeassistant.const import (
     CONF_LATITUDE,
     CONF_LONGITUDE,
     CONF_PASSWORD,
+    CONF_SHOW_ON_MAP,
     CONF_USERNAME,
 )
 from homeassistant.core import callback
-from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers import aiohttp_client, config_validation as cv
 
 from .const import (
     CONF_BALANCING_AUTHORITY,
     CONF_BALANCING_AUTHORITY_ABBREV,
-    CONF_SHOW_ON_MAP,
     DOMAIN,
     LOGGER,
 )
+from .coordinator import WattTimeConfigEntry
 
 CONF_LOCATION_TYPE = "location_type"
 
 LOCATION_TYPE_COORDINATES = "Specify coordinates"
 LOCATION_TYPE_HOME = "Use home location"
 
-STEP_COORDINATES_DATA_SCHEMA = vol.Schema(
+STEP_COORDINATES_DATA_SCHEMA = probatio.Schema(
     {
-        vol.Required(CONF_LATITUDE): cv.latitude,
-        vol.Required(CONF_LONGITUDE): cv.longitude,
+        probatio.Required(CONF_LATITUDE): cv.latitude,
+        probatio.Required(CONF_LONGITUDE): cv.longitude,
     }
 )
 
-STEP_LOCATION_DATA_SCHEMA = vol.Schema(
+STEP_LOCATION_DATA_SCHEMA = probatio.Schema(
     {
-        vol.Required(CONF_LOCATION_TYPE): vol.In(
+        probatio.Required(CONF_LOCATION_TYPE): probatio.In(
             [LOCATION_TYPE_HOME, LOCATION_TYPE_COORDINATES]
         ),
     }
 )
 
-STEP_REAUTH_CONFIRM_DATA_SCHEMA = vol.Schema(
+STEP_REAUTH_CONFIRM_DATA_SCHEMA = probatio.Schema(
     {
-        vol.Required(CONF_PASSWORD): str,
+        probatio.Required(probatio.Secret(CONF_PASSWORD)): str,
     }
 )
 
-STEP_USER_DATA_SCHEMA = vol.Schema(
+STEP_USER_DATA_SCHEMA = probatio.Schema(
     {
-        vol.Required(CONF_USERNAME): str,
-        vol.Required(CONF_PASSWORD): str,
+        probatio.Required(CONF_USERNAME): str,
+        probatio.Required(probatio.Secret(CONF_PASSWORD)): str,
     }
 )
 
@@ -68,7 +66,7 @@ def get_unique_id(data: dict[str, Any]) -> str:
     return f"{data[CONF_LATITUDE]}, {data[CONF_LONGITUDE]}"
 
 
-class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
+class WattTimeConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for WattTime."""
 
     VERSION = 1
@@ -79,8 +77,12 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._data: dict[str, Any] = {}
 
     async def _async_validate_credentials(
-        self, username: str, password: str, error_step_id: str, error_schema: vol.Schema
-    ) -> FlowResult:
+        self,
+        username: str,
+        password: str,
+        error_step_id: str,
+        error_schema: probatio.Schema,
+    ) -> ConfigFlowResult:
         """Validate input credentials and proceed accordingly."""
         session = aiohttp_client.async_get_clientsession(self.hass)
 
@@ -91,15 +93,15 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 step_id=error_step_id,
                 data_schema=error_schema,
                 errors={"base": "invalid_auth"},
-                description_placeholders={CONF_USERNAME: username},
+                description_placeholders={"username": username},
             )
-        except Exception as err:  # pylint: disable=broad-except
+        except Exception as err:  # noqa: BLE001
             LOGGER.exception("Unexpected exception while logging in: %s", err)
             return self.async_show_form(
                 step_id=error_step_id,
                 data_schema=error_schema,
                 errors={"base": "unknown"},
-                description_placeholders={CONF_USERNAME: username},
+                description_placeholders={"username": username},
             )
 
         if CONF_LATITUDE in self._data:
@@ -122,13 +124,16 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     @staticmethod
     @callback
-    def async_get_options_flow(config_entry: ConfigEntry) -> OptionsFlow:
+    @override
+    def async_get_options_flow(
+        config_entry: WattTimeConfigEntry,
+    ) -> WattTimeOptionsFlowHandler:
         """Define the config flow to handle options."""
-        return WattTimeOptionsFlowHandler(config_entry)
+        return WattTimeOptionsFlowHandler()
 
     async def async_step_coordinates(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle the coordinates step."""
         if not user_input:
             return self.async_show_form(
@@ -144,7 +149,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         try:
             grid_region = await self._client.emissions.async_get_grid_region(
-                user_input[CONF_LATITUDE], user_input[CONF_LONGITUDE]
+                user_input[CONF_LATITUDE], user_input[CONF_LONGITUDE], "co2_moer"
             )
         except CoordinatesNotFoundError:
             return self.async_show_form(
@@ -152,7 +157,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 data_schema=STEP_COORDINATES_DATA_SCHEMA,
                 errors={CONF_LATITUDE: "unknown_coordinates"},
             )
-        except Exception as err:  # pylint: disable=broad-except
+        except Exception as err:  # noqa: BLE001
             LOGGER.exception("Unexpected exception while getting region: %s", err)
             return self.async_show_form(
                 step_id="coordinates",
@@ -167,14 +172,14 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 CONF_PASSWORD: self._data[CONF_PASSWORD],
                 CONF_LATITUDE: user_input[CONF_LATITUDE],
                 CONF_LONGITUDE: user_input[CONF_LONGITUDE],
-                CONF_BALANCING_AUTHORITY: grid_region["name"],
-                CONF_BALANCING_AUTHORITY_ABBREV: grid_region["abbrev"],
+                CONF_BALANCING_AUTHORITY: grid_region["region_full_name"],
+                CONF_BALANCING_AUTHORITY_ABBREV: grid_region["region"],
             },
         )
 
     async def async_step_location(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle the "pick a location" step."""
         if not user_input:
             return self.async_show_form(
@@ -190,20 +195,22 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             )
         return await self.async_step_coordinates()
 
-    async def async_step_reauth(self, entry_data: Mapping[str, Any]) -> FlowResult:
+    async def async_step_reauth(
+        self, entry_data: Mapping[str, Any]
+    ) -> ConfigFlowResult:
         """Handle configuration by re-auth."""
         self._data = {**entry_data}
         return await self.async_step_reauth_confirm()
 
     async def async_step_reauth_confirm(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle re-auth completion."""
         if not user_input:
             return self.async_show_form(
                 step_id="reauth_confirm",
                 data_schema=STEP_REAUTH_CONFIRM_DATA_SCHEMA,
-                description_placeholders={CONF_USERNAME: self._data[CONF_USERNAME]},
+                description_placeholders={"username": self._data[CONF_USERNAME]},
             )
 
         self._data[CONF_PASSWORD] = user_input[CONF_PASSWORD]
@@ -215,9 +222,10 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             STEP_REAUTH_CONFIRM_DATA_SCHEMA,
         )
 
+    @override
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle the initial step."""
         if not user_input:
             return self.async_show_form(
@@ -232,27 +240,23 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
 
-class WattTimeOptionsFlowHandler(config_entries.OptionsFlow):
+class WattTimeOptionsFlowHandler(OptionsFlow):
     """Handle a WattTime options flow."""
-
-    def __init__(self, entry: ConfigEntry) -> None:
-        """Initialize."""
-        self.entry = entry
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Manage the options."""
         if user_input is not None:
-            return self.async_create_entry(title="", data=user_input)
+            return self.async_create_entry(data=user_input)
 
         return self.async_show_form(
             step_id="init",
-            data_schema=vol.Schema(
+            data_schema=probatio.Schema(
                 {
-                    vol.Required(
+                    probatio.Required(
                         CONF_SHOW_ON_MAP,
-                        default=self.entry.options.get(CONF_SHOW_ON_MAP, True),
+                        default=self.config_entry.options.get(CONF_SHOW_ON_MAP, True),
                     ): bool
                 }
             ),

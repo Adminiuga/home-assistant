@@ -1,40 +1,41 @@
 """Support for HomematicIP Cloud alarm control panel."""
-from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING, override
 
+from homematicip.async_home import AsyncHome
+from homematicip.connection.rest_connection import RestResult
 from homematicip.functionalHomes import SecurityAndAlarmHome
 
 from homeassistant.components.alarm_control_panel import (
     AlarmControlPanelEntity,
     AlarmControlPanelEntityFeature,
-)
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import (
-    STATE_ALARM_ARMED_AWAY,
-    STATE_ALARM_ARMED_HOME,
-    STATE_ALARM_DISARMED,
-    STATE_ALARM_TRIGGERED,
+    AlarmControlPanelState,
 )
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.entity import DeviceInfo
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from . import DOMAIN as HMIPC_DOMAIN
-from .hap import AsyncHome, HomematicipHAP
+from .const import DOMAIN, MODE_AWAY
+from .hap import HomematicIPConfigEntry, HomematicipHAP
 
 _LOGGER = logging.getLogger(__name__)
+
+# arm anyway checks and then arms in two calls, a disarm must not run in between
+PARALLEL_UPDATES = 1
 
 CONST_ALARM_CONTROL_PANEL_NAME = "HmIP Alarm Control Panel"
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    config_entry: HomematicIPConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up the HomematicIP alrm control panel from a config entry."""
-    hap = hass.data[HMIPC_DOMAIN][config_entry.unique_id]
+    hap = config_entry.runtime_data
     async_add_entities([HomematicipAlarmControlPanelEntity(hap)])
 
 
@@ -46,59 +47,149 @@ class HomematicipAlarmControlPanelEntity(AlarmControlPanelEntity):
         AlarmControlPanelEntityFeature.ARM_HOME
         | AlarmControlPanelEntityFeature.ARM_AWAY
     )
+    _attr_code_arm_required = False
+    _feature_id = "alarm"
 
     def __init__(self, hap: HomematicipHAP) -> None:
         """Initialize the alarm control panel."""
+        self._hap = hap
         self._home: AsyncHome = hap.home
-        _LOGGER.info("Setting up %s", self.name)
+        self._blocking_channels: list[dict] = []
 
     @property
+    @override
     def device_info(self) -> DeviceInfo:
         """Return device specific attributes."""
+        if TYPE_CHECKING:
+            assert self.platform.config_entry is not None
         return DeviceInfo(
-            identifiers={(HMIPC_DOMAIN, f"ACP {self._home.id}")},
+            identifiers={(DOMAIN, f"ACP {self._home.id}")},
             manufacturer="eQ-3",
             model=CONST_ALARM_CONTROL_PANEL_NAME,
             name=self.name,
-            via_device=(HMIPC_DOMAIN, self._home.id),
+            via_device_id=dr.async_get_device_id_by_identifier(
+                self.hass,
+                (DOMAIN, self._home.id),
+                config_entry_id=self.platform.config_entry.entry_id,
+            ),
         )
 
     @property
-    def state(self) -> str:
+    @override
+    def alarm_state(self) -> AlarmControlPanelState:
         """Return the state of the alarm control panel."""
         # check for triggered alarm
         if self._security_and_alarm.alarmActive:
-            return STATE_ALARM_TRIGGERED
+            return AlarmControlPanelState.TRIGGERED
 
         activation_state = self._home.get_security_zones_activation()
         # check arm_away
         if activation_state == (True, True):
-            return STATE_ALARM_ARMED_AWAY
+            return AlarmControlPanelState.ARMED_AWAY
         # check arm_home
         if activation_state == (False, True):
-            return STATE_ALARM_ARMED_HOME
+            return AlarmControlPanelState.ARMED_HOME
 
-        return STATE_ALARM_DISARMED
+        return AlarmControlPanelState.DISARMED
 
     @property
     def _security_and_alarm(self) -> SecurityAndAlarmHome:
         return self._home.get_functionalHome(SecurityAndAlarmHome)
 
+    async def _async_set_zones_activation(
+        self, *, internal: bool, external: bool
+    ) -> None:
+        """Set the zone activation and raise when the panel refuses it."""
+        result = await self._home.set_security_zones_activation_async(
+            internal, external
+        )
+        self._raise_for_result(result)
+
+    def _blocking_labels(self, result: RestResult) -> list[str]:
+        """Return the labels of the devices that refused the request."""
+        return sorted(
+            label.strip()
+            for label in self._home.get_security_zone_activation_problems(result)
+        )
+
+    def _raise_for_result(self, result: RestResult) -> None:
+        """Raise a translated error when the panel did not accept the request."""
+        problems = self._blocking_labels(result)
+        # a request-based panel answers 200 without arming when a sensor blocks it
+        if result.success and not problems:
+            # the access point does not push a refusal, so the reply is published here
+            self._hap.async_set_arming_blocked(False)
+            self._blocking_channels = []
+            return
+
+        if not problems:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="alarm_activation_failed",
+            )
+        self._blocking_channels = (
+            self._home.get_security_zone_activation_problem_channels(result)
+        )
+        self._hap.async_set_arming_blocked(True)
+        raise HomeAssistantError(
+            translation_domain=DOMAIN,
+            translation_key="alarm_activation_blocked",
+            translation_placeholders={"devices": ", ".join(problems)},
+        )
+
+    @override
     async def async_alarm_disarm(self, code: str | None = None) -> None:
         """Send disarm command."""
-        await self._home.set_security_zones_activation(False, False)
+        await self._async_set_zones_activation(internal=False, external=False)
 
+    @override
     async def async_alarm_arm_home(self, code: str | None = None) -> None:
         """Send arm home command."""
-        await self._home.set_security_zones_activation(False, True)
+        await self._async_set_zones_activation(internal=False, external=True)
 
+    @override
     async def async_alarm_arm_away(self, code: str | None = None) -> None:
         """Send arm away command."""
-        await self._home.set_security_zones_activation(True, True)
+        await self._async_set_zones_activation(internal=True, external=True)
 
+    async def async_arm_anyway(self, mode: str) -> None:
+        """Arm although sensors report a problem, leaving them unmonitored."""
+        internal = mode == MODE_AWAY
+        approved = self._blocking_channels
+
+        # The access point ignores whatever blocks at the time of the call, not only
+        # what the refusal the user saw named, so check again first. Per channel,
+        # because one device can block on several of them under one label.
+        result = await self._home.set_security_zones_activation_async(internal, True)
+        channels = self._home.get_security_zone_activation_problem_channels(result)
+        if not channels:
+            # armed after all, or refused without naming a device
+            self._raise_for_result(result)
+            return
+
+        if any(channel not in approved for channel in channels):
+            self._blocking_channels = channels
+            self._hap.async_set_arming_blocked(True)
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="alarm_activation_outdated",
+                translation_placeholders={
+                    "devices": ", ".join(self._blocking_labels(result))
+                },
+            )
+
+        result = await self._home.set_security_zones_activation_with_ignore_list_async(
+            internal, True, ignorable_device_channels=channels
+        )
+        self._raise_for_result(result)
+
+    @override
     async def async_added_to_hass(self) -> None:
         """Register callbacks."""
         self._home.on_update(self._async_device_changed)
+        self.async_on_remove(
+            lambda: self._home.remove_callback(self._async_device_changed)
+        )
 
     @callback
     def _async_device_changed(self, *args, **kwargs) -> None:
@@ -109,11 +200,15 @@ class HomematicipAlarmControlPanelEntity(AlarmControlPanelEntity):
             self.async_write_ha_state()
         else:
             _LOGGER.debug(
-                "Device Changed Event for %s (Alarm Control Panel) not fired. Entity is disabled",
+                (
+                    "Device Changed Event for %s (Alarm Control Panel) not fired."
+                    " Entity is disabled"
+                ),
                 self.name,
             )
 
     @property
+    @override
     def name(self) -> str:
         """Return the name of the generic entity."""
         name = CONST_ALARM_CONTROL_PANEL_NAME
@@ -122,11 +217,13 @@ class HomematicipAlarmControlPanelEntity(AlarmControlPanelEntity):
         return name
 
     @property
+    @override
     def available(self) -> bool:
         """Return if alarm control panel is available."""
         return self._home.connected
 
     @property
+    @override
     def unique_id(self) -> str:
         """Return a unique ID."""
-        return f"{self.__class__.__name__}_{self._home.id}"
+        return f"{self._home.id}_{self._feature_id}"

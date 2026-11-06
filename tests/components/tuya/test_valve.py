@@ -1,0 +1,276 @@
+"""Test Tuya valve platform."""
+
+from typing import Any
+from unittest.mock import patch
+
+from freezegun.api import FrozenDateTimeFactory
+import pytest
+from pytest_homeassistant.common import MockConfigEntry, snapshot_platform
+from syrupy.assertion import SnapshotAssertion
+from tuya_sharing import CustomerDevice, Manager
+
+from homeassistant.components.tuya.const import DOMAIN
+from homeassistant.components.valve import (
+    DOMAIN as VALVE_DOMAIN,
+    SERVICE_CLOSE_VALVE,
+    SERVICE_OPEN_VALVE,
+)
+from homeassistant.const import ATTR_ENTITY_ID, STATE_UNKNOWN, Platform
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr, entity_registry as er
+
+from . import (
+    TuyaNotificationHelper,
+    add_indexed_switches,
+    check_selective_state_update,
+    initialize_entry,
+)
+
+
+@pytest.fixture(autouse=True)
+def platform_autouse():
+    """Platform fixture."""
+    with patch("homeassistant.components.tuya.PLATFORMS", [Platform.VALVE]):
+        yield
+
+
+@pytest.mark.parametrize("mock_device_code", ["sfkzq_ed7frwissyqrejic"])
+async def test_single_channel_device_has_no_child_devices(
+    hass: HomeAssistant,
+    mock_manager: Manager,
+    mock_config_entry: MockConfigEntry,
+    mock_device: CustomerDevice,
+    device_registry: dr.DeviceRegistry,
+    entity_registry: er.EntityRegistry,
+) -> None:
+    """Test a device exposing a single channel keeps its entities on the device."""
+    for channel in range(2, 9):
+        for container in (
+            mock_device.function,
+            mock_device.status_range,
+            mock_device.status,
+        ):
+            container.pop(f"switch_{channel}", None)
+
+    await initialize_entry(hass, mock_manager, mock_config_entry, mock_device)
+
+    assert not dr.async_child_entries_for_config_entry(
+        device_registry, mock_config_entry.entry_id
+    )
+    entity_entry = entity_registry.async_get("valve.jie_hashui_fa_valve")
+    assert entity_entry
+    device_entry = device_registry.async_get_device_by_identifier(
+        (DOMAIN, mock_device.id), mock_config_entry.entry_id
+    )
+    assert device_entry
+    assert entity_entry.device_id == device_entry.id
+
+
+@pytest.mark.parametrize("mock_device_code", ["ggq_7ytb3h8u"])
+@pytest.mark.parametrize(
+    ("channels", "expected_children", "expected_parent_valves"),
+    [
+        pytest.param(1, 0, 2, id="single_channel"),
+        pytest.param(2, 2, 1, id="multi_channel"),
+    ],
+)
+async def test_ggq_indexed_valve_child_devices(
+    hass: HomeAssistant,
+    mock_manager: Manager,
+    mock_config_entry: MockConfigEntry,
+    mock_device: CustomerDevice,
+    device_registry: dr.DeviceRegistry,
+    entity_registry: er.EntityRegistry,
+    channels: int,
+    expected_children: int,
+    expected_parent_valves: int,
+) -> None:
+    """Test indexed GGQ valves only move to child devices for multi-channel devices."""
+    # The fixture only exposes the unindexed "switch" DP
+    add_indexed_switches(mock_device, channels)
+
+    await initialize_entry(hass, mock_manager, mock_config_entry, mock_device)
+
+    parent = device_registry.async_get_device_by_identifier(
+        (DOMAIN, mock_device.id), mock_config_entry.entry_id
+    )
+    assert parent is not None
+    assert (
+        len(dr.async_entries_for_parent_device(device_registry, parent.id))
+        == expected_children
+    )
+    assert (
+        len(er.async_entries_for_device(entity_registry, parent.id))
+        == expected_parent_valves
+    )
+
+
+@pytest.mark.parametrize("mock_device_code", ["ggq_7ytb3h8u"])
+@pytest.mark.parametrize("code", ["switch_1", "switch_2"])
+@pytest.mark.parametrize(
+    ("service", "value"),
+    [(SERVICE_OPEN_VALVE, True), (SERVICE_CLOSE_VALVE, False)],
+)
+async def test_ggq_indexed_valve_action(
+    hass: HomeAssistant,
+    mock_manager: Manager,
+    mock_config_entry: MockConfigEntry,
+    mock_device: CustomerDevice,
+    entity_registry: er.EntityRegistry,
+    code: str,
+    service: str,
+    value: bool,
+) -> None:
+    """Test indexed GGQ valve actions target the corresponding DP."""
+    add_indexed_switches(mock_device, 2)
+    await initialize_entry(hass, mock_manager, mock_config_entry, mock_device)
+    entity_id = entity_registry.async_get_entity_id(
+        VALVE_DOMAIN, DOMAIN, f"tuya.{mock_device.id}{code}"
+    )
+    assert entity_id is not None
+
+    await hass.services.async_call(
+        VALVE_DOMAIN, service, {ATTR_ENTITY_ID: entity_id}, blocking=True
+    )
+
+    mock_manager.send_commands.assert_called_once_with(
+        mock_device.id, [{"code": code, "value": value}]
+    )
+
+
+@pytest.mark.usefixtures("no_quirk")
+async def test_platform_setup_and_discovery(
+    hass: HomeAssistant,
+    mock_manager: Manager,
+    mock_config_entry: MockConfigEntry,
+    mock_devices: list[CustomerDevice],
+    entity_registry: er.EntityRegistry,
+    snapshot: SnapshotAssertion,
+) -> None:
+    """Test platform setup and discovery."""
+    await initialize_entry(hass, mock_manager, mock_config_entry, mock_devices)
+
+    await snapshot_platform(hass, entity_registry, snapshot, mock_config_entry.entry_id)
+
+
+@pytest.mark.parametrize(
+    "mock_device_code",
+    ["sfkzq_ed7frwissyqrejic"],
+)
+@pytest.mark.parametrize(
+    ("updates", "expected_state", "last_reported"),
+    [
+        # Update without dpcode - state should not change, last_reported stays
+        # at available_reported
+        ({"battery_percentage": 50}, "open", "2024-01-01T00:00:20+00:00"),
+        # Update with dpcode - state should change, last_reported advances
+        ({"switch_1": False}, "closed", "2024-01-01T00:01:00+00:00"),
+        # Update with multiple properties including dpcode - state should change
+        (
+            {"battery_percentage": 50, "switch_1": False},
+            "closed",
+            "2024-01-01T00:01:00+00:00",
+        ),
+    ],
+)
+@pytest.mark.freeze_time("2024-01-01")
+async def test_selective_state_update(
+    hass: HomeAssistant,
+    mock_manager: Manager,
+    mock_config_entry: MockConfigEntry,
+    mock_device: CustomerDevice,
+    notification_helper: TuyaNotificationHelper,
+    freezer: FrozenDateTimeFactory,
+    updates: dict[str, Any],
+    expected_state: str,
+    last_reported: str,
+) -> None:
+    """Test skip_update/last_reported."""
+    await initialize_entry(hass, mock_manager, mock_config_entry, mock_device)
+    await check_selective_state_update(
+        hass,
+        mock_device,
+        notification_helper,
+        freezer,
+        entity_id="valve.jie_hashui_fa_channel_1_valve",
+        dpcode="switch_1",
+        initial_state="open",
+        updates=updates,
+        expected_state=expected_state,
+        last_reported=last_reported,
+    )
+
+
+@pytest.mark.parametrize(
+    "mock_device_code",
+    ["sfkzq_ed7frwissyqrejic"],
+)
+@pytest.mark.parametrize(
+    ("service", "expected_commands"),
+    [
+        (
+            SERVICE_OPEN_VALVE,
+            [{"code": "switch_1", "value": True}],
+        ),
+        (
+            SERVICE_CLOSE_VALVE,
+            [{"code": "switch_1", "value": False}],
+        ),
+    ],
+)
+async def test_action(
+    hass: HomeAssistant,
+    mock_manager: Manager,
+    mock_config_entry: MockConfigEntry,
+    mock_device: CustomerDevice,
+    service: str,
+    expected_commands: list[dict[str, Any]],
+) -> None:
+    """Test valve action."""
+    entity_id = "valve.jie_hashui_fa_channel_1_valve"
+    await initialize_entry(hass, mock_manager, mock_config_entry, mock_device)
+
+    state = hass.states.get(entity_id)
+    assert state is not None, f"{entity_id} does not exist"
+    await hass.services.async_call(
+        VALVE_DOMAIN,
+        service,
+        {
+            ATTR_ENTITY_ID: entity_id,
+        },
+        blocking=True,
+    )
+    mock_manager.send_commands.assert_called_once_with(
+        mock_device.id, expected_commands
+    )
+
+
+@pytest.mark.parametrize(
+    "mock_device_code",
+    ["sfkzq_ed7frwissyqrejic"],
+)
+@pytest.mark.parametrize(
+    ("initial_status", "expected_state"),
+    [
+        (True, "open"),
+        (False, "closed"),
+        (None, STATE_UNKNOWN),
+        ("some string", STATE_UNKNOWN),
+    ],
+)
+async def test_state(
+    hass: HomeAssistant,
+    mock_manager: Manager,
+    mock_config_entry: MockConfigEntry,
+    mock_device: CustomerDevice,
+    initial_status: Any,
+    expected_state: str,
+) -> None:
+    """Test valve state."""
+    entity_id = "valve.jie_hashui_fa_channel_1_valve"
+    mock_device.status["switch_1"] = initial_status
+    await initialize_entry(hass, mock_manager, mock_config_entry, mock_device)
+
+    state = hass.states.get(entity_id)
+    assert state is not None, f"{entity_id} does not exist"
+    assert state.state == expected_state

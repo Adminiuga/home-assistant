@@ -1,155 +1,95 @@
-"""Platform for the Aladdin Connect cover component."""
-from __future__ import annotations
+"""Cover Entity for Genie Garage Door."""
 
-from datetime import timedelta
-import logging
-from typing import Any, Final
+from typing import Any, override
 
-from AIOAladdinConnect import AladdinConnectClient
-import voluptuous as vol
+import aiohttp
 
-from homeassistant.components.cover import (
-    PLATFORM_SCHEMA as BASE_PLATFORM_SCHEMA,
-    CoverDeviceClass,
-    CoverEntity,
-)
-from homeassistant.config_entries import SOURCE_IMPORT, ConfigEntry
-from homeassistant.const import (
-    CONF_PASSWORD,
-    CONF_USERNAME,
-    STATE_CLOSED,
-    STATE_CLOSING,
-    STATE_OPENING,
-)
-from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import PlatformNotReady
-import homeassistant.helpers.config_validation as cv
-from homeassistant.helpers.entity import DeviceInfo
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
+from homeassistant.components.cover import CoverDeviceClass, CoverEntity
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .const import DOMAIN, STATES_MAP, SUPPORTED_FEATURES
-from .model import DoorDevice
+from .const import DOMAIN, SUPPORTED_FEATURES
+from .coordinator import AladdinConnectConfigEntry, AladdinConnectCoordinator
+from .entity import AladdinConnectEntity
 
-_LOGGER: Final = logging.getLogger(__name__)
-
-PLATFORM_SCHEMA: Final = BASE_PLATFORM_SCHEMA.extend(
-    {vol.Required(CONF_USERNAME): cv.string, vol.Required(CONF_PASSWORD): cv.string}
-)
-SCAN_INTERVAL = timedelta(seconds=300)
-
-
-async def async_setup_platform(
-    hass: HomeAssistant,
-    config: ConfigType,
-    async_add_entities: AddEntitiesCallback,
-    discovery_info: DiscoveryInfoType | None = None,
-) -> None:
-    """Set up Aladdin Connect devices yaml depreciated."""
-    _LOGGER.warning(
-        "Configuring Aladdin Connect through yaml is deprecated"
-        "Please remove it from your configuration as it has already been imported to a config entry"
-    )
-    await hass.async_create_task(
-        hass.config_entries.flow.async_init(
-            DOMAIN,
-            context={"source": SOURCE_IMPORT},
-            data=config,
-        )
-    )
+PARALLEL_UPDATES = 1
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    entry: AladdinConnectConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    """Set up the Aladdin Connect platform."""
-    acc: AladdinConnectClient = hass.data[DOMAIN][config_entry.entry_id]
-    doors = await acc.get_doors()
-    if doors is None:
-        raise PlatformNotReady("Error from Aladdin Connect getting doors")
-    async_add_entities(
-        (AladdinDevice(acc, door, config_entry) for door in doors),
-    )
+    """Set up the cover platform."""
+    coordinator = entry.runtime_data
+    known_devices: set[str] = set()
+
+    @callback
+    def _async_add_new_devices() -> None:
+        """Detect and add entities for new doors."""
+        current_devices = set(coordinator.data)
+        new_devices = current_devices - known_devices
+        if new_devices:
+            known_devices.update(new_devices)
+            async_add_entities(
+                AladdinCoverEntity(coordinator, door_id) for door_id in new_devices
+            )
+
+    _async_add_new_devices()
+    entry.async_on_unload(coordinator.async_add_listener(_async_add_new_devices))
 
 
-class AladdinDevice(CoverEntity):
+class AladdinCoverEntity(AladdinConnectEntity, CoverEntity):
     """Representation of Aladdin Connect cover."""
 
     _attr_device_class = CoverDeviceClass.GARAGE
     _attr_supported_features = SUPPORTED_FEATURES
+    _attr_name = None
 
-    def __init__(
-        self, acc: AladdinConnectClient, device: DoorDevice, entry: ConfigEntry
-    ) -> None:
+    def __init__(self, coordinator: AladdinConnectCoordinator, door_id: str) -> None:
         """Initialize the Aladdin Connect cover."""
-        self._acc = acc
+        super().__init__(coordinator, door_id)
+        self._attr_unique_id = door_id
 
-        self._device_id = device["device_id"]
-        self._number = device["door_number"]
-        self._name = device["name"]
-        self._serial = device["serial"]
-        self._model = device["model"]
-        self._attr_unique_id = f"{self._device_id}-{self._number}"
-        self._attr_has_entity_name = True
-
-    @property
-    def device_info(self) -> DeviceInfo | None:
-        """Device information for Aladdin Connect cover."""
-        return DeviceInfo(
-            identifiers={(DOMAIN, f"{self._device_id}-{self._number}")},
-            name=self._name,
-            manufacturer="Overhead Door",
-            model=self._model,
-        )
-
-    async def async_added_to_hass(self) -> None:
-        """Connect Aladdin Connect to the cloud."""
-
-        async def update_callback() -> None:
-            """Schedule a state update."""
-            self.async_write_ha_state()
-
-        self._acc.register_callback(update_callback, self._serial, self._number)
-        await self._acc.get_doors(self._serial)
-
-    async def async_will_remove_from_hass(self) -> None:
-        """Close Aladdin Connect before removing."""
-        await self._acc.close()
-
-    async def async_close_cover(self, **kwargs: Any) -> None:
-        """Issue close command to cover."""
-        await self._acc.close_door(self._device_id, self._number)
-
+    @override
     async def async_open_cover(self, **kwargs: Any) -> None:
         """Issue open command to cover."""
-        await self._acc.open_door(self._device_id, self._number)
+        try:
+            await self.client.open_door(self._device_id, self._number)
+        except aiohttp.ClientError as err:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="open_door_failed",
+            ) from err
 
-    async def async_update(self) -> None:
-        """Update status of cover."""
-        await self._acc.get_doors(self._serial)
+    @override
+    async def async_close_cover(self, **kwargs: Any) -> None:
+        """Issue close command to cover."""
+        try:
+            await self.client.close_door(self._device_id, self._number)
+        except aiohttp.ClientError as err:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="close_door_failed",
+            ) from err
 
     @property
+    @override
     def is_closed(self) -> bool | None:
         """Update is closed attribute."""
-        value = STATES_MAP.get(self._acc.get_door_status(self._device_id, self._number))
-        if value is None:
+        if (status := self.door.status) is None:
             return None
-        return value == STATE_CLOSED
+        return status == "closed"
 
     @property
-    def is_closing(self) -> bool:
+    @override
+    def is_closing(self) -> bool | None:
         """Update is closing attribute."""
-        return (
-            STATES_MAP.get(self._acc.get_door_status(self._device_id, self._number))
-            == STATE_CLOSING
-        )
+        return self.door.status == "closing"
 
     @property
-    def is_opening(self) -> bool:
+    @override
+    def is_opening(self) -> bool | None:
         """Update is opening attribute."""
-        return (
-            STATES_MAP.get(self._acc.get_door_status(self._device_id, self._number))
-            == STATE_OPENING
-        )
+        return self.door.status == "opening"

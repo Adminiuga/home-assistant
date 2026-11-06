@@ -1,13 +1,17 @@
 """Support for Homekit sensors."""
-from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-import logging
+from enum import IntEnum
+from typing import override
 
 from aiohomekit.model import Accessory, Transport
 from aiohomekit.model.characteristics import Characteristic, CharacteristicsTypes
-from aiohomekit.model.characteristics.const import ThreadNodeCapabilities, ThreadStatus
+from aiohomekit.model.characteristics.const import (
+    CurrentAirPurifierStateValues,
+    ThreadNodeCapabilities,
+    ThreadStatus,
+)
 from aiohomekit.model.services import Service, ServicesTypes
 
 from homeassistant.components.bluetooth import (
@@ -22,44 +26,41 @@ from homeassistant.components.sensor import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
-    CONCENTRATION_MICROGRAMS_PER_CUBIC_METER,
-    CONCENTRATION_PARTS_PER_MILLION,
-    ELECTRIC_CURRENT_AMPERE,
-    ELECTRIC_POTENTIAL_VOLT,
-    ENERGY_KILO_WATT_HOUR,
     LIGHT_LUX,
-    PERCENTAGE,
-    POWER_WATT,
-    PRESSURE_HPA,
     SIGNAL_STRENGTH_DECIBELS_MILLIWATT,
-    SOUND_PRESSURE_DB,
-    TEMP_CELSIUS,
+    EntityCategory,
     Platform,
+    UnitOfDensity,
+    UnitOfElectricCurrent,
+    UnitOfElectricPotential,
+    UnitOfEnergy,
+    UnitOfPower,
+    UnitOfPressure,
+    UnitOfRatio,
+    UnitOfSoundPressure,
+    UnitOfTemperature,
 )
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.entity import EntityCategory
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.typing import ConfigType
 
-from . import KNOWN_DEVICES
 from .connection import HKDevice
+from .const import KNOWN_DEVICES
 from .entity import CharacteristicEntity, HomeKitEntity
 from .utils import folded_name
 
-_LOGGER = logging.getLogger(__name__)
 
-
-@dataclass
+@dataclass(frozen=True)
 class HomeKitSensorEntityDescription(SensorEntityDescription):
     """Describes Homekit sensor."""
 
     probe: Callable[[Characteristic], bool] | None = None
     format: Callable[[Characteristic], str] | None = None
+    enum: dict[IntEnum, str] | None = None
 
 
 def thread_node_capability_to_str(char: Characteristic) -> str:
-    """
-    Return the thread device type as a string.
+    """Return the thread device type as a string.
 
     The underlying value is a bitmask, but we want to turn that to
     a human readable string. Some devices will have multiple capabilities.
@@ -96,8 +97,7 @@ def thread_node_capability_to_str(char: Characteristic) -> str:
 
 
 def thread_status_to_str(char: Characteristic) -> str:
-    """
-    Return the thread status as a string.
+    """Return the thread status as a string.
 
     The underlying value is a bitmask, but we want to turn that to
     a human readable string. So we check the flags in order. E.g. BORDER_ROUTER implies
@@ -144,96 +144,106 @@ def thread_status_to_str(char: Characteristic) -> str:
 
 
 SIMPLE_SENSOR: dict[str, HomeKitSensorEntityDescription] = {
-    CharacteristicsTypes.VENDOR_CONNECTSENSE_ENERGY_WATT: HomeKitSensorEntityDescription(
-        key=CharacteristicsTypes.VENDOR_CONNECTSENSE_ENERGY_WATT,
-        name="Power",
-        device_class=SensorDeviceClass.POWER,
-        state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=POWER_WATT,
+    CharacteristicsTypes.VENDOR_CONNECTSENSE_ENERGY_WATT: (
+        HomeKitSensorEntityDescription(
+            key=CharacteristicsTypes.VENDOR_CONNECTSENSE_ENERGY_WATT,
+            name="Power",
+            device_class=SensorDeviceClass.POWER,
+            state_class=SensorStateClass.MEASUREMENT,
+            native_unit_of_measurement=UnitOfPower.WATT,
+        )
     ),
-    CharacteristicsTypes.VENDOR_CONNECTSENSE_ENERGY_AMPS: HomeKitSensorEntityDescription(
-        key=CharacteristicsTypes.VENDOR_CONNECTSENSE_ENERGY_AMPS,
-        name="Current",
-        device_class=SensorDeviceClass.CURRENT,
-        state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=ELECTRIC_CURRENT_AMPERE,
+    CharacteristicsTypes.VENDOR_CONNECTSENSE_ENERGY_AMPS: (
+        HomeKitSensorEntityDescription(
+            key=CharacteristicsTypes.VENDOR_CONNECTSENSE_ENERGY_AMPS,
+            name="Current",
+            device_class=SensorDeviceClass.CURRENT,
+            state_class=SensorStateClass.MEASUREMENT,
+            native_unit_of_measurement=UnitOfElectricCurrent.AMPERE,
+        )
     ),
-    CharacteristicsTypes.VENDOR_CONNECTSENSE_ENERGY_AMPS_20: HomeKitSensorEntityDescription(
-        key=CharacteristicsTypes.VENDOR_CONNECTSENSE_ENERGY_AMPS_20,
-        name="Current",
-        device_class=SensorDeviceClass.CURRENT,
-        state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=ELECTRIC_CURRENT_AMPERE,
+    CharacteristicsTypes.VENDOR_CONNECTSENSE_ENERGY_AMPS_20: (
+        HomeKitSensorEntityDescription(
+            key=CharacteristicsTypes.VENDOR_CONNECTSENSE_ENERGY_AMPS_20,
+            name="Current",
+            device_class=SensorDeviceClass.CURRENT,
+            state_class=SensorStateClass.MEASUREMENT,
+            native_unit_of_measurement=UnitOfElectricCurrent.AMPERE,
+        )
     ),
-    CharacteristicsTypes.VENDOR_CONNECTSENSE_ENERGY_KW_HOUR: HomeKitSensorEntityDescription(
-        key=CharacteristicsTypes.VENDOR_CONNECTSENSE_ENERGY_KW_HOUR,
-        name="Energy kWh",
-        device_class=SensorDeviceClass.ENERGY,
-        state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=ENERGY_KILO_WATT_HOUR,
+    CharacteristicsTypes.VENDOR_CONNECTSENSE_ENERGY_KW_HOUR: (
+        HomeKitSensorEntityDescription(
+            key=CharacteristicsTypes.VENDOR_CONNECTSENSE_ENERGY_KW_HOUR,
+            name="Energy kWh",
+            device_class=SensorDeviceClass.ENERGY,
+            state_class=SensorStateClass.TOTAL_INCREASING,
+            native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        )
     ),
     CharacteristicsTypes.VENDOR_EVE_ENERGY_WATT: HomeKitSensorEntityDescription(
         key=CharacteristicsTypes.VENDOR_EVE_ENERGY_WATT,
         name="Power",
         device_class=SensorDeviceClass.POWER,
         state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=POWER_WATT,
+        native_unit_of_measurement=UnitOfPower.WATT,
     ),
     CharacteristicsTypes.VENDOR_EVE_ENERGY_KW_HOUR: HomeKitSensorEntityDescription(
         key=CharacteristicsTypes.VENDOR_EVE_ENERGY_KW_HOUR,
         name="Energy kWh",
         device_class=SensorDeviceClass.ENERGY,
         state_class=SensorStateClass.TOTAL_INCREASING,
-        native_unit_of_measurement=ENERGY_KILO_WATT_HOUR,
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
     ),
     CharacteristicsTypes.VENDOR_EVE_ENERGY_VOLTAGE: HomeKitSensorEntityDescription(
         key=CharacteristicsTypes.VENDOR_EVE_ENERGY_VOLTAGE,
         name="Volts",
         device_class=SensorDeviceClass.VOLTAGE,
         state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=ELECTRIC_POTENTIAL_VOLT,
+        native_unit_of_measurement=UnitOfElectricPotential.VOLT,
     ),
     CharacteristicsTypes.VENDOR_EVE_ENERGY_AMPERE: HomeKitSensorEntityDescription(
         key=CharacteristicsTypes.VENDOR_EVE_ENERGY_AMPERE,
         name="Amps",
         device_class=SensorDeviceClass.CURRENT,
         state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=ELECTRIC_CURRENT_AMPERE,
+        native_unit_of_measurement=UnitOfElectricCurrent.AMPERE,
     ),
     CharacteristicsTypes.VENDOR_KOOGEEK_REALTIME_ENERGY: HomeKitSensorEntityDescription(
         key=CharacteristicsTypes.VENDOR_KOOGEEK_REALTIME_ENERGY,
         name="Power",
         device_class=SensorDeviceClass.POWER,
         state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=POWER_WATT,
+        native_unit_of_measurement=UnitOfPower.WATT,
     ),
-    CharacteristicsTypes.VENDOR_KOOGEEK_REALTIME_ENERGY_2: HomeKitSensorEntityDescription(
-        key=CharacteristicsTypes.VENDOR_KOOGEEK_REALTIME_ENERGY_2,
-        name="Power",
-        device_class=SensorDeviceClass.POWER,
-        state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=POWER_WATT,
+    CharacteristicsTypes.VENDOR_KOOGEEK_REALTIME_ENERGY_2: (
+        HomeKitSensorEntityDescription(
+            key=CharacteristicsTypes.VENDOR_KOOGEEK_REALTIME_ENERGY_2,
+            name="Power",
+            device_class=SensorDeviceClass.POWER,
+            state_class=SensorStateClass.MEASUREMENT,
+            native_unit_of_measurement=UnitOfPower.WATT,
+        )
     ),
     CharacteristicsTypes.VENDOR_EVE_DEGREE_AIR_PRESSURE: HomeKitSensorEntityDescription(
         key=CharacteristicsTypes.VENDOR_EVE_DEGREE_AIR_PRESSURE,
         name="Air Pressure",
         device_class=SensorDeviceClass.PRESSURE,
         state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=PRESSURE_HPA,
+        native_unit_of_measurement=UnitOfPressure.HPA,
     ),
     CharacteristicsTypes.VENDOR_VOCOLINC_OUTLET_ENERGY: HomeKitSensorEntityDescription(
         key=CharacteristicsTypes.VENDOR_VOCOLINC_OUTLET_ENERGY,
         name="Power",
         device_class=SensorDeviceClass.POWER,
         state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=POWER_WATT,
+        native_unit_of_measurement=UnitOfPower.WATT,
     ),
     CharacteristicsTypes.TEMPERATURE_CURRENT: HomeKitSensorEntityDescription(
         key=CharacteristicsTypes.TEMPERATURE_CURRENT,
         name="Current Temperature",
         device_class=SensorDeviceClass.TEMPERATURE,
         state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=TEMP_CELSIUS,
+        native_unit_of_measurement=UnitOfTemperature.CELSIUS,
         # This sensor is only for temperature characteristics that are not part
         # of a temperature sensor service.
         probe=(lambda char: char.service.type != ServicesTypes.TEMPERATURE_SENSOR),
@@ -243,7 +253,7 @@ SIMPLE_SENSOR: dict[str, HomeKitSensorEntityDescription] = {
         name="Current Humidity",
         device_class=SensorDeviceClass.HUMIDITY,
         state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=PERCENTAGE,
+        native_unit_of_measurement=UnitOfRatio.PERCENTAGE,
         # This sensor is only for humidity characteristics that are not part
         # of a humidity sensor service.
         probe=(lambda char: char.service.type != ServicesTypes.HUMIDITY_SENSOR),
@@ -259,62 +269,112 @@ SIMPLE_SENSOR: dict[str, HomeKitSensorEntityDescription] = {
         name="PM2.5 Density",
         device_class=SensorDeviceClass.PM25,
         state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=CONCENTRATION_MICROGRAMS_PER_CUBIC_METER,
+        native_unit_of_measurement=UnitOfDensity.MICROGRAMS_PER_CUBIC_METER,
     ),
     CharacteristicsTypes.DENSITY_PM10: HomeKitSensorEntityDescription(
         key=CharacteristicsTypes.DENSITY_PM10,
         name="PM10 Density",
         device_class=SensorDeviceClass.PM10,
         state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=CONCENTRATION_MICROGRAMS_PER_CUBIC_METER,
+        native_unit_of_measurement=UnitOfDensity.MICROGRAMS_PER_CUBIC_METER,
     ),
     CharacteristicsTypes.DENSITY_OZONE: HomeKitSensorEntityDescription(
         key=CharacteristicsTypes.DENSITY_OZONE,
         name="Ozone Density",
         device_class=SensorDeviceClass.OZONE,
         state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=CONCENTRATION_MICROGRAMS_PER_CUBIC_METER,
+        native_unit_of_measurement=UnitOfDensity.MICROGRAMS_PER_CUBIC_METER,
     ),
     CharacteristicsTypes.DENSITY_NO2: HomeKitSensorEntityDescription(
         key=CharacteristicsTypes.DENSITY_NO2,
         name="Nitrogen Dioxide Density",
         device_class=SensorDeviceClass.NITROGEN_DIOXIDE,
         state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=CONCENTRATION_MICROGRAMS_PER_CUBIC_METER,
+        native_unit_of_measurement=UnitOfDensity.MICROGRAMS_PER_CUBIC_METER,
     ),
     CharacteristicsTypes.DENSITY_SO2: HomeKitSensorEntityDescription(
         key=CharacteristicsTypes.DENSITY_SO2,
         name="Sulphur Dioxide Density",
         device_class=SensorDeviceClass.SULPHUR_DIOXIDE,
         state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=CONCENTRATION_MICROGRAMS_PER_CUBIC_METER,
+        native_unit_of_measurement=UnitOfDensity.MICROGRAMS_PER_CUBIC_METER,
     ),
     CharacteristicsTypes.DENSITY_VOC: HomeKitSensorEntityDescription(
         key=CharacteristicsTypes.DENSITY_VOC,
         name="Volatile Organic Compound Density",
         device_class=SensorDeviceClass.VOLATILE_ORGANIC_COMPOUNDS,
         state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=CONCENTRATION_MICROGRAMS_PER_CUBIC_METER,
+        native_unit_of_measurement=UnitOfDensity.MICROGRAMS_PER_CUBIC_METER,
     ),
     CharacteristicsTypes.THREAD_NODE_CAPABILITIES: HomeKitSensorEntityDescription(
         key=CharacteristicsTypes.THREAD_NODE_CAPABILITIES,
-        name="Thread Capabilities",
-        device_class="homekit_controller__thread_node_capabilities",
         entity_category=EntityCategory.DIAGNOSTIC,
         format=thread_node_capability_to_str,
+        device_class=SensorDeviceClass.ENUM,
+        options=[
+            "border_router_capable",
+            "full",
+            "minimal",
+            "none",
+            "router_eligible",
+            "sleepy",
+        ],
+        translation_key="thread_node_capabilities",
     ),
     CharacteristicsTypes.THREAD_STATUS: HomeKitSensorEntityDescription(
         key=CharacteristicsTypes.THREAD_STATUS,
-        name="Thread Status",
-        device_class="homekit_controller__thread_status",
         entity_category=EntityCategory.DIAGNOSTIC,
         format=thread_status_to_str,
+        device_class=SensorDeviceClass.ENUM,
+        options=[
+            "border_router",
+            "child",
+            "detached",
+            "disabled",
+            "joining",
+            "leader",
+            "router",
+        ],
+        translation_key="thread_status",
+    ),
+    CharacteristicsTypes.AIR_PURIFIER_STATE_CURRENT: HomeKitSensorEntityDescription(
+        key=CharacteristicsTypes.AIR_PURIFIER_STATE_CURRENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        device_class=SensorDeviceClass.ENUM,
+        enum={
+            CurrentAirPurifierStateValues.INACTIVE: "inactive",
+            CurrentAirPurifierStateValues.IDLE: "idle",
+            CurrentAirPurifierStateValues.ACTIVE: "purifying",
+        },
+        translation_key="air_purifier_state_current",
     ),
     CharacteristicsTypes.VENDOR_NETATMO_NOISE: HomeKitSensorEntityDescription(
         key=CharacteristicsTypes.VENDOR_NETATMO_NOISE,
         name="Noise",
         state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=SOUND_PRESSURE_DB,
+        native_unit_of_measurement=UnitOfSoundPressure.DECIBEL,
+        device_class=SensorDeviceClass.SOUND_PRESSURE,
+    ),
+    CharacteristicsTypes.FILTER_LIFE_LEVEL: HomeKitSensorEntityDescription(
+        key=CharacteristicsTypes.FILTER_LIFE_LEVEL,
+        name="Filter lifetime",
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=UnitOfRatio.PERCENTAGE,
+    ),
+    CharacteristicsTypes.WATER_LEVEL: HomeKitSensorEntityDescription(
+        key=CharacteristicsTypes.WATER_LEVEL,
+        translation_key="water_level",
+        native_unit_of_measurement=UnitOfRatio.PERCENTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+    ),
+    CharacteristicsTypes.VENDOR_EVE_THERMO_VALVE_POSITION: (
+        HomeKitSensorEntityDescription(
+            key=CharacteristicsTypes.VENDOR_EVE_THERMO_VALVE_POSITION,
+            translation_key="valve_position",
+            entity_category=EntityCategory.DIAGNOSTIC,
+            state_class=SensorStateClass.MEASUREMENT,
+            native_unit_of_measurement=UnitOfRatio.PERCENTAGE,
+        )
     ),
 }
 
@@ -324,10 +384,10 @@ class HomeKitSensor(HomeKitEntity, SensorEntity):
 
     _attr_state_class = SensorStateClass.MEASUREMENT
 
-    @property
-    def name(self) -> str | None:
-        """Return the name of the device."""
-        full_name = super().name
+    @override
+    def _homekit_name(self) -> str:
+        """Return the name provided by the HomeKit accessory."""
+        full_name = super()._homekit_name()
         default_name = self.default_name
         if (
             default_name
@@ -342,18 +402,21 @@ class HomeKitHumiditySensor(HomeKitSensor):
     """Representation of a Homekit humidity sensor."""
 
     _attr_device_class = SensorDeviceClass.HUMIDITY
-    _attr_native_unit_of_measurement = PERCENTAGE
+    _attr_native_unit_of_measurement = UnitOfRatio.PERCENTAGE
 
+    @override
     def get_characteristic_types(self) -> list[str]:
         """Define the homekit characteristics the entity is tracking."""
         return [CharacteristicsTypes.RELATIVE_HUMIDITY_CURRENT]
 
     @property
+    @override
     def default_name(self) -> str:
         """Return the default name of the device."""
         return "Humidity"
 
     @property
+    @override
     def native_value(self) -> float:
         """Return the current humidity."""
         return self.service.value(CharacteristicsTypes.RELATIVE_HUMIDITY_CURRENT)
@@ -363,18 +426,21 @@ class HomeKitTemperatureSensor(HomeKitSensor):
     """Representation of a Homekit temperature sensor."""
 
     _attr_device_class = SensorDeviceClass.TEMPERATURE
-    _attr_native_unit_of_measurement = TEMP_CELSIUS
+    _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
 
+    @override
     def get_characteristic_types(self) -> list[str]:
         """Define the homekit characteristics the entity is tracking."""
         return [CharacteristicsTypes.TEMPERATURE_CURRENT]
 
     @property
+    @override
     def default_name(self) -> str:
         """Return the default name of the device."""
         return "Temperature"
 
     @property
+    @override
     def native_value(self) -> float:
         """Return the current temperature in Celsius."""
         return self.service.value(CharacteristicsTypes.TEMPERATURE_CURRENT)
@@ -386,16 +452,19 @@ class HomeKitLightSensor(HomeKitSensor):
     _attr_device_class = SensorDeviceClass.ILLUMINANCE
     _attr_native_unit_of_measurement = LIGHT_LUX
 
+    @override
     def get_characteristic_types(self) -> list[str]:
         """Define the homekit characteristics the entity is tracking."""
         return [CharacteristicsTypes.LIGHT_LEVEL_CURRENT]
 
     @property
+    @override
     def default_name(self) -> str:
         """Return the default name of the device."""
         return "Light Level"
 
     @property
+    @override
     def native_value(self) -> int:
         """Return the current light level in lux."""
         return self.service.value(CharacteristicsTypes.LIGHT_LEVEL_CURRENT)
@@ -405,18 +474,21 @@ class HomeKitCarbonDioxideSensor(HomeKitSensor):
     """Representation of a Homekit Carbon Dioxide sensor."""
 
     _attr_device_class = SensorDeviceClass.CO2
-    _attr_native_unit_of_measurement = CONCENTRATION_PARTS_PER_MILLION
+    _attr_native_unit_of_measurement = UnitOfRatio.PARTS_PER_MILLION
 
+    @override
     def get_characteristic_types(self) -> list[str]:
         """Define the homekit characteristics the entity is tracking."""
         return [CharacteristicsTypes.CARBON_DIOXIDE_LEVEL]
 
     @property
+    @override
     def default_name(self) -> str:
         """Return the default name of the device."""
         return "Carbon Dioxide"
 
     @property
+    @override
     def native_value(self) -> int:
         """Return the current CO2 level in ppm."""
         return self.service.value(CharacteristicsTypes.CARBON_DIOXIDE_LEVEL)
@@ -426,9 +498,10 @@ class HomeKitBatterySensor(HomeKitSensor):
     """Representation of a Homekit battery sensor."""
 
     _attr_device_class = SensorDeviceClass.BATTERY
-    _attr_native_unit_of_measurement = PERCENTAGE
+    _attr_native_unit_of_measurement = UnitOfRatio.PERCENTAGE
     _attr_entity_category = EntityCategory.DIAGNOSTIC
 
+    @override
     def get_characteristic_types(self) -> list[str]:
         """Define the homekit characteristics the entity is tracking."""
         return [
@@ -438,28 +511,32 @@ class HomeKitBatterySensor(HomeKitSensor):
         ]
 
     @property
+    @override
     def default_name(self) -> str:
         """Return the default name of the device."""
         return "Battery"
 
     @property
+    @override
     def icon(self) -> str:
         """Return the sensor icon."""
-        if not self.available or self.state is None:
+        native_value = self.native_value
+        if not self.available or native_value is None:
             return "mdi:battery-unknown"
 
         # This is similar to the logic in helpers.icon, but we have delegated the
         # decision about what mdi:battery-alert is to the device.
         icon = "mdi:battery"
-        if self.is_charging and self.state > 10:
-            percentage = int(round(self.state / 20 - 0.01)) * 20
+        is_charging = self.is_charging
+        if is_charging and native_value > 10:
+            percentage = round(native_value / 20 - 0.01) * 20
             icon += f"-charging-{percentage}"
-        elif self.is_charging:
+        elif is_charging:
             icon += "-outline"
         elif self.is_low_battery:
             icon += "-alert"
-        elif self.state < 95:
-            percentage = max(int(round(self.state / 10 - 0.01)) * 10, 10)
+        elif native_value < 95:
+            percentage = max(round(native_value / 10 - 0.01) * 10, 10)
             icon += f"-{percentage}"
 
         return icon
@@ -471,21 +548,21 @@ class HomeKitBatterySensor(HomeKitSensor):
 
     @property
     def is_charging(self) -> bool:
-        """Return true if currently charing."""
+        """Return true if currently charging."""
         # 0 = not charging
         # 1 = charging
         # 2 = not chargeable
         return self.service.value(CharacteristicsTypes.CHARGING_STATE) == 1
 
     @property
+    @override
     def native_value(self) -> int:
         """Return the current battery level percentage."""
         return self.service.value(CharacteristicsTypes.BATTERY_LEVEL)
 
 
 class SimpleSensor(CharacteristicEntity, SensorEntity):
-    """
-    A simple sensor for a single characteristic.
+    """A simple sensor for a single characteristic.
 
     This may be an additional secondary entity that is part of another service. An
     example is a switch that has an energy sensor.
@@ -505,26 +582,24 @@ class SimpleSensor(CharacteristicEntity, SensorEntity):
     ) -> None:
         """Initialise a secondary HomeKit characteristic sensor."""
         self.entity_description = description
+        if self.entity_description.enum:
+            self._attr_options = list(self.entity_description.enum.values())
         super().__init__(conn, info, char)
 
+    @override
     def get_characteristic_types(self) -> list[str]:
         """Define the homekit characteristics the entity is tracking."""
         return [self._char.type]
 
     @property
-    def name(self) -> str:
-        """Return the name of the device if any."""
-        if name := self.accessory.name:
-            return f"{name} {self.entity_description.name}"
-        return f"{self.entity_description.name}"
-
-    @property
+    @override
     def native_value(self) -> str | int | float:
         """Return the current sensor value."""
-        val = self._char.value
+        if self.entity_description.enum:
+            return self.entity_description.enum[self._char.value]
         if self.entity_description.format:
-            return self.entity_description.format(val)
-        return val
+            return self.entity_description.format(self._char)
+        return self._char.value
 
 
 ENTITY_TYPES = {
@@ -551,33 +626,32 @@ class RSSISensor(HomeKitEntity, SensorEntity):
     _attr_native_unit_of_measurement = SIGNAL_STRENGTH_DECIBELS_MILLIWATT
     _attr_should_poll = False
 
+    def __init__(self, accessory: HKDevice, devinfo: ConfigType) -> None:
+        """Initialise a HomeKit Controller RSSI sensor."""
+        super().__init__(accessory, devinfo)
+        self._attr_unique_id = f"{accessory.unique_id}_rssi"
+
+    @override
     def get_characteristic_types(self) -> list[str]:
         """Define the homekit characteristics the entity cares about."""
         return []
 
     @property
+    @override
     def available(self) -> bool:
         """Return if the bluetooth device is available."""
         address = self._accessory.pairing_data["AccessoryAddress"]
         return async_ble_device_from_address(self.hass, address) is not None
 
     @property
-    def name(self) -> str:
-        """Return the name of the sensor."""
-        return "Signal strength"
-
-    @property
+    @override
     def old_unique_id(self) -> str:
         """Return the old ID of this device."""
         serial = self.accessory_info.value(CharacteristicsTypes.SERIAL_NUMBER)
         return f"homekit-{serial}-rssi"
 
     @property
-    def unique_id(self) -> str:
-        """Return the ID of this device."""
-        return f"{self._accessory.unique_id}_rssi"
-
-    @property
+    @override
     def native_value(self) -> int | None:
         """Return the current rssi value."""
         address = self._accessory.pairing_data["AccessoryAddress"]
@@ -588,7 +662,7 @@ class RSSISensor(HomeKitEntity, SensorEntity):
 async def async_setup_entry(
     hass: HomeAssistant,
     config_entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up Homekit sensors."""
     hkid = config_entry.data["AccessoryPairingID"]
@@ -631,12 +705,13 @@ async def async_setup_entry(
 
     @callback
     def async_add_accessory(accessory: Accessory) -> bool:
-        if conn.pairing.transport != Transport.BLE:
+        if conn.pairing.transport is not Transport.BLE:
             return False
 
         accessory_info = accessory.services.first(
             service_type=ServicesTypes.ACCESSORY_INFORMATION
         )
+        assert accessory_info
         info = {"aid": accessory.aid, "iid": accessory_info.iid}
         entity = RSSISensor(conn, info)
         conn.async_migrate_unique_id(

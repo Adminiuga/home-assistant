@@ -1,10 +1,13 @@
 """Config flow for HLK-SW16."""
+
 import asyncio
+from typing import Any, override
 
 from hlk_sw16 import create_hlk_sw16_connection
-import voluptuous as vol
+from hlk_sw16.protocol import SW16Client
+import probatio
 
-from homeassistant import config_entries
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_HOST, CONF_PORT
 from homeassistant.core import HomeAssistant
 
@@ -17,15 +20,15 @@ from .const import (
 )
 from .errors import CannotConnect
 
-DATA_SCHEMA = vol.Schema(
+DATA_SCHEMA = probatio.Schema(
     {
-        vol.Required(CONF_HOST): str,
-        vol.Optional(CONF_PORT, default=DEFAULT_PORT): vol.Coerce(int),
+        probatio.Required(CONF_HOST): str,
+        probatio.Optional(CONF_PORT, default=DEFAULT_PORT): probatio.Coerce(int),
     }
 )
 
 
-async def connect_client(hass, user_input):
+async def connect_client(hass: HomeAssistant, user_input: dict[str, Any]) -> SW16Client:
     """Connect the HLK-SW16 client."""
     client_aw = create_hlk_sw16_connection(
         host=user_input[CONF_HOST],
@@ -35,15 +38,17 @@ async def connect_client(hass, user_input):
         reconnect_interval=DEFAULT_RECONNECT_INTERVAL,
         keep_alive_interval=DEFAULT_KEEP_ALIVE_INTERVAL,
     )
-    return await asyncio.wait_for(client_aw, timeout=CONNECTION_TIMEOUT)
+    async with asyncio.timeout(CONNECTION_TIMEOUT):
+        return await client_aw
 
 
-async def validate_input(hass: HomeAssistant, user_input):
+async def validate_input(hass: HomeAssistant, user_input: dict[str, Any]) -> None:
     """Validate the user input allows us to connect."""
     try:
         client = await connect_client(hass, user_input)
-    except asyncio.TimeoutError as err:
+    except TimeoutError as err:
         raise CannotConnect from err
+
     try:
 
         def disconnect_callback():
@@ -56,21 +61,32 @@ async def validate_input(hass: HomeAssistant, user_input):
         client.disconnect_callback = None
         client.stop()
         raise
-    else:
-        client.disconnect_callback = None
-        client.stop()
+
+    client.disconnect_callback = None
+    client.stop()
 
 
-class SW16FlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
+class SW16FlowHandler(ConfigFlow, domain=DOMAIN):
     """Handle a HLK-SW16 config flow."""
 
     VERSION = 1
 
-    async def async_step_import(self, user_input):
+    async def async_step_import(self, import_data: dict[str, Any]) -> ConfigFlowResult:
         """Handle import."""
-        return await self.async_step_user(user_input)
+        self._async_abort_entries_match(
+            {CONF_HOST: import_data[CONF_HOST], CONF_PORT: import_data[CONF_PORT]}
+        )
+        try:
+            await validate_input(self.hass, import_data)
+        except CannotConnect:
+            return self.async_abort(reason="cannot_connect")
+        address = f"{import_data[CONF_HOST]}:{import_data[CONF_PORT]}"
+        return self.async_create_entry(title=address, data=import_data)
 
-    async def async_step_user(self, user_input=None):
+    @override
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle the initial step."""
         errors = {}
         if user_input is not None:
@@ -79,10 +95,11 @@ class SW16FlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             )
             try:
                 await validate_input(self.hass, user_input)
-                address = f"{user_input[CONF_HOST]}:{user_input[CONF_PORT]}"
-                return self.async_create_entry(title=address, data=user_input)
             except CannotConnect:
                 errors["base"] = "cannot_connect"
+            else:
+                address = f"{user_input[CONF_HOST]}:{user_input[CONF_PORT]}"
+                return self.async_create_entry(title=address, data=user_input)
 
         return self.async_show_form(
             step_id="user", data_schema=DATA_SCHEMA, errors=errors

@@ -1,14 +1,13 @@
 """Provides device automations for homekit devices."""
-from __future__ import annotations
 
 from collections.abc import Callable, Generator
 from typing import TYPE_CHECKING, Any
 
 from aiohomekit.model.characteristics import CharacteristicsTypes
 from aiohomekit.model.characteristics.const import InputEventValues
-from aiohomekit.model.services import ServicesTypes
+from aiohomekit.model.services import Service, ServicesTypes
 from aiohomekit.utils import clamp_enum_to_char
-import voluptuous as vol
+import probatio
 
 from homeassistant.components.device_automation import DEVICE_TRIGGER_BASE_SCHEMA
 from homeassistant.config_entries import ConfigEntry
@@ -42,8 +41,8 @@ CONF_SUBTYPE = "subtype"
 
 TRIGGER_SCHEMA = DEVICE_TRIGGER_BASE_SCHEMA.extend(
     {
-        vol.Required(CONF_TYPE): vol.In(TRIGGER_TYPES),
-        vol.Required(CONF_SUBTYPE): vol.In(TRIGGER_SUBTYPES),
+        probatio.Required(CONF_TYPE): probatio.In(TRIGGER_TYPES),
+        probatio.Required(CONF_SUBTYPE): probatio.In(TRIGGER_SUBTYPES),
     }
 )
 
@@ -57,28 +56,42 @@ HK_TO_HA_INPUT_EVENT_VALUES = {
 class TriggerSource:
     """Represents a stateless source of event data from HomeKit."""
 
-    def __init__(
+    def __init__(self, hass: HomeAssistant) -> None:
+        """Initialize a set of triggers for a device."""
+        self._hass = hass
+        self._triggers: dict[tuple[str, str], dict[str, Any]] = {}
+        self._callbacks: dict[tuple[str, str], list[Callable[[Any], None]]] = {}
+        self._iid_trigger_keys: dict[int, set[tuple[str, str]]] = {}
+
+    @callback
+    def async_setup(
         self, connection: HKDevice, aid: int, triggers: list[dict[str, Any]]
     ) -> None:
-        """Initialize a set of triggers for a device."""
-        self._hass = connection.hass
-        self._connection = connection
-        self._aid = aid
-        self._triggers: dict[tuple[str, str], dict[str, Any]] = {}
-        for trigger in triggers:
-            self._triggers[(trigger["type"], trigger["subtype"])] = trigger
-        self._callbacks: dict[int, list[Callable[[Any], None]]] = {}
+        """Set up a set of triggers for a device.
 
-    def fire(self, iid, value):
+        This function must be re-entrant since
+        it is called when the device is first added and
+        when the config entry is reloaded.
+        """
+        for trigger_data in triggers:
+            trigger_key = (trigger_data[CONF_TYPE], trigger_data[CONF_SUBTYPE])
+            self._triggers[trigger_key] = trigger_data
+            iid = trigger_data["characteristic"]
+            self._iid_trigger_keys.setdefault(iid, set()).add(trigger_key)
+            connection.add_watchable_characteristics([(aid, iid)])
+
+    def fire(self, iid: int, ev: dict[str, Any]) -> None:
         """Process events that have been received from a HomeKit accessory."""
-        for event_handler in self._callbacks.get(iid, []):
-            event_handler(value)
+        for trigger_key in self._iid_trigger_keys.get(iid, set()):
+            for event_handler in self._callbacks.get(trigger_key, []):
+                event_handler(ev)
 
-    def async_get_triggers(self) -> Generator[tuple[str, str], None, None]:
-        """List device triggers for homekit devices."""
+    def async_get_triggers(self) -> Generator[tuple[str, str]]:
+        """List device triggers for HomeKit devices."""
         yield from self._triggers
 
-    async def async_attach_trigger(
+    @callback
+    def async_attach_trigger(
         self,
         config: ConfigType,
         action: TriggerActionType,
@@ -86,28 +99,28 @@ class TriggerSource:
     ) -> CALLBACK_TYPE:
         """Attach a trigger."""
         trigger_data = trigger_info["trigger_data"]
+        type_: str = config[CONF_TYPE]
+        sub_type: str = config[CONF_SUBTYPE]
+        trigger_key = (type_, sub_type)
         job = HassJob(action)
+        trigger_callbacks = self._callbacks.setdefault(trigger_key, [])
+        hass = self._hass
 
         @callback
-        def event_handler(char):
-            if config[CONF_SUBTYPE] != HK_TO_HA_INPUT_EVENT_VALUES[char["value"]]:
+        def event_handler(ev: dict[str, Any]) -> None:
+            if sub_type != HK_TO_HA_INPUT_EVENT_VALUES[ev["value"]]:
                 return
-            self._hass.async_run_hass_job(job, {"trigger": {**trigger_data, **config}})
+            hass.async_run_hass_job(job, {"trigger": {**trigger_data, **config}})
 
-        trigger = self._triggers[config[CONF_TYPE], config[CONF_SUBTYPE]]
-        iid = trigger["characteristic"]
+        trigger_callbacks.append(event_handler)
 
-        await self._connection.add_watchable_characteristics([(self._aid, iid)])
-        self._callbacks.setdefault(iid, []).append(event_handler)
-
-        def async_remove_handler():
-            if iid in self._callbacks:
-                self._callbacks[iid].remove(event_handler)
+        def async_remove_handler() -> None:
+            trigger_callbacks.remove(event_handler)
 
         return async_remove_handler
 
 
-def enumerate_stateless_switch(service):
+def enumerate_stateless_switch(service: Service) -> list[dict[str, Any]]:
     """Enumerate a stateless switch, like a single button."""
 
     # A stateless switch that has a SERVICE_LABEL_INDEX is part of a group
@@ -135,7 +148,7 @@ def enumerate_stateless_switch(service):
     ]
 
 
-def enumerate_stateless_switch_group(service):
+def enumerate_stateless_switch_group(service: Service) -> list[dict[str, Any]]:
     """Enumerate a group of stateless switches, like a remote control."""
     switches = list(
         service.accessory.services.filter(
@@ -145,7 +158,7 @@ def enumerate_stateless_switch_group(service):
         )
     )
 
-    results = []
+    results: list[dict[str, Any]] = []
     for idx, switch in enumerate(switches):
         char = switch[CharacteristicsTypes.INPUT_EVENT]
 
@@ -153,19 +166,19 @@ def enumerate_stateless_switch_group(service):
         # manufacturer might not - clamp options to what they say.
         all_values = clamp_enum_to_char(InputEventValues, char)
 
-        for event_type in all_values:
-            results.append(
-                {
-                    "characteristic": char.iid,
-                    "value": event_type,
-                    "type": f"button{idx + 1}",
-                    "subtype": HK_TO_HA_INPUT_EVENT_VALUES[event_type],
-                }
-            )
+        results.extend(
+            {
+                "characteristic": char.iid,
+                "value": event_type,
+                "type": f"button{idx + 1}",
+                "subtype": HK_TO_HA_INPUT_EVENT_VALUES[event_type],
+            }
+            for event_type in all_values
+        )
     return results
 
 
-def enumerate_doorbell(service):
+def enumerate_doorbell(service: Service) -> list[dict[str, Any]]:
     """Enumerate doorbell buttons."""
     input_event = service[CharacteristicsTypes.INPUT_EVENT]
 
@@ -173,17 +186,15 @@ def enumerate_doorbell(service):
     # manufacturer might not - clamp options to what they say.
     all_values = clamp_enum_to_char(InputEventValues, input_event)
 
-    results = []
-    for event_type in all_values:
-        results.append(
-            {
-                "characteristic": input_event.iid,
-                "value": event_type,
-                "type": "doorbell",
-                "subtype": HK_TO_HA_INPUT_EVENT_VALUES[event_type],
-            }
-        )
-    return results
+    return [
+        {
+            "characteristic": input_event.iid,
+            "value": event_type,
+            "type": "doorbell",
+            "subtype": HK_TO_HA_INPUT_EVENT_VALUES[event_type],
+        }
+        for event_type in all_values
+    ]
 
 
 TRIGGER_FINDERS = {
@@ -196,12 +207,15 @@ TRIGGER_FINDERS = {
 async def async_setup_triggers_for_entry(
     hass: HomeAssistant, config_entry: ConfigEntry
 ) -> None:
-    """Triggers aren't entities as they have no state, but we still need to set them up for a config entry."""
+    """Set up triggers for a config entry.
+
+    Triggers aren't entities as they have no state.
+    """
     hkid = config_entry.data["AccessoryPairingID"]
     conn: HKDevice = hass.data[KNOWN_DEVICES][hkid]
 
     @callback
-    def async_add_service(service):
+    def async_add_characteristic(service: Service) -> bool:
         aid = service.accessory.aid
         service_type = service.type
 
@@ -214,31 +228,50 @@ async def async_setup_triggers_for_entry(
         # They have to be different accessories (they can be on the same bridge)
         # In practice, this is inline with what iOS actually supports AFAWCT.
         device_id = conn.devices[aid]
-        if device_id in hass.data[TRIGGERS]:
+        if TRIGGERS in hass.data and device_id in hass.data[TRIGGERS]:
             return False
 
-        # Just because we recognise the service type doesn't mean we can actually
+        # Just because we recognize the service type doesn't mean we can actually
         # extract any triggers - so only proceed if we can
         triggers = TRIGGER_FINDERS[service_type](service)
         if len(triggers) == 0:
             return False
 
-        trigger = TriggerSource(conn, aid, triggers)
-        hass.data[TRIGGERS][device_id] = trigger
+        trigger = async_get_or_create_trigger_source(conn.hass, device_id)
+        trigger.async_setup(conn, aid, triggers)
 
         return True
 
-    conn.add_listener(async_add_service)
+    conn.add_trigger_factory(async_add_characteristic)
 
 
-def async_fire_triggers(conn: HKDevice, events: dict[tuple[int, int], Any]):
+@callback
+def async_get_or_create_trigger_source(
+    hass: HomeAssistant, device_id: str
+) -> TriggerSource:
+    """Get or create a trigger source for a device id."""
+    trigger_sources: dict[str, TriggerSource] = hass.data.setdefault(TRIGGERS, {})
+    if not (source := trigger_sources.get(device_id)):
+        source = TriggerSource(hass)
+        trigger_sources[device_id] = source
+    return source
+
+
+def async_fire_triggers(
+    conn: HKDevice, events: dict[tuple[int, int], dict[str, Any]]
+) -> None:
     """Process events generated by a HomeKit accessory into automation triggers."""
-    trigger_sources: dict[str, TriggerSource] = conn.hass.data[TRIGGERS]
+    trigger_sources: dict[str, TriggerSource] = conn.hass.data.get(TRIGGERS, {})
+    if not trigger_sources:
+        return
     for (aid, iid), ev in events.items():
         if aid in conn.devices:
             device_id = conn.devices[aid]
             if source := trigger_sources.get(device_id):
-                source.fire(iid, ev)
+                # If the value is None, we received the event via polling
+                # and we don't want to trigger on that
+                if ev.get("value") is not None:
+                    source.fire(iid, ev)
 
 
 async def async_get_triggers(
@@ -271,5 +304,6 @@ async def async_attach_trigger(
 ) -> CALLBACK_TYPE:
     """Attach a trigger."""
     device_id = config[CONF_DEVICE_ID]
-    device = hass.data[TRIGGERS][device_id]
-    return await device.async_attach_trigger(config, action, trigger_info)
+    return async_get_or_create_trigger_source(hass, device_id).async_attach_trigger(
+        config, action, trigger_info
+    )

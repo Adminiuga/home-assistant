@@ -1,10 +1,12 @@
 """Config flow for PoolSense integration."""
+
 import logging
+from typing import Any, override
 
 from poolsense import PoolSense
-import voluptuous as vol
+import probatio
 
-from homeassistant import config_entries
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
 from homeassistant.helpers import aiohttp_client
 
@@ -13,15 +15,15 @@ from .const import DOMAIN
 _LOGGER = logging.getLogger(__name__)
 
 
-class PoolSenseConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
+class PoolSenseConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for PoolSense."""
 
     VERSION = 1
 
-    def __init__(self):
-        """Initialize PoolSense config flow."""
-
-    async def async_step_user(self, user_input=None):
+    @override
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle the initial step."""
         errors = {}
 
@@ -37,6 +39,7 @@ class PoolSenseConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 aiohttp_client.async_get_clientsession(self.hass),
                 user_input[CONF_EMAIL],
                 user_input[CONF_PASSWORD],
+                None,
             )
             api_key_valid = await poolsense.test_poolsense_credentials()
 
@@ -54,8 +57,11 @@ class PoolSenseConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="user",
-            data_schema=vol.Schema(
-                {vol.Required(CONF_EMAIL): str, vol.Required(CONF_PASSWORD): str}
+            data_schema=probatio.Schema(
+                {
+                    probatio.Required(CONF_EMAIL): str,
+                    probatio.Required(probatio.Secret(CONF_PASSWORD)): str,
+                }
             ),
             errors=errors,
         )

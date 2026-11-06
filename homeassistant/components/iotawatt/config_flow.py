@@ -1,13 +1,15 @@
 """Config flow for iotawatt integration."""
-from __future__ import annotations
 
 import logging
+from typing import Any, override
 
 from iotawattpy.iotawatt import Iotawatt
-import voluptuous as vol
+import probatio
 
-from homeassistant import config_entries, core, exceptions
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_USERNAME
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import httpx_client
 
 from .const import CONNECTION_ERRORS, DOMAIN
@@ -15,9 +17,7 @@ from .const import CONNECTION_ERRORS, DOMAIN
 _LOGGER = logging.getLogger(__name__)
 
 
-async def validate_input(
-    hass: core.HomeAssistant, data: dict[str, str]
-) -> dict[str, str]:
+async def validate_input(hass: HomeAssistant, data: dict[str, str]) -> dict[str, str]:
     """Validate the user input allows us to connect."""
     iotawatt = Iotawatt(
         "",
@@ -30,7 +30,7 @@ async def validate_input(
         is_connected = await iotawatt.connect()
     except CONNECTION_ERRORS:
         return {"base": "cannot_connect"}
-    except Exception:  # pylint: disable=broad-except
+    except Exception:
         _LOGGER.exception("Unexpected exception")
         return {"base": "unknown"}
 
@@ -40,23 +40,28 @@ async def validate_input(
     return {}
 
 
-class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
+class IOTaWattConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for iotawatt."""
 
     VERSION = 1
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize."""
-        self._data = {}
+        self._data: dict[str, Any] = {}
 
-    async def async_step_user(self, user_input=None):
+    @override
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle the initial step."""
         if user_input is None:
             user_input = {}
 
-        schema = vol.Schema(
+        schema = probatio.Schema(
             {
-                vol.Required(CONF_HOST, default=user_input.get(CONF_HOST, "")): str,
+                probatio.Required(
+                    CONF_HOST, default=user_input.get(CONF_HOST, "")
+                ): str,
             }
         )
         if not user_input:
@@ -71,18 +76,21 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(step_id="user", data_schema=schema, errors=errors)
 
-    async def async_step_auth(self, user_input=None):
+    async def async_step_auth(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Authenticate user if authentication is enabled on the IoTaWatt device."""
         if user_input is None:
             user_input = {}
 
-        data_schema = vol.Schema(
+        data_schema = probatio.Schema(
             {
-                vol.Required(
+                probatio.Required(
                     CONF_USERNAME, default=user_input.get(CONF_USERNAME, "")
                 ): str,
-                vol.Required(
-                    CONF_PASSWORD, default=user_input.get(CONF_PASSWORD, "")
+                probatio.Required(
+                    probatio.Secret(CONF_PASSWORD),
+                    default=user_input.get(CONF_PASSWORD, ""),
                 ): str,
             }
         )
@@ -99,9 +107,9 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return self.async_create_entry(title=data[CONF_HOST], data=data)
 
 
-class CannotConnect(exceptions.HomeAssistantError):
+class CannotConnect(HomeAssistantError):
     """Error to indicate we cannot connect."""
 
 
-class InvalidAuth(exceptions.HomeAssistantError):
+class InvalidAuth(HomeAssistantError):
     """Error to indicate there is invalid auth."""

@@ -1,24 +1,25 @@
 """Tests for the Snooz component."""
-from __future__ import annotations
 
 from dataclasses import dataclass
 from unittest.mock import patch
 
-from bleak import BLEDevice
-from pysnooz.commands import SnoozCommandData
+from pysnooz import SnoozDeviceState, parse_snooz_advertisement, turn_off
 from pysnooz.testing import MockSnoozDevice
+from pytest_homeassistant.common import MockConfigEntry
+from pytest_homeassistant.components.bluetooth import (
+    generate_ble_device,
+    inject_bluetooth_service_info,
+)
 
 from homeassistant.components.snooz.const import DOMAIN
 from homeassistant.const import CONF_ADDRESS, CONF_TOKEN
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.service_info.bluetooth import BluetoothServiceInfo
 
-from tests.common import MockConfigEntry
-
 TEST_ADDRESS = "00:00:00:00:AB:CD"
 TEST_SNOOZ_LOCAL_NAME = "Snooz-ABCD"
 TEST_SNOOZ_DISPLAY_NAME = "Snooz ABCD"
-TEST_PAIRING_TOKEN = "deadbeef"
+TEST_PAIRING_TOKEN = "deadbeefdeadbeef"
 
 NOT_SNOOZ_SERVICE_INFO = BluetoothServiceInfo(
     name="Definitely not snooz",
@@ -34,7 +35,7 @@ SNOOZ_SERVICE_INFO_PAIRING = BluetoothServiceInfo(
     name=TEST_SNOOZ_LOCAL_NAME,
     address=TEST_ADDRESS,
     rssi=-63,
-    manufacturer_data={65552: bytes([4]) + bytes.fromhex(TEST_PAIRING_TOKEN)},
+    manufacturer_data={65552: bytes([5]) + bytes.fromhex(TEST_PAIRING_TOKEN)},
     service_uuids=[
         "80c37f00-cc16-11e4-8830-0800200c9a66",
         "90759319-1668-44da-9ef3-492d593bd1e5",
@@ -45,6 +46,21 @@ SNOOZ_SERVICE_INFO_PAIRING = BluetoothServiceInfo(
 
 SNOOZ_SERVICE_INFO_NOT_PAIRING = BluetoothServiceInfo(
     name=TEST_SNOOZ_LOCAL_NAME,
+    address=TEST_ADDRESS,
+    rssi=-63,
+    manufacturer_data={65552: bytes([4]) + bytes([0] * 8)},
+    service_uuids=[
+        "80c37f00-cc16-11e4-8830-0800200c9a66",
+        "90759319-1668-44da-9ef3-492d593bd1e5",
+    ],
+    service_data={},
+    source="local",
+)
+
+# Some Bluetooth stacks report the name stored in the device name characteristic
+# ("Snooz") instead of the advertised name ("Snooz-XXXX") after connecting
+SNOOZ_SERVICE_INFO_CHARACTERISTIC_NAME = BluetoothServiceInfo(
+    name="Snooz",
     address=TEST_ADDRESS,
     rssi=-63,
     manufacturer_data={65552: bytes([4]) + bytes([0] * 8)},
@@ -67,16 +83,18 @@ class SnoozFixture:
 
 async def create_mock_snooz(
     connected: bool = True,
-    initial_state: SnoozCommandData = SnoozCommandData(on=False, volume=0),
+    initial_state: SnoozDeviceState = SnoozDeviceState(on=False, volume=0),
 ) -> MockSnoozDevice:
     """Create a mock device."""
 
-    ble_device = SNOOZ_SERVICE_INFO_NOT_PAIRING
-    device = MockSnoozDevice(ble_device, initial_state=initial_state)
+    ble_device = generate_ble_device(TEST_ADDRESS, TEST_SNOOZ_LOCAL_NAME)
+    advertisement = parse_snooz_advertisement(SNOOZ_SERVICE_INFO_PAIRING)
+    assert advertisement is not None
+    device = MockSnoozDevice(ble_device, advertisement, initial_state=initial_state)
 
     # execute a command to initiate the connection
     if connected is True:
-        await device.async_execute_command(initial_state)
+        await device.async_execute_command(turn_off())
 
     return device
 
@@ -86,20 +104,20 @@ async def create_mock_snooz_config_entry(
 ) -> MockConfigEntry:
     """Create a mock config entry."""
 
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id=TEST_ADDRESS,
+        data={CONF_ADDRESS: TEST_ADDRESS, CONF_TOKEN: TEST_PAIRING_TOKEN},
+    )
+    entry.add_to_hass(hass)
+    inject_bluetooth_service_info(hass, SNOOZ_SERVICE_INFO_NOT_PAIRING)
+
     with patch(
         "homeassistant.components.snooz.SnoozDevice", return_value=device
-    ), patch(
-        "homeassistant.components.snooz.async_ble_device_from_address",
-        return_value=BLEDevice(device.address, device.name),
-    ):
-        entry = MockConfigEntry(
-            domain=DOMAIN,
-            unique_id=TEST_ADDRESS,
-            data={CONF_ADDRESS: TEST_ADDRESS, CONF_TOKEN: TEST_PAIRING_TOKEN},
-        )
-        entry.add_to_hass(hass)
-
+    ) as mock_snooz_device:
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
-        return entry
+        assert mock_snooz_device.call_args.args[1].password == TEST_PAIRING_TOKEN
+
+    return entry

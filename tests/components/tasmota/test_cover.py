@@ -1,6 +1,8 @@
 """The tests for the Tasmota cover platform."""
+
 import copy
 import json
+from typing import Any
 from unittest.mock import patch
 
 from hatasmota.utils import (
@@ -10,10 +12,13 @@ from hatasmota.utils import (
     get_topic_tele_will,
 )
 import pytest
+from pytest_homeassistant.common import async_fire_mqtt_message
+from pytest_homeassistant.typing import MqttMockHAClient, MqttMockPahoClient
 
 from homeassistant.components import cover
 from homeassistant.components.tasmota.const import DEFAULT_PREFIX
 from homeassistant.const import ATTR_ASSUMED_STATE, STATE_UNKNOWN, Platform
+from homeassistant.core import HomeAssistant
 
 from .test_common import (
     DEFAULT_CONFIG,
@@ -21,6 +26,8 @@ from .test_common import (
     help_test_availability_discovery_update,
     help_test_availability_poll_state,
     help_test_availability_when_connection_lost,
+    help_test_deep_sleep_availability,
+    help_test_deep_sleep_availability_when_connection_lost,
     help_test_discovery_device_remove,
     help_test_discovery_removal,
     help_test_discovery_update_unchanged,
@@ -28,29 +35,30 @@ from .test_common import (
     help_test_entity_id_update_subscriptions,
 )
 
-from tests.common import async_fire_mqtt_message
-
 COVER_SUPPORT = (
-    cover.SUPPORT_OPEN
-    | cover.SUPPORT_CLOSE
-    | cover.SUPPORT_STOP
-    | cover.SUPPORT_SET_POSITION
+    cover.CoverEntityFeature.OPEN
+    | cover.CoverEntityFeature.CLOSE
+    | cover.CoverEntityFeature.STOP
+    | cover.CoverEntityFeature.SET_POSITION
 )
 TILT_SUPPORT = (
-    cover.SUPPORT_OPEN_TILT
-    | cover.SUPPORT_CLOSE_TILT
-    | cover.SUPPORT_STOP_TILT
-    | cover.SUPPORT_SET_TILT_POSITION
+    cover.CoverEntityFeature.OPEN_TILT
+    | cover.CoverEntityFeature.CLOSE_TILT
+    | cover.CoverEntityFeature.STOP_TILT
+    | cover.CoverEntityFeature.SET_TILT_POSITION
 )
 
 
-async def test_missing_relay(hass, mqtt_mock, setup_tasmota):
+async def test_missing_relay(
+    hass: HomeAssistant, mqtt_mock: MqttMockHAClient, setup_tasmota
+) -> None:
     """Test no cover is discovered if relays are missing."""
 
 
 @pytest.mark.parametrize(
-    "relay_config, num_covers",
+    ("relay_config", "num_covers"),
     [
+        ([3, 3, 3, 3, 3, 3, 1, 1, 3, 3] + [3, 3] * 12, 16),
         ([3, 3, 3, 3, 3, 3, 1, 1, 3, 3], 4),
         ([3, 3, 3, 3, 0, 0, 0, 0], 2),
         ([3, 3, 1, 1, 0, 0, 0, 0], 1),
@@ -58,8 +66,12 @@ async def test_missing_relay(hass, mqtt_mock, setup_tasmota):
     ],
 )
 async def test_multiple_covers(
-    hass, mqtt_mock, setup_tasmota, relay_config, num_covers
-):
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    setup_tasmota,
+    relay_config,
+    num_covers,
+) -> None:
     """Test discovery of multiple covers."""
     config = copy.deepcopy(DEFAULT_CONFIG)
     config["rl"] = relay_config
@@ -77,7 +89,9 @@ async def test_multiple_covers(
     assert len(hass.states.async_all("cover")) == num_covers
 
 
-async def test_tilt_support(hass, mqtt_mock, setup_tasmota):
+async def test_tilt_support(
+    hass: HomeAssistant, mqtt_mock: MqttMockHAClient, setup_tasmota
+) -> None:
     """Test tilt support detection."""
     config = copy.deepcopy(DEFAULT_CONFIG)
     config["rl"] = [3, 3, 3, 3, 3, 3, 3, 3]
@@ -111,7 +125,9 @@ async def test_tilt_support(hass, mqtt_mock, setup_tasmota):
     assert state.attributes["supported_features"] == COVER_SUPPORT
 
 
-async def test_controlling_state_via_mqtt_tilt(hass, mqtt_mock, setup_tasmota):
+async def test_controlling_state_via_mqtt_tilt(
+    hass: HomeAssistant, mqtt_mock: MqttMockHAClient, setup_tasmota
+) -> None:
     """Test state update via MQTT."""
     config = copy.deepcopy(DEFAULT_CONFIG)
     config["rl"][0] = 3
@@ -281,10 +297,10 @@ async def test_controlling_state_via_mqtt_tilt(hass, mqtt_mock, setup_tasmota):
     assert state.attributes["current_position"] == 100
 
 
-@pytest.mark.parametrize("tilt", ("", ',"Tilt":0'))
+@pytest.mark.parametrize("tilt", ["", ',"Tilt":0'])
 async def test_controlling_state_via_mqtt_inverted(
-    hass, mqtt_mock, setup_tasmota, tilt
-):
+    hass: HomeAssistant, mqtt_mock: MqttMockHAClient, setup_tasmota, tilt
+) -> None:
     """Test state update via MQTT."""
     config = copy.deepcopy(DEFAULT_CONFIG)
     config["rl"][0] = 3
@@ -448,7 +464,9 @@ async def test_controlling_state_via_mqtt_inverted(
     assert state.attributes["current_position"] == 0
 
 
-async def call_service(hass, entity_id, service, **kwargs):
+async def call_service(
+    hass: HomeAssistant, entity_id: str, service: str, **kwargs: Any
+) -> None:
     """Call a fan service."""
     await hass.services.async_call(
         cover.DOMAIN,
@@ -458,7 +476,9 @@ async def call_service(hass, entity_id, service, **kwargs):
     )
 
 
-async def test_sending_mqtt_commands(hass, mqtt_mock, setup_tasmota):
+async def test_sending_mqtt_commands(
+    hass: HomeAssistant, mqtt_mock: MqttMockHAClient, setup_tasmota
+) -> None:
     """Test the sending MQTT commands."""
     config = copy.deepcopy(DEFAULT_CONFIG)
     config["dn"] = "Test"
@@ -485,7 +505,7 @@ async def test_sending_mqtt_commands(hass, mqtt_mock, setup_tasmota):
     # Close the cover and verify MQTT message is sent
     await call_service(hass, "cover.test_cover_1", "close_cover")
     mqtt_mock.async_publish.assert_called_once_with(
-        "tasmota_49A3BC/cmnd/ShutterClose1", "", 0, False
+        "tasmota_49A3BC/cmnd/ShutterClose1", "", 0, False, message_expiry_interval=None
     )
     mqtt_mock.async_publish.reset_mock()
 
@@ -496,49 +516,65 @@ async def test_sending_mqtt_commands(hass, mqtt_mock, setup_tasmota):
     # Open the cover and verify MQTT message is sent
     await call_service(hass, "cover.test_cover_1", "open_cover")
     mqtt_mock.async_publish.assert_called_once_with(
-        "tasmota_49A3BC/cmnd/ShutterOpen1", "", 0, False
+        "tasmota_49A3BC/cmnd/ShutterOpen1", "", 0, False, message_expiry_interval=None
     )
     mqtt_mock.async_publish.reset_mock()
 
     # Stop the cover and verify MQTT message is sent
     await call_service(hass, "cover.test_cover_1", "stop_cover")
     mqtt_mock.async_publish.assert_called_once_with(
-        "tasmota_49A3BC/cmnd/ShutterStop1", "", 0, False
+        "tasmota_49A3BC/cmnd/ShutterStop1", "", 0, False, message_expiry_interval=None
     )
     mqtt_mock.async_publish.reset_mock()
 
     # Set position and verify MQTT message is sent
     await call_service(hass, "cover.test_cover_1", "set_cover_position", position=0)
     mqtt_mock.async_publish.assert_called_once_with(
-        "tasmota_49A3BC/cmnd/ShutterPosition1", "0", 0, False
+        "tasmota_49A3BC/cmnd/ShutterPosition1",
+        "0",
+        0,
+        False,
+        message_expiry_interval=None,
     )
     mqtt_mock.async_publish.reset_mock()
 
     # Set position and verify MQTT message is sent
     await call_service(hass, "cover.test_cover_1", "set_cover_position", position=99)
     mqtt_mock.async_publish.assert_called_once_with(
-        "tasmota_49A3BC/cmnd/ShutterPosition1", "99", 0, False
+        "tasmota_49A3BC/cmnd/ShutterPosition1",
+        "99",
+        0,
+        False,
+        message_expiry_interval=None,
     )
     mqtt_mock.async_publish.reset_mock()
 
     # Close the cover tilt and verify MQTT message is sent
     await call_service(hass, "cover.test_cover_1", "close_cover_tilt")
     mqtt_mock.async_publish.assert_called_once_with(
-        "tasmota_49A3BC/cmnd/ShutterTilt1", "CLOSE", 0, False
+        "tasmota_49A3BC/cmnd/ShutterTilt1",
+        "CLOSE",
+        0,
+        False,
+        message_expiry_interval=None,
     )
     mqtt_mock.async_publish.reset_mock()
 
     # Open the cover tilt and verify MQTT message is sent
     await call_service(hass, "cover.test_cover_1", "open_cover_tilt")
     mqtt_mock.async_publish.assert_called_once_with(
-        "tasmota_49A3BC/cmnd/ShutterTilt1", "OPEN", 0, False
+        "tasmota_49A3BC/cmnd/ShutterTilt1",
+        "OPEN",
+        0,
+        False,
+        message_expiry_interval=None,
     )
     mqtt_mock.async_publish.reset_mock()
 
     # Stop the cover tilt and verify MQTT message is sent
     await call_service(hass, "cover.test_cover_1", "stop_cover_tilt")
     mqtt_mock.async_publish.assert_called_once_with(
-        "tasmota_49A3BC/cmnd/ShutterStop1", "", 0, False
+        "tasmota_49A3BC/cmnd/ShutterStop1", "", 0, False, message_expiry_interval=None
     )
     mqtt_mock.async_publish.reset_mock()
 
@@ -547,7 +583,11 @@ async def test_sending_mqtt_commands(hass, mqtt_mock, setup_tasmota):
         hass, "cover.test_cover_1", "set_cover_tilt_position", tilt_position=0
     )
     mqtt_mock.async_publish.assert_called_once_with(
-        "tasmota_49A3BC/cmnd/ShutterTilt1", "-90", 0, False
+        "tasmota_49A3BC/cmnd/ShutterTilt1",
+        "-90",
+        0,
+        False,
+        message_expiry_interval=None,
     )
     mqtt_mock.async_publish.reset_mock()
 
@@ -556,12 +596,14 @@ async def test_sending_mqtt_commands(hass, mqtt_mock, setup_tasmota):
         hass, "cover.test_cover_1", "set_cover_tilt_position", tilt_position=100
     )
     mqtt_mock.async_publish.assert_called_once_with(
-        "tasmota_49A3BC/cmnd/ShutterTilt1", "90", 0, False
+        "tasmota_49A3BC/cmnd/ShutterTilt1", "90", 0, False, message_expiry_interval=None
     )
     mqtt_mock.async_publish.reset_mock()
 
 
-async def test_sending_mqtt_commands_inverted(hass, mqtt_mock, setup_tasmota):
+async def test_sending_mqtt_commands_inverted(
+    hass: HomeAssistant, mqtt_mock: MqttMockHAClient, setup_tasmota
+) -> None:
     """Test the sending MQTT commands."""
     config = copy.deepcopy(DEFAULT_CONFIG)
     config["dn"] = "Test"
@@ -588,7 +630,7 @@ async def test_sending_mqtt_commands_inverted(hass, mqtt_mock, setup_tasmota):
     # Close the cover and verify MQTT message is sent
     await call_service(hass, "cover.test_cover_1", "close_cover")
     mqtt_mock.async_publish.assert_called_once_with(
-        "tasmota_49A3BC/cmnd/ShutterClose1", "", 0, False
+        "tasmota_49A3BC/cmnd/ShutterClose1", "", 0, False, message_expiry_interval=None
     )
     mqtt_mock.async_publish.reset_mock()
 
@@ -599,35 +641,46 @@ async def test_sending_mqtt_commands_inverted(hass, mqtt_mock, setup_tasmota):
     # Open the cover and verify MQTT message is sent
     await call_service(hass, "cover.test_cover_1", "open_cover")
     mqtt_mock.async_publish.assert_called_once_with(
-        "tasmota_49A3BC/cmnd/ShutterOpen1", "", 0, False
+        "tasmota_49A3BC/cmnd/ShutterOpen1", "", 0, False, message_expiry_interval=None
     )
     mqtt_mock.async_publish.reset_mock()
 
     # Stop the cover and verify MQTT message is sent
     await call_service(hass, "cover.test_cover_1", "stop_cover")
     mqtt_mock.async_publish.assert_called_once_with(
-        "tasmota_49A3BC/cmnd/ShutterStop1", "", 0, False
+        "tasmota_49A3BC/cmnd/ShutterStop1", "", 0, False, message_expiry_interval=None
     )
     mqtt_mock.async_publish.reset_mock()
 
     # Set position and verify MQTT message is sent
     await call_service(hass, "cover.test_cover_1", "set_cover_position", position=0)
     mqtt_mock.async_publish.assert_called_once_with(
-        "tasmota_49A3BC/cmnd/ShutterPosition1", "100", 0, False
+        "tasmota_49A3BC/cmnd/ShutterPosition1",
+        "100",
+        0,
+        False,
+        message_expiry_interval=None,
     )
     mqtt_mock.async_publish.reset_mock()
 
     # Set position and verify MQTT message is sent
     await call_service(hass, "cover.test_cover_1", "set_cover_position", position=99)
     mqtt_mock.async_publish.assert_called_once_with(
-        "tasmota_49A3BC/cmnd/ShutterPosition1", "1", 0, False
+        "tasmota_49A3BC/cmnd/ShutterPosition1",
+        "1",
+        0,
+        False,
+        message_expiry_interval=None,
     )
     mqtt_mock.async_publish.reset_mock()
 
 
 async def test_availability_when_connection_lost(
-    hass, mqtt_client_mock, mqtt_mock, setup_tasmota
-):
+    hass: HomeAssistant,
+    mqtt_client_mock: MqttMockPahoClient,
+    mqtt_mock: MqttMockHAClient,
+    setup_tasmota,
+) -> None:
     """Test availability after MQTT disconnection."""
     config = copy.deepcopy(DEFAULT_CONFIG)
     config["dn"] = "Test"
@@ -639,35 +692,76 @@ async def test_availability_when_connection_lost(
         mqtt_mock,
         Platform.COVER,
         config,
-        entity_id="test_cover_1",
+        object_id="test_cover_1",
     )
 
 
-async def test_availability(hass, mqtt_mock, setup_tasmota):
+async def test_deep_sleep_availability_when_connection_lost(
+    hass: HomeAssistant,
+    mqtt_client_mock: MqttMockPahoClient,
+    mqtt_mock: MqttMockHAClient,
+    setup_tasmota,
+) -> None:
+    """Test availability after MQTT disconnection."""
+    config = copy.deepcopy(DEFAULT_CONFIG)
+    config["dn"] = "Test"
+    config["rl"][0] = 3
+    config["rl"][1] = 3
+    await help_test_deep_sleep_availability_when_connection_lost(
+        hass,
+        mqtt_client_mock,
+        mqtt_mock,
+        Platform.COVER,
+        config,
+        object_id="test_cover_1",
+    )
+
+
+async def test_availability(
+    hass: HomeAssistant, mqtt_mock: MqttMockHAClient, setup_tasmota
+) -> None:
     """Test availability."""
     config = copy.deepcopy(DEFAULT_CONFIG)
     config["dn"] = "Test"
     config["rl"][0] = 3
     config["rl"][1] = 3
     await help_test_availability(
-        hass, mqtt_mock, Platform.COVER, config, entity_id="test_cover_1"
+        hass, mqtt_mock, Platform.COVER, config, object_id="test_cover_1"
     )
 
 
-async def test_availability_discovery_update(hass, mqtt_mock, setup_tasmota):
+async def test_deep_sleep_availability(
+    hass: HomeAssistant, mqtt_mock: MqttMockHAClient, setup_tasmota
+) -> None:
+    """Test availability."""
+    config = copy.deepcopy(DEFAULT_CONFIG)
+    config["dn"] = "Test"
+    config["rl"][0] = 3
+    config["rl"][1] = 3
+    await help_test_deep_sleep_availability(
+        hass, mqtt_mock, Platform.COVER, config, object_id="test_cover_1"
+    )
+
+
+async def test_availability_discovery_update(
+    hass: HomeAssistant, mqtt_mock: MqttMockHAClient, setup_tasmota
+) -> None:
     """Test availability discovery update."""
     config = copy.deepcopy(DEFAULT_CONFIG)
     config["dn"] = "Test"
     config["rl"][0] = 3
     config["rl"][1] = 3
     await help_test_availability_discovery_update(
-        hass, mqtt_mock, Platform.COVER, config, entity_id="test_cover_1"
+        hass, mqtt_mock, Platform.COVER, config, object_id="test_cover_1"
     )
 
 
 async def test_availability_poll_state(
-    hass, mqtt_client_mock, mqtt_mock, setup_tasmota
-):
+    hass: HomeAssistant,
+    mqtt_client_mock: MqttMockPahoClient,
+    mqtt_mock: MqttMockHAClient,
+    setup_tasmota,
+) -> None:
     """Test polling after MQTT connection (re)established."""
     config = copy.deepcopy(DEFAULT_CONFIG)
     config["rl"][0] = 3
@@ -678,7 +772,12 @@ async def test_availability_poll_state(
     )
 
 
-async def test_discovery_removal_cover(hass, mqtt_mock, caplog, setup_tasmota):
+async def test_discovery_removal_cover(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    caplog: pytest.LogCaptureFixture,
+    setup_tasmota,
+) -> None:
     """Test removal of discovered cover."""
     config1 = copy.deepcopy(DEFAULT_CONFIG)
     config1["dn"] = "Test"
@@ -696,12 +795,17 @@ async def test_discovery_removal_cover(hass, mqtt_mock, caplog, setup_tasmota):
         Platform.COVER,
         config1,
         config2,
-        entity_id="test_cover_1",
+        object_id="test_cover_1",
         name="Test cover 1",
     )
 
 
-async def test_discovery_update_unchanged_cover(hass, mqtt_mock, caplog, setup_tasmota):
+async def test_discovery_update_unchanged_cover(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    caplog: pytest.LogCaptureFixture,
+    setup_tasmota,
+) -> None:
     """Test update of discovered cover."""
     config = copy.deepcopy(DEFAULT_CONFIG)
     config["dn"] = "Test"
@@ -717,12 +821,14 @@ async def test_discovery_update_unchanged_cover(hass, mqtt_mock, caplog, setup_t
             Platform.COVER,
             config,
             discovery_update,
-            entity_id="test_cover_1",
+            object_id="test_cover_1",
             name="Test cover 1",
         )
 
 
-async def test_discovery_device_remove(hass, mqtt_mock, setup_tasmota):
+async def test_discovery_device_remove(
+    hass: HomeAssistant, mqtt_mock: MqttMockHAClient, setup_tasmota
+) -> None:
     """Test device registry remove."""
     config = copy.deepcopy(DEFAULT_CONFIG)
     config["dn"] = "Test"
@@ -734,7 +840,9 @@ async def test_discovery_device_remove(hass, mqtt_mock, setup_tasmota):
     )
 
 
-async def test_entity_id_update_subscriptions(hass, mqtt_mock, setup_tasmota):
+async def test_entity_id_update_subscriptions(
+    hass: HomeAssistant, mqtt_mock: MqttMockHAClient, setup_tasmota
+) -> None:
     """Test MQTT subscriptions are managed when entity_id is updated."""
     config = copy.deepcopy(DEFAULT_CONFIG)
     config["dn"] = "Test"
@@ -747,16 +855,18 @@ async def test_entity_id_update_subscriptions(hass, mqtt_mock, setup_tasmota):
         get_topic_tele_will(config),
     ]
     await help_test_entity_id_update_subscriptions(
-        hass, mqtt_mock, Platform.COVER, config, topics, entity_id="test_cover_1"
+        hass, mqtt_mock, Platform.COVER, config, topics, object_id="test_cover_1"
     )
 
 
-async def test_entity_id_update_discovery_update(hass, mqtt_mock, setup_tasmota):
+async def test_entity_id_update_discovery_update(
+    hass: HomeAssistant, mqtt_mock: MqttMockHAClient, setup_tasmota
+) -> None:
     """Test MQTT discovery update when entity_id is updated."""
     config = copy.deepcopy(DEFAULT_CONFIG)
     config["dn"] = "Test"
     config["rl"][0] = 3
     config["rl"][1] = 3
     await help_test_entity_id_update_discovery_update(
-        hass, mqtt_mock, Platform.COVER, config, entity_id="test_cover_1"
+        hass, mqtt_mock, Platform.COVER, config, object_id="test_cover_1"
     )

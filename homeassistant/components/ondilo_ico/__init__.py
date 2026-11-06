@@ -1,43 +1,52 @@
 """The Ondilo ICO integration."""
 
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.components.application_credentials import (
+    ClientCredential,
+    async_import_client_credential,
+)
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers import config_entry_oauth2_flow
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.config_entry_oauth2_flow import (
+    async_get_config_entry_implementation,
+)
+from homeassistant.helpers.typing import ConfigType
 
-from . import api, config_flow
-from .const import DOMAIN
-from .oauth_impl import OndiloOauth2Implementation
+from .api import OndiloClient
+from .const import DOMAIN, OAUTH2_CLIENT_ID, OAUTH2_CLIENT_SECRET
+from .coordinator import OndiloIcoConfigEntry, OndiloIcoPoolsCoordinator
 
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 PLATFORMS = [Platform.SENSOR]
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Set up Ondilo ICO from a config entry."""
-
-    config_flow.OAuth2FlowHandler.async_register_implementation(
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Set up the Ondilo ICO integration."""
+    # Import the default client credential.
+    await async_import_client_credential(
         hass,
-        OndiloOauth2Implementation(hass),
+        DOMAIN,
+        ClientCredential(OAUTH2_CLIENT_ID, OAUTH2_CLIENT_SECRET, name="Ondilo ICO"),
     )
-
-    implementation = (
-        await config_entry_oauth2_flow.async_get_config_entry_implementation(
-            hass, entry
-        )
-    )
-
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = api.OndiloClient(hass, entry, implementation)
-
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     return True
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Unload a config entry."""
-    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-    if unload_ok:
-        hass.data[DOMAIN].pop(entry.entry_id)
+async def async_setup_entry(hass: HomeAssistant, entry: OndiloIcoConfigEntry) -> None:
+    """Set up Ondilo ICO from a config entry."""
+    implementation = await async_get_config_entry_implementation(hass, entry)
 
-    return unload_ok
+    coordinator = OndiloIcoPoolsCoordinator(
+        hass, entry, OndiloClient(hass, entry, implementation)
+    )
+
+    await coordinator.async_config_entry_first_refresh()
+
+    entry.runtime_data = coordinator
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: OndiloIcoConfigEntry) -> None:
+    """Unload a config entry."""
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)

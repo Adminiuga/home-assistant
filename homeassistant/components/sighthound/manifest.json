@@ -1,9 +1,12 @@
 {
   "domain": "sighthound",
   "name": "Sighthound",
-  "documentation": "https://www.home-assistant.io/integrations/sighthound",
-  "requirements": ["pillow==9.3.0", "simplehound==0.3"],
+  "categories": ["ai_voice.image_recognition"],
   "codeowners": ["@robmarkcole"],
+  "connectivity": ["cloud"],
+  "documentation": "https://www.home-assistant.io/integrations/sighthound",
   "iot_class": "cloud_polling",
-  "loggers": ["simplehound"]
+  "loggers": ["simplehound"],
+  "quality_scale": "legacy",
+  "requirements": ["Pillow==13.0.0", "simplehound==0.3"]
 }

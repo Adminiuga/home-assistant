@@ -1,127 +1,67 @@
 """Sensor for checking the status of London Underground tube lines."""
-from __future__ import annotations
 
-from datetime import timedelta
 import logging
+from typing import Any, override
 
-import async_timeout
-from london_tube_status import TubeData
-import voluptuous as vol
-
-from homeassistant.components.sensor import PLATFORM_SCHEMA, SensorEntity
+from homeassistant.components.sensor import SensorEntity
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import PlatformNotReady
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
-import homeassistant.helpers.config_validation as cv
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
-from homeassistant.helpers.update_coordinator import (
-    CoordinatorEntity,
-    DataUpdateCoordinator,
-)
+from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
+
+from .const import CONF_LINE, DOMAIN
+from .coordinator import LondonTubeCoordinator, LondonUndergroundConfigEntry
 
 _LOGGER = logging.getLogger(__name__)
 
-DOMAIN = "london_underground"
 
-CONF_LINE = "line"
-
-ICON = "mdi:subway"
-
-SCAN_INTERVAL = timedelta(seconds=30)
-
-TUBE_LINES = [
-    "Bakerloo",
-    "Central",
-    "Circle",
-    "District",
-    "DLR",
-    "Elizabeth line",
-    "Hammersmith & City",
-    "Jubilee",
-    "London Overground",
-    "Metropolitan",
-    "Northern",
-    "Piccadilly",
-    "Victoria",
-    "Waterloo & City",
-]
-
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
-    {vol.Required(CONF_LINE): vol.All(cv.ensure_list, [vol.In(list(TUBE_LINES))])}
-)
-
-
-async def async_setup_platform(
+async def async_setup_entry(
     hass: HomeAssistant,
-    config: ConfigType,
-    async_add_entities: AddEntitiesCallback,
-    discovery_info: DiscoveryInfoType | None = None,
+    entry: LondonUndergroundConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    """Set up the Tube sensor."""
+    """Set up the London Underground sensor from config entry."""
 
-    session = async_get_clientsession(hass)
-
-    data = TubeData(session)
-    coordinator = LondonTubeCoordinator(hass, data)
-
-    await coordinator.async_refresh()
-
-    if not coordinator.last_update_success:
-        raise PlatformNotReady
-
-    sensors = []
-    for line in config[CONF_LINE]:
-        sensors.append(LondonTubeSensor(coordinator, line))
-
-    async_add_entities(sensors)
-
-
-class LondonTubeCoordinator(DataUpdateCoordinator):
-    """London Underground sensor coordinator."""
-
-    def __init__(self, hass, data):
-        """Initialize coordinator."""
-        super().__init__(
-            hass,
-            _LOGGER,
-            name=DOMAIN,
-            update_interval=SCAN_INTERVAL,
-        )
-        self._data = data
-
-    async def _async_update_data(self):
-        async with async_timeout.timeout(10):
-            await self._data.update()
-            return self._data.data
+    async_add_entities(
+        LondonTubeSensor(entry.runtime_data, line) for line in entry.options[CONF_LINE]
+    )
 
 
 class LondonTubeSensor(CoordinatorEntity[LondonTubeCoordinator], SensorEntity):
     """Sensor that reads the status of a line from Tube Data."""
 
     _attr_attribution = "Powered by TfL Open Data"
+    _attr_icon = "mdi:subway"
+    _attr_has_entity_name = True  # Use modern entity naming
 
-    def __init__(self, coordinator, name):
+    def __init__(self, coordinator: LondonTubeCoordinator, name: str) -> None:
         """Initialize the London Underground sensor."""
         super().__init__(coordinator)
         self._name = name
+        # Add unique_id for proper entity registry
+        self._attr_unique_id = f"tube_{name.lower().replace(' ', '_')}"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, DOMAIN)},
+            name="London Underground",
+            manufacturer="Transport for London",
+            model="Tube Status",
+            entry_type=DeviceEntryType.SERVICE,
+        )
 
     @property
-    def name(self):
+    @override
+    def name(self) -> str:
         """Return the name of the sensor."""
         return self._name
 
     @property
-    def native_value(self):
+    @override
+    def native_value(self) -> str:
         """Return the state of the sensor."""
         return self.coordinator.data[self.name]["State"]
 
     @property
-    def icon(self):
-        """Icon to use in the frontend, if any."""
-        return ICON
-
-    @property
-    def extra_state_attributes(self):
+    @override
+    def extra_state_attributes(self) -> dict[str, Any]:
         """Return other details about the sensor state."""
         return {"Description": self.coordinator.data[self.name]["Description"]}

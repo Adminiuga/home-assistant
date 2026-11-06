@@ -1,0 +1,417 @@
+"""AI tasks to be handled by agents."""
+
+from dataclasses import dataclass
+from datetime import timedelta
+import io
+import mimetypes
+from pathlib import Path
+import tempfile
+from typing import TYPE_CHECKING, Any, override
+
+import probatio
+
+from homeassistant.components import conversation, media_source
+from homeassistant.components.http.auth import async_sign_path
+from homeassistant.core import Context, HomeAssistant, ServiceResponse, callback
+from homeassistant.exceptions import ServiceValidationError
+from homeassistant.helpers import llm
+from homeassistant.helpers.chat_session import ChatSession, async_get_chat_session
+from homeassistant.util import RE_SANITIZE_FILENAME, dt as dt_util, slugify
+from homeassistant.util.json import JsonValueType
+
+from .const import (
+    DATA_COMPONENT,
+    DATA_MEDIA_SOURCE,
+    DATA_PREFERENCES,
+    DOMAIN,
+    IMAGE_DIR,
+    IMAGE_EXPIRY_TIME,
+    AITaskEntityFeature,
+)
+from .evaluation import (
+    QUESTIONS_SCHEMA,
+    EvaluationQuestion,
+    EvaluationTask,
+    EvaluationTaskResult,
+)
+from .permissions import async_check_permissions
+
+if TYPE_CHECKING:
+    from .entity import AITaskEntity
+
+_FEATURE_NOT_SUPPORTED_TRANSLATION_KEYS = {
+    AITaskEntityFeature.GENERATE_DATA: "generate_data_not_supported",
+    AITaskEntityFeature.GENERATE_IMAGE: "generate_image_not_supported",
+    AITaskEntityFeature.EVALUATE: "evaluate_not_supported",
+}
+
+
+def _save_media_image(image_data: media_source.MediaImage) -> Path:
+    """Save media image to temp file."""
+    with tempfile.NamedTemporaryFile(
+        mode="wb",
+        suffix=mimetypes.guess_extension(image_data.mime_type, False),
+        delete=False,
+    ) as temp_file:
+        temp_file.write(image_data.content)
+        return Path(temp_file.name)
+
+
+async def _resolve_attachments(
+    hass: HomeAssistant,
+    session: ChatSession,
+    attachments: list[dict] | None = None,
+) -> list[conversation.Attachment]:
+    """Resolve attachments for a task."""
+    resolved_attachments: list[conversation.Attachment] = []
+    created_files: list[Path] = []
+
+    def cleanup_files() -> None:
+        """Cleanup temporary files."""
+        for file in created_files:
+            file.unlink(missing_ok=True)
+
+    @callback
+    def cleanup_files_callback() -> None:
+        """Cleanup temporary files."""
+        if created_files:
+            hass.async_add_executor_job(cleanup_files)
+
+    session.async_on_cleanup(cleanup_files_callback)
+
+    for attachment in attachments or []:
+        media_content_id = attachment["media_content_id"]
+
+        if image_data := await media_source.async_get_media_image(
+            hass, media_content_id
+        ):
+            temp_filename = await hass.async_add_executor_job(
+                _save_media_image, image_data
+            )
+            created_files.append(temp_filename)
+
+            resolved_attachments.append(
+                conversation.Attachment(
+                    media_content_id=media_content_id,
+                    mime_type=image_data.mime_type,
+                    path=temp_filename,
+                )
+            )
+            continue
+
+        media = await media_source.async_resolve_media(hass, media_content_id, None)
+        if media.path is None:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="local_attachments_only",
+            )
+        resolved_attachments.append(
+            conversation.Attachment(
+                media_content_id=media_content_id,
+                mime_type=attachment.get("media_content_type") or media.mime_type,
+                path=media.path,
+            )
+        )
+
+    return resolved_attachments
+
+
+@callback
+def _async_get_entity(
+    hass: HomeAssistant,
+    entity_id: str | None,
+    preferred_entity_id: str | None,
+    feature: AITaskEntityFeature,
+    attachments: list[dict] | None,
+) -> AITaskEntity:
+    """Return the AI Task entity for a task and validate it supports it."""
+    if entity_id is None:
+        entity_id = preferred_entity_id
+
+    if entity_id is None:
+        raise ServiceValidationError(
+            translation_domain=DOMAIN,
+            translation_key="no_entity",
+        )
+
+    entity = hass.data[DATA_COMPONENT].get_entity(entity_id)
+    if entity is None:
+        raise ServiceValidationError(
+            translation_domain=DOMAIN,
+            translation_key="entity_not_found",
+            translation_placeholders={"entity_id": entity_id},
+        )
+
+    if feature not in entity.supported_features:
+        raise ServiceValidationError(
+            translation_domain=DOMAIN,
+            translation_key=_FEATURE_NOT_SUPPORTED_TRANSLATION_KEYS[feature],
+            translation_placeholders={"entity_id": entity_id},
+        )
+
+    if (
+        attachments
+        and AITaskEntityFeature.SUPPORT_ATTACHMENTS not in entity.supported_features
+    ):
+        raise ServiceValidationError(
+            translation_domain=DOMAIN,
+            translation_key="attachments_not_supported",
+            translation_placeholders={"entity_id": entity_id},
+        )
+
+    return entity
+
+
+async def async_generate_data(
+    hass: HomeAssistant,
+    *,
+    task_name: str,
+    entity_id: str | None = None,
+    instructions: str,
+    structure: probatio.Schema | None = None,
+    attachments: list[dict] | None = None,
+    llm_api: llm.API | None = None,
+    context: Context | None = None,
+) -> GenDataTaskResult:
+    """Run a data generation task in the AI Task integration."""
+    await async_check_permissions(hass, entity_id, attachments, context)
+
+    entity = _async_get_entity(
+        hass,
+        entity_id,
+        hass.data[DATA_PREFERENCES].gen_data_entity_id,
+        AITaskEntityFeature.GENERATE_DATA,
+        attachments,
+    )
+
+    with async_get_chat_session(hass, context=context) as session:
+        resolved_attachments = await _resolve_attachments(hass, session, attachments)
+
+        return await entity.internal_async_generate_data(
+            session,
+            GenDataTask(
+                name=task_name,
+                instructions=instructions,
+                structure=structure,
+                attachments=resolved_attachments or None,
+                llm_api=llm_api,
+            ),
+            context,
+        )
+
+
+async def async_generate_image(
+    hass: HomeAssistant,
+    *,
+    task_name: str,
+    entity_id: str | None = None,
+    instructions: str,
+    attachments: list[dict] | None = None,
+    context: Context | None = None,
+) -> ServiceResponse:
+    """Run an image generation task in the AI Task integration."""
+    await async_check_permissions(hass, entity_id, attachments, context)
+
+    entity = _async_get_entity(
+        hass,
+        entity_id,
+        hass.data[DATA_PREFERENCES].gen_image_entity_id,
+        AITaskEntityFeature.GENERATE_IMAGE,
+        attachments,
+    )
+
+    with async_get_chat_session(hass, context=context) as session:
+        resolved_attachments = await _resolve_attachments(hass, session, attachments)
+
+        task_result = await entity.internal_async_generate_image(
+            session,
+            GenImageTask(
+                name=task_name,
+                instructions=instructions,
+                attachments=resolved_attachments or None,
+            ),
+            context,
+        )
+
+    service_result = task_result.as_dict()
+    image_data = service_result.pop("image_data")
+    if service_result.get("revised_prompt") is None:
+        service_result["revised_prompt"] = instructions
+
+    source = hass.data[DATA_MEDIA_SOURCE]
+
+    current_time = dt_util.now()
+    ext = mimetypes.guess_extension(task_result.mime_type, False) or ".png"
+    sanitized_task_name = RE_SANITIZE_FILENAME.sub("", slugify(task_name))
+
+    image_file = ImageData(
+        filename=f"{current_time.strftime('%Y-%m-%d_%H%M%S')}_{sanitized_task_name}{ext}",
+        file=io.BytesIO(image_data),
+        content_type=task_result.mime_type,
+    )
+
+    target_folder = media_source.MediaSourceItem.from_uri(
+        hass, f"media-source://{DOMAIN}/{IMAGE_DIR}", None
+    )
+
+    service_result["media_source_id"] = await source.async_upload_media(
+        target_folder, image_file
+    )
+
+    item = media_source.MediaSourceItem.from_uri(
+        hass, service_result["media_source_id"], None
+    )
+    service_result["url"] = async_sign_path(
+        hass,
+        (await source.async_resolve_media(item)).url,
+        timedelta(seconds=IMAGE_EXPIRY_TIME),
+    )
+
+    return service_result
+
+
+@dataclass(slots=True)
+class GenDataTask:
+    """Gen data task to be processed."""
+
+    name: str
+    """Name of the task."""
+
+    instructions: str
+    """Instructions on what needs to be done."""
+
+    structure: probatio.Schema | None = None
+    """Optional structure for the data to be generated."""
+
+    attachments: list[conversation.Attachment] | None = None
+    """List of attachments to go along the instructions."""
+
+    llm_api: llm.API | None = None
+    """API to provide to the LLM."""
+
+    @override
+    def __str__(self) -> str:
+        """Return task as a string."""
+        return f"<GenDataTask {self.name}: {id(self)}>"
+
+
+@dataclass(slots=True)
+class GenDataTaskResult:
+    """Result of gen data task."""
+
+    conversation_id: str
+    """Unique identifier for the conversation."""
+
+    data: Any
+    """Data generated by the task."""
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return result as a dict."""
+        return {
+            "conversation_id": self.conversation_id,
+            "data": self.data,
+        }
+
+
+@dataclass(slots=True)
+class GenImageTask:
+    """Gen image task to be processed."""
+
+    name: str
+    """Name of the task."""
+
+    instructions: str
+    """Instructions on what needs to be done."""
+
+    attachments: list[conversation.Attachment] | None = None
+    """List of attachments to go along the instructions."""
+
+    @override
+    def __str__(self) -> str:
+        """Return task as a string."""
+        return f"<GenImageTask {self.name}: {id(self)}>"
+
+
+@dataclass(slots=True)
+class GenImageTaskResult:
+    """Result of gen image task."""
+
+    image_data: bytes
+    """Raw image data generated by the model."""
+
+    conversation_id: str
+    """Unique identifier for the conversation."""
+
+    mime_type: str
+    """MIME type of the generated image."""
+
+    width: int | None = None
+    """Width of the generated image, if available."""
+
+    height: int | None = None
+    """Height of the generated image, if available."""
+
+    model: str | None = None
+    """Model used to generate the image, if available."""
+
+    revised_prompt: str | None = None
+    """Revised prompt used to generate the image, if applicable."""
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return result as a dict."""
+        return {
+            "image_data": self.image_data,
+            "conversation_id": self.conversation_id,
+            "mime_type": self.mime_type,
+            "width": self.width,
+            "height": self.height,
+            "model": self.model,
+            "revised_prompt": self.revised_prompt,
+        }
+
+
+@dataclass(slots=True)
+class ImageData:
+    """Implementation of media_source.local_source.UploadedFile protocol."""
+
+    filename: str
+    file: io.IOBase
+    content_type: str
+
+
+async def async_evaluate(
+    hass: HomeAssistant,
+    *,
+    task_name: str,
+    questions: dict[str, EvaluationQuestion],
+    state: JsonValueType = None,
+    entity_id: str | None = None,
+    attachments: list[dict] | None = None,
+    context: Context | None = None,
+) -> EvaluationTaskResult:
+    """Evaluate questions using the selected AI task entity."""
+    await async_check_permissions(hass, entity_id, attachments, context)
+    questions = QUESTIONS_SCHEMA(questions)
+    if state is None and not attachments:
+        raise ServiceValidationError(
+            translation_domain=DOMAIN,
+            translation_key="evaluate_missing_input",
+        )
+    entity = _async_get_entity(
+        hass,
+        entity_id,
+        hass.data[DATA_PREFERENCES].evaluate_entity_id,
+        AITaskEntityFeature.EVALUATE,
+        attachments,
+    )
+    with async_get_chat_session(hass, context=context) as session:
+        resolved_attachments = await _resolve_attachments(hass, session, attachments)
+        return await entity.internal_async_evaluate(
+            EvaluationTask(
+                name=task_name,
+                questions=questions,
+                state=state,
+                attachments=resolved_attachments or None,
+            ),
+            context,
+        )

@@ -1,5 +1,4 @@
 """Utilities to help with aiohttp."""
-from __future__ import annotations
 
 from http import HTTPStatus
 import io
@@ -10,7 +9,7 @@ from aiohttp import payload, web
 from aiohttp.typedefs import JSONDecoder
 from multidict import CIMultiDict, MultiDict
 
-from homeassistant.helpers.json import json_loads
+from .json import json_loads
 
 
 class MockStreamReader:
@@ -27,10 +26,37 @@ class MockStreamReader:
         return self._content.read(byte_count)
 
 
+class MockStreamReaderChunked(MockStreamReader):
+    """Mock a stream reader with simulated chunked data."""
+
+    async def readchunk(self) -> tuple[bytes, bool]:
+        """Read bytes."""
+        return (self._content.read(), False)
+
+
+class MockPayloadWriter:
+    """Small mock to imitate payload writer."""
+
+    def enable_chunking(self) -> None:
+        """Enable chunking."""
+
+    def send_headers(self, *args: Any, **kwargs: Any) -> None:
+        """Write headers."""
+
+    async def write_headers(self, *args: Any, **kwargs: Any) -> None:
+        """Write headers."""
+
+    async def write(self, *args: Any, **kwargs: Any) -> None:
+        """Write payload."""
+
+
+_MOCK_PAYLOAD_WRITER = MockPayloadWriter()
+
+
 class MockRequest:
     """Mock an aiohttp request."""
 
-    mock_source: str | None = None
+    mock_source: str
 
     def __init__(
         self,
@@ -41,6 +67,7 @@ class MockRequest:
         headers: dict[str, str] | None = None,
         query_string: str | None = None,
         url: str = "",
+        remote: str | None = None,
     ) -> None:
         """Initialize a request."""
         self.method = method
@@ -48,8 +75,15 @@ class MockRequest:
         self.status = status
         self.headers: CIMultiDict[str] = CIMultiDict(headers or {})
         self.query_string = query_string or ""
+        self.keep_alive = False
+        self.version = (1, 1)
         self._content = content
         self.mock_source = mock_source
+        self._payload_writer = _MOCK_PAYLOAD_WRITER
+        self.remote = remote
+
+    async def _prepare_hook(self, response: Any) -> None:
+        """Prepare hook."""
 
     @property
     def query(self) -> MultiDict[str]:
@@ -65,6 +99,11 @@ class MockRequest:
     def content(self) -> MockStreamReader:
         """Return the body as text."""
         return MockStreamReader(self._content)
+
+    @property
+    def body_exists(self) -> bool:
+        """Return True if request has HTTP BODY, False otherwise."""
+        return bool(self._text)
 
     async def json(self, loads: JSONDecoder = json_loads) -> Any:
         """Return the body as JSON."""
@@ -84,12 +123,11 @@ def serialize_response(response: web.Response) -> dict[str, Any]:
     if (body := response.body) is None:
         body_decoded = None
     elif isinstance(body, payload.StringPayload):
-        # pylint: disable=protected-access
-        body_decoded = body._value.decode(body.encoding)
+        body_decoded = body._value.decode(body.encoding or "utf-8")  # noqa: SLF001
     elif isinstance(body, bytes):
         body_decoded = body.decode(response.charset or "utf-8")
     else:
-        raise ValueError("Unknown payload encoding")
+        raise TypeError("Unknown payload encoding")
 
     return {
         "status": response.status,

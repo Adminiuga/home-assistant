@@ -1,9 +1,12 @@
 {
   "domain": "laundrify",
   "name": "laundrify",
-  "config_flow": true,
-  "documentation": "https://www.home-assistant.io/integrations/laundrify",
-  "requirements": ["laundrify_aio==1.1.2"],
+  "categories": ["appliances_cleaning.laundry"],
   "codeowners": ["@xLarry"],
-  "iot_class": "cloud_polling"
+  "config_flow": true,
+  "connectivity": ["cloud"],
+  "documentation": "https://www.home-assistant.io/integrations/laundrify",
+  "integration_type": "hub",
+  "iot_class": "cloud_polling",
+  "requirements": ["laundrify-aio==1.2.2"]
 }

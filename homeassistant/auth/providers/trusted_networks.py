@@ -3,7 +3,6 @@
 It shows list of users if access from trusted network.
 Abort login flow if not access from trusted network.
 """
-from __future__ import annotations
 
 from collections.abc import Mapping
 from ipaddress import (
@@ -14,21 +13,27 @@ from ipaddress import (
     ip_address,
     ip_network,
 )
-from typing import Any, Union, cast
+from typing import Any, cast, override
 
-import voluptuous as vol
+import probatio
 
 from homeassistant.core import callback
-from homeassistant.data_entry_flow import FlowResult
 from homeassistant.exceptions import HomeAssistantError
-import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.network import is_cloud_connection
 
-from . import AUTH_PROVIDER_SCHEMA, AUTH_PROVIDERS, AuthProvider, LoginFlow
 from .. import InvalidAuthError
-from ..models import Credentials, RefreshToken, UserMeta
+from ..models import (
+    AuthFlowContext,
+    AuthFlowResult,
+    Credentials,
+    RefreshToken,
+    UserMeta,
+)
+from . import AUTH_PROVIDER_SCHEMA, AUTH_PROVIDERS, AuthProvider, LoginFlow
 
-IPAddress = Union[IPv4Address, IPv6Address]
-IPNetwork = Union[IPv4Network, IPv6Network]
+type IPAddress = IPv4Address | IPv6Address
+type IPNetwork = IPv4Network | IPv6Network
 
 CONF_TRUSTED_NETWORKS = "trusted_networks"
 CONF_TRUSTED_USERS = "trusted_users"
@@ -37,24 +42,26 @@ CONF_ALLOW_BYPASS_LOGIN = "allow_bypass_login"
 
 CONFIG_SCHEMA = AUTH_PROVIDER_SCHEMA.extend(
     {
-        vol.Required(CONF_TRUSTED_NETWORKS): vol.All(cv.ensure_list, [ip_network]),
-        vol.Optional(CONF_TRUSTED_USERS, default={}): vol.Schema(
+        probatio.Required(CONF_TRUSTED_NETWORKS): probatio.All(
+            probatio.EnsureList(), [ip_network]
+        ),
+        probatio.Optional(CONF_TRUSTED_USERS, default={}): probatio.Schema(
             # we only validate the format of user_id or group_id
             {
-                ip_network: vol.All(
-                    cv.ensure_list,
+                ip_network: probatio.All(
+                    probatio.EnsureList(),
                     [
-                        vol.Or(
+                        probatio.Or(
                             cv.uuid4_hex,
-                            vol.Schema({vol.Required(CONF_GROUP): cv.uuid4_hex}),
+                            probatio.Schema({probatio.Required(CONF_GROUP): str}),
                         )
                     ],
                 )
             }
         ),
-        vol.Optional(CONF_ALLOW_BYPASS_LOGIN, default=False): cv.boolean,
+        probatio.Optional(CONF_ALLOW_BYPASS_LOGIN, default=False): cv.boolean,
     },
-    extra=vol.PREVENT_EXTRA,
+    extra=probatio.PREVENT_EXTRA,
 )
 
 
@@ -92,12 +99,10 @@ class TrustedNetworksAuthProvider(AuthProvider):
             for trusted_proxy in self.hass.http.trusted_proxies
         ]
 
-    @property
-    def support_mfa(self) -> bool:
-        """Trusted Networks auth provider does not support MFA."""
-        return False
-
-    async def async_login_flow(self, context: dict[str, Any] | None) -> LoginFlow:
+    @override
+    async def async_login_flow(
+        self, context: AuthFlowContext | None
+    ) -> TrustedNetworksLoginFlow:
         """Return a flow to login."""
         assert context is not None
         ip_addr = cast(IPAddress, context.get("ip_address"))
@@ -137,6 +142,7 @@ class TrustedNetworksAuthProvider(AuthProvider):
             self.config[CONF_ALLOW_BYPASS_LOGIN],
         )
 
+    @override
     async def async_get_or_create_credentials(
         self, flow_result: Mapping[str, str]
     ) -> Credentials:
@@ -165,6 +171,7 @@ class TrustedNetworksAuthProvider(AuthProvider):
         # We only allow login as exist user
         raise InvalidUserError
 
+    @override
     async def async_user_meta_for_credentials(
         self, credentials: Credentials
     ) -> UserMeta:
@@ -192,13 +199,23 @@ class TrustedNetworksAuthProvider(AuthProvider):
         if any(ip_addr in trusted_proxy for trusted_proxy in self.trusted_proxies):
             raise InvalidAuthError("Can't allow access from a proxy server")
 
-        if "cloud" in self.hass.config.components:
-            from hass_nabucasa import remote  # pylint: disable=import-outside-toplevel
-
-            if remote.is_cloud_request.get():
-                raise InvalidAuthError("Can't allow access from Home Assistant Cloud")
+        if is_cloud_connection(self.hass):
+            raise InvalidAuthError("Can't allow access from Home Assistant Cloud")
 
     @callback
+    @override
+    def async_can_start_login(self, context: AuthFlowContext) -> bool:
+        """Return if the request comes from a trusted network."""
+        if (ip_addr := context.get("ip_address")) is None:
+            return False
+        try:
+            self.async_validate_access(ip_addr)
+        except InvalidAuthError:
+            return False
+        return True
+
+    @callback
+    @override
     def async_validate_refresh_token(
         self, refresh_token: RefreshToken, remote_ip: str | None = None
     ) -> None:
@@ -210,7 +227,7 @@ class TrustedNetworksAuthProvider(AuthProvider):
         self.async_validate_access(ip_address(remote_ip))
 
 
-class TrustedNetworksLoginFlow(LoginFlow):
+class TrustedNetworksLoginFlow(LoginFlow[TrustedNetworksAuthProvider]):
     """Handler for the login flow."""
 
     def __init__(
@@ -226,14 +243,13 @@ class TrustedNetworksLoginFlow(LoginFlow):
         self._ip_address = ip_addr
         self._allow_bypass_login = allow_bypass_login
 
+    @override
     async def async_step_init(
         self, user_input: dict[str, str] | None = None
-    ) -> FlowResult:
+    ) -> AuthFlowResult:
         """Handle the step of the form."""
         try:
-            cast(
-                TrustedNetworksAuthProvider, self._auth_provider
-            ).async_validate_access(self._ip_address)
+            self._auth_provider.async_validate_access(self._ip_address)
 
         except InvalidAuthError:
             return self.async_abort(reason="not_allowed")
@@ -248,7 +264,7 @@ class TrustedNetworksLoginFlow(LoginFlow):
 
         return self.async_show_form(
             step_id="init",
-            data_schema=vol.Schema(
-                {vol.Required("user"): vol.In(self._available_users)}
+            data_schema=probatio.Schema(
+                {probatio.Required("user"): probatio.In(self._available_users)}
             ),
         )

@@ -1,11 +1,12 @@
 {
   "domain": "risco",
   "name": "Risco",
-  "config_flow": true,
-  "documentation": "https://www.home-assistant.io/integrations/risco",
-  "requirements": ["pyrisco==0.5.5"],
+  "categories": ["security_safety.alarm_systems"],
   "codeowners": ["@OnFreund"],
-  "quality_scale": "platinum",
+  "config_flow": true,
+  "connectivity": ["network"],
+  "documentation": "https://www.home-assistant.io/integrations/risco",
   "iot_class": "local_push",
-  "loggers": ["pyrisco"]
+  "loggers": ["pyrisco"],
+  "requirements": ["pyrisco==0.8.1"]
 }

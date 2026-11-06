@@ -1,9 +1,17 @@
 """Test Media Source model methods."""
-from homeassistant.components.media_player import MediaClass, MediaType
+
+import pytest
+
+from homeassistant.components.media_player import (
+    MediaClass,
+    MediaType,
+    SearchMediaQuery,
+)
 from homeassistant.components.media_source import const, models
+from homeassistant.core import HomeAssistant
 
 
-async def test_browse_media_as_dict():
+async def test_browse_media_as_dict() -> None:
     """Test BrowseMediaSource conversion to media player item dict."""
     base = models.BrowseMediaSource(
         domain=const.DOMAIN,
@@ -40,7 +48,7 @@ async def test_browse_media_as_dict():
     assert item["children"][0]["media_class"] == MediaClass.MUSIC
 
 
-async def test_browse_media_parent_no_children():
+async def test_browse_media_parent_no_children() -> None:
     """Test BrowseMediaSource conversion to media player item dict."""
     base = models.BrowseMediaSource(
         domain=const.DOMAIN,
@@ -63,7 +71,30 @@ async def test_browse_media_parent_no_children():
     assert item["children_media_class"] is None
 
 
-async def test_media_source_default_name():
+async def test_media_source_default_name() -> None:
     """Test MediaSource uses domain as default name."""
     source = models.MediaSource(const.DOMAIN)
     assert source.name == const.DOMAIN
+
+
+async def test_media_source_item_media_source_id(hass: HomeAssistant) -> None:
+    """Test MediaSourceItem media_source_id property."""
+    # Test with domain and identifier
+    item = models.MediaSourceItem(hass, "test_domain", "test/identifier", None)
+    assert item.media_source_id == "media-source://test_domain/test/identifier"
+
+    # Test with domain only
+    item = models.MediaSourceItem(hass, "test_domain", "", None)
+    assert item.media_source_id == "media-source://test_domain"
+
+    # Test with no domain (root)
+    item = models.MediaSourceItem(hass, None, "", None)
+    assert item.media_source_id == "media-source://"
+
+
+async def test_media_source_search_media_not_implemented(hass: HomeAssistant) -> None:
+    """Test the base MediaSource.async_search_media raises NotImplementedError."""
+    source = models.MediaSource(const.DOMAIN)
+    item = models.MediaSourceItem(hass, const.DOMAIN, "", None)
+    with pytest.raises(NotImplementedError):
+        await source.async_search_media(item, SearchMediaQuery(search_query="test"))

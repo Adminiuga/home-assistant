@@ -1,60 +1,43 @@
 """StarLine base entity."""
-from __future__ import annotations
 
-from collections.abc import Callable
+from typing import override
+
+from starline import StarlineDevice
 
 from homeassistant.helpers.entity import Entity
 
-from .account import StarlineAccount, StarlineDevice
+from .account import StarlineAccount
 
 
 class StarlineEntity(Entity):
     """StarLine base entity class."""
 
     _attr_should_poll = False
+    _attr_has_entity_name = True
 
     def __init__(
-        self, account: StarlineAccount, device: StarlineDevice, key: str, name: str
+        self, account: StarlineAccount, device: StarlineDevice, key: str
     ) -> None:
         """Initialize StarLine entity."""
         self._account = account
         self._device = device
         self._key = key
-        self._name = name
-        self._unsubscribe_api: Callable | None = None
+        # Legacy format, kept as migrating existing unique IDs is not worth the risk
+        self._attr_unique_id = f"starline-{key}-{device.device_id}"  # pylint: disable=home-assistant-entity-unique-id-redundant-domain
+        self._attr_device_info = account.device_info(device)
 
     @property
-    def available(self):
+    @override
+    def available(self) -> bool:
         """Return True if entity is available."""
         return self._account.api.available
 
-    @property
-    def unique_id(self):
-        """Return the unique ID of the entity."""
-        return f"starline-{self._key}-{self._device.device_id}"
-
-    @property
-    def name(self):
-        """Return the name of the entity."""
-        return f"{self._device.name} {self._name}"
-
-    @property
-    def device_info(self):
-        """Return the device info."""
-        return self._account.device_info(self._device)
-
-    def update(self):
+    def update(self) -> None:
         """Read new state data."""
         self.schedule_update_ha_state()
 
-    async def async_added_to_hass(self):
+    @override
+    async def async_added_to_hass(self) -> None:
         """Call when entity about to be added to Home Assistant."""
         await super().async_added_to_hass()
-        self._unsubscribe_api = self._account.api.add_update_listener(self.update)
-
-    async def async_will_remove_from_hass(self):
-        """Call when entity is being removed from Home Assistant."""
-        await super().async_will_remove_from_hass()
-        if self._unsubscribe_api is not None:
-            self._unsubscribe_api()
-            self._unsubscribe_api = None
+        self.async_on_remove(self._account.api.add_update_listener(self.update))

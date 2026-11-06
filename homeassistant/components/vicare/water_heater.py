@@ -1,42 +1,49 @@
 """Viessmann ViCare water_heater device."""
-from contextlib import suppress
-import logging
-from typing import Any
 
+from collections.abc import Callable
+from contextlib import suppress
+from datetime import time
+import logging
+from typing import Any, override
+
+from PyViCare.PyViCareDevice import Device as PyViCareDevice
+from PyViCare.PyViCareDeviceConfig import PyViCareDeviceConfig
+from PyViCare.PyViCareHeatingDevice import HeatingCircuit as PyViCareHeatingCircuit
 from PyViCare.PyViCareUtils import (
+    PyViCareCommandError,
+    PyViCareDeviceCommunicationError,
+    PyViCareInternalServerError,
     PyViCareInvalidDataError,
     PyViCareNotSupportedFeatureError,
     PyViCareRateLimitError,
 )
-import requests
 
 from homeassistant.components.water_heater import (
     WaterHeaterEntity,
     WaterHeaterEntityFeature,
 )
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
+    ATTR_MODE,
     ATTR_TEMPERATURE,
     PRECISION_TENTHS,
-    PRECISION_WHOLE,
-    TEMP_CELSIUS,
+    UnitOfTemperature,
 )
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity import DeviceInfo
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.core import HomeAssistant, ServiceResponse
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .const import (
-    CONF_HEATING_TYPE,
-    DOMAIN,
-    VICARE_API,
-    VICARE_DEVICE_CONFIG,
-    VICARE_NAME,
-)
+from .const import DOMAIN
+from .entity import ViCareEntity
+from .services import ATTR_FROM, ATTR_TO, HA_TO_VICARE_CIRCULATION_MODE, WEEKDAYS
+from .types import ViCareConfigEntry, ViCareDevice
+from .utils import get_circuits
 
 _LOGGER = logging.getLogger(__name__)
 
 VICARE_MODE_DHW = "dhw"
+VICARE_MODE_HEATING = "heating"
 VICARE_MODE_DHWANDHEATING = "dhwAndHeating"
+VICARE_MODE_DHWANDHEATINGCOOLING = "dhwAndHeatingCooling"
 VICARE_MODE_FORCEDREDUCED = "forcedReduced"
 VICARE_MODE_FORCEDNORMAL = "forcedNormal"
 VICARE_MODE_OFF = "standby"
@@ -50,6 +57,8 @@ OPERATION_MODE_OFF = "off"
 VICARE_TO_HA_HVAC_DHW = {
     VICARE_MODE_DHW: OPERATION_MODE_ON,
     VICARE_MODE_DHWANDHEATING: OPERATION_MODE_ON,
+    VICARE_MODE_DHWANDHEATINGCOOLING: OPERATION_MODE_ON,
+    VICARE_MODE_HEATING: OPERATION_MODE_OFF,
     VICARE_MODE_FORCEDREDUCED: OPERATION_MODE_OFF,
     VICARE_MODE_FORCEDNORMAL: OPERATION_MODE_ON,
     VICARE_MODE_OFF: OPERATION_MODE_OFF,
@@ -61,150 +70,197 @@ HA_TO_VICARE_HVAC_DHW = {
 }
 
 
-def _get_circuits(vicare_api):
-    """Return the list of circuits."""
-    try:
-        return vicare_api.circuits
-    except PyViCareNotSupportedFeatureError:
-        _LOGGER.info("No circuits found")
-        return []
+VICARE_TO_HA_CIRCULATION_MODE = {
+    value: key for key, value in HA_TO_VICARE_CIRCULATION_MODE.items()
+}
+
+VICARE_API_ERRORS = (
+    PyViCareDeviceCommunicationError,
+    PyViCareInternalServerError,
+    PyViCareInvalidDataError,
+    PyViCareRateLimitError,
+)
+
+
+def _to_vicare_time(value: time) -> str:
+    """Format a slot time for ViCare, which marks the end of the day as 24:00."""
+    if value == time.max:
+        return "24:00"
+    return value.strftime("%H:%M")
+
+
+def _build_entities(
+    device_list: list[ViCareDevice],
+) -> list[ViCareWater]:
+    """Create ViCare domestic hot water entities for a device."""
+
+    return [
+        ViCareWater(
+            device.serial,
+            device.config,
+            device.api,
+            circuit,
+        )
+        for device in device_list
+        for circuit in get_circuits(device.api)
+    ]
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    config_entry: ViCareConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    """Set up the ViCare climate platform."""
-    name = VICARE_NAME
-    entities = []
-    api = hass.data[DOMAIN][config_entry.entry_id][VICARE_API]
-    circuits = await hass.async_add_executor_job(_get_circuits, api)
-
-    for circuit in circuits:
-        suffix = ""
-        if len(circuits) > 1:
-            suffix = f" {circuit.id}"
-
-        entity = ViCareWater(
-            f"{name} Water{suffix}",
-            api,
-            circuit,
-            hass.data[DOMAIN][config_entry.entry_id][VICARE_DEVICE_CONFIG],
-            config_entry.data[CONF_HEATING_TYPE],
+    """Set up the ViCare water heater platform."""
+    async_add_entities(
+        await hass.async_add_executor_job(
+            _build_entities,
+            config_entry.runtime_data.devices,
         )
-        entities.append(entity)
-
-    async_add_entities(entities)
+    )
 
 
-class ViCareWater(WaterHeaterEntity):
+class ViCareWater(ViCareEntity, WaterHeaterEntity):
     """Representation of the ViCare domestic hot water device."""
 
     _attr_precision = PRECISION_TENTHS
     _attr_supported_features = WaterHeaterEntityFeature.TARGET_TEMPERATURE
+    _attr_native_temperature_unit = UnitOfTemperature.CELSIUS
+    _attr_min_temp = VICARE_TEMP_WATER_MIN
+    _attr_max_temp = VICARE_TEMP_WATER_MAX
+    _attr_operation_list = list(HA_TO_VICARE_HVAC_DHW)
+    _attr_translation_key = "domestic_hot_water"
+    _current_mode: str | None = None
+    _dhw_active: bool | None = None
 
-    def __init__(self, name, api, circuit, device_config, heating_type):
+    def __init__(
+        self,
+        device_serial: str | None,
+        device_config: PyViCareDeviceConfig,
+        device: PyViCareDevice,
+        circuit: PyViCareHeatingCircuit,
+    ) -> None:
         """Initialize the DHW water_heater device."""
-        self._name = name
-        self._state = None
-        self._api = api
+        super().__init__(circuit.id, device_serial, device_config, device)
         self._circuit = circuit
-        self._device_config = device_config
-        self._attributes = {}
-        self._target_temperature = None
-        self._current_temperature = None
-        self._current_mode = None
-        self._heating_type = heating_type
+        self._attributes: dict[str, Any] = {}
 
     def update(self) -> None:
         """Let HA know there has been an update from the ViCare API."""
-        try:
+        with self.vicare_api_handler():
             with suppress(PyViCareNotSupportedFeatureError):
-                self._current_temperature = (
+                self._attr_native_current_temperature = (
                     self._api.getDomesticHotWaterStorageTemperature()
                 )
 
             with suppress(PyViCareNotSupportedFeatureError):
-                self._target_temperature = (
+                self._attr_native_target_temperature = (
                     self._api.getDomesticHotWaterDesiredTemperature()
                 )
 
             with suppress(PyViCareNotSupportedFeatureError):
                 self._current_mode = self._circuit.getActiveMode()
 
-        except requests.exceptions.ConnectionError:
-            _LOGGER.error("Unable to retrieve data from ViCare server")
-        except PyViCareRateLimitError as limit_exception:
-            _LOGGER.error("Vicare API rate limit exceeded: %s", limit_exception)
-        except ValueError:
-            _LOGGER.error("Unable to decode data from ViCare server")
-        except PyViCareInvalidDataError as invalid_data_exception:
-            _LOGGER.error("Invalid data from Vicare server: %s", invalid_data_exception)
+            with suppress(PyViCareNotSupportedFeatureError):
+                self._dhw_active = self._api.getDomesticHotWaterActive()
 
-    @property
-    def unique_id(self) -> str:
-        """Return unique ID for this device."""
-        return f"{self._device_config.getConfig().serial}-{self._circuit.id}"
-
-    @property
-    def device_info(self) -> DeviceInfo:
-        """Return device info for this device."""
-        return DeviceInfo(
-            identifiers={(DOMAIN, self._device_config.getConfig().serial)},
-            name=self._device_config.getModel(),
-            manufacturer="Viessmann",
-            model=self._device_config.getModel(),
-            configuration_url="https://developer.viessmann.com/",
-        )
-
-    @property
-    def name(self):
-        """Return the name of the water_heater device."""
-        return self._name
-
-    @property
-    def temperature_unit(self):
-        """Return the unit of measurement."""
-        return TEMP_CELSIUS
-
-    @property
-    def current_temperature(self):
-        """Return the current temperature."""
-        return self._current_temperature
-
-    @property
-    def target_temperature(self):
-        """Return the temperature we try to reach."""
-        return self._target_temperature
-
+    @override
     def set_temperature(self, **kwargs: Any) -> None:
         """Set new target temperatures."""
         if (temp := kwargs.get(ATTR_TEMPERATURE)) is not None:
             self._api.setDomesticHotWaterTemperature(temp)
-            self._target_temperature = temp
+            self._attr_native_target_temperature = temp
 
     @property
-    def min_temp(self):
-        """Return the minimum temperature."""
-        return VICARE_TEMP_WATER_MIN
-
-    @property
-    def max_temp(self):
-        """Return the maximum temperature."""
-        return VICARE_TEMP_WATER_MAX
-
-    @property
-    def target_temperature_step(self) -> float:
-        """Set target temperature step to wholes."""
-        return PRECISION_WHOLE
-
-    @property
-    def current_operation(self):
+    @override
+    def current_operation(self) -> str | None:
         """Return current operation ie. heat, cool, idle."""
+        if self._dhw_active is not None:
+            return OPERATION_MODE_ON if self._dhw_active else OPERATION_MODE_OFF
+        if self._current_mode is None:
+            return None
         return VICARE_TO_HA_HVAC_DHW.get(self._current_mode)
 
-    @property
-    def operation_list(self):
-        """Return the list of available operation modes."""
-        return list(HA_TO_VICARE_HVAC_DHW)
+    def get_circulation_schedule(self) -> ServiceResponse:
+        """Return the DHW circulation pump schedule."""
+        schedule = self._get_circulation_schedule()
+        return {
+            day: [
+                {
+                    ATTR_FROM: f"{slot['start']}:00",
+                    ATTR_TO: f"{slot['end']}:00",
+                    ATTR_MODE: VICARE_TO_HA_CIRCULATION_MODE[slot["mode"]],
+                }
+                for slot in sorted(
+                    schedule[day[:3]], key=lambda entry: entry["position"]
+                )
+            ]
+            for day in WEEKDAYS
+        }
+
+    def set_circulation_schedule(self, **slots_by_day: list[dict[str, Any]]) -> None:
+        """Set the DHW circulation pump schedule, keeping days not passed."""
+        schedule = self._get_circulation_schedule()
+        supported_modes = self._read_circulation(
+            self._api.getDomesticHotWaterCirculationScheduleModes
+        )
+        for slots in slots_by_day.values():
+            for slot in slots:
+                if (
+                    HA_TO_VICARE_CIRCULATION_MODE[slot[ATTR_MODE]]
+                    not in supported_modes
+                ):
+                    raise ServiceValidationError(
+                        translation_domain=DOMAIN,
+                        translation_key="circulation_mode_not_supported",
+                        translation_placeholders={
+                            "mode": slot[ATTR_MODE],
+                            "modes": ", ".join(
+                                VICARE_TO_HA_CIRCULATION_MODE[mode]
+                                for mode in supported_modes
+                            ),
+                        },
+                    )
+        new_schedule = {day[:3]: schedule[day[:3]] for day in WEEKDAYS}
+        for day, slots in slots_by_day.items():
+            new_schedule[day[:3]] = [
+                {
+                    "start": _to_vicare_time(slot[ATTR_FROM]),
+                    "end": _to_vicare_time(slot[ATTR_TO]),
+                    "mode": HA_TO_VICARE_CIRCULATION_MODE[slot[ATTR_MODE]],
+                    "position": position,
+                }
+                for position, slot in enumerate(slots)
+            ]
+        try:
+            self._api.setDomesticHotWaterCirculationSchedule(new_schedule)
+        except PyViCareCommandError as err:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="circulation_schedule_not_set",
+                translation_placeholders={"error": err.message},
+            ) from err
+        except VICARE_API_ERRORS as err:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="api_error",
+            ) from err
+
+    def _get_circulation_schedule(self) -> dict[str, Any]:
+        """Return the raw circulation schedule or raise if unsupported."""
+        return self._read_circulation(self._api.getDomesticHotWaterCirculationSchedule)
+
+    def _read_circulation[T](self, read: Callable[[], T]) -> T:
+        """Read circulation data, translating unsupported features and API errors."""
+        try:
+            return read()
+        except PyViCareNotSupportedFeatureError as err:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="circulation_schedule_not_supported",
+            ) from err
+        except VICARE_API_ERRORS as err:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="api_error",
+            ) from err

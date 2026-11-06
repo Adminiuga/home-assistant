@@ -1,21 +1,17 @@
 """Support for the Xiaomi IR Remote (Chuangmi IR)."""
-from __future__ import annotations
 
-import asyncio
-from datetime import timedelta
 import logging
 import time
-from typing import Any
+from typing import Any, override
 
 from miio import ChuangmiIr, DeviceException
-import voluptuous as vol
+import probatio
 
-from homeassistant.components import persistent_notification
 from homeassistant.components.remote import (
     ATTR_DELAY_SECS,
     ATTR_NUM_REPEATS,
     DEFAULT_DELAY_SECS,
-    PLATFORM_SCHEMA,
+    PLATFORM_SCHEMA as REMOTE_PLATFORM_SCHEMA,
     RemoteEntity,
 )
 from homeassistant.const import (
@@ -27,41 +23,41 @@ from homeassistant.const import (
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import PlatformNotReady
-from homeassistant.helpers import config_validation as cv, entity_platform
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
-from homeassistant.util.dt import utcnow
 
-from .const import SERVICE_LEARN, SERVICE_SET_REMOTE_LED_OFF, SERVICE_SET_REMOTE_LED_ON
+from .const import CONF_SLOT
 
 _LOGGER = logging.getLogger(__name__)
 
 DATA_KEY = "remote.xiaomi_miio"
 
-CONF_SLOT = "slot"
 CONF_COMMANDS = "commands"
 
 DEFAULT_TIMEOUT = 10
 DEFAULT_SLOT = 1
 
-COMMAND_SCHEMA = vol.Schema(
-    {vol.Required(CONF_COMMAND): vol.All(cv.ensure_list, [cv.string])}
+COMMAND_SCHEMA = probatio.Schema(
+    {probatio.Required(CONF_COMMAND): probatio.All(probatio.EnsureList(), [cv.string])}
 )
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
+PLATFORM_SCHEMA = REMOTE_PLATFORM_SCHEMA.extend(
     {
-        vol.Optional(CONF_NAME): cv.string,
-        vol.Required(CONF_HOST): cv.string,
-        vol.Optional(CONF_TIMEOUT, default=DEFAULT_TIMEOUT): cv.positive_int,
-        vol.Optional(CONF_SLOT, default=DEFAULT_SLOT): vol.All(
-            int, vol.Range(min=1, max=1000000)
+        probatio.Optional(CONF_NAME): cv.string,
+        probatio.Required(CONF_HOST): cv.string,
+        probatio.Optional(CONF_TIMEOUT, default=DEFAULT_TIMEOUT): cv.positive_int,
+        probatio.Optional(CONF_SLOT, default=DEFAULT_SLOT): probatio.All(
+            int, probatio.Range(min=1, max=1000000)
         ),
-        vol.Required(CONF_TOKEN): vol.All(str, vol.Length(min=32, max=32)),
-        vol.Optional(CONF_COMMANDS, default={}): cv.schema_with_slug_keys(
+        probatio.Required(probatio.Secret(CONF_TOKEN)): probatio.All(
+            str, probatio.Length(min=32, max=32)
+        ),
+        probatio.Optional(CONF_COMMANDS, default={}): cv.schema_with_slug_keys(
             COMMAND_SCHEMA
         ),
     },
-    extra=vol.ALLOW_EXTRA,
+    extra=probatio.ALLOW_EXTRA,
 )
 
 
@@ -76,7 +72,7 @@ async def async_setup_platform(
     token = config[CONF_TOKEN]
 
     # Create handler
-    _LOGGER.info("Initializing with host %s (token %s...)", host, token[:5])
+    _LOGGER.debug("Initializing with host %s (token %s...)", host, token[:5])
 
     # The Chuang Mi IR Remote Controller wants to be re-discovered every
     # 5 minutes. As long as polling is disabled the device should be
@@ -88,7 +84,7 @@ async def async_setup_platform(
         device_info = await hass.async_add_executor_job(device.info)
         model = device_info.model
         unique_id = f"{model}-{device_info.mac_address}"
-        _LOGGER.info(
+        _LOGGER.debug(
             "%s %s %s detected",
             model,
             device_info.firmware_version,
@@ -113,71 +109,6 @@ async def async_setup_platform(
 
     async_add_entities([xiaomi_miio_remote])
 
-    async def async_service_led_off_handler(entity, service):
-        """Handle set_led_off command."""
-        await hass.async_add_executor_job(entity.device.set_indicator_led, False)
-
-    async def async_service_led_on_handler(entity, service):
-        """Handle set_led_on command."""
-        await hass.async_add_executor_job(entity.device.set_indicator_led, True)
-
-    async def async_service_learn_handler(entity, service):
-        """Handle a learn command."""
-        device = entity.device
-
-        slot = service.data.get(CONF_SLOT, entity.slot)
-
-        await hass.async_add_executor_job(device.learn, slot)
-
-        timeout = service.data.get(CONF_TIMEOUT, entity.timeout)
-
-        _LOGGER.info("Press the key you want Home Assistant to learn")
-        start_time = utcnow()
-        while (utcnow() - start_time) < timedelta(seconds=timeout):
-            message = await hass.async_add_executor_job(device.read, slot)
-            _LOGGER.debug("Message received from device: '%s'", message)
-
-            if "code" in message and message["code"]:
-                log_msg = "Received command is: {}".format(message["code"])
-                _LOGGER.info(log_msg)
-                persistent_notification.async_create(
-                    hass, log_msg, title="Xiaomi Miio Remote"
-                )
-                return
-
-            if "error" in message and message["error"]["message"] == "learn timeout":
-                await hass.async_add_executor_job(device.learn, slot)
-
-            await asyncio.sleep(1)
-
-        _LOGGER.error("Timeout. No infrared command captured")
-        persistent_notification.async_create(
-            hass, "Timeout. No infrared command captured", title="Xiaomi Miio Remote"
-        )
-
-    platform = entity_platform.async_get_current_platform()
-
-    platform.async_register_entity_service(
-        SERVICE_LEARN,
-        {
-            vol.Optional(CONF_TIMEOUT, default=10): cv.positive_int,
-            vol.Optional(CONF_SLOT, default=1): vol.All(
-                int, vol.Range(min=1, max=1000000)
-            ),
-        },
-        async_service_learn_handler,
-    )
-    platform.async_register_entity_service(
-        SERVICE_SET_REMOTE_LED_ON,
-        {},
-        async_service_led_on_handler,
-    )
-    platform.async_register_entity_service(
-        SERVICE_SET_REMOTE_LED_OFF,
-        {},
-        async_service_led_off_handler,
-    )
-
 
 class XiaomiMiioRemote(RemoteEntity):
     """Representation of a Xiaomi Miio Remote device."""
@@ -186,23 +117,13 @@ class XiaomiMiioRemote(RemoteEntity):
 
     def __init__(self, friendly_name, device, unique_id, slot, timeout, commands):
         """Initialize the remote."""
-        self._name = friendly_name
+        self._attr_name = friendly_name
         self._device = device
-        self._unique_id = unique_id
+        self._attr_unique_id = unique_id
         self._slot = slot
         self._timeout = timeout
         self._state = False
         self._commands = commands
-
-    @property
-    def unique_id(self):
-        """Return an unique ID."""
-        return self._unique_id
-
-    @property
-    def name(self):
-        """Return the name of the remote."""
-        return self._name
 
     @property
     def device(self):
@@ -220,14 +141,16 @@ class XiaomiMiioRemote(RemoteEntity):
         return self._timeout
 
     @property
-    def is_on(self):
+    @override
+    def is_on(self) -> bool:
         """Return False if device is unreachable, else True."""
         try:
             self.device.info()
-            return True
         except DeviceException:
             return False
+        return True
 
+    @override
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn the device on."""
         _LOGGER.error(
@@ -235,6 +158,7 @@ class XiaomiMiioRemote(RemoteEntity):
             "please use 'remote.send_command' to send commands"
         )
 
+    @override
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn the device off."""
         _LOGGER.error(
@@ -252,6 +176,7 @@ class XiaomiMiioRemote(RemoteEntity):
                 "Transmit of IR command failed, %s, exception: %s", payload, ex
             )
 
+    @override
     def send_command(self, command, **kwargs):
         """Send a command."""
         num_repeats = kwargs.get(ATTR_NUM_REPEATS)

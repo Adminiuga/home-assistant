@@ -1,12 +1,29 @@
 {
   "config": {
+    "error": {
+      "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]"
+    },
     "step": {
       "user": {
         "description": "Do you want to add Radio Browser to Home Assistant?"
       }
+    }
+  },
+  "exceptions": {
+    "cannot_connect": {
+      "message": "Could not connect to Radio Browser"
     },
-    "abort": {
-      "single_instance_allowed": "[%key:common::config_flow::abort::single_instance_allowed%]"
+    "config_entry_not_ready": {
+      "message": "Radio Browser integration is not ready"
+    },
+    "radio_browser_error": {
+      "message": "Error occurred while communicating with Radio Browser"
+    },
+    "station_not_found": {
+      "message": "The radio station is no longer available"
+    },
+    "unknown_stream_type": {
+      "message": "Could not determine the stream type of the radio station"
     }
   }
 }

@@ -1,36 +1,58 @@
 """Config flow for Ridwell integration."""
-from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, override
 
 from aioridwell import async_get_client
 from aioridwell.errors import InvalidCredentialsError, RidwellError
-import voluptuous as vol
+import probatio
 
-from homeassistant import config_entries
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
-from homeassistant.data_entry_flow import FlowResult
-from homeassistant.helpers import aiohttp_client, config_validation as cv
+from homeassistant.core import callback
+from homeassistant.helpers import aiohttp_client, config_validation as cv, selector
+from homeassistant.helpers.schema_config_entry_flow import (
+    SchemaFlowFormStep,
+    SchemaOptionsFlowHandler,
+)
 
-from .const import DOMAIN, LOGGER
+from .const import CALENDAR_TITLE_OPTIONS, CONF_CALENDAR_TITLE, DOMAIN, LOGGER
+from .coordinator import RidwellConfigEntry
 
-STEP_REAUTH_CONFIRM_DATA_SCHEMA = vol.Schema(
+STEP_REAUTH_CONFIRM_DATA_SCHEMA = probatio.Schema(
     {
-        vol.Required(CONF_PASSWORD): cv.string,
+        probatio.Required(probatio.Secret(CONF_PASSWORD)): cv.string,
     }
 )
 
-STEP_USER_DATA_SCHEMA = vol.Schema(
+STEP_USER_DATA_SCHEMA = probatio.Schema(
     {
-        vol.Required(CONF_USERNAME): cv.string,
-        vol.Required(CONF_PASSWORD): cv.string,
+        probatio.Required(CONF_USERNAME): cv.string,
+        probatio.Required(probatio.Secret(CONF_PASSWORD)): cv.string,
+    }
+)
+
+OPTIONS_SCHEMA = probatio.Schema(
+    {
+        probatio.Optional(CONF_CALENDAR_TITLE): selector.SelectSelector(
+            selector.SelectSelectorConfig(
+                options=CALENDAR_TITLE_OPTIONS,
+                multiple=False,
+                mode=selector.SelectSelectorMode.LIST,
+                translation_key=CONF_CALENDAR_TITLE,
+            ),
+        )
     }
 )
 
 
-class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
-    """Handle a config flow for WattTime."""
+OPTIONS_FLOW = {
+    "init": SchemaFlowFormStep(OPTIONS_SCHEMA),
+}
+
+
+class RidwellConfigFlow(ConfigFlow, domain=DOMAIN):
+    """Handle a config flow for Ridwell."""
 
     VERSION = 2
 
@@ -40,8 +62,8 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._username: str | None = None
 
     async def _async_validate(
-        self, error_step_id: str, error_schema: vol.Schema
-    ) -> FlowResult:
+        self, error_step_id: str, error_schema: probatio.Schema
+    ) -> ConfigFlowResult:
         """Validate input credentials and proceed accordingly."""
         errors = {}
         session = aiohttp_client.async_get_clientsession(self.hass)
@@ -63,7 +85,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 step_id=error_step_id,
                 data_schema=error_schema,
                 errors=errors,
-                description_placeholders={CONF_USERNAME: self._username},
+                description_placeholders={"username": self._username},
             )
 
         if existing_entry := await self.async_set_unique_id(self._username):
@@ -81,20 +103,43 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             data={CONF_USERNAME: self._username, CONF_PASSWORD: self._password},
         )
 
-    async def async_step_reauth(self, entry_data: Mapping[str, Any]) -> FlowResult:
+    @staticmethod
+    @callback
+    @override
+    def async_get_options_flow(
+        config_entry: RidwellConfigEntry,
+    ) -> SchemaOptionsFlowHandler:
+        """Get options flow for this handler."""
+        try:
+            schema_options_flow_handler = SchemaOptionsFlowHandler(
+                config_entry, OPTIONS_FLOW
+            )
+        except SystemError as err:
+            LOGGER.error("Unknown System error: %s", err)
+        except RidwellError as err:
+            LOGGER.error("Unknown Ridwell error: %s", err)
+
+        return schema_options_flow_handler
+
+    async def async_step_reauth(
+        self, entry_data: Mapping[str, Any]
+    ) -> ConfigFlowResult:
         """Handle configuration by re-auth."""
         self._username = entry_data[CONF_USERNAME]
         return await self.async_step_reauth_confirm()
 
     async def async_step_reauth_confirm(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle re-auth completion."""
         if not user_input:
+            if TYPE_CHECKING:
+                assert self._username
+
             return self.async_show_form(
                 step_id="reauth_confirm",
                 data_schema=STEP_REAUTH_CONFIRM_DATA_SCHEMA,
-                description_placeholders={CONF_USERNAME: self._username},
+                description_placeholders={"username": self._username},
             )
 
         self._password = user_input[CONF_PASSWORD]
@@ -103,9 +148,10 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             "reauth_confirm", STEP_REAUTH_CONFIRM_DATA_SCHEMA
         )
 
+    @override
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle the initial step."""
         if not user_input:
             return self.async_show_form(

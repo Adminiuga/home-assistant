@@ -1,11 +1,23 @@
 {
   "domain": "onvif",
   "name": "ONVIF",
-  "documentation": "https://www.home-assistant.io/integrations/onvif",
-  "requirements": ["onvif-zeep-async==1.2.1", "WSDiscovery==2.0.0"],
-  "dependencies": ["ffmpeg"],
-  "codeowners": ["@hunterjm"],
+  "categories": ["security_safety.cameras"],
+  "codeowners": ["@jterrace"],
   "config_flow": true,
+  "connectivity": ["network"],
+  "dependencies": ["ffmpeg"],
+  "dhcp": [
+    {
+      "registered_devices": true
+    }
+  ],
+  "documentation": "https://www.home-assistant.io/integrations/onvif",
+  "integration_type": "device",
   "iot_class": "local_push",
-  "loggers": ["onvif", "wsdiscovery", "zeep"]
+  "loggers": ["onvif", "wsdiscovery", "zeep"],
+  "requirements": [
+    "onvif-zeep-async==4.3.0",
+    "onvif_parsers==2.5.0",
+    "WSDiscovery==2.1.2"
+  ]
 }

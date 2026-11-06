@@ -1,0 +1,42 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "data": {
+          "altitude": "Altitude",
+          "location": "[%key:common::config_flow::data::location%]",
+          "radius": "Radius"
+        },
+        "description": "Fill in the location to track."
+      }
+    }
+  },
+  "exceptions": {
+    "authentication_error": {
+      "message": "An error occurred while authenticating with OpenSky"
+    },
+    "update_error": {
+      "message": "An error occurred while fetching data from OpenSky"
+    }
+  },
+  "options": {
+    "error": {
+      "invalid_auth": "[%key:common::config_flow::error::invalid_auth%]",
+      "no_authentication": "You need to authenticate to be contributing",
+      "password_missing": "Password is missing",
+      "username_missing": "Username is missing"
+    },
+    "step": {
+      "init": {
+        "data": {
+          "altitude": "[%key:component::opensky::config::step::user::data::altitude%]",
+          "contributing_user": "I'm contributing to OpenSky",
+          "password": "[%key:common::config_flow::data::password%]",
+          "radius": "[%key:component::opensky::config::step::user::data::radius%]",
+          "username": "[%key:common::config_flow::data::username%]"
+        },
+        "description": "You can log in to your OpenSky account to increase the update frequency."
+      }
+    }
+  }
+}

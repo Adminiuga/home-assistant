@@ -1,12 +1,9 @@
 """Network client device class."""
 
-from __future__ import annotations
-
 from datetime import datetime
 from typing import Any
 
-from homeassistant.util import slugify
-import homeassistant.util.dt as dt_util
+from homeassistant.util import dt as dt_util, slugify
 
 from .const import ATTR_DEVICE_TRACKER
 
@@ -26,6 +23,13 @@ class Device:
     def name(self) -> str:
         """Return device name."""
         return str(self._params.get("host-name", self.mac))
+
+    @property
+    def host_name(self) -> str | None:
+        """Return the DHCP host name, if the client has one."""
+        if (host_name := self._params.get("host-name")) is None or host_name == "":
+            return None
+        return str(host_name)
 
     @property
     def ip_address(self) -> str | None:

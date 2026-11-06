@@ -1,9 +1,13 @@
 {
   "domain": "rainbird",
   "name": "Rain Bird",
+  "categories": ["garden_plants"],
+  "codeowners": ["@konikvranik", "@allenporter"],
+  "config_flow": true,
+  "connectivity": ["network"],
   "documentation": "https://www.home-assistant.io/integrations/rainbird",
-  "requirements": ["pyrainbird==0.4.3"],
-  "codeowners": ["@konikvranik"],
+  "integration_type": "hub",
   "iot_class": "local_polling",
-  "loggers": ["pyrainbird"]
+  "loggers": ["pyrainbird"],
+  "requirements": ["pyrainbird==6.6.0"]
 }

@@ -1,23 +1,45 @@
 """Configure Synology DSM tests."""
-from unittest.mock import patch
+
+from collections.abc import Generator
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
+from homeassistant.core import HomeAssistant
+from homeassistant.setup import async_setup_component
 
-def pytest_configure(config):
-    """Register custom marker for tests."""
-    config.addinivalue_line(
-        "markers", "no_bypass_setup: mark test to disable bypass_setup_fixture"
-    )
+from .common import mock_dsm_hardware, mock_dsm_information
+from .consts import HOST, MACS
 
 
-@pytest.fixture(name="bypass_setup", autouse=True)
-def bypass_setup_fixture(request):
-    """Mock component setup."""
-    if "no_bypass_setup" in request.keywords:
-        yield
-    else:
-        with patch(
-            "homeassistant.components.synology_dsm.async_setup_entry", return_value=True
-        ):
-            yield
+@pytest.fixture
+def mock_setup_entry() -> Generator[AsyncMock]:
+    """Mock setting up a config entry."""
+    with patch(
+        "homeassistant.components.synology_dsm.async_setup_entry", return_value=None
+    ) as mock_setup:
+        yield mock_setup
+
+
+@pytest.fixture
+async def setup_media_source(hass: HomeAssistant) -> None:
+    """Set up media source."""
+    assert await async_setup_component(hass, "media_source", {})
+
+
+@pytest.fixture(name="mock_dsm")
+def fixture_dsm():
+    """Set up SynologyDSM API fixture."""
+    with patch("homeassistant.components.synology_dsm.common.SynologyDSM") as dsm:
+        dsm.login = AsyncMock(return_value=True)
+        dsm.update = AsyncMock(return_value=True)
+
+        dsm.information = mock_dsm_information()
+        dsm.network = Mock(
+            update=AsyncMock(return_value=True), macs=MACS, hostname=HOST
+        )
+        dsm.hardware = mock_dsm_hardware()
+        dsm.surveillance_station.update = AsyncMock(return_value=True)
+        dsm.upgrade.update = AsyncMock(return_value=True)
+        dsm.file = AsyncMock(get_shared_folders=AsyncMock(return_value=None))
+    return dsm

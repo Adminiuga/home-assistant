@@ -1,7 +1,6 @@
 """Support for Velbus thermostat."""
-from __future__ import annotations
 
-from typing import Any
+from typing import Any, override
 
 from velbusaio.channels import Temperature as VelbusTemp
 
@@ -10,27 +9,29 @@ from homeassistant.components.climate import (
     ClimateEntityFeature,
     HVACMode,
 )
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import ATTR_TEMPERATURE, TEMP_CELSIUS
+from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.exceptions import ServiceValidationError
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
+from . import VelbusConfigEntry
 from .const import DOMAIN, PRESET_MODES
-from .entity import VelbusEntity
+from .entity import VelbusEntity, api_call
+
+PARALLEL_UPDATES = 0
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    entry: VelbusConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up Velbus switch based on config_entry."""
-    await hass.data[DOMAIN][entry.entry_id]["tsk"]
-    cntrl = hass.data[DOMAIN][entry.entry_id]["cntrl"]
-    entities = []
-    for channel in cntrl.get_all("climate"):
-        entities.append(VelbusClimate(channel))
-    async_add_entities(entities)
+    await entry.runtime_data.scan_task
+    async_add_entities(
+        VelbusClimate(channel)
+        for channel in entry.runtime_data.controller.get_all_climate()
+    )
 
 
 class VelbusClimate(VelbusEntity, ClimateEntity):
@@ -40,17 +41,18 @@ class VelbusClimate(VelbusEntity, ClimateEntity):
     _attr_supported_features = (
         ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.PRESET_MODE
     )
-    _attr_temperature_unit = TEMP_CELSIUS
-    _attr_hvac_mode = HVACMode.HEAT
-    _attr_hvac_modes = [HVACMode.HEAT]
+    _attr_native_temperature_unit = UnitOfTemperature.CELSIUS
+    _attr_hvac_modes = [HVACMode.HEAT, HVACMode.COOL]
     _attr_preset_modes = list(PRESET_MODES)
 
     @property
-    def target_temperature(self) -> float | None:
+    @override
+    def native_target_temperature(self) -> float | None:
         """Return the temperature we try to reach."""
         return self._channel.get_climate_target()
 
     @property
+    @override
     def preset_mode(self) -> str | None:
         """Return the current Preset for this channel."""
         return next(
@@ -63,10 +65,19 @@ class VelbusClimate(VelbusEntity, ClimateEntity):
         )
 
     @property
-    def current_temperature(self) -> int | None:
+    @override
+    def native_current_temperature(self) -> float | None:
         """Return the current temperature."""
         return self._channel.get_state()
 
+    @property
+    @override
+    def hvac_mode(self) -> HVACMode:
+        """Return the current hvac mode based on cool_mode message."""
+        return HVACMode.COOL if self._channel.get_cool_mode() else HVACMode.HEAT
+
+    @api_call
+    @override
     async def async_set_temperature(self, **kwargs: Any) -> None:
         """Set new target temperatures."""
         if (temp := kwargs.get(ATTR_TEMPERATURE)) is None:
@@ -74,7 +85,22 @@ class VelbusClimate(VelbusEntity, ClimateEntity):
         await self._channel.set_temp(temp)
         self.async_write_ha_state()
 
+    @api_call
+    @override
     async def async_set_preset_mode(self, preset_mode: str) -> None:
         """Set the new preset mode."""
         await self._channel.set_preset(PRESET_MODES[preset_mode])
+        self.async_write_ha_state()
+
+    @api_call
+    @override
+    async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
+        """Set the new hvac mode."""
+        if hvac_mode not in self._attr_hvac_modes:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="invalid_hvac_mode",
+                translation_placeholders={"hvac_mode": str(hvac_mode)},
+            )
+        await self._channel.set_mode(hvac_mode)
         self.async_write_ha_state()

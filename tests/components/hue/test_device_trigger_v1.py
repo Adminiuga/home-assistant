@@ -1,30 +1,48 @@
 """The tests for Philips Hue device triggers for V1 bridge."""
 
+from unittest.mock import Mock, patch
+
+from freezegun.api import FrozenDateTimeFactory
+import pytest
+from pytest_homeassistant.common import (
+    async_fire_time_changed,
+    async_get_device_automations,
+)
+from pytest_unordered import unordered
+
 from homeassistant.components import automation, hue
 from homeassistant.components.device_automation import DeviceAutomationType
-from homeassistant.components.hue.v1 import device_trigger
+from homeassistant.components.hue.v1 import device_trigger, sensor_base
+from homeassistant.const import Platform
+from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.setup import async_setup_component
 
-from .conftest import setup_platform
+from .conftest import create_config_entry, setup_platform
 from .test_sensor_v1 import HUE_DIMMER_REMOTE_1, HUE_TAP_REMOTE_1
-
-from tests.common import assert_lists_same, async_get_device_automations
 
 REMOTES_RESPONSE = {"7": HUE_TAP_REMOTE_1, "8": HUE_DIMMER_REMOTE_1}
 
 
-async def test_get_triggers(hass, mock_bridge_v1, device_reg):
+async def test_get_triggers(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    mock_bridge_v1: Mock,
+    device_registry: dr.DeviceRegistry,
+) -> None:
     """Test we get the expected triggers from a hue remote."""
     mock_bridge_v1.mock_sensor_responses.append(REMOTES_RESPONSE)
-    await setup_platform(hass, mock_bridge_v1, ["sensor", "binary_sensor"])
+    await setup_platform(
+        hass, mock_bridge_v1, [Platform.SENSOR, Platform.BINARY_SENSOR]
+    )
 
     assert len(mock_bridge_v1.mock_requests) == 1
     # 2 remotes, just 1 battery sensor
     assert len(hass.states.async_all()) == 1
 
     # Get triggers for specific tap switch
-    hue_tap_device = device_reg.async_get_device(
-        {(hue.DOMAIN, "00:00:00:00:00:44:23:08")}
+    hue_tap_device = device_registry.async_get_device_by_identifier(
+        (hue.DOMAIN, "00:00:00:00:00:44:23:08"), mock_bridge_v1.config_entry.entry_id
     )
     triggers = await async_get_device_automations(
         hass, DeviceAutomationType.TRIGGER, hue_tap_device.id
@@ -41,11 +59,14 @@ async def test_get_triggers(hass, mock_bridge_v1, device_reg):
         }
         for t_type, t_subtype in device_trigger.HUE_TAP_REMOTE
     ]
-    assert_lists_same(triggers, expected_triggers)
+    assert triggers == unordered(expected_triggers)
 
     # Get triggers for specific dimmer switch
-    hue_dimmer_device = device_reg.async_get_device(
-        {(hue.DOMAIN, "00:17:88:01:10:3e:3a:dc")}
+    hue_dimmer_device = device_registry.async_get_device_by_identifier(
+        (hue.DOMAIN, "00:17:88:01:10:3e:3a:dc"), mock_bridge_v1.config_entry.entry_id
+    )
+    hue_bat_sensor = entity_registry.async_get(
+        "sensor.hue_dimmer_switch_1_battery_level"
     )
     triggers = await async_get_device_automations(
         hass, DeviceAutomationType.TRIGGER, hue_dimmer_device.id
@@ -56,7 +77,7 @@ async def test_get_triggers(hass, mock_bridge_v1, device_reg):
         "domain": "sensor",
         "device_id": hue_dimmer_device.id,
         "type": "battery_level",
-        "entity_id": "sensor.hue_dimmer_switch_1_battery_level",
+        "entity_id": hue_bat_sensor.id,
         "metadata": {"secondary": True},
     }
     expected_triggers = [
@@ -73,19 +94,27 @@ async def test_get_triggers(hass, mock_bridge_v1, device_reg):
             for t_type, t_subtype in device_trigger.HUE_DIMMER_REMOTE
         ),
     ]
-    assert_lists_same(triggers, expected_triggers)
+    assert triggers == unordered(expected_triggers)
 
 
-async def test_if_fires_on_state_change(hass, mock_bridge_v1, device_reg, calls):
+async def test_if_fires_on_state_change(
+    hass: HomeAssistant,
+    mock_bridge_v1: Mock,
+    device_registry: dr.DeviceRegistry,
+    service_calls: list[ServiceCall],
+    freezer: FrozenDateTimeFactory,
+) -> None:
     """Test for button press trigger firing."""
     mock_bridge_v1.mock_sensor_responses.append(REMOTES_RESPONSE)
-    await setup_platform(hass, mock_bridge_v1, ["sensor", "binary_sensor"])
+    await setup_platform(
+        hass, mock_bridge_v1, [Platform.SENSOR, Platform.BINARY_SENSOR]
+    )
     assert len(mock_bridge_v1.mock_requests) == 1
     assert len(hass.states.async_all()) == 1
 
     # Set an automation with a specific tap switch trigger
-    hue_tap_device = device_reg.async_get_device(
-        {(hue.DOMAIN, "00:00:00:00:00:44:23:08")}
+    hue_tap_device = device_registry.async_get_device_by_identifier(
+        (hue.DOMAIN, "00:00:00:00:00:44:23:08"), mock_bridge_v1.config_entry.entry_id
     )
     assert await async_setup_component(
         hass,
@@ -135,14 +164,14 @@ async def test_if_fires_on_state_change(hass, mock_bridge_v1, device_reg, calls)
     }
     mock_bridge_v1.mock_sensor_responses.append(new_sensor_response)
 
-    # Force updates to run again
-    await mock_bridge_v1.sensor_manager.coordinator.async_refresh()
-    await hass.async_block_till_done()
+    freezer.tick(sensor_base.SensorManager.SCAN_INTERVAL)
+    async_fire_time_changed(hass)
+    await hass.async_block_till_done(wait_background_tasks=True)
 
     assert len(mock_bridge_v1.mock_requests) == 2
 
-    assert len(calls) == 1
-    assert calls[0].data["some"] == "B4 - 18"
+    assert len(service_calls) == 1
+    assert service_calls[0].data["some"] == "B4 - 18"
 
     # Fake another button press.
     new_sensor_response["7"] = dict(new_sensor_response["7"])
@@ -152,8 +181,57 @@ async def test_if_fires_on_state_change(hass, mock_bridge_v1, device_reg, calls)
     }
     mock_bridge_v1.mock_sensor_responses.append(new_sensor_response)
 
-    # Force updates to run again
-    await mock_bridge_v1.sensor_manager.coordinator.async_refresh()
-    await hass.async_block_till_done()
+    freezer.tick(sensor_base.SensorManager.SCAN_INTERVAL)
+    async_fire_time_changed(hass)
+    await hass.async_block_till_done(wait_background_tasks=True)
     assert len(mock_bridge_v1.mock_requests) == 3
-    assert len(calls) == 1
+    assert len(service_calls) == 1
+
+
+async def test_error_when_remote_is_gone_after_config_entry_loads(
+    hass: HomeAssistant,
+    mock_bridge_v1: Mock,
+    device_registry: dr.DeviceRegistry,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test a trigger for a remote that is no longer on the bridge is reported."""
+    mock_bridge_v1.mock_sensor_responses.append(REMOTES_RESPONSE)
+    config_entry = create_config_entry(api_version=1)
+    config_entry.add_to_hass(hass)
+    gone_device = device_registry.async_get_or_create(
+        config_entry_id=config_entry.entry_id,
+        identifiers={(hue.DOMAIN, "00:00:00:00:00:00:00:00")},
+    )
+
+    assert await async_setup_component(
+        hass,
+        automation.DOMAIN,
+        {
+            automation.DOMAIN: [
+                {
+                    "trigger": {
+                        "platform": "device",
+                        "domain": hue.DOMAIN,
+                        "device_id": gone_device.id,
+                        "type": "remote_button_short_press",
+                        "subtype": "button_4",
+                    },
+                    "action": {"service": "test.automation"},
+                }
+            ]
+        },
+    )
+    await hass.async_block_till_done()
+
+    mock_bridge_v1.config_entry = config_entry
+    with (
+        patch.object(hue.migration, "is_v2_bridge", return_value=False),
+        patch("homeassistant.components.hue.HueBridge", return_value=mock_bridge_v1),
+    ):
+        await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert (
+        f"Got error 'Device {gone_device.id} is not available on the Hue bridge' "
+        "when setting up triggers for automation 0" in caplog.text
+    )

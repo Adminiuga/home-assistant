@@ -1,0 +1,91 @@
+"""Tests for the Leviton Decora Wi-Fi config flow."""
+
+from unittest.mock import MagicMock
+
+import pytest
+from pytest_homeassistant.common import MockConfigEntry
+
+from homeassistant.components.decora_wifi.const import DOMAIN
+from homeassistant.config_entries import SOURCE_USER
+from homeassistant.core import HomeAssistant
+from homeassistant.data_entry_flow import FlowResultType
+
+from .const import TEST_USER_ID, TEST_USERNAME, USER_INPUT
+
+
+@pytest.mark.usefixtures("mock_setup_entry")
+async def test_user_flow_success(
+    hass: HomeAssistant, mock_decora_wifi: MagicMock
+) -> None:
+    """Test a successful user-initiated config flow."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "user"
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input=USER_INPUT
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["title"] == TEST_USERNAME
+    assert result["data"] == USER_INPUT
+    assert result["result"].unique_id == TEST_USER_ID
+
+
+@pytest.mark.parametrize(
+    ("login_return_value", "login_side_effect", "expected_error"),
+    [
+        (None, None, "invalid_auth"),
+        (True, ValueError("Cannot connect"), "cannot_connect"),
+    ],
+)
+@pytest.mark.usefixtures("mock_setup_entry")
+async def test_user_flow_error_and_recovery(
+    hass: HomeAssistant,
+    mock_decora_wifi: MagicMock,
+    login_return_value: bool | None,
+    login_side_effect: Exception | None,
+    expected_error: str,
+) -> None:
+    """Test user flow shows the correct error and the user can retry."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
+    )
+
+    # First attempt: error
+    mock_decora_wifi.login.return_value = login_return_value
+    mock_decora_wifi.login.side_effect = login_side_effect
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input=USER_INPUT
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": expected_error}
+
+    # Second attempt: success
+    mock_decora_wifi.login.side_effect = None
+    mock_decora_wifi.login.return_value = True
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input=USER_INPUT
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+
+
+async def test_user_flow_duplicate(
+    hass: HomeAssistant,
+    mock_decora_wifi: MagicMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test that duplicate accounts are rejected."""
+    mock_config_entry.add_to_hass(hass)
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input=USER_INPUT
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "already_configured"

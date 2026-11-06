@@ -1,7 +1,6 @@
 """Support for MySensors sensors."""
-from __future__ import annotations
 
-from typing import Any
+from typing import Any, override
 
 from awesomeversion import AwesomeVersion
 
@@ -11,35 +10,40 @@ from homeassistant.components.sensor import (
     SensorEntityDescription,
     SensorStateClass,
 )
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
-    CONDUCTIVITY,
     DEGREE,
-    ELECTRIC_CURRENT_AMPERE,
-    ELECTRIC_POTENTIAL_MILLIVOLT,
-    ELECTRIC_POTENTIAL_VOLT,
-    ENERGY_KILO_WATT_HOUR,
-    FREQUENCY_HERTZ,
-    LENGTH_METERS,
     LIGHT_LUX,
-    MASS_KILOGRAMS,
     PERCENTAGE,
-    POWER_VOLT_AMPERE,
-    POWER_WATT,
-    SOUND_PRESSURE_DB,
-    TEMP_CELSIUS,
-    TEMP_FAHRENHEIT,
-    VOLUME_CUBIC_METERS,
     Platform,
+    UnitOfApparentPower,
+    UnitOfConductivity,
+    UnitOfElectricCurrent,
+    UnitOfElectricPotential,
+    UnitOfEnergy,
+    UnitOfFrequency,
+    UnitOfLength,
+    UnitOfMass,
+    UnitOfPower,
+    UnitOfReactivePower,
+    UnitOfSoundPressure,
+    UnitOfTemperature,
+    UnitOfVolume,
 )
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.util.unit_system import METRIC_SYSTEM
 
-from .. import mysensors
-from .const import MYSENSORS_DISCOVERY, DiscoveryInfo
-from .helpers import on_unload
+from . import setup_mysensors_platform
+from .const import (
+    ATTR_NODE_ID,
+    MYSENSORS_DISCOVERY,
+    MYSENSORS_NODE_DISCOVERY,
+    DiscoveryInfo,
+    NodeDiscoveryInfo,
+)
+from .entity import MySensorNodeEntity, MySensorsChildEntity
+from .models import MySensorsConfigEntry
 
 SENSORS: dict[str, SensorEntityDescription] = {
     "V_TEMP": SensorEntityDescription(
@@ -91,15 +95,17 @@ SENSORS: dict[str, SensorEntityDescription] = {
         key="V_DIRECTION",
         native_unit_of_measurement=DEGREE,
         icon="mdi:compass",
+        device_class=SensorDeviceClass.WIND_DIRECTION,
+        state_class=SensorStateClass.MEASUREMENT_ANGLE,
     ),
     "V_WEIGHT": SensorEntityDescription(
         key="V_WEIGHT",
-        native_unit_of_measurement=MASS_KILOGRAMS,
+        native_unit_of_measurement=UnitOfMass.KILOGRAMS,
         device_class=SensorDeviceClass.WEIGHT,
     ),
     "V_DISTANCE": SensorEntityDescription(
         key="V_DISTANCE",
-        native_unit_of_measurement=LENGTH_METERS,
+        native_unit_of_measurement=UnitOfLength.METERS,
         device_class=SensorDeviceClass.DISTANCE,
     ),
     "V_IMPEDANCE": SensorEntityDescription(
@@ -108,13 +114,13 @@ SENSORS: dict[str, SensorEntityDescription] = {
     ),
     "V_WATT": SensorEntityDescription(
         key="V_WATT",
-        native_unit_of_measurement=POWER_WATT,
+        native_unit_of_measurement=UnitOfPower.WATT,
         device_class=SensorDeviceClass.POWER,
         state_class=SensorStateClass.MEASUREMENT,
     ),
     "V_KWH": SensorEntityDescription(
         key="V_KWH",
-        native_unit_of_measurement=ENERGY_KILO_WATT_HOUR,
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
         device_class=SensorDeviceClass.ENERGY,
         state_class=SensorStateClass.TOTAL_INCREASING,
     ),
@@ -124,22 +130,25 @@ SENSORS: dict[str, SensorEntityDescription] = {
         icon="mdi:white-balance-sunny",
     ),
     "V_FLOW": SensorEntityDescription(
+        # The documentation on this measurement is inconsistent.
+        # Better not to set a device class here yet.
         key="V_FLOW",
-        native_unit_of_measurement=LENGTH_METERS,
+        native_unit_of_measurement=UnitOfLength.METERS,
         icon="mdi:gauge",
     ),
     "V_VOLUME": SensorEntityDescription(
         key="V_VOLUME",
-        native_unit_of_measurement=VOLUME_CUBIC_METERS,
+        native_unit_of_measurement=UnitOfVolume.CUBIC_METERS,
+        device_class=SensorDeviceClass.VOLUME,
     ),
     "V_LEVEL_S_SOUND": SensorEntityDescription(
         key="V_LEVEL_S_SOUND",
-        native_unit_of_measurement=SOUND_PRESSURE_DB,
-        icon="mdi:volume-high",
+        native_unit_of_measurement=UnitOfSoundPressure.DECIBEL,
+        device_class=SensorDeviceClass.SOUND_PRESSURE,
     ),
     "V_LEVEL_S_VIBRATION": SensorEntityDescription(
         key="V_LEVEL_S_VIBRATION",
-        native_unit_of_measurement=FREQUENCY_HERTZ,
+        native_unit_of_measurement=UnitOfFrequency.HERTZ,
     ),
     "V_LEVEL_S_LIGHT_LEVEL": SensorEntityDescription(
         key="V_LEVEL_S_LIGHT_LEVEL",
@@ -154,59 +163,69 @@ SENSORS: dict[str, SensorEntityDescription] = {
     ),
     "V_VOLTAGE": SensorEntityDescription(
         key="V_VOLTAGE",
-        native_unit_of_measurement=ELECTRIC_POTENTIAL_VOLT,
+        native_unit_of_measurement=UnitOfElectricPotential.VOLT,
         device_class=SensorDeviceClass.VOLTAGE,
         state_class=SensorStateClass.MEASUREMENT,
     ),
     "V_CURRENT": SensorEntityDescription(
         key="V_CURRENT",
-        native_unit_of_measurement=ELECTRIC_CURRENT_AMPERE,
+        native_unit_of_measurement=UnitOfElectricCurrent.AMPERE,
         device_class=SensorDeviceClass.CURRENT,
         state_class=SensorStateClass.MEASUREMENT,
     ),
+    "V_IR_RECORD": SensorEntityDescription(
+        key="V_IR_RECORD",
+        icon="mdi:remote",
+    ),
     "V_PH": SensorEntityDescription(
         key="V_PH",
-        native_unit_of_measurement="pH",
+        device_class=SensorDeviceClass.PH,
     ),
     "V_ORP": SensorEntityDescription(
         key="V_ORP",
-        native_unit_of_measurement=ELECTRIC_POTENTIAL_MILLIVOLT,
+        native_unit_of_measurement=UnitOfElectricPotential.MILLIVOLT,
+        device_class=SensorDeviceClass.VOLTAGE,
     ),
     "V_EC": SensorEntityDescription(
         key="V_EC",
-        native_unit_of_measurement=CONDUCTIVITY,
+        native_unit_of_measurement=UnitOfConductivity.MICROSIEMENS_PER_CM,
     ),
     "V_VAR": SensorEntityDescription(
         key="V_VAR",
-        native_unit_of_measurement="var",
+        native_unit_of_measurement=UnitOfReactivePower.VOLT_AMPERE_REACTIVE,
     ),
     "V_VA": SensorEntityDescription(
         key="V_VA",
-        native_unit_of_measurement=POWER_VOLT_AMPERE,
+        native_unit_of_measurement=UnitOfApparentPower.VOLT_AMPERE,
+        device_class=SensorDeviceClass.APPARENT_POWER,
     ),
 }
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    config_entry: MySensorsConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up this platform for a specific ConfigEntry(==Gateway)."""
 
     async def async_discover(discovery_info: DiscoveryInfo) -> None:
         """Discover and add a MySensors sensor."""
-        mysensors.setup_mysensors_platform(
-            hass,
+        setup_mysensors_platform(
+            config_entry,
             Platform.SENSOR,
             discovery_info,
             MySensorsSensor,
-            async_add_entities=async_add_entities,
+            async_add_entities,
         )
 
-    on_unload(
-        hass,
-        config_entry.entry_id,
+    @callback
+    def async_node_discover(discovery_info: NodeDiscoveryInfo) -> None:
+        """Add battery sensor for each MySensors node."""
+        node_id = discovery_info[ATTR_NODE_ID]
+        async_add_entities([MyBatterySensor(config_entry, node_id)])
+
+    config_entry.async_on_unload(
         async_dispatcher_connect(
             hass,
             MYSENSORS_DISCOVERY.format(config_entry.entry_id, Platform.SENSOR),
@@ -214,8 +233,44 @@ async def async_setup_entry(
         ),
     )
 
+    config_entry.async_on_unload(
+        async_dispatcher_connect(
+            hass,
+            MYSENSORS_NODE_DISCOVERY.format(config_entry.entry_id),
+            async_node_discover,
+        ),
+    )
 
-class MySensorsSensor(mysensors.device.MySensorsEntity, SensorEntity):
+
+class MyBatterySensor(MySensorNodeEntity, SensorEntity):
+    """Battery sensor of MySensors node."""
+
+    _attr_device_class = SensorDeviceClass.BATTERY
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = PERCENTAGE
+    _attr_force_update = True
+
+    @property
+    @override
+    def unique_id(self) -> str:
+        """Return a unique ID for use in home assistant."""
+        return f"{self.gateway_id}-{self.node_id}-battery"
+
+    @property
+    @override
+    def name(self) -> str:
+        """Return the name of this entity."""
+        return f"{self.node_name} Battery"
+
+    @callback
+    @override
+    def _async_update_callback(self) -> None:
+        """Update the controller with the latest battery level."""
+        self._attr_native_value = self._node.battery_level
+        self.async_write_ha_state()
+
+
+class MySensorsSensor(MySensorsChildEntity, SensorEntity):
     """Representation of a MySensors Sensor child node."""
 
     _attr_force_update = True
@@ -227,11 +282,13 @@ class MySensorsSensor(mysensors.device.MySensorsEntity, SensorEntity):
             self.entity_description = entity_description
 
     @property
+    @override
     def native_value(self) -> str | None:
         """Return the state of the sensor."""
         return self._values.get(self.value_type)
 
     @property
+    @override
     def native_unit_of_measurement(self) -> str | None:
         """Return the unit of measurement of this entity."""
         set_req = self.gateway.const.SetReq
@@ -244,8 +301,8 @@ class MySensorsSensor(mysensors.device.MySensorsEntity, SensorEntity):
 
         if set_req(self.value_type) == set_req.V_TEMP:
             if self.hass.config.units is METRIC_SYSTEM:
-                return TEMP_CELSIUS
-            return TEMP_FAHRENHEIT
+                return UnitOfTemperature.CELSIUS
+            return UnitOfTemperature.FAHRENHEIT
 
         if hasattr(self, "entity_description"):
             return self.entity_description.native_unit_of_measurement
@@ -257,9 +314,9 @@ class MySensorsSensor(mysensors.device.MySensorsEntity, SensorEntity):
         entity_description = SENSORS.get(set_req(self.value_type).name)
 
         if not entity_description:
-            pres = self.gateway.const.Presentation
+            presentation = self.gateway.const.Presentation
             entity_description = SENSORS.get(
-                f"{set_req(self.value_type).name}_{pres(self.child_type).name}"
+                f"{set_req(self.value_type).name}_{presentation(self.child_type).name}"
             )
 
         return entity_description

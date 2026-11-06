@@ -1,0 +1,14 @@
+{
+  "domain": "google_photos",
+  "name": "Google Photos",
+  "categories": ["productivity_information.documents_photos"],
+  "codeowners": ["@allenporter"],
+  "config_flow": true,
+  "connectivity": ["cloud"],
+  "dependencies": ["application_credentials"],
+  "documentation": "https://www.home-assistant.io/integrations/google_photos",
+  "integration_type": "service",
+  "iot_class": "cloud_polling",
+  "loggers": ["google_photos_library_api"],
+  "requirements": ["google-photos-library-api==0.12.1"]
+}

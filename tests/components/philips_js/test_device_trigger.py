@@ -1,26 +1,16 @@
 """The tests for Philips TV device triggers."""
-import pytest
 
-import homeassistant.components.automation as automation
+from pytest_homeassistant.common import async_get_device_automations
+from pytest_unordered import unordered
+
+from homeassistant.components import automation
 from homeassistant.components.device_automation import DeviceAutomationType
 from homeassistant.components.philips_js.const import DOMAIN
+from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.setup import async_setup_component
 
-from tests.common import (
-    assert_lists_same,
-    async_get_device_automations,
-    async_mock_service,
-)
-from tests.components.blueprint.conftest import stub_blueprint_populate  # noqa: F401
 
-
-@pytest.fixture
-def calls(hass):
-    """Track calls to a mock service."""
-    return async_mock_service(hass, "test", "automation")
-
-
-async def test_get_triggers(hass, mock_device):
+async def test_get_triggers(hass: HomeAssistant, mock_device) -> None:
     """Test we get the expected triggers."""
     expected_triggers = [
         {
@@ -34,12 +24,17 @@ async def test_get_triggers(hass, mock_device):
     triggers = await async_get_device_automations(
         hass, DeviceAutomationType.TRIGGER, mock_device.id
     )
-    assert_lists_same(triggers, expected_triggers)
+    triggers = [trigger for trigger in triggers if trigger["domain"] == DOMAIN]
+    assert triggers == unordered(expected_triggers)
 
 
 async def test_if_fires_on_turn_on_request(
-    hass, calls, mock_tv, mock_entity, mock_device
-):
+    hass: HomeAssistant,
+    service_calls: list[ServiceCall],
+    mock_tv,
+    mock_entity,
+    mock_device,
+) -> None:
     """Test for turn_on and turn_off triggers firing."""
 
     mock_tv.on = False
@@ -76,6 +71,10 @@ async def test_if_fires_on_turn_on_request(
     )
 
     await hass.async_block_till_done()
-    assert len(calls) == 1
-    assert calls[0].data["some"] == mock_device.id
-    assert calls[0].data["id"] == 0
+    assert len(service_calls) == 2
+    assert service_calls[0].domain == "media_player"
+    assert service_calls[0].service == "turn_on"
+    assert service_calls[1].domain == "test"
+    assert service_calls[1].service == "automation"
+    assert service_calls[1].data["some"] == mock_device.id
+    assert service_calls[1].data["id"] == 0

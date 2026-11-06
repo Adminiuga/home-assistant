@@ -1,14 +1,15 @@
 """API for Neato Botvac bound to Home Assistant OAuth."""
-from __future__ import annotations
 
 from asyncio import run_coroutine_threadsafe
-from typing import Any
+from typing import Any, override
 
 import pybotvac
 
-from homeassistant import config_entries, core
+from homeassistant import core
 from homeassistant.components.application_credentials import AuthImplementation
 from homeassistant.helpers import config_entry_oauth2_flow
+
+from .hub import NeatoConfigEntry
 
 
 class ConfigEntryAuth(pybotvac.OAuthSession):  # type: ignore[misc]
@@ -17,7 +18,7 @@ class ConfigEntryAuth(pybotvac.OAuthSession):  # type: ignore[misc]
     def __init__(
         self,
         hass: core.HomeAssistant,
-        config_entry: config_entries.ConfigEntry,
+        config_entry: NeatoConfigEntry,
         implementation: config_entry_oauth2_flow.AbstractOAuth2Implementation,
     ) -> None:
         """Initialize Neato Botvac Auth."""
@@ -28,7 +29,7 @@ class ConfigEntryAuth(pybotvac.OAuthSession):  # type: ignore[misc]
         super().__init__(self.session.token, vendor=pybotvac.Neato())
 
     def refresh_tokens(self) -> str:
-        """Refresh and return new Neato Botvac tokens using Home Assistant OAuth2 session."""
+        """Refresh and return new Neato Botvac tokens."""
         run_coroutine_threadsafe(
             self.session.async_ensure_token_valid(), self.hass.loop
         ).result()
@@ -39,14 +40,17 @@ class ConfigEntryAuth(pybotvac.OAuthSession):  # type: ignore[misc]
 class NeatoImplementation(AuthImplementation):
     """Neato implementation of LocalOAuth2Implementation.
 
-    We need this class because we have to add client_secret and scope to the authorization request.
+    We need this class because we have to add client_secret
+    and scope to the authorization request.
     """
 
     @property
+    @override
     def extra_authorize_data(self) -> dict[str, Any]:
         """Extra data that needs to be appended to the authorize url."""
         return {"client_secret": self.client_secret}
 
+    @override
     async def async_generate_authorize_url(self, flow_id: str) -> str:
         """Generate a url for the user to authorize.
 

@@ -1,0 +1,386 @@
+"""KNX integration services."""
+
+from enum import StrEnum
+import logging
+from typing import TYPE_CHECKING, cast
+
+import probatio
+from xknx.core import ValueReader
+from xknx.dpt import DPTArray, DPTBase, DPTBinary
+from xknx.exceptions import ConversionError
+from xknx.telegram import Telegram
+from xknx.telegram.address import parse_device_group_address
+from xknx.telegram.apci import GroupValueRead, GroupValueResponse, GroupValueWrite
+
+from homeassistant.const import SERVICE_RELOAD, Platform
+from homeassistant.core import (
+    HomeAssistant,
+    ServiceCall,
+    ServiceResponse,
+    SupportsResponse,
+    callback,
+)
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.service import (
+    async_register_admin_service,
+    async_register_platform_entity_service,
+)
+from homeassistant.util.json import JsonValueType
+
+from .const import DOMAIN, KNX_MODULE_KEY
+from .expose import create_knx_exposure
+from .schema import ExposeSchema
+from .validation import dpt_base_type_validator, ga_validator
+
+if TYPE_CHECKING:
+    from .knx_module import KNXModule
+
+_LOGGER = logging.getLogger(__name__)
+
+
+class KnxService(StrEnum):
+    """Store keys for KNX services."""
+
+    EVENT_REGISTER = "event_register"
+    EXPOSURE_REGISTER = "exposure_register"
+    READ = "read"
+    SAVE_SCENE = "save_scene"
+    SEND = "send"
+
+
+class KnxServiceArgument(StrEnum):
+    """Store keys for KNX service arguments."""
+
+    ADDRESS = "address"
+    PAYLOAD = "payload"
+    REMOVE = "remove"
+    RESPONSE = "response"
+    TYPE = "type"
+
+
+_DESCRIPTION_PLACEHOLDERS = {
+    "sensor_value_types_url": "https://www.home-assistant.io/integrations/knx/#value-types"
+}
+
+# Seconds `knx.read` waits for an answer when response data was requested.
+READ_RESPONSE_TIMEOUT = 2.0
+
+
+@callback
+def async_setup_services(hass: HomeAssistant) -> None:
+    """Register KNX integration services."""
+    hass.services.async_register(
+        DOMAIN,
+        KnxService.SEND,
+        service_send_to_knx_bus,
+        schema=SERVICE_SEND_SCHEMA,
+        description_placeholders=_DESCRIPTION_PLACEHOLDERS,
+    )
+
+    hass.services.async_register(
+        DOMAIN,
+        KnxService.READ,
+        service_read_to_knx_bus,
+        schema=SERVICE_READ_SCHEMA,
+        supports_response=SupportsResponse.OPTIONAL,
+    )
+
+    async_register_admin_service(
+        hass,
+        DOMAIN,
+        KnxService.EVENT_REGISTER,
+        service_event_register_modify,
+        schema=SERVICE_EVENT_REGISTER_SCHEMA,
+        description_placeholders=_DESCRIPTION_PLACEHOLDERS,
+    )
+
+    async_register_admin_service(
+        hass,
+        DOMAIN,
+        KnxService.EXPOSURE_REGISTER,
+        service_exposure_register_modify,
+        schema=SERVICE_EXPOSURE_REGISTER_SCHEMA,
+        description_placeholders=_DESCRIPTION_PLACEHOLDERS,
+    )
+
+    async_register_admin_service(
+        hass,
+        DOMAIN,
+        SERVICE_RELOAD,
+        service_reload_integration,
+    )
+
+    async_register_platform_entity_service(
+        hass,
+        DOMAIN,
+        KnxService.SAVE_SCENE,
+        entity_domain=Platform.SCENE,
+        schema=None,
+        func="async_save_scene",
+    )
+
+
+@callback
+def get_knx_module(hass: HomeAssistant) -> KNXModule:
+    """Return KNXModule instance."""
+    try:
+        return hass.data[KNX_MODULE_KEY]
+    except KeyError as err:
+        raise HomeAssistantError(
+            translation_domain=DOMAIN, translation_key="integration_not_loaded"
+        ) from err
+
+
+SERVICE_EVENT_REGISTER_SCHEMA = probatio.Schema(
+    {
+        probatio.Required(KnxServiceArgument.ADDRESS): probatio.All(
+            probatio.EnsureList(),
+            [ga_validator],
+        ),
+        probatio.Optional(KnxServiceArgument.TYPE): dpt_base_type_validator,
+        probatio.Optional(KnxServiceArgument.REMOVE, default=False): cv.boolean,
+    }
+)
+
+
+async def service_event_register_modify(call: ServiceCall) -> None:
+    """Service for adding or removing a GroupAddress to the knx_event filter."""
+    knx_module = get_knx_module(call.hass)
+
+    attr_address = call.data[KnxServiceArgument.ADDRESS]
+    group_addresses = set(map(parse_device_group_address, attr_address))
+
+    if call.data.get(KnxServiceArgument.REMOVE):
+        _error_gas = set()
+        for group_address in group_addresses:
+            try:
+                knx_module.knx_event_callback.group_addresses.remove(group_address)
+            except ValueError:
+                _error_gas.add(group_address)
+            if group_address in knx_module.group_address_transcoder:
+                del knx_module.group_address_transcoder[group_address]
+
+        if not _error_gas:
+            return
+        raise HomeAssistantError(
+            translation_domain=DOMAIN,
+            translation_key="service_event_register_ga_not_found",
+            translation_placeholders={
+                "group_addresses": ", ".join(map(str, sorted(_error_gas)))
+            },
+        )
+
+    if (dpt := call.data.get(KnxServiceArgument.TYPE)) and (
+        transcoder := DPTBase.parse_transcoder(dpt)
+    ):
+        knx_module.group_address_transcoder.update(
+            dict.fromkeys(group_addresses, transcoder)
+        )
+    for group_address in group_addresses:
+        if group_address in knx_module.knx_event_callback.group_addresses:
+            continue
+        knx_module.knx_event_callback.group_addresses.append(group_address)
+        _LOGGER.debug(
+            "Service event_register registered event for '%s'",
+            str(group_address),
+        )
+
+
+SERVICE_EXPOSURE_REGISTER_SCHEMA = probatio.Any(
+    ExposeSchema.EXPOSE_SENSOR_SCHEMA.extend(
+        {
+            probatio.Optional(KnxServiceArgument.REMOVE, default=False): cv.boolean,
+        }
+    ),
+    probatio.Schema(
+        # for removing only `address` is required
+        {
+            probatio.Required(KnxServiceArgument.ADDRESS): ga_validator,
+            probatio.Required(KnxServiceArgument.REMOVE): probatio.All(
+                cv.boolean, True
+            ),
+        },
+        extra=probatio.ALLOW_EXTRA,
+    ),
+)
+
+
+async def service_exposure_register_modify(call: ServiceCall) -> None:
+    """Service for adding or removing an exposure to KNX bus."""
+    knx_module = get_knx_module(call.hass)
+
+    group_address = call.data[KnxServiceArgument.ADDRESS]
+
+    if call.data.get(KnxServiceArgument.REMOVE):
+        try:
+            removed_exposure = knx_module.service_exposures.pop(group_address)
+        except KeyError as err:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="service_exposure_remove_not_found",
+                translation_placeholders={
+                    "group_address": group_address,
+                },
+            ) from err
+
+        removed_exposure.async_remove()
+        return
+
+    if group_address in knx_module.service_exposures:
+        replaced_exposure = knx_module.service_exposures.pop(group_address)
+        _LOGGER.warning(
+            (
+                "Service exposure_register replacing already registered exposure"
+                " for '%s' - %s"
+            ),
+            group_address,
+            replaced_exposure.name,
+        )
+        replaced_exposure.async_remove()
+    exposure = create_knx_exposure(knx_module.hass, knx_module.xknx, call.data)
+    knx_module.service_exposures[group_address] = exposure
+    _LOGGER.debug(
+        "Service exposure_register registered exposure for '%s' - %s",
+        group_address,
+        exposure.name,
+    )
+
+
+SERVICE_SEND_SCHEMA = probatio.Any(
+    probatio.Schema(
+        {
+            probatio.Required(KnxServiceArgument.ADDRESS): probatio.All(
+                probatio.EnsureList(),
+                [ga_validator],
+            ),
+            probatio.Required(KnxServiceArgument.PAYLOAD): cv.match_all,
+            probatio.Required(KnxServiceArgument.TYPE): dpt_base_type_validator,
+            probatio.Optional(KnxServiceArgument.RESPONSE, default=False): cv.boolean,
+        }
+    ),
+    probatio.Schema(
+        # without type given payload is treated as raw bytes
+        {
+            probatio.Required(KnxServiceArgument.ADDRESS): probatio.All(
+                probatio.EnsureList(),
+                [ga_validator],
+            ),
+            probatio.Required(KnxServiceArgument.PAYLOAD): probatio.Any(
+                cv.positive_int, [cv.positive_int]
+            ),
+            probatio.Optional(KnxServiceArgument.RESPONSE, default=False): cv.boolean,
+        }
+    ),
+)
+
+
+async def service_send_to_knx_bus(call: ServiceCall) -> None:
+    """Service for sending an arbitrary KNX message to the KNX bus."""
+    knx_module = get_knx_module(call.hass)
+
+    attr_address = call.data[KnxServiceArgument.ADDRESS]
+    attr_payload = call.data[KnxServiceArgument.PAYLOAD]
+    attr_type = call.data.get(KnxServiceArgument.TYPE)
+    attr_response = call.data[KnxServiceArgument.RESPONSE]
+
+    payload: DPTBinary | DPTArray
+    if attr_type is not None:
+        transcoder = DPTBase.parse_transcoder(attr_type)
+        if transcoder is None:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="service_send_invalid_type",
+                translation_placeholders={"type": attr_type},
+            )
+        try:
+            payload = transcoder.to_knx(attr_payload)
+        except ConversionError as err:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="service_send_invalid_payload",
+                translation_placeholders={"error": str(err)},
+            ) from err
+    elif isinstance(attr_payload, int):
+        payload = DPTBinary(attr_payload)
+    else:
+        payload = DPTArray(attr_payload)
+
+    for address in attr_address:
+        telegram = Telegram(
+            destination_address=parse_device_group_address(address),
+            payload=GroupValueResponse(payload)
+            if attr_response
+            else GroupValueWrite(payload),
+            source_address=knx_module.xknx.current_address,
+        )
+        await knx_module.xknx.telegrams.put(telegram)
+
+
+SERVICE_READ_SCHEMA = probatio.Schema(
+    {
+        probatio.Required(KnxServiceArgument.ADDRESS): probatio.All(
+            probatio.EnsureList(),
+            [ga_validator],
+        )
+    }
+)
+
+
+async def service_read_to_knx_bus(call: ServiceCall) -> ServiceResponse:
+    """Service for sending a GroupValueRead telegram to the KNX bus."""
+    knx_module = get_knx_module(call.hass)
+    addresses: list[str] = call.data[KnxServiceArgument.ADDRESS]
+
+    if call.return_response:
+        if len(addresses) != 1:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="service_read_response_single_address",
+            )
+        return await _read_with_response(knx_module, addresses[0])
+
+    for address in addresses:
+        telegram = Telegram(
+            destination_address=parse_device_group_address(address),
+            payload=GroupValueRead(),
+            source_address=knx_module.xknx.current_address,
+        )
+        await knx_module.xknx.telegrams.put(telegram)
+    return None
+
+
+async def _read_with_response(knx_module: KNXModule, address: str) -> ServiceResponse:
+    """Send a GroupValueRead and return the answering telegram."""
+    value_reader = ValueReader(
+        knx_module.xknx,
+        parse_device_group_address(address),
+        timeout_in_seconds=READ_RESPONSE_TIMEOUT,
+    )
+    telegram = await value_reader.read()
+    if telegram is None:
+        raise HomeAssistantError(
+            translation_domain=DOMAIN,
+            translation_key="service_read_no_response",
+            translation_placeholders={"address": address},
+        )
+    # Decoded with the DPT the loaded project assigns to the address, if any.
+    telegram_dict = knx_module.telegrams.telegram_to_dict(telegram)
+    payload = telegram_dict["payload"]
+    return {
+        "value": cast(JsonValueType, telegram_dict["value"]),
+        "unit": telegram_dict["unit"],
+        "dpt_main": telegram_dict["dpt_main"],
+        "dpt_sub": telegram_dict["dpt_sub"],
+        "dpt_name": telegram_dict["dpt_name"],
+        "payload": list(payload) if isinstance(payload, tuple) else payload,
+        "source": telegram_dict["source"],
+        "source_name": telegram_dict["source_name"],
+    }
+
+
+async def service_reload_integration(call: ServiceCall) -> None:
+    """Reload the integration."""
+    knx_module = get_knx_module(call.hass)
+    await call.hass.config_entries.async_reload(knx_module.entry.entry_id)
+    call.hass.bus.async_fire(f"event_{DOMAIN}_reloaded", context=call.context)

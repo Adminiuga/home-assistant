@@ -1,25 +1,40 @@
-"""Support for (EMEA/EU-based) Honeywell TCC climate systems."""
-DOMAIN = "evohome"
+"""The constants of the Evohome integration."""
 
-STORAGE_VER = 1
-STORAGE_KEY = DOMAIN
+from datetime import timedelta
+from enum import StrEnum, unique
+from typing import TYPE_CHECKING, Final
 
-# The Parent's (i.e. TCS, Controller's) operating mode is one of:
-EVO_RESET = "AutoWithReset"
-EVO_AUTO = "Auto"
-EVO_AUTOECO = "AutoWithEco"
-EVO_AWAY = "Away"
-EVO_DAYOFF = "DayOff"
-EVO_CUSTOM = "Custom"
-EVO_HEATOFF = "HeatingOff"
+from homeassistant.util.hass_dict import HassKey
 
-# The Children's operating mode is one of:
-EVO_FOLLOW = "FollowSchedule"  # the operating mode is 'inherited' from the TCS
-EVO_TEMPOVER = "TemporaryOverride"
-EVO_PERMOVER = "PermanentOverride"
+if TYPE_CHECKING:
+    from . import EvoData
 
-# These are used only to help prevent E501 (line too long) violations
-GWS = "gateways"
-TCS = "temperatureControlSystems"
+DOMAIN: Final = "evohome"
+EVOHOME_DATA: HassKey[EvoData] = HassKey(DOMAIN)
 
-UTC_OFFSET = "currentOffsetMinutes"
+STORAGE_VER: Final = 1
+STORAGE_KEY: Final = DOMAIN
+
+CONF_LOCATION_IDX: Final = "location_idx"
+
+SCAN_INTERVAL_DEFAULT: Final = timedelta(seconds=300)
+SCAN_INTERVAL_MINIMUM: Final = timedelta(seconds=60)
+
+# Schedules are weekly, so are re-fetched only to pick up any changes made elsewhere
+SCHEDULE_MAX_AGE: Final = timedelta(hours=1)
+
+# Support for the refresh_system service is being deprecated
+REFRESH_BREAKS_IN_HA_VERSION: Final = "2027.1.0"
+
+NEXT_SP_FROM: Final = "next_sp_from"
+THIS_SP_FROM: Final = "this_sp_from"
+
+
+@unique
+class EvoService(StrEnum):
+    """The Evohome services."""
+
+    REFRESH_SYSTEM = "refresh_system"
+    SET_SYSTEM_MODE = "set_system_mode"
+    SET_ZONE_OVERRIDE = "set_zone_override"
+    SET_DHW_OVERRIDE = "set_dhw_override"
